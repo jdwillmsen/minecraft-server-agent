@@ -59,7 +59,9 @@ func main() {
 		Voice:     adapters.NewNoopVoice(log),
 		Directory: registry,
 	}
-	eventBus := bus.New() // wired for future event-driven plugins (join/leave/welcome, Stage 2+)
+	// Every answerable chat message is published here; Stage 2+ plugins
+	// (join/leave/welcome) subscribe rather than touching the connection.
+	eventBus := bus.New()
 
 	httpServer := httpapi.New(cfg.HTTPAddr)
 	go func() {
@@ -109,14 +111,7 @@ func runConnectLoop(ctx context.Context, cfg config.Config, log *logging.Logger,
 			log.Info("disconnected", logging.Fields{"session_lasted_ms": lasted.Milliseconds()})
 		}
 
-		if lasted >= stableSessionThreshold {
-			delay = minDelay
-		} else {
-			delay *= 2
-			if delay > maxDelay {
-				delay = maxDelay
-			}
-		}
+		delay = nextDelay(delay, lasted, minDelay, maxDelay)
 		wait := jitter(delay)
 		log.Info("reconnecting", logging.Fields{"delay_ms": wait.Milliseconds()})
 
@@ -126,6 +121,23 @@ func runConnectLoop(ctx context.Context, cfg config.Config, log *logging.Logger,
 		case <-time.After(wait):
 		}
 	}
+}
+
+// nextDelay is the reconnect backoff step: a session that stayed up at
+// least stableSessionThreshold is treated as healthy and resets the delay
+// to min, while anything shorter doubles the previous delay up to max.
+func nextDelay(current, lasted, min, max time.Duration) time.Duration {
+	if lasted >= stableSessionThreshold {
+		return min
+	}
+	next := current * 2
+	if next < min {
+		return min
+	}
+	if next > max {
+		return max
+	}
+	return next
 }
 
 // jitter randomizes d to 50-100% of its value, so multiple agent instances
@@ -144,7 +156,7 @@ func jitter(d time.Duration) time.Duration {
 // cancellation surfaced as a read error, which the caller ignores because
 // it checks ctx.Err() itself).
 func session(ctx context.Context, cfg config.Config, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus) error {
-	ts, err := mcauth.TokenSource(ctx, cfg.AuthCacheDir, os.Stdout)
+	ts, err := mcauth.TokenSource(ctx, cfg.AuthCacheDir, cfg.MCUsername, os.Stdout)
 	if err != nil {
 		return fmt.Errorf("auth: %w", err)
 	}
@@ -159,6 +171,21 @@ func session(ctx context.Context, cfg config.Config, log *logging.Logger, regist
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
+
+	// conn.ReadPacket below only unblocks on the connection's own context,
+	// which gophertunnel derives from the RakNet link rather than from the
+	// ctx passed to DialContext - so closing the connection is the only way
+	// a shutdown signal can interrupt a read on an idle server.
+	sessionDone := make(chan struct{})
+	defer close(sessionDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-sessionDone:
+		}
+	}()
+
 	log.Info("joined", logging.Fields{"address": addr})
 
 	spawnCtx, spawnCancel := context.WithTimeout(ctx, 30*time.Second)
@@ -202,6 +229,8 @@ func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblin
 	}
 
 	trigger := chat.ParseTrigger(text.Message)
+	eventBus.Publish(chat.MessageEvent{ActorXUID: id, Message: text.Message, Trigger: trigger})
+
 	switch trigger.Kind {
 	case chat.TriggerCommand:
 		handleCommand(ctx, id, trigger, log, registry, pctx)

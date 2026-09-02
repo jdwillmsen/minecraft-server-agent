@@ -181,3 +181,10 @@ func TestParseTrigger_MentionSubstringInsideAnotherWord(t *testing.T) {
 		t.Errorf("Kind = %v, want TriggerMention (substring match is intentionally permissive)", got.Kind)
 	}
 }
+
+func TestMessageEvent_KindIsTheChatMessageKind(t *testing.T) {
+	var ev MessageEvent
+	if ev.Kind() != MessageKind {
+		t.Errorf("Kind() = %q, want %q", ev.Kind(), MessageKind)
+	}
+}

@@ -9,18 +9,14 @@ import (
 )
 
 func TestServer_Healthz(t *testing.T) {
-	srv := New(":0")
-	go func() { _ = srv.ListenAndServe() }()
-	defer func() { _ = srv.Shutdown(context.Background()) }()
-
 	// New(":0") binds an ephemeral port we can't easily discover through
 	// http.Server, so exercise the handler directly instead of over the
-	// network.
+	// network. TestServer_ShutdownIsClean covers the real listener.
+	srv := New(":0")
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 
-	handlerServer := New(":0")
-	handlerServer.httpServer.Handler.ServeHTTP(rec, req)
+	srv.httpServer.Handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)

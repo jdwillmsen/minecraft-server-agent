@@ -126,3 +126,22 @@ func ParseTrigger(message string) Trigger {
 
 	return Trigger{Kind: TriggerNone}
 }
+
+// MessageKind is the bus event kind published for every answerable chat
+// message that survives identity resolution and the self/sibling guard.
+const MessageKind = "chat.message"
+
+// MessageEvent is what the protocol client publishes on the bus for each
+// such message, so event-driven plugins can observe chat without touching
+// the Bedrock connection.
+type MessageEvent struct {
+	// ActorXUID is the resolved sender identity (see Identity).
+	ActorXUID string
+	// Message is the original chat line, unmodified.
+	Message string
+	// Trigger is the classification ParseTrigger produced for Message.
+	Trigger Trigger
+}
+
+// Kind satisfies the bus's Event interface.
+func (MessageEvent) Kind() string { return MessageKind }

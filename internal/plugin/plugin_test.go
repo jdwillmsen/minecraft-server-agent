@@ -141,3 +141,133 @@ func TestPermissionString(t *testing.T) {
 		}
 	}
 }
+
+func TestRegister_CommandNameIsNormalisedForDispatch(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(stubPlugin{name: "a", cmds: []Command{okCommand("Help", PermissionVisitor)}}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	// chat.ParseTrigger lowercases what the player typed, so a command
+	// registered with any casing must still be reachable.
+	reply, err := r.Dispatch(context.Background(), &Context{}, "help", Invocation{ActorPermission: PermissionVisitor})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if reply != "ok:Help" {
+		t.Errorf("reply = %q, want ok:Help", reply)
+	}
+}
+
+func TestDispatch_MatchesCommandNameCaseInsensitively(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(stubPlugin{name: "a", cmds: []Command{okCommand("ping", PermissionVisitor)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Dispatch(context.Background(), &Context{}, "PING", Invocation{ActorPermission: PermissionVisitor}); err != nil {
+		t.Errorf("dispatch of PING: %v", err)
+	}
+}
+
+func TestRegister_CaseDifferingNamesCollide(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(stubPlugin{name: "a", cmds: []Command{okCommand("help", PermissionVisitor)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register(stubPlugin{name: "b", cmds: []Command{okCommand("HELP", PermissionVisitor)}}); err == nil {
+		t.Fatal("expected HELP to collide with the already-registered help")
+	}
+}
+
+func TestRegister_RejectsDuplicateNamesWithinOnePlugin(t *testing.T) {
+	r := NewRegistry()
+	err := r.Register(stubPlugin{name: "a", cmds: []Command{
+		okCommand("ping", PermissionVisitor),
+		okCommand("Ping", PermissionVisitor),
+	}})
+	if err == nil {
+		t.Fatal("expected an error for a plugin declaring the same command twice")
+	}
+	if len(r.Commands()) != 0 {
+		t.Errorf("Commands() = %v, want none registered after a failed Register", r.Commands())
+	}
+}
+
+func TestRegister_RejectsEmptyCommandName(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(stubPlugin{name: "a", cmds: []Command{okCommand("  ", PermissionVisitor)}}); err == nil {
+		t.Fatal("expected an error for a command with an empty name")
+	}
+}
+
+func TestRegister_RejectsNilRun(t *testing.T) {
+	r := NewRegistry()
+	err := r.Register(stubPlugin{name: "a", cmds: []Command{{Name: "broken", Permission: PermissionVisitor}}})
+	if err == nil {
+		t.Fatal("expected an error for a command with a nil Run")
+	}
+	if _, err := r.Dispatch(context.Background(), &Context{}, "broken", Invocation{}); !errors.Is(err, ErrUnknownCommand) {
+		t.Errorf("err = %v, want ErrUnknownCommand for a rejected command", err)
+	}
+}
+
+func TestDispatch_RecoversPluginPanic(t *testing.T) {
+	r := NewRegistry()
+	err := r.Register(stubPlugin{name: "boom", cmds: []Command{{
+		Name:       "explode",
+		Permission: PermissionVisitor,
+		Run: func(ctx context.Context, pctx *Context, inv Invocation) (string, error) {
+			panic("plugin bug")
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reply, err := r.Dispatch(context.Background(), &Context{}, "explode", Invocation{ActorPermission: PermissionVisitor})
+	if !errors.Is(err, ErrCommandPanicked) {
+		t.Fatalf("err = %v, want ErrCommandPanicked", err)
+	}
+	if reply != "" {
+		t.Errorf("reply = %q, want empty after a panic", reply)
+	}
+}
+
+func TestDispatch_SurvivesAPanicAndKeepsServingOtherCommands(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(stubPlugin{name: "boom", cmds: []Command{{
+		Name:       "explode",
+		Permission: PermissionVisitor,
+		Run: func(ctx context.Context, pctx *Context, inv Invocation) (string, error) {
+			panic("plugin bug")
+		},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register(stubPlugin{name: "a", cmds: []Command{okCommand("ping", PermissionVisitor)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := r.Dispatch(context.Background(), &Context{}, "explode", Invocation{ActorPermission: PermissionVisitor}); err == nil {
+		t.Fatal("expected an error from the panicking command")
+	}
+	reply, err := r.Dispatch(context.Background(), &Context{}, "ping", Invocation{ActorPermission: PermissionVisitor})
+	if err != nil || reply != "ok:ping" {
+		t.Errorf("after a panic, ping returned (%q, %v), want (ok:ping, nil)", reply, err)
+	}
+}
+
+func TestDispatch_PanicIsCheckedAfterPermission(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(stubPlugin{name: "boom", cmds: []Command{{
+		Name:       "op-explode",
+		Permission: PermissionOperator,
+		Run: func(ctx context.Context, pctx *Context, inv Invocation) (string, error) {
+			panic("must never run")
+		},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Dispatch(context.Background(), &Context{}, "op-explode", Invocation{ActorPermission: PermissionVisitor}); !errors.Is(err, ErrPermissionDenied) {
+		t.Errorf("err = %v, want ErrPermissionDenied", err)
+	}
+}

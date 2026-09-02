@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -128,20 +129,47 @@ func NewRegistry() *Registry {
 	return &Registry{commands: make(map[string]Command)}
 }
 
-// Register adds a plugin's commands to the registry. It fails if any
-// command name collides with one already registered, so two plugins can
-// never silently shadow each other.
+// commandKey normalises a command name into the form the registry keys on,
+// so the case-insensitive matching Command.Name documents is enforced here
+// rather than assumed of every caller.
+func commandKey(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+// Register adds a plugin's commands to the registry. It rejects a plugin
+// whose commands are unusable (empty name, nil Run) or whose names collide
+// with each other or with one already registered, so two plugins can never
+// silently shadow each other and no unrunnable command can ever be
+// dispatched. Registration is all-or-nothing.
 func (r *Registry) Register(p Plugin) error {
+	cmds := p.Commands()
+	keys := make([]string, len(cmds))
+	for i, cmd := range cmds {
+		key := commandKey(cmd.Name)
+		if key == "" {
+			return fmt.Errorf("plugin %s: command %d has an empty name", p.Name(), i)
+		}
+		if cmd.Run == nil {
+			return fmt.Errorf("plugin %s: command %q has a nil Run function", p.Name(), cmd.Name)
+		}
+		for j := 0; j < i; j++ {
+			if keys[j] == key {
+				return fmt.Errorf("plugin %s: command %q is declared twice", p.Name(), cmd.Name)
+			}
+		}
+		keys[i] = key
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for _, cmd := range p.Commands() {
-		if _, exists := r.commands[cmd.Name]; exists {
+	for i, cmd := range cmds {
+		if _, exists := r.commands[keys[i]]; exists {
 			return fmt.Errorf("plugin %s: command %q is already registered", p.Name(), cmd.Name)
 		}
 	}
-	for _, cmd := range p.Commands() {
-		r.commands[cmd.Name] = cmd
+	for i, cmd := range cmds {
+		r.commands[keys[i]] = cmd
 	}
 	r.plugins = append(r.plugins, p)
 	return nil
@@ -155,13 +183,19 @@ var ErrUnknownCommand = fmt.Errorf("unknown command")
 // is below the command's required level.
 var ErrPermissionDenied = fmt.Errorf("permission denied")
 
+// ErrCommandPanicked is returned by Dispatch when a plugin's Run panicked.
+var ErrCommandPanicked = fmt.Errorf("command panicked")
+
 // Dispatch finds the command named name and runs it, after checking that
 // inv.ActorPermission meets the command's requirement. name is matched
-// case-insensitively by the caller (see internal/chat.ParseTrigger, which
-// already lowercases it).
+// case-insensitively.
+//
+// A panic inside a plugin's Run is recovered and returned as an error: a
+// plugin bug must not be able to take down the agent's connect loop or its
+// HTTP endpoints.
 func (r *Registry) Dispatch(ctx context.Context, pctx *Context, name string, inv Invocation) (reply string, err error) {
 	r.mu.RLock()
-	cmd, ok := r.commands[name]
+	cmd, ok := r.commands[commandKey(name)]
 	r.mu.RUnlock()
 
 	if !ok {
@@ -170,6 +204,13 @@ func (r *Registry) Dispatch(ctx context.Context, pctx *Context, name string, inv
 	if inv.ActorPermission < cmd.Permission {
 		return "", ErrPermissionDenied
 	}
+
+	defer func() {
+		if p := recover(); p != nil {
+			reply = ""
+			err = fmt.Errorf("%w: command %q: %v", ErrCommandPanicked, cmd.Name, p)
+		}
+	}()
 	return cmd.Run(ctx, pctx, inv)
 }
 

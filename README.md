@@ -61,7 +61,7 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice
 | `RECONNECT_MIN_MS` | `5000` | Initial reconnect backoff |
 | `RECONNECT_MAX_MS` | `300000` | Reconnect backoff ceiling |
 | `HTTP_ADDR` | `:8080` | `/healthz` + `/metrics` listen address |
-| `AUTH_CACHE_DIR` | `/data/auth` | Where the Xbox Live token is cached |
+| `AUTH_CACHE_DIR` | `/data/auth` | Where the Xbox Live token is cached, one file per `MC_USERNAME` |
 | `LOG_LEVEL` | `info` | `info` or `debug` |
 
 ## Identity model

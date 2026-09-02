@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -28,7 +29,7 @@ type Logger struct {
 // "debug" is treated as info.
 func New(levelName string) *Logger {
 	lvl := LevelInfo
-	if levelName == "debug" {
+	if strings.EqualFold(strings.TrimSpace(levelName), "debug") {
 		lvl = LevelDebug
 	}
 	return &Logger{level: lvl}
