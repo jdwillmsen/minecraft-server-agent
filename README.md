@@ -3,8 +3,8 @@
 Minecraft Bedrock server chat agent: tool-calling LLM assistant, welcomes, stats, knowledge lookup.
 
 The chat "ear" and brain for the FWB Bedrock server. Connects as a headless
-`bedrock-protocol` client (via `sandertv/gophertunnel`), reads chat, and
-dispatches `!` commands and `@server` mentions to a small plugin host.
+Bedrock client (via `sandertv/gophertunnel`), reads chat, and dispatches
+`!` commands and `@server` mentions to a small plugin host.
 
 ## What this is not
 
@@ -40,8 +40,9 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice
 - `internal/logging` - structured JSON stdout logging (Loki-compatible)
 - `internal/chat` - packet parsing, XUID-based identity, command/mention
   detection, self/sibling loop guard
-- `internal/bus` - typed pub/sub event bus (for future join/leave/welcome
-  plugins)
+- `internal/bus` - typed pub/sub event bus; every answerable chat message is
+  published as a `chat.MessageEvent`, so later event-driven plugins
+  (join/leave/welcome) subscribe instead of touching the connection
 - `internal/plugin` - the `Plugin`/`Context`/`Registry` extension surface
 - `internal/plugins` - concrete plugins (`core` today; `welcome`, `stats`,
   `ask`, etc. in later stages)
