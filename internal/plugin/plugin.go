@@ -32,8 +32,8 @@ import (
 var DefaultDispatchTimeout = 5 * time.Second
 
 // Permission is the minimum privilege level a command requires, resolved
-// from the server's permissions.json (read by mc-console-bridge, wired in
-// a later stage).
+// from the server's permissions.json via mc-console-bridge's
+// GET /permissions (see internal/adapters.PermissionResolver).
 type Permission int
 
 const (
@@ -56,8 +56,9 @@ func (p Permission) String() string {
 }
 
 // Voice is how a plugin speaks - always through the console bridge, never
-// as a player. Implemented against mc-console-bridge starting Stage 2; a
-// no-op implementation is used until then.
+// as a player. Implemented against mc-console-bridge by
+// internal/adapters.BridgeVoice; a no-op implementation remains for tests
+// that exercise dispatch without a bridge.
 type Voice interface {
 	// Tell whispers message to the player identified by xuid.
 	Tell(ctx context.Context, xuid, message string) error
