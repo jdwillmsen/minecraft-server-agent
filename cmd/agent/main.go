@@ -303,13 +303,20 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	}
 
 	log.Info("command_replied", logging.Fields{"command": trigger.Command, "actor": actorXUID, "reply": reply})
+
+	// The reply runs on the packet-read goroutine just like Dispatch does,
+	// so it needs the same bound: a hung Voice implementation must not be
+	// able to stall the read loop indefinitely.
+	replyCtx, cancel := context.WithTimeout(ctx, plugin.DefaultDispatchTimeout)
+	defer cancel()
+
 	if actorXUID == chat.ServerOrigin {
-		if err := pctx.Voice.Say(ctx, reply); err != nil {
+		if err := pctx.Voice.Say(replyCtx, reply); err != nil {
 			log.Error("voice_say_failed", logging.Fields{"command": trigger.Command, "error": err.Error()})
 		}
 		return
 	}
-	if err := pctx.Voice.Tell(ctx, actorXUID, reply); err != nil {
+	if err := pctx.Voice.Tell(replyCtx, actorXUID, reply); err != nil {
 		log.Error("voice_tell_failed", logging.Fields{"command": trigger.Command, "actor": actorXUID, "error": err.Error()})
 	}
 }

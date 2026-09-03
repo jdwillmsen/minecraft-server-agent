@@ -3,6 +3,7 @@ package mcauth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -238,12 +239,87 @@ func TestSaveToken_IsAtomic_NoTempFileLeftOnSuccess(t *testing.T) {
 	if err := saveToken(path, &oauth2.Token{AccessToken: "a", RefreshToken: "r"}); err != nil {
 		t.Fatalf("saveToken: %v", err)
 	}
-	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
-		t.Errorf("temp file left behind after a successful save: err=%v", err)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "token.json" {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("cache dir after a successful save = %v, want only [token.json]", names)
 	}
 	got, err := loadToken(path)
 	if err != nil || got.AccessToken != "a" {
 		t.Errorf("loadToken after save = (%+v, %v), want AccessToken=a, nil", got, err)
+	}
+}
+
+func TestSaveToken_ConcurrentSaversNeverExposeAPartialFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token.json")
+
+	if err := saveToken(path, &oauth2.Token{AccessToken: "seed", RefreshToken: "r"}); err != nil {
+		t.Fatalf("seed saveToken: %v", err)
+	}
+
+	const savers = 4
+	const savesEach = 10
+
+	stop := make(chan struct{})
+	readErrCh := make(chan error, 1)
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := loadToken(path); err != nil {
+				readErrCh <- err
+				return
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, savers)
+	for i := 0; i < savers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < savesEach; j++ {
+				tok := &oauth2.Token{AccessToken: fmt.Sprintf("a-%d-%d", i, j), RefreshToken: "r"}
+				if err := saveToken(path, tok); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(stop)
+	<-readerDone
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("saveToken during concurrent saves: %v", err)
+	}
+	select {
+	case err := <-readErrCh:
+		t.Fatalf("loadToken saw a partially-written file during concurrent saves: %v", err)
+	default:
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("cache dir holds %d entries after concurrent saves, want only token.json", len(entries))
 	}
 }
 

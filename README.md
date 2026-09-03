@@ -79,11 +79,23 @@ since accepting it would let a player impersonate the console.
 
 ## First-run login
 
-On first connect (and whenever the cached token can't be refreshed), the
-agent prints a Microsoft device-code login URL and code to stdout - in a
-container, that means the pod logs. Complete the login once; the resulting
-token is cached under `AUTH_CACHE_DIR` (a persistent volume in production)
-and refreshed automatically on subsequent runs.
+The device-code login runs in exactly one case: no cache file exists yet for
+`MC_USERNAME` under `AUTH_CACHE_DIR`. The agent then prints a Microsoft
+device-code login URL and code to stdout - in a container, that means the pod
+logs. Complete the login once; the resulting token is cached under
+`AUTH_CACHE_DIR` (a persistent volume in production) and refreshed
+automatically on subsequent runs.
+
+Any other cache problem is deliberately *not* an interactive re-login, since
+a container would otherwise block on a device code nobody is watching for:
+
+- **Corrupt, unreadable, or refresh-token-less cache file** - startup fails
+  loudly and the process exits non-zero. Recover by deleting the
+  `token-*.json` file for that username under `AUTH_CACHE_DIR` and
+  restarting, which takes the first-run path above.
+- **Expired or revoked refresh token** - surfaces as a dial failure and the
+  connect loop retries with backoff indefinitely; no login prompt is ever
+  printed. Recover the same way: delete the cache file and restart.
 
 ## Development
 

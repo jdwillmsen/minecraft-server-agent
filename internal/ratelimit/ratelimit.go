@@ -14,10 +14,11 @@ import (
 // supplied by the caller rather than read internally, so tests don't need
 // real delays to exercise window expiry.
 type PerActor struct {
-	mu     sync.Mutex
-	max    int
-	window time.Duration
-	events map[string][]time.Time
+	mu        sync.Mutex
+	max       int
+	window    time.Duration
+	events    map[string][]time.Time
+	lastSweep time.Time
 }
 
 // NewPerActor builds a limiter allowing at most max calls per actor in any
@@ -46,5 +47,24 @@ func (r *PerActor) Allow(actor string, now time.Time) bool {
 		return false
 	}
 	r.events[actor] = append(kept, now)
+	r.sweep(now)
 	return true
+}
+
+// sweep drops actors with no events left inside the current window, at most
+// once per window. Without it the map would retain an entry for every actor
+// that ever issued a command, for the life of the process. Callers must
+// hold mu.
+func (r *PerActor) sweep(now time.Time) {
+	if now.Sub(r.lastSweep) < r.window {
+		return
+	}
+	r.lastSweep = now
+
+	cutoff := now.Add(-r.window)
+	for actor, events := range r.events {
+		if len(events) == 0 || !events[len(events)-1].After(cutoff) {
+			delete(r.events, actor)
+		}
+	}
 }

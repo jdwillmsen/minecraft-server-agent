@@ -152,23 +152,38 @@ func loadToken(path string) (*oauth2.Token, error) {
 	return &tok, nil
 }
 
-// saveToken writes tok to path atomically: it writes to a temporary file in
-// the same directory, then renames it over path. A crash or concurrent
-// write mid-save can therefore never leave path holding a partially-written
-// (and so unparseable) token.
+// saveToken writes tok to path atomically: it writes to a uniquely-named
+// temporary file in the same directory, flushes it to stable storage, then
+// renames it over path. Readers of path therefore see either the previous
+// token or the new one, never a partially-written (and so unparseable)
+// file, even when several processes share one cache directory.
 func saveToken(path string, tok *oauth2.Token) error {
 	data, err := json.Marshal(tok)
 	if err != nil {
 		return err
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, tokenFileMode); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".token-*")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	tmpName := tmp.Name()
+	defer func() {
+		tmp.Close()
+		os.Remove(tmpName)
+	}()
+
+	if err := tmp.Chmod(tokenFileMode); err != nil {
 		return err
 	}
-	return nil
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
