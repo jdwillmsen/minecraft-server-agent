@@ -21,7 +21,7 @@ type Config struct {
 	ReconnectMinMs int
 	ReconnectMaxMs int
 
-	// HTTP server for /healthz and /metrics.
+	// HTTP server for /healthz, /readyz, and /metrics.
 	HTTPAddr string
 
 	// AuthCacheDir is where the Xbox Live device-code token is cached
