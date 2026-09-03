@@ -1,44 +1,80 @@
 // Package httpapi exposes the agent's own operational endpoints: /healthz
-// for liveness and /metrics for Prometheus scraping. Feature-specific
-// metrics get registered here starting with Stage 6; the registry is wired
-// up now so there's a stable place to add them later.
+// for liveness, /readyz for whether the Bedrock session is actually up, and
+// /metrics for Prometheus scraping.
 package httpapi
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
-
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Server is the agent's HTTP server.
 type Server struct {
 	httpServer *http.Server
+	ln         net.Listener
+	ready      atomic.Bool
 }
 
-// New builds a Server listening on addr, with /healthz and /metrics wired.
-func New(addr string) *Server {
+// New binds addr and builds a Server with /healthz, /readyz, and /metrics
+// wired. The listener is bound synchronously here (rather than lazily
+// inside ListenAndServe) so a bad address or an already-used port fails
+// loudly at startup instead of being discovered later by a background
+// goroutine whose error might go unnoticed.
+func New(addr string) (*Server, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("httpapi: listen on %s: %w", addr, err)
+	}
+
+	s := &Server{ln: ln}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if !s.ready.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("not ready"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	})
+	mux.Handle("/metrics", metricsHandler())
 
-	return &Server{
-		httpServer: &http.Server{
-			Addr:              addr,
-			Handler:           mux,
-			ReadHeaderTimeout: 5 * time.Second,
-		},
+	s.httpServer = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
+	return s, nil
 }
 
-// ListenAndServe blocks serving HTTP until the server is shut down or
-// fails to start.
+// Addr reports the address the server is actually bound to - useful in
+// tests that bind an ephemeral port (":0").
+func (s *Server) Addr() net.Addr {
+	return s.ln.Addr()
+}
+
+// SetReady controls what /readyz reports. The connect loop calls this: true
+// once a Bedrock session is established, false the moment it's lost, so
+// /readyz reflects real session state rather than always answering ok.
+func (s *Server) SetReady(ready bool) {
+	s.ready.Store(ready)
+}
+
+// ListenAndServe blocks serving HTTP on the listener bound by New, until the
+// server is shut down or the listener fails.
 func (s *Server) ListenAndServe() error {
-	err := s.httpServer.ListenAndServe()
+	err := s.httpServer.Serve(s.ln)
 	if err == http.ErrServerClosed {
 		return nil
 	}

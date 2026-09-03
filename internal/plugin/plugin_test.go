@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
+
+	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 )
 
 type stubPlugin struct {
@@ -48,7 +51,7 @@ func TestRegister_PartialFailureDoesNotRegisterAnyCommand(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for the colliding command")
 	}
-	if _, err := r.Dispatch(context.Background(), &Context{}, "newcmd", Invocation{ActorPermission: PermissionVisitor}); err != ErrUnknownCommand {
+	if _, err := r.Dispatch(context.Background(), &Context{}, "newcmd", Invocation{ActorPermission: PermissionVisitor}); !errors.Is(err, ErrUnknownCommand) {
 		t.Errorf("expected newcmd to remain unregistered after a partial-collision Register call, got err=%v", err)
 	}
 }
@@ -253,6 +256,93 @@ func TestDispatch_SurvivesAPanicAndKeepsServingOtherCommands(t *testing.T) {
 	reply, err := r.Dispatch(context.Background(), &Context{}, "ping", Invocation{ActorPermission: PermissionVisitor})
 	if err != nil || reply != "ok:ping" {
 		t.Errorf("after a panic, ping returned (%q, %v), want (ok:ping, nil)", reply, err)
+	}
+}
+
+func TestDispatch_TimesOutAHungCommandWithoutWaitingForIt(t *testing.T) {
+	orig := DefaultDispatchTimeout
+	DefaultDispatchTimeout = 30 * time.Millisecond
+	defer func() { DefaultDispatchTimeout = orig }()
+
+	r := NewRegistry()
+	if err := r.Register(stubPlugin{name: "hangs", cmds: []Command{{
+		Name:       "hang",
+		Permission: PermissionVisitor,
+		Run: func(ctx context.Context, pctx *Context, inv Invocation) (string, error) {
+			<-ctx.Done() // never returns on its own; only the timeout unblocks it
+			return "", ctx.Err()
+		},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	_, err := r.Dispatch(context.Background(), &Context{}, "hang", Invocation{ActorPermission: PermissionVisitor})
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrCommandTimedOut) {
+		t.Fatalf("err = %v, want ErrCommandTimedOut", err)
+	}
+	// Dispatch must return at (approximately) DefaultDispatchTimeout, not
+	// hang forever waiting for a command that only unblocks because of that
+	// same timeout - proving the caller (in production, the packet read
+	// loop) is never stalled past this bound.
+	if elapsed > DefaultDispatchTimeout+time.Second {
+		t.Errorf("Dispatch took %v, want close to DefaultDispatchTimeout (%v)", elapsed, DefaultDispatchTimeout)
+	}
+}
+
+func TestDispatch_StillReturnsPromptlyForAFastCommand(t *testing.T) {
+	r := NewRegistry()
+	if err := r.Register(stubPlugin{name: "a", cmds: []Command{okCommand("ping", PermissionVisitor)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	reply, err := r.Dispatch(context.Background(), &Context{}, "ping", Invocation{ActorPermission: PermissionVisitor})
+	if err != nil || reply != "ok:ping" {
+		t.Fatalf("reply=%q err=%v, want ok:ping, nil", reply, err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("a fast command took %v to return", elapsed)
+	}
+}
+
+type recordingEventHandler struct {
+	kinds    []string
+	received []bus.Event
+}
+
+func (h *recordingEventHandler) Name() string        { return "recorder" }
+func (h *recordingEventHandler) Commands() []Command { return nil }
+func (h *recordingEventHandler) Kinds() []string     { return h.kinds }
+func (h *recordingEventHandler) HandleEvent(ctx context.Context, pctx *Context, ev bus.Event) error {
+	h.received = append(h.received, ev)
+	return nil
+}
+
+type joinEvent struct{ playerXUID string }
+
+func (joinEvent) Kind() string { return "join" }
+
+func TestEventHandler_ReceivesTheActualEventNotJustItsKind(t *testing.T) {
+	h := &recordingEventHandler{kinds: []string{"join"}}
+	var eh EventHandler = h
+
+	ev := joinEvent{playerXUID: "2535412345678901"}
+	if err := eh.HandleEvent(context.Background(), &Context{}, ev); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+
+	if len(h.received) != 1 {
+		t.Fatalf("received %d events, want 1", len(h.received))
+	}
+	got, ok := h.received[0].(joinEvent)
+	if !ok {
+		t.Fatalf("received event has type %T, want joinEvent", h.received[0])
+	}
+	if got.playerXUID != ev.playerXUID {
+		t.Errorf("playerXUID = %q, want %q - a welcome plugin needs this to know who joined", got.playerXUID, ev.playerXUID)
 	}
 }
 

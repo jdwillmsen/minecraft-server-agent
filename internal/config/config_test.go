@@ -9,7 +9,8 @@ func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
 		"MC_HOST", "MC_USERNAME", "MC_PORT",
-		"RECONNECT_MIN_MS", "RECONNECT_MAX_MS", "HTTP_ADDR", "AUTH_CACHE_DIR", "LOG_LEVEL",
+		"RECONNECT_MIN_MS", "RECONNECT_MAX_MS", "HTTP_ADDR", "AUTH_CACHE_DIR",
+		"COMMAND_RATE_LIMIT_PER_MINUTE", "LOG_LEVEL",
 	} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
@@ -61,6 +62,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want info", cfg.LogLevel)
 	}
+	if cfg.CommandRateLimitPerMinute != 10 {
+		t.Errorf("CommandRateLimitPerMinute = %d, want 10", cfg.CommandRateLimitPerMinute)
+	}
 }
 
 func TestLoad_PortOverride(t *testing.T) {
@@ -97,6 +101,32 @@ func TestLoad_ZeroPortFails(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for zero MC_PORT")
+	}
+}
+
+func TestLoad_PortAboveValidRangeFails(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("MC_HOST", "mc.example.internal")
+	t.Setenv("MC_USERNAME", "agent-bot")
+	t.Setenv("MC_PORT", "99999999")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for MC_PORT above 65535")
+	}
+}
+
+func TestLoad_MaxValidPortSucceeds(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("MC_HOST", "mc.example.internal")
+	t.Setenv("MC_USERNAME", "agent-bot")
+	t.Setenv("MC_PORT", "65535")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.MCPort != 65535 {
+		t.Errorf("MCPort = %d, want 65535", cfg.MCPort)
 	}
 }
 

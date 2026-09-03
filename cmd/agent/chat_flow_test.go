@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 
@@ -13,7 +14,15 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/logging"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 )
+
+// unlimitedRateLimit is a generous limiter for tests that exercise chat flow
+// but aren't themselves testing rate limiting - see TestHandleCommand_RateLimit
+// for that behavior in isolation.
+func unlimitedRateLimit() *ratelimit.PerActor {
+	return ratelimit.NewPerActor(1000, time.Minute)
+}
 
 // recordingVoice stands in for the Stage 2 console bridge so a test can
 // assert what a player would actually have seen.
@@ -79,7 +88,7 @@ func newHarness(t *testing.T) (*plugin.Registry, *plugin.Context, *recordingVoic
 	voice := &recordingVoice{}
 	pctx := &plugin.Context{Voice: voice, Directory: registry}
 	eventBus := bus.New()
-	events := eventBus.Subscribe(chat.MessageKind, 8)
+	events, _ := eventBus.Subscribe(chat.MessageKind, 8)
 	return registry, pctx, voice, eventBus, events
 }
 
@@ -173,7 +182,7 @@ func TestChatCommandFlow(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			registry, pctx, voice, eventBus, _ := newHarness(t)
-			handlePacket(context.Background(), tc.pk, selfXUID, siblings, log, registry, pctx, eventBus)
+			handlePacket(context.Background(), tc.pk, selfXUID, siblings, log, registry, pctx, eventBus, unlimitedRateLimit())
 
 			got := voice.output()
 			if len(got) != len(tc.want) {
@@ -188,16 +197,48 @@ func TestChatCommandFlow(t *testing.T) {
 	}
 }
 
+// TestHandleCommand_RateLimitBlocksASpammingActorButNotOthers proves the
+// limiter is actually wired into the dispatch path, not just unit-tested in
+// isolation: a player who exceeds their budget stops getting replies, while
+// an unrelated player is unaffected.
+func TestHandleCommand_RateLimitBlocksASpammingActorButNotOthers(t *testing.T) {
+	registry, pctx, voice, eventBus, _ := newHarness(t)
+	log := logging.New("info")
+	limiter := ratelimit.NewPerActor(2, time.Minute)
+
+	const otherPlayer = "2535499999999998"
+	for i := 0; i < 5; i++ {
+		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter)
+	}
+	handlePacket(context.Background(), chatPacket(otherPlayer, "Alex", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter)
+
+	got := voice.output()
+	want := []string{
+		"tell " + playerXUID + ": pong",
+		"tell " + playerXUID + ": pong",
+		"tell " + otherPlayer + ": pong",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("voice output = %v (%d replies), want %d replies: 2 for the spammer (rate-limited after that), 1 for the other player", got, len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("voice output[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 // TestChatMessagePublishedOnBus proves the "ear" half of the split: every
 // answerable message reaches subscribers with the resolved XUID identity
 // and its parsed trigger, whether or not a command ran.
 func TestChatMessagePublishedOnBus(t *testing.T) {
 	registry, pctx, _, eventBus, events := newHarness(t)
 	log := logging.New("info")
+	limiter := unlimitedRateLimit()
 
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping now"), selfXUID, nil, log, registry, pctx, eventBus)
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server hello"), selfXUID, nil, log, registry, pctx, eventBus)
-	handlePacket(context.Background(), chatPacket(selfXUID, "Agent", "!ping"), selfXUID, nil, log, registry, pctx, eventBus)
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping now"), selfXUID, nil, log, registry, pctx, eventBus, limiter)
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server hello"), selfXUID, nil, log, registry, pctx, eventBus, limiter)
+	handlePacket(context.Background(), chatPacket(selfXUID, "Agent", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter)
 
 	first, ok := (<-events).(chat.MessageEvent)
 	if !ok {

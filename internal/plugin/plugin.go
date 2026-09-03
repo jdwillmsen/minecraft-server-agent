@@ -11,11 +11,25 @@ package plugin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 )
+
+// DefaultDispatchTimeout bounds how long a single command's Run may take
+// before Dispatch gives up and returns ErrCommandTimedOut. Enforced so a
+// plugin blocked on a slow downstream call (the bridge in Stage 2, the LLM
+// in Stage 4) can never permanently stall the caller - which today is the
+// Bedrock packet read loop.
+//
+// A var, not a const, so tests can shorten it rather than waiting out the
+// real production value.
+var DefaultDispatchTimeout = 5 * time.Second
 
 // Permission is the minimum privilege level a command requires, resolved
 // from the server's permissions.json (read by mc-console-bridge, wired in
@@ -95,10 +109,12 @@ type Plugin interface {
 // (join/leave/death/server-log events, ...). A Plugin that doesn't need
 // this simply doesn't implement it.
 type EventHandler interface {
-	// HandleEvent is called for every event the plugin's Kinds() selects.
-	// It must not block for long - slow work should be started in a
-	// goroutine.
-	HandleEvent(ctx context.Context, pctx *Context, kind string) error
+	// HandleEvent is called for every event the plugin's Kinds() selects,
+	// with the actual event so the handler can read its payload (e.g. a
+	// join event's player XUID) - type-assert ev to the concrete type its
+	// Kind() implies. It must not block for long - slow work should be
+	// started in a goroutine.
+	HandleEvent(ctx context.Context, pctx *Context, ev bus.Event) error
 	// Kinds lists the event kinds this plugin wants delivered.
 	Kinds() []string
 }
@@ -177,22 +193,36 @@ func (r *Registry) Register(p Plugin) error {
 
 // ErrUnknownCommand is returned by Dispatch when no plugin registered the
 // requested command.
-var ErrUnknownCommand = fmt.Errorf("unknown command")
+var ErrUnknownCommand = errors.New("unknown command")
 
 // ErrPermissionDenied is returned by Dispatch when the actor's permission
 // is below the command's required level.
-var ErrPermissionDenied = fmt.Errorf("permission denied")
+var ErrPermissionDenied = errors.New("permission denied")
 
 // ErrCommandPanicked is returned by Dispatch when a plugin's Run panicked.
-var ErrCommandPanicked = fmt.Errorf("command panicked")
+var ErrCommandPanicked = errors.New("command panicked")
+
+// ErrCommandTimedOut is returned by Dispatch when a plugin's Run did not
+// return within DefaultDispatchTimeout.
+var ErrCommandTimedOut = errors.New("command timed out")
 
 // Dispatch finds the command named name and runs it, after checking that
 // inv.ActorPermission meets the command's requirement. name is matched
 // case-insensitively.
 //
-// A panic inside a plugin's Run is recovered and returned as an error: a
-// plugin bug must not be able to take down the agent's connect loop or its
-// HTTP endpoints.
+// Run executes with a bounded timeout (DefaultDispatchTimeout) derived from
+// ctx: a plugin that never returns cannot block the caller forever - today
+// that caller is the Bedrock packet read loop, so an unbounded call here
+// would deafen the whole agent. A panic inside Run is likewise recovered
+// and returned as an error, so a plugin bug can say the wrong thing but
+// cannot take down the connect loop or the HTTP endpoints.
+//
+// Note: on timeout, Dispatch returns without waiting for the still-running
+// Run to finish - Go has no way to force-cancel a goroutine that ignores
+// ctx, so a plugin that both blocks and ignores its context leaks a
+// goroutine until it eventually returns. Well-behaved plugins (including
+// every one shipped in this repo) respect ctx cancellation in any I/O they
+// perform, which avoids that leak in practice.
 func (r *Registry) Dispatch(ctx context.Context, pctx *Context, name string, inv Invocation) (reply string, err error) {
 	r.mu.RLock()
 	cmd, ok := r.commands[commandKey(name)]
@@ -205,13 +235,32 @@ func (r *Registry) Dispatch(ctx context.Context, pctx *Context, name string, inv
 		return "", ErrPermissionDenied
 	}
 
-	defer func() {
-		if p := recover(); p != nil {
-			reply = ""
-			err = fmt.Errorf("%w: command %q: %v", ErrCommandPanicked, cmd.Name, p)
-		}
+	runCtx, cancel := context.WithTimeout(ctx, DefaultDispatchTimeout)
+	defer cancel()
+
+	type outcome struct {
+		reply string
+		err   error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		var out outcome
+		defer func() {
+			if p := recover(); p != nil {
+				out = outcome{"", fmt.Errorf("%w: command %q: %v", ErrCommandPanicked, cmd.Name, p)}
+			}
+			done <- out
+		}()
+		reply, err := cmd.Run(runCtx, pctx, inv)
+		out = outcome{reply, err}
 	}()
-	return cmd.Run(ctx, pctx, inv)
+
+	select {
+	case out := <-done:
+		return out.reply, out.err
+	case <-runCtx.Done():
+		return "", fmt.Errorf("%w: command %q", ErrCommandTimedOut, cmd.Name)
+	}
 }
 
 // Commands returns every registered command, sorted by name. Satisfies

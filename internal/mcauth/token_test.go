@@ -1,8 +1,13 @@
 package mcauth
 
 import (
+	"context"
+	"errors"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -140,6 +145,132 @@ func TestTokenFileName_StaysInsideCacheDir(t *testing.T) {
 func TestTokenFileName_RejectsBlankUsername(t *testing.T) {
 	if _, err := tokenFileName("   "); err == nil {
 		t.Fatal("expected an error for a blank username")
+	}
+}
+
+// withStubLogin swaps requestLiveToken for the duration of a test and
+// restores the real one afterward, since it's a package-level var shared
+// across the test binary.
+func withStubLogin(t *testing.T, stub func(ctx context.Context, out io.Writer) (*oauth2.Token, error)) {
+	t.Helper()
+	orig := requestLiveToken
+	requestLiveToken = stub
+	t.Cleanup(func() { requestLiveToken = orig })
+}
+
+func TestTokenSource_MissingCacheFileTriggersLogin(t *testing.T) {
+	dir := t.TempDir()
+	loginCalls := 0
+	withStubLogin(t, func(ctx context.Context, out io.Writer) (*oauth2.Token, error) {
+		loginCalls++
+		return &oauth2.Token{AccessToken: "fresh", RefreshToken: "fresh-refresh"}, nil
+	})
+
+	if _, err := TokenSource(context.Background(), dir, "agent-one", io.Discard); err != nil {
+		t.Fatalf("TokenSource: %v", err)
+	}
+	if loginCalls != 1 {
+		t.Errorf("login called %d times, want 1 for a missing cache file", loginCalls)
+	}
+
+	name, err := tokenFileName("agent-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := loadToken(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatalf("the token the login returned was not persisted: %v", err)
+	}
+	if saved.AccessToken != "fresh" {
+		t.Errorf("saved AccessToken = %q, want fresh", saved.AccessToken)
+	}
+}
+
+func TestTokenSource_CorruptCacheFileIsAHardErrorNotALoginPrompt(t *testing.T) {
+	dir := t.TempDir()
+	name, err := tokenFileName("agent-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loginCalls := 0
+	withStubLogin(t, func(ctx context.Context, out io.Writer) (*oauth2.Token, error) {
+		loginCalls++
+		t.Error("interactive login must not be attempted for a corrupt cache file")
+		return nil, errors.New("should not be reached")
+	})
+
+	if _, err := TokenSource(context.Background(), dir, "agent-one", io.Discard); err == nil {
+		t.Fatal("expected TokenSource to fail hard on a corrupt cache file")
+	}
+	if loginCalls != 0 {
+		t.Errorf("login called %d times, want 0", loginCalls)
+	}
+}
+
+func TestTokenSource_MissingRefreshTokenIsAHardErrorNotALoginPrompt(t *testing.T) {
+	dir := t.TempDir()
+	name, err := tokenFileName("agent-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveToken(filepath.Join(dir, name), &oauth2.Token{AccessToken: "access-only"}); err != nil {
+		t.Fatal(err)
+	}
+
+	withStubLogin(t, func(ctx context.Context, out io.Writer) (*oauth2.Token, error) {
+		t.Error("interactive login must not be attempted when the cache file lacks a refresh token")
+		return nil, errors.New("should not be reached")
+	})
+
+	if _, err := TokenSource(context.Background(), dir, "agent-one", io.Discard); err == nil {
+		t.Fatal("expected TokenSource to fail hard rather than prompt a login")
+	}
+}
+
+func TestSaveToken_IsAtomic_NoTempFileLeftOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token.json")
+
+	if err := saveToken(path, &oauth2.Token{AccessToken: "a", RefreshToken: "r"}); err != nil {
+		t.Fatalf("saveToken: %v", err)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Errorf("temp file left behind after a successful save: err=%v", err)
+	}
+	got, err := loadToken(path)
+	if err != nil || got.AccessToken != "a" {
+		t.Errorf("loadToken after save = (%+v, %v), want AccessToken=a, nil", got, err)
+	}
+}
+
+func TestCachingTokenSource_TokenIsSafeForConcurrentUse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "token.json")
+	stub := &stubTokenSource{tokens: make([]*oauth2.Token, 50)}
+	for i := range stub.tokens {
+		stub.tokens[i] = &oauth2.Token{AccessToken: "tok", RefreshToken: "refresh"}
+	}
+	cts := &cachingTokenSource{path: path, inner: stub}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(stub.tokens))
+	for range stub.tokens {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := cts.Token(); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Errorf("concurrent Token() call failed: %v", err)
 	}
 }
 

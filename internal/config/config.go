@@ -28,6 +28,11 @@ type Config struct {
 	// across restarts. Must be a persistent volume in production.
 	AuthCacheDir string
 
+	// CommandRateLimitPerMinute caps how many ! commands a single actor
+	// (XUID) may trigger per rolling minute, so chat spam can't turn into
+	// unbounded downstream calls once a command's Run does real work.
+	CommandRateLimitPerMinute int
+
 	// Logging.
 	LogLevel string
 }
@@ -43,7 +48,7 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
-	port, err := positiveInt("MC_PORT", 19132)
+	port, err := portNumber("MC_PORT", 19132)
 	if err != nil {
 		return Config{}, err
 	}
@@ -58,16 +63,21 @@ func Load() (Config, error) {
 	if reconnectMax < reconnectMin {
 		return Config{}, fmt.Errorf("RECONNECT_MAX_MS (%d) must be >= RECONNECT_MIN_MS (%d)", reconnectMax, reconnectMin)
 	}
+	commandRateLimit, err := positiveInt("COMMAND_RATE_LIMIT_PER_MINUTE", 10)
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
-		MCHost:         host,
-		MCPort:         port,
-		MCUsername:     username,
-		ReconnectMinMs: reconnectMin,
-		ReconnectMaxMs: reconnectMax,
-		HTTPAddr:       stringDefault("HTTP_ADDR", ":8080"),
-		AuthCacheDir:   stringDefault("AUTH_CACHE_DIR", "/data/auth"),
-		LogLevel:       strings.ToLower(stringDefault("LOG_LEVEL", "info")),
+		MCHost:                    host,
+		MCPort:                    port,
+		MCUsername:                username,
+		ReconnectMinMs:            reconnectMin,
+		ReconnectMaxMs:            reconnectMax,
+		HTTPAddr:                  stringDefault("HTTP_ADDR", ":8080"),
+		AuthCacheDir:              stringDefault("AUTH_CACHE_DIR", "/data/auth"),
+		CommandRateLimitPerMinute: commandRateLimit,
+		LogLevel:                  strings.ToLower(stringDefault("LOG_LEVEL", "info")),
 	}
 	return cfg, nil
 }
@@ -99,6 +109,20 @@ func positiveInt(name string, def int) (int, error) {
 	}
 	if n <= 0 {
 		return 0, fmt.Errorf("environment variable %s must be a positive integer, got %d", name, n)
+	}
+	return n, nil
+}
+
+// portNumber is positiveInt narrowed to the valid TCP/UDP port range, so a
+// typo like MC_PORT=99999999 fails at startup instead of surfacing later as
+// an inscrutable dial error.
+func portNumber(name string, def int) (int, error) {
+	n, err := positiveInt(name, def)
+	if err != nil {
+		return 0, err
+	}
+	if n > 65535 {
+		return 0, fmt.Errorf("environment variable %s must be a valid port (1-65535), got %d", name, n)
 	}
 	return n, nil
 }

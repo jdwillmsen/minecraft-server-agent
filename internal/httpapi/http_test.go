@@ -9,13 +9,14 @@ import (
 )
 
 func TestServer_Healthz(t *testing.T) {
-	// New(":0") binds an ephemeral port we can't easily discover through
-	// http.Server, so exercise the handler directly instead of over the
-	// network. TestServer_ShutdownIsClean covers the real listener.
-	srv := New(":0")
+	srv, err := New("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.ln.Close()
+
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
-
 	srv.httpServer.Handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -26,11 +27,43 @@ func TestServer_Healthz(t *testing.T) {
 	}
 }
 
+func TestServer_Readyz_NotReadyUntilSetReady(t *testing.T) {
+	srv, err := New("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.ln.Close()
+
+	get := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		return rec
+	}
+
+	if rec := get(); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("before SetReady(true): status = %d, want 503", rec.Code)
+	}
+
+	srv.SetReady(true)
+	if rec := get(); rec.Code != http.StatusOK {
+		t.Errorf("after SetReady(true): status = %d, want 200", rec.Code)
+	}
+
+	srv.SetReady(false)
+	if rec := get(); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("after SetReady(false): status = %d, want 503", rec.Code)
+	}
+}
+
 func TestServer_Metrics(t *testing.T) {
-	srv := New(":0")
+	srv, err := New("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.ln.Close()
+
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
-
 	srv.httpServer.Handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
@@ -38,14 +71,30 @@ func TestServer_Metrics(t *testing.T) {
 	}
 }
 
+func TestNew_FailsLoudlyOnAnAlreadyBoundAddress(t *testing.T) {
+	first, err := New("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer first.ln.Close()
+
+	if _, err := New(first.Addr().String()); err == nil {
+		t.Fatal("expected New to fail binding an address already in use")
+	}
+}
+
 func TestServer_ShutdownIsClean(t *testing.T) {
-	srv := New("127.0.0.1:0")
+	srv, err := New("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
 
-	// Give the listener a moment to start before shutting it down.
-	time.Sleep(50 * time.Millisecond)
-
+	// The listener is bound synchronously by New above, so there is nothing
+	// to wait on before Shutdown - no sleep-based race with the Serve
+	// goroutine's startup.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {

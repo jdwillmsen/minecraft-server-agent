@@ -50,7 +50,9 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice
   interfaces (`NoopVoice` today; a real bridge-backed `Voice` in Stage 2)
 - `internal/mcauth` - Xbox Live device-code login with on-disk token
   caching, so a restart doesn't require a fresh interactive login
-- `internal/httpapi` - `/healthz` and `/metrics`
+- `internal/httpapi` - `/healthz`, `/readyz` (reflects real Bedrock session
+  state), and `/metrics`
+- `internal/ratelimit` - per-actor sliding-window command rate limiting
 
 ## Environment variables
 
@@ -61,8 +63,9 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice
 | `MC_PORT` | `19132` | Bedrock server port |
 | `RECONNECT_MIN_MS` | `5000` | Initial reconnect backoff |
 | `RECONNECT_MAX_MS` | `300000` | Reconnect backoff ceiling |
-| `HTTP_ADDR` | `:8080` | `/healthz` + `/metrics` listen address |
+| `HTTP_ADDR` | `:8080` | `/healthz` + `/readyz` + `/metrics` listen address |
 | `AUTH_CACHE_DIR` | `/data/auth` | Where the Xbox Live token is cached, one file per `MC_USERNAME` |
+| `COMMAND_RATE_LIMIT_PER_MINUTE` | `10` | Max `!` commands a single actor (XUID) may trigger per rolling minute |
 | `LOG_LEVEL` | `info` | `info` or `debug` |
 
 ## Identity model

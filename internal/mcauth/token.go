@@ -11,9 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/sandertv/gophertunnel/minecraft/auth"
 	"golang.org/x/oauth2"
@@ -25,12 +27,23 @@ const tokenFileMode = 0o600
 // username can't push the path past a filesystem's name limit.
 const tokenSlugLimit = 32
 
+// requestLiveToken is the interactive device-code login. A package-level
+// var, not a direct call, so tests can substitute a stub and prove
+// TokenSource only reaches it on a genuinely absent cache file - never on a
+// corrupt one (see the loadToken error handling below).
+var requestLiveToken = auth.RequestLiveTokenContext
+
 // TokenSource returns an oauth2.TokenSource backed by a token cached under
-// cacheDir for the account named by username. If no cached token exists (or
-// it's unreadable), it performs an interactive device-code login, writing
-// the code and URL to out - which in a container is stdout, so the
-// instructions land in the pod's logs exactly like minecraft-afk-bot's
-// device_code_required event does today.
+// cacheDir for the account named by username.
+//
+// If no cached token file exists yet, it performs an interactive
+// device-code login, writing the code and URL to out - which in a container
+// is stdout, so the instructions land in the pod's logs exactly like
+// minecraft-afk-bot's device_code_required event does today. Any other load
+// failure (a corrupt file, a permissions problem, a transient I/O error) is
+// a hard error instead: falling through to an interactive login on those
+// would silently block reconnect attempts for up to ~15 minutes waiting on
+// a device code nobody is watching for, every time.
 //
 // Every subsequent refresh is persisted back to cacheDir, so a later
 // restart resumes without a fresh login as long as the refresh token is
@@ -48,7 +61,10 @@ func TokenSource(ctx context.Context, cacheDir, username string, out io.Writer) 
 
 	tok, err := loadToken(path)
 	if err != nil {
-		tok, err = auth.RequestLiveTokenContext(ctx, out)
+		if !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("mcauth: load cached token: %w", err)
+		}
+		tok, err = requestLiveToken(ctx, out)
 		if err != nil {
 			return nil, fmt.Errorf("mcauth: device-code login: %w", err)
 		}
@@ -63,12 +79,20 @@ func TokenSource(ctx context.Context, cacheDir, username string, out io.Writer) 
 
 // cachingTokenSource wraps another oauth2.TokenSource and persists every
 // token it returns, so a background refresh doesn't get lost on restart.
+//
+// gophertunnel may call Token() concurrently with its own background
+// refresh goroutine, so access to inner and the cache file is serialised by
+// mu rather than relying on inner's own thread-safety for the write side.
 type cachingTokenSource struct {
+	mu    sync.Mutex
 	path  string
 	inner oauth2.TokenSource
 }
 
 func (c *cachingTokenSource) Token() (*oauth2.Token, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	tok, err := c.inner.Token()
 	if err != nil {
 		return nil, err
@@ -108,6 +132,11 @@ func tokenFileName(username string) (string, error) {
 	return fmt.Sprintf("token-%s-%x.json", slug, sum[:4]), nil
 }
 
+// loadToken reads and validates the cached token at path. A missing file
+// returns an error satisfying errors.Is(err, fs.ErrNotExist); every other
+// failure (malformed JSON, no refresh token) is a distinct error, so callers
+// can tell "nothing cached yet" apart from "something is wrong with what's
+// cached" and react differently (see TokenSource above).
 func loadToken(path string) (*oauth2.Token, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -115,18 +144,31 @@ func loadToken(path string) (*oauth2.Token, error) {
 	}
 	var tok oauth2.Token
 	if err := json.Unmarshal(data, &tok); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("mcauth: cached token at %s is not valid JSON: %w", path, err)
 	}
 	if tok.RefreshToken == "" {
-		return nil, errors.New("mcauth: cached token has no refresh token")
+		return nil, fmt.Errorf("mcauth: cached token at %s has no refresh token", path)
 	}
 	return &tok, nil
 }
 
+// saveToken writes tok to path atomically: it writes to a temporary file in
+// the same directory, then renames it over path. A crash or concurrent
+// write mid-save can therefore never leave path holding a partially-written
+// (and so unparseable) token.
 func saveToken(path string, tok *oauth2.Token) error {
 	data, err := json.Marshal(tok)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, tokenFileMode)
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, tokenFileMode); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
