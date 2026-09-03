@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -9,12 +12,14 @@ import (
 
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 
+	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/logging"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 )
 
 // unlimitedRateLimit is a generous limiter for tests that exercise chat flow
@@ -74,7 +79,7 @@ const (
 	siblingBot = "2535488888888888"
 )
 
-func newHarness(t *testing.T) (*plugin.Registry, *plugin.Context, *recordingVoice, *bus.Bus, <-chan bus.Event) {
+func newHarness(t *testing.T) (*plugin.Registry, *plugin.Context, *recordingVoice, *bus.Bus, <-chan bus.Event, *roster.Roster, *adapters.PermissionResolver) {
 	t.Helper()
 
 	registry := plugin.NewRegistry()
@@ -89,7 +94,25 @@ func newHarness(t *testing.T) (*plugin.Registry, *plugin.Context, *recordingVoic
 	pctx := &plugin.Context{Voice: voice, Directory: registry}
 	eventBus := bus.New()
 	events, _ := eventBus.Subscribe(chat.MessageKind, 8)
-	return registry, pctx, voice, eventBus, events
+	return registry, pctx, voice, eventBus, events, roster.New(), fakePermResolver(t, nil)
+}
+
+// fakePermResolver returns a PermissionResolver backed by a throwaway HTTP
+// server serving perms (nil behaves as an empty map — every real XUID
+// resolves to visitor, matching this harness's default expectations; only
+// chat.ServerOrigin resolves to operator, without ever reaching this
+// server).
+func fakePermResolver(t *testing.T, perms map[string]string) *adapters.PermissionResolver {
+	t.Helper()
+	if perms == nil {
+		perms = map[string]string{}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(perms)
+	}))
+	t.Cleanup(srv.Close)
+	client := adapters.NewBridgeClient(srv.URL, "test-token", time.Second)
+	return adapters.NewPermissionResolver(client, time.Minute, logging.New("info"))
 }
 
 func chatPacket(xuid, sourceName, message string) *packet.Text {
@@ -134,6 +157,15 @@ func TestChatCommandFlow(t *testing.T) {
 			name: "operator-only command is refused for a visitor",
 			pk:   chatPacket(playerXUID, "Steve", "!shutdown"),
 			want: nil,
+		},
+		{
+			// The scenario the Stage 1 TODO explicitly called out: an XUID
+			// absent from permissions.json (playerXUID above) must never
+			// be granted operator trust, but the console sentinel must —
+			// it is not a real XUID and will never appear in that map.
+			name: "operator-only command is allowed for the console origin",
+			pk:   chatPacket("", "", "!shutdown"),
+			want: []string{"say: shutting down"},
 		},
 		{
 			name: "empty xuid with a name is not trusted as the console",
@@ -181,8 +213,8 @@ func TestChatCommandFlow(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			registry, pctx, voice, eventBus, _ := newHarness(t)
-			handlePacket(context.Background(), tc.pk, selfXUID, siblings, log, registry, pctx, eventBus, unlimitedRateLimit())
+			registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
+			handlePacket(context.Background(), tc.pk, selfXUID, siblings, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver)
 
 			got := voice.output()
 			if len(got) != len(tc.want) {
@@ -202,15 +234,15 @@ func TestChatCommandFlow(t *testing.T) {
 // isolation: a player who exceeds their budget stops getting replies, while
 // an unrelated player is unaffected.
 func TestHandleCommand_RateLimitBlocksASpammingActorButNotOthers(t *testing.T) {
-	registry, pctx, voice, eventBus, _ := newHarness(t)
+	registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
 	log := logging.New("info")
 	limiter := ratelimit.NewPerActor(2, time.Minute)
 
 	const otherPlayer = "2535499999999998"
 	for i := 0; i < 5; i++ {
-		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter)
+		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver)
 	}
-	handlePacket(context.Background(), chatPacket(otherPlayer, "Alex", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter)
+	handlePacket(context.Background(), chatPacket(otherPlayer, "Alex", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver)
 
 	got := voice.output()
 	want := []string{
@@ -232,13 +264,13 @@ func TestHandleCommand_RateLimitBlocksASpammingActorButNotOthers(t *testing.T) {
 // answerable message reaches subscribers with the resolved XUID identity
 // and its parsed trigger, whether or not a command ran.
 func TestChatMessagePublishedOnBus(t *testing.T) {
-	registry, pctx, _, eventBus, events := newHarness(t)
+	registry, pctx, _, eventBus, events, playerRoster, permResolver := newHarness(t)
 	log := logging.New("info")
 	limiter := unlimitedRateLimit()
 
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping now"), selfXUID, nil, log, registry, pctx, eventBus, limiter)
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server hello"), selfXUID, nil, log, registry, pctx, eventBus, limiter)
-	handlePacket(context.Background(), chatPacket(selfXUID, "Agent", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter)
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping now"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver)
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server hello"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver)
+	handlePacket(context.Background(), chatPacket(selfXUID, "Agent", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver)
 
 	first, ok := (<-events).(chat.MessageEvent)
 	if !ok {

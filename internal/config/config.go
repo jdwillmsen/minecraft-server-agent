@@ -33,6 +33,16 @@ type Config struct {
 	// unbounded downstream calls once a command's Run does real work.
 	CommandRateLimitPerMinute int
 
+	// ConsoleBridgeURL is the base URL of mc-console-bridge's HTTP API
+	// (e.g. http://<release>-console-bridge.<ns>.svc.cluster.local:8766).
+	// This is the only path to server-voice output and permissions.json.
+	ConsoleBridgeURL string
+	// ConsoleBridgeToken authenticates every bridge request as a bearer
+	// token; the bridge rejects anything else.
+	ConsoleBridgeToken string
+	// ConsoleBridgeTimeoutMs bounds every individual bridge HTTP call.
+	ConsoleBridgeTimeoutMs int
+
 	// Logging.
 	LogLevel string
 }
@@ -67,6 +77,18 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	bridgeURL, err := required("CONSOLE_BRIDGE_URL")
+	if err != nil {
+		return Config{}, err
+	}
+	bridgeToken, err := required("CONSOLE_BRIDGE_TOKEN")
+	if err != nil {
+		return Config{}, err
+	}
+	bridgeTimeout, err := positiveInt("CONSOLE_BRIDGE_TIMEOUT_MS", 5000)
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
 		MCHost:                    host,
@@ -77,6 +99,9 @@ func Load() (Config, error) {
 		HTTPAddr:                  stringDefault("HTTP_ADDR", ":8080"),
 		AuthCacheDir:              stringDefault("AUTH_CACHE_DIR", "/data/auth"),
 		CommandRateLimitPerMinute: commandRateLimit,
+		ConsoleBridgeURL:          bridgeURL,
+		ConsoleBridgeToken:        bridgeToken,
+		ConsoleBridgeTimeoutMs:    bridgeTimeout,
 		LogLevel:                  strings.ToLower(stringDefault("LOG_LEVEL", "info")),
 	}
 	return cfg, nil

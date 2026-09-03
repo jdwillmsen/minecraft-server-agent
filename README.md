@@ -22,32 +22,41 @@ an LLM and read-only tools; only the bridge can ever write to the console.
 
 ## Status
 
-**Stage 1** (see the design doc: connect loop, event bus, plugin host, the
-`core` plugin's `!help`/`!ping`). No real console output yet - replies are
-logged, not sent - and no permission resolution, database, or LLM. Those
-land in later stages.
+**Stage 2** (see the design doc: real console-bridge-backed `Voice`/`Facts`,
+live permission resolution from `permissions.json`, and a join-triggered
+welcome). `!help`, `!ping`, and `!players` all reach real players now, and
+an operator-only command is actually gated by the server's own
+`permissions.json` rather than treating everyone as a visitor. No database
+or LLM yet - those land in later stages.
 
 ## Architecture
 
 ```
-gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice
-                                                                    (logging stand-in for now,
-                                                                     mc-console-bridge in Stage 2)
+gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (mc-console-bridge)
+                    \-> roster.Roster (join detection, XUID->gamertag) --> plugin.EventHandler (welcome)
 ```
 
-- `cmd/agent` - entry point: config, wiring, connect/reconnect loop
+- `cmd/agent` - entry point: config, wiring, connect/reconnect loop, the
+  event dispatcher that pumps bus events to `plugin.EventHandler`s
 - `internal/config` - environment variable parsing
 - `internal/logging` - structured JSON stdout logging (Loki-compatible)
 - `internal/chat` - packet parsing, XUID-based identity, command/mention
   detection, self/sibling loop guard
-- `internal/bus` - typed pub/sub event bus; every answerable chat message is
-  published as a `chat.MessageEvent`, so later event-driven plugins
-  (join/leave/welcome) subscribe instead of touching the connection
+- `internal/roster` - live XUID<->gamertag mapping from `PlayerList`
+  packets; the authoritative join/leave signal (not chat, not the raw
+  `add_player` proximity packet) and the name source `Voice.Tell` resolves
+  a reply target from
+- `internal/bus` - typed pub/sub event bus; every answerable chat message
+  (`chat.MessageEvent`) and every genuinely new arrival
+  (`roster.JoinEvent`) is published here, so event-driven plugins subscribe
+  instead of touching the connection
 - `internal/plugin` - the `Plugin`/`Context`/`Registry` extension surface
-- `internal/plugins` - concrete plugins (`core` today; `welcome`, `stats`,
-  `ask`, etc. in later stages)
+- `internal/plugins` - concrete plugins: `core` (`!help`/`!ping`), `stats`
+  (`!players`), `welcome` (event-driven, no commands)
 - `internal/adapters` - implementations of the plugin package's capability
-  interfaces (`NoopVoice` today; a real bridge-backed `Voice` in Stage 2)
+  interfaces: `BridgeClient` (shared HTTP transport to mc-console-bridge),
+  `BridgeVoice`, `BridgeFacts`, `PermissionResolver` (cached
+  `GET /permissions` lookups); `NoopVoice` remains for tests
 - `internal/mcauth` - Xbox Live device-code login with on-disk token
   caching, so a restart doesn't require a fresh interactive login
 - `internal/httpapi` - `/healthz`, `/readyz` (reflects real Bedrock session
@@ -66,6 +75,9 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice
 | `HTTP_ADDR` | `:8080` | `/healthz` + `/readyz` + `/metrics` listen address |
 | `AUTH_CACHE_DIR` | `/data/auth` | Where the Xbox Live token is cached, one file per `MC_USERNAME` |
 | `COMMAND_RATE_LIMIT_PER_MINUTE` | `10` | Max `!` commands a single actor (XUID) may trigger per rolling minute |
+| `CONSOLE_BRIDGE_URL` | *(required)* | Base URL of `mc-console-bridge`'s HTTP API |
+| `CONSOLE_BRIDGE_TOKEN` | *(required)* | Bearer token the bridge authenticates every request against |
+| `CONSOLE_BRIDGE_TIMEOUT_MS` | `5000` | Timeout for each individual bridge HTTP call |
 | `LOG_LEVEL` | `info` | `info` or `debug` |
 
 ## Identity model
@@ -76,6 +88,28 @@ arbitrary XUID. A message with both an empty XUID and an empty name is
 treated as console-originated (`send-command say ...`); a message with an
 empty XUID but a non-empty name is rejected outright rather than trusted,
 since accepting it would let a player impersonate the console.
+
+## Permission model
+
+Every `!` command's actor permission is resolved from `mc-console-bridge`'s
+`GET /permissions` (a cached read of the server's real `permissions.json`),
+except one sentinel: `chat.ServerOrigin` (console-originated messages) is
+trusted at operator level without ever reaching the bridge, since it isn't a
+real XUID and will never appear in that file. Any XUID absent from the map -
+never seen by the server, or a bridge lookup failure - resolves to the
+least-privileged real level (`visitor`), so an unrecognised player is never
+granted more trust than a stranger, and a bridge outage fails closed.
+
+## Targeting a reply
+
+`Voice.Tell` only ever receives an XUID, but Bedrock's `tellraw` needs a
+selector or a name. The agent resolves the XUID to a gamertag via
+`internal/roster` (fed from the server's own `PlayerList` packets - the
+authoritative live roster, never the spoofable chat `SourceName`) and
+targets the reply with `@a[name="<gamertag>"]`, a real Bedrock selector -
+not a bare name token, which `mc-console-bridge`'s allowlist deliberately
+keeps whitespace-free and which a gamertag containing a space (Xbox
+gamertags may) couldn't satisfy anyway.
 
 ## First-run login
 

@@ -1,0 +1,93 @@
+// Package roster tracks the server's live player roster from PlayerList
+// packets, the authoritative source for who is actually connected —
+// unlike chat, which is only ever present when someone types. It serves
+// two needs: join detection (for the welcome plugin) and XUID-to-gamertag
+// resolution (for targeting a tellraw reply at a specific player, since
+// Voice.Tell only carries the XUID).
+package roster
+
+import "sync"
+
+// Entry is one player's identity as reported by the server's own roster,
+// not the spoofable chat SourceName field.
+type Entry struct {
+	XUID     string
+	Username string
+}
+
+// JoinKind is the bus event kind published for a genuinely new arrival.
+const JoinKind = "roster.join"
+
+// JoinEvent is published once per player the first time their XUID appears
+// in an add record this process has not already seen.
+type JoinEvent struct {
+	Entry
+}
+
+// Kind satisfies the bus's Event interface.
+func (JoinEvent) Kind() string { return JoinKind }
+
+// Roster holds the current XUID-to-username mapping. Safe for concurrent
+// use.
+type Roster struct {
+	mu      sync.Mutex
+	players map[string]string
+}
+
+// New builds an empty Roster.
+func New() *Roster {
+	return &Roster{players: make(map[string]string)}
+}
+
+// Apply updates the roster from one PlayerList packet's entries and
+// reports every player who is newly present — an add whose XUID this
+// Roster had not already recorded. A player already known who reappears
+// (e.g. a duplicate add, which the protocol permits) is not reported
+// again. A blank XUID is ignored outright: it carries no usable identity
+// and must never be treated as a join.
+func (r *Roster) Apply(entries []PlayerListEntry) []Entry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var joins []Entry
+	for _, e := range entries {
+		if e.XUID == "" {
+			continue
+		}
+		switch {
+		case e.Remove:
+			delete(r.players, e.XUID)
+		default:
+			if _, known := r.players[e.XUID]; !known {
+				joins = append(joins, Entry{XUID: e.XUID, Username: e.Username})
+			}
+			r.players[e.XUID] = e.Username
+		}
+	}
+	return joins
+}
+
+// NameFor returns the username currently on record for xuid, so a caller
+// that only has an XUID (as Voice.Tell does) can build a tellraw target.
+// ok is false if xuid is not in the current roster (never seen, or left).
+func (r *Roster) NameFor(xuid string) (name string, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	name, ok = r.players[xuid]
+	return name, ok
+}
+
+// PlayerListEntry is the subset of protocol.PlayerListEntry this package
+// needs. Defined here rather than importing the protocol package directly,
+// so Roster's own tests don't need to construct a full gophertunnel
+// PlayerListEntry (which carries skin data and other fields irrelevant to
+// roster tracking) — the caller (cmd/agent) maps the real packet type into
+// this one at the single point they meet.
+type PlayerListEntry struct {
+	XUID     string
+	Username string
+	// Remove is true for a removal record, false for an add. Named for
+	// what it means here rather than mirroring the protocol's numeric
+	// ActionType, which callers translate at the boundary.
+	Remove bool
+}

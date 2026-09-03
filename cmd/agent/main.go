@@ -2,10 +2,9 @@
 // Bedrock server. It connects as a headless client, reads chat, and
 // dispatches ! commands and @server mentions to registered plugins.
 //
-// Stage 1 wires the connect loop, plugin dispatch, and the core plugin
-// end-to-end with a logging stand-in for server-voice output; a real
-// mc-console-bridge-backed Voice, permission resolution from
-// permissions.json, and the LLM answer path land in later stages.
+// Stage 2 wires a real mc-console-bridge-backed Voice and Facts, live
+// permission resolution from permissions.json, and join-triggered
+// welcomes; the LLM answer path lands in a later stage.
 package main
 
 import (
@@ -21,6 +20,7 @@ import (
 	"time"
 
 	"github.com/sandertv/gophertunnel/minecraft"
+	"github.com/sandertv/gophertunnel/minecraft/protocol"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 	"golang.org/x/oauth2"
 
@@ -34,7 +34,13 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 )
+
+// welcomeDelay is how long the welcome plugin waits after a join before
+// greeting, to stay clear of the documented open upstream crash-on-join
+// defect on this server.
+const welcomeDelay = 5 * time.Second
 
 // stableSessionThreshold mirrors minecraft-afk-bot: the reconnect backoff
 // only resets to its minimum once a session has stayed up at least this
@@ -51,20 +57,51 @@ func main() {
 	}
 	log := logging.New(cfg.LogLevel)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Info("shutdown_signal", logging.Fields{"signal": sig.String()})
+		cancel()
+	}()
+
+	// roster is the live XUID<->gamertag mapping, fed from PlayerList
+	// packets (see handlePlayerList). It serves two needs: join detection
+	// for the welcome plugin, and gamertag resolution for BridgeVoice.Tell
+	// (which only ever receives an XUID).
+	playerRoster := roster.New()
+
+	bridgeTimeout := time.Duration(cfg.ConsoleBridgeTimeoutMs) * time.Millisecond
+	bridgeClient := adapters.NewBridgeClient(cfg.ConsoleBridgeURL, cfg.ConsoleBridgeToken, bridgeTimeout)
+	permResolver := adapters.NewPermissionResolver(bridgeClient, adapters.DefaultPermissionsCacheTTL, log)
+
 	registry := plugin.NewRegistry()
 	if err := registry.Register(plugins.NewCore()); err != nil {
-		log.Error("plugin_register_failed", logging.Fields{"error": err.Error()})
+		log.Error("plugin_register_failed", logging.Fields{"plugin": "core", "error": err.Error()})
+		os.Exit(1)
+	}
+	if err := registry.Register(plugins.NewStats()); err != nil {
+		log.Error("plugin_register_failed", logging.Fields{"plugin": "stats", "error": err.Error()})
+		os.Exit(1)
+	}
+	welcomePlugin := plugins.NewWelcome(ctx, welcomeDelay, log)
+	if err := registry.Register(welcomePlugin); err != nil {
+		log.Error("plugin_register_failed", logging.Fields{"plugin": "welcome", "error": err.Error()})
 		os.Exit(1)
 	}
 
 	pctx := &plugin.Context{
-		Voice:     adapters.NewNoopVoice(log),
+		Voice:     adapters.NewBridgeVoice(bridgeClient, playerRoster),
+		Facts:     adapters.NewBridgeFacts(bridgeClient),
 		Directory: registry,
 	}
-	// Every answerable chat message is published here; Stage 2+ plugins
-	// (join/leave/welcome) subscribe rather than touching the connection.
+	// Every answerable chat message and every roster join is published
+	// here; event-driven plugins (welcome) subscribe via startEventDispatch
+	// rather than touching the connection directly.
 	eventBus := bus.New()
 	limiter := ratelimit.NewPerActor(cfg.CommandRateLimitPerMinute, time.Minute)
+	startEventDispatch(ctx, eventBus, registry, pctx, log)
 
 	httpServer, err := httpapi.New(cfg.HTTPAddr)
 	if err != nil {
@@ -74,15 +111,6 @@ func main() {
 		log.Error("http_bind_failed", logging.Fields{"error": err.Error()})
 		os.Exit(1)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		sig := <-sigCh
-		log.Info("shutdown_signal", logging.Fields{"signal": sig.String()})
-		cancel()
-	}()
 
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil {
@@ -106,7 +134,7 @@ func main() {
 	}
 
 	log.Info("starting", logging.Fields{"mc_host": cfg.MCHost, "mc_port": cfg.MCPort})
-	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer)
+	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
@@ -118,7 +146,7 @@ func main() {
 
 // runConnectLoop owns the reconnect/backoff policy. Each iteration runs one
 // session to completion (or failure), then waits before trying again.
-func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server) {
+func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver) {
 	minDelay := time.Duration(cfg.ReconnectMinMs) * time.Millisecond
 	maxDelay := time.Duration(cfg.ReconnectMaxMs) * time.Millisecond
 	delay := minDelay
@@ -131,7 +159,7 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		firstAttempt = false
 
 		started := time.Now()
-		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer)
+		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver)
 		lasted := time.Since(started)
 		httpServer.SetReady(false)
 
@@ -188,7 +216,7 @@ func jitter(d time.Duration) time.Duration {
 // clean disconnect and a non-nil error on anything else (including ctx
 // cancellation surfaced as a read error, which the caller ignores because
 // it checks ctx.Err() itself).
-func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server) error {
+func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver) error {
 	dialer := minecraft.Dialer{TokenSource: ts}
 	addr := net.JoinHostPort(cfg.MCHost, strconv.Itoa(cfg.MCPort))
 
@@ -241,13 +269,21 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		if err != nil {
 			return err
 		}
-		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter)
+		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver)
 	}
 }
 
-func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor) {
-	text, ok := pk.(*packet.Text)
-	if !ok || !chat.IsAnswerableType(text.TextType) {
+func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver) {
+	switch pk := pk.(type) {
+	case *packet.Text:
+		handleText(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, permResolver)
+	case *packet.PlayerList:
+		handlePlayerList(pk, selfXUID, siblingXUIDs, log, eventBus, playerRoster)
+	}
+}
+
+func handleText(ctx context.Context, text *packet.Text, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, permResolver *adapters.PermissionResolver) {
+	if !chat.IsAnswerableType(text.TextType) {
 		return
 	}
 
@@ -264,7 +300,7 @@ func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblin
 
 	switch trigger.Kind {
 	case chat.TriggerCommand:
-		handleCommand(ctx, id, trigger, log, registry, pctx, limiter)
+		handleCommand(ctx, id, trigger, log, registry, pctx, limiter, permResolver)
 	case chat.TriggerMention:
 		// Stage 4 wires this to the LLM tool-calling loop; Stage 1 only
 		// proves the detection path end-to-end.
@@ -272,22 +308,45 @@ func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblin
 	}
 }
 
-func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, limiter *ratelimit.PerActor) {
+// handlePlayerList updates the live roster from one PlayerList packet and
+// publishes a roster.JoinEvent for each genuinely new, non-self,
+// non-sibling arrival — filtered here, before publishing, the same way
+// handleText filters chat before publishing chat.MessageEvent, so every
+// event-driven plugin downstream can assume it never sees this agent's own
+// presence or a sibling bot's.
+func handlePlayerList(pk *packet.PlayerList, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, eventBus *bus.Bus, playerRoster *roster.Roster) {
+	entries := make([]roster.PlayerListEntry, len(pk.Entries))
+	for i, e := range pk.Entries {
+		entries[i] = roster.PlayerListEntry{
+			XUID:     e.XUID,
+			Username: e.Username,
+			Remove:   e.ActionType == protocol.PlayerListActionRemove,
+		}
+	}
+
+	for _, join := range playerRoster.Apply(entries) {
+		if chat.IsSelfOrSibling(join.XUID, selfXUID, siblingXUIDs) {
+			continue
+		}
+		log.Info("player_joined", logging.Fields{"xuid": join.XUID, "username": join.Username})
+		eventBus.Publish(roster.JoinEvent{Entry: join})
+	}
+}
+
+func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, limiter *ratelimit.PerActor, permResolver *adapters.PermissionResolver) {
 	if !limiter.Allow(actorXUID, time.Now()) {
 		log.Info("command_rate_limited", logging.Fields{"command": trigger.Command, "actor": actorXUID})
 		return
 	}
 
-	// TODO(stage 2): resolve real permission from permissions.json via
-	// mc-console-bridge. Every actor is treated as a visitor until then, so
-	// no operator-only command can be reached before that wiring exists.
-	//
-	// chat.ServerOrigin is a sentinel, not a real XUID, and will never
-	// appear in permissions.json - when real lookups land, make sure
-	// "XUID not found" there doesn't get mapped to either a privilege drop
-	// for legitimate console output (ServerOrigin) or a privilege
-	// escalation for an unrecognised player.
-	inv := plugin.Invocation{ActorXUID: actorXUID, ActorPermission: plugin.PermissionVisitor, Args: trigger.Args}
+	// Bounded separately from the command dispatch below: a slow or down
+	// bridge must not itself stall the read loop waiting on a permission
+	// lookup before Dispatch even gets its own timeout.
+	permCtx, permCancel := context.WithTimeout(ctx, plugin.DefaultDispatchTimeout)
+	actorPermission := permResolver.Resolve(permCtx, actorXUID)
+	permCancel()
+
+	inv := plugin.Invocation{ActorXUID: actorXUID, ActorPermission: actorPermission, Args: trigger.Args}
 
 	reply, err := registry.Dispatch(ctx, pctx, trigger.Command, inv)
 	switch {
@@ -318,5 +377,45 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	}
 	if err := pctx.Voice.Tell(replyCtx, actorXUID, reply); err != nil {
 		log.Error("voice_tell_failed", logging.Fields{"command": trigger.Command, "actor": actorXUID, "error": err.Error()})
+	}
+}
+
+// startEventDispatch subscribes every registered plugin.EventHandler to
+// each bus kind it declared interest in via Kinds(), and runs one goroutine
+// per (plugin, kind) subscription pumping events to HandleEvent until ctx
+// is cancelled. Called once at startup, after every plugin is registered —
+// registry.Plugins() is a fixed set for the life of the process, so there
+// is nothing to re-subscribe on a reconnect; join/leave and chat events
+// keep flowing to the same subscriptions across sessions.
+func startEventDispatch(ctx context.Context, b *bus.Bus, registry *plugin.Registry, pctx *plugin.Context, log *logging.Logger) {
+	for _, p := range registry.Plugins() {
+		eh, ok := p.(plugin.EventHandler)
+		if !ok {
+			continue
+		}
+		for _, kind := range eh.Kinds() {
+			ch, unsub := b.Subscribe(kind, 16)
+			go dispatchEvents(ctx, p.Name(), kind, ch, unsub, eh, pctx, log)
+		}
+	}
+}
+
+func dispatchEvents(ctx context.Context, pluginName, kind string, ch <-chan bus.Event, unsub func(), eh plugin.EventHandler, pctx *plugin.Context, log *logging.Logger) {
+	defer unsub()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			handleCtx, cancel := context.WithTimeout(ctx, plugin.DefaultDispatchTimeout)
+			err := eh.HandleEvent(handleCtx, pctx, ev)
+			cancel()
+			if err != nil {
+				log.Error("event_handler_failed", logging.Fields{"plugin": pluginName, "kind": kind, "error": err.Error()})
+			}
+		}
 	}
 }

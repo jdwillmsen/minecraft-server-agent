@@ -11,15 +11,27 @@ func clearEnv(t *testing.T) {
 		"MC_HOST", "MC_USERNAME", "MC_PORT",
 		"RECONNECT_MIN_MS", "RECONNECT_MAX_MS", "HTTP_ADDR", "AUTH_CACHE_DIR",
 		"COMMAND_RATE_LIMIT_PER_MINUTE", "LOG_LEVEL",
+		"CONSOLE_BRIDGE_URL", "CONSOLE_BRIDGE_TOKEN", "CONSOLE_BRIDGE_TIMEOUT_MS",
 	} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
 	}
 }
 
+// setRequired sets every env var Load() requires to succeed, so tests that
+// aren't exercising one of these specifically don't need to restate them.
+func setRequired(t *testing.T) {
+	t.Helper()
+	t.Setenv("MC_HOST", "mc.example.internal")
+	t.Setenv("MC_USERNAME", "agent-bot")
+	t.Setenv("CONSOLE_BRIDGE_URL", "http://bridge.example.internal:8766")
+	t.Setenv("CONSOLE_BRIDGE_TOKEN", "test-token")
+}
+
 func TestLoad_MissingHostFails(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MC_USERNAME", "agent-bot")
+	setRequired(t)
+	t.Setenv("MC_HOST", "")
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error when MC_HOST is unset")
@@ -28,17 +40,37 @@ func TestLoad_MissingHostFails(t *testing.T) {
 
 func TestLoad_MissingUsernameFails(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MC_HOST", "mc.example.internal")
+	setRequired(t)
+	t.Setenv("MC_USERNAME", "")
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error when MC_USERNAME is unset")
 	}
 }
 
+func TestLoad_MissingConsoleBridgeURLFails(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("CONSOLE_BRIDGE_URL", "")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error when CONSOLE_BRIDGE_URL is unset")
+	}
+}
+
+func TestLoad_MissingConsoleBridgeTokenFails(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("CONSOLE_BRIDGE_TOKEN", "")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error when CONSOLE_BRIDGE_TOKEN is unset")
+	}
+}
+
 func TestLoad_Defaults(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MC_HOST", "mc.example.internal")
-	t.Setenv("MC_USERNAME", "agent-bot")
+	setRequired(t)
 
 	cfg, err := Load()
 	if err != nil {
@@ -65,12 +97,44 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.CommandRateLimitPerMinute != 10 {
 		t.Errorf("CommandRateLimitPerMinute = %d, want 10", cfg.CommandRateLimitPerMinute)
 	}
+	if cfg.ConsoleBridgeURL != "http://bridge.example.internal:8766" {
+		t.Errorf("ConsoleBridgeURL = %q, want the configured URL", cfg.ConsoleBridgeURL)
+	}
+	if cfg.ConsoleBridgeToken != "test-token" {
+		t.Errorf("ConsoleBridgeToken = %q, want the configured token", cfg.ConsoleBridgeToken)
+	}
+	if cfg.ConsoleBridgeTimeoutMs != 5000 {
+		t.Errorf("ConsoleBridgeTimeoutMs = %d, want 5000", cfg.ConsoleBridgeTimeoutMs)
+	}
+}
+
+func TestLoad_ConsoleBridgeTimeoutOverride(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("CONSOLE_BRIDGE_TIMEOUT_MS", "1500")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ConsoleBridgeTimeoutMs != 1500 {
+		t.Errorf("ConsoleBridgeTimeoutMs = %d, want 1500", cfg.ConsoleBridgeTimeoutMs)
+	}
+}
+
+func TestLoad_ConsoleBridgeTimeoutZeroFails(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("CONSOLE_BRIDGE_TIMEOUT_MS", "0")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for a zero CONSOLE_BRIDGE_TIMEOUT_MS")
+	}
 }
 
 func TestLoad_PortOverride(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MC_HOST", "mc.example.internal")
-	t.Setenv("MC_USERNAME", "agent-bot")
+	setRequired(t)
 	t.Setenv("MC_PORT", "25565")
 
 	cfg, err := Load()
@@ -84,8 +148,7 @@ func TestLoad_PortOverride(t *testing.T) {
 
 func TestLoad_NonIntegerPortFails(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MC_HOST", "mc.example.internal")
-	t.Setenv("MC_USERNAME", "agent-bot")
+	setRequired(t)
 	t.Setenv("MC_PORT", "not-a-number")
 
 	if _, err := Load(); err == nil {
@@ -95,8 +158,7 @@ func TestLoad_NonIntegerPortFails(t *testing.T) {
 
 func TestLoad_ZeroPortFails(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MC_HOST", "mc.example.internal")
-	t.Setenv("MC_USERNAME", "agent-bot")
+	setRequired(t)
 	t.Setenv("MC_PORT", "0")
 
 	if _, err := Load(); err == nil {
@@ -106,8 +168,7 @@ func TestLoad_ZeroPortFails(t *testing.T) {
 
 func TestLoad_PortAboveValidRangeFails(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MC_HOST", "mc.example.internal")
-	t.Setenv("MC_USERNAME", "agent-bot")
+	setRequired(t)
 	t.Setenv("MC_PORT", "99999999")
 
 	if _, err := Load(); err == nil {
@@ -117,8 +178,7 @@ func TestLoad_PortAboveValidRangeFails(t *testing.T) {
 
 func TestLoad_MaxValidPortSucceeds(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MC_HOST", "mc.example.internal")
-	t.Setenv("MC_USERNAME", "agent-bot")
+	setRequired(t)
 	t.Setenv("MC_PORT", "65535")
 
 	cfg, err := Load()
@@ -132,8 +192,7 @@ func TestLoad_MaxValidPortSucceeds(t *testing.T) {
 
 func TestLoad_ReconnectMaxBelowMinFails(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MC_HOST", "mc.example.internal")
-	t.Setenv("MC_USERNAME", "agent-bot")
+	setRequired(t)
 	t.Setenv("RECONNECT_MIN_MS", "10000")
 	t.Setenv("RECONNECT_MAX_MS", "1000")
 
@@ -144,6 +203,7 @@ func TestLoad_ReconnectMaxBelowMinFails(t *testing.T) {
 
 func TestLoad_HostAndUsernameAreTrimmed(t *testing.T) {
 	clearEnv(t)
+	setRequired(t)
 	t.Setenv("MC_HOST", "  mc.example.internal  ")
 	t.Setenv("MC_USERNAME", "  agent-bot  ")
 
