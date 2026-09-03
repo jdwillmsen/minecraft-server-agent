@@ -152,6 +152,55 @@ func TestBridgeVoice_Say_DeliveryFailurePropagates(t *testing.T) {
 	}
 }
 
+// TestBridgeVoice_Say_MultiLineMessageIsFlattened covers the reply path a
+// player takes when !players relays the console's own `list` output, which
+// is several lines. `say` consumes the rest of the console line, so the
+// bridge refuses any command containing a line break — an unflattened
+// message would be dropped with the reply never reaching anyone.
+func TestBridgeVoice_Say_MultiLineMessageIsFlattened(t *testing.T) {
+	var gotCommand string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req commandRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		gotCommand = req.Command
+		json.NewEncoder(w).Encode(commandResponse{Rule: "say"})
+	}))
+	defer srv.Close()
+
+	v := NewBridgeVoice(NewBridgeClient(srv.URL, "tok", time.Second), fakeNames{})
+	if err := v.Say(context.Background(), "There are 2/10 players online:\r\nSteve\nAlex\n"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if strings.ContainsAny(gotCommand, "\n\r") {
+		t.Errorf("command = %q, want no line break — the bridge refuses those outright", gotCommand)
+	}
+	if gotCommand != "say There are 2/10 players online: Steve Alex" {
+		t.Errorf("command = %q, want the message flattened onto one line", gotCommand)
+	}
+}
+
+func TestBridgeVoice_Say_BlankMessageRefusedWithoutCallingBridge(t *testing.T) {
+	for _, message := range []string{"", "   ", "\n", " \r\n "} {
+		called := false
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called = true
+			json.NewEncoder(w).Encode(commandResponse{Rule: "say"})
+		}))
+
+		v := NewBridgeVoice(NewBridgeClient(srv.URL, "tok", time.Second), fakeNames{})
+		err := v.Say(context.Background(), message)
+		srv.Close()
+
+		if err == nil {
+			t.Errorf("Say(%q) = nil error, want an error — there is nothing to broadcast", message)
+		}
+		if called {
+			t.Errorf("Say(%q) reached the bridge, want it refused locally", message)
+		}
+	}
+}
+
 func TestBridgeVoice_Tell_Timeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(50 * time.Millisecond)

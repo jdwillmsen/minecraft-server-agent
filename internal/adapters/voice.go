@@ -115,11 +115,25 @@ func (v *BridgeVoice) Tell(ctx context.Context, xuid, message string) error {
 	return nil
 }
 
+// sayLineBreaks flattens every line-break form into a single space.
+// Bedrock's `say` consumes the rest of the console line, so a message
+// carrying a newline would either smuggle a second console line or (as
+// mc-console-bridge's allowlist does) be refused outright. Console output
+// relayed through Facts is routinely multi-line, so this is the normal
+// case, not an edge one.
+var sayLineBreaks = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ")
+
 // Say broadcasts message to everyone via the console's own `say`, which is
 // the entire reason replies go through the bridge rather than a connected
-// player's own chat: the message carries no gamertag prefix at all.
+// player's own chat: the message carries no gamertag prefix at all. The
+// message is flattened to one line first; `say` with nothing left to
+// broadcast is an error rather than a silently discarded reply.
 func (v *BridgeVoice) Say(ctx context.Context, message string) error {
-	if _, err := v.client.runCommand(ctx, "say "+message); err != nil {
+	line := strings.TrimSpace(sayLineBreaks.Replace(message))
+	if line == "" {
+		return fmt.Errorf("bridge voice: say: message is empty after flattening line breaks, nothing to broadcast")
+	}
+	if _, err := v.client.runCommand(ctx, "say "+line); err != nil {
 		return fmt.Errorf("bridge voice: say: %w", err)
 	}
 	return nil

@@ -18,8 +18,9 @@ type Entry struct {
 // JoinKind is the bus event kind published for a genuinely new arrival.
 const JoinKind = "roster.join"
 
-// JoinEvent is published once per player the first time their XUID appears
-// in an add record this process has not already seen.
+// JoinEvent is published once per player who genuinely arrives while this
+// session is watching — an add record for an XUID not already on the
+// roster, and not part of the session's opening snapshot.
 type JoinEvent struct {
 	Entry
 }
@@ -32,11 +33,29 @@ func (JoinEvent) Kind() string { return JoinKind }
 type Roster struct {
 	mu      sync.Mutex
 	players map[string]string
+	// snapshotSeen is false until this session's opening PlayerList has
+	// been absorbed. The server sends every already-connected player as an
+	// add record immediately after login, so without this the whole
+	// existing population would look like a burst of arrivals.
+	snapshotSeen bool
 }
 
-// New builds an empty Roster.
+// New builds an empty Roster awaiting its first session snapshot.
 func New() *Roster {
 	return &Roster{players: make(map[string]string)}
+}
+
+// BeginSession discards everything the Roster knows and puts it back into
+// its pre-snapshot state. Leave records only arrive while connected, so
+// across a disconnect gap the retained map is not merely incomplete but
+// wrong: it would claim players who have since left are still online (and
+// suppress a genuine rejoin as already-known). Call this at the start of
+// every session, before any packet from it is applied.
+func (r *Roster) BeginSession() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.players = make(map[string]string)
+	r.snapshotSeen = false
 }
 
 // Apply updates the roster from one PlayerList packet's entries and
@@ -45,20 +64,30 @@ func New() *Roster {
 // (e.g. a duplicate add, which the protocol permits) is not reported
 // again. A blank XUID is ignored outright: it carries no usable identity
 // and must never be treated as a join.
+//
+// The first packet of a session carrying at least one usable entry is the
+// server's roster snapshot: those players were already connected before
+// this process was watching, so they are recorded but never reported as
+// joins. A packet with no usable entry leaves the snapshot unconsumed, so
+// an empty update cannot cause the real snapshot behind it to be mistaken
+// for arrivals.
 func (r *Roster) Apply(entries []PlayerListEntry) []Entry {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	snapshot := !r.snapshotSeen
 
 	var joins []Entry
 	for _, e := range entries {
 		if e.XUID == "" {
 			continue
 		}
+		r.snapshotSeen = true
 		switch {
 		case e.Remove:
 			delete(r.players, e.XUID)
 		default:
-			if _, known := r.players[e.XUID]; !known {
+			if _, known := r.players[e.XUID]; !known && !snapshot {
 				joins = append(joins, Entry{XUID: e.XUID, Username: e.Username})
 			}
 			r.players[e.XUID] = e.Username

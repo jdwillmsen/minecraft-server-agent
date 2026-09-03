@@ -251,6 +251,11 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		return fmt.Errorf("spawn: %w", err)
 	}
 
+	// Anything the roster still holds predates this connection and cannot
+	// be trusted: leaves that happened while disconnected were never seen.
+	// The server's own opening PlayerList repopulates it from scratch.
+	playerRoster.BeginSession()
+
 	selfXUID := conn.IdentityData().XUID
 	log.Info("spawned", logging.Fields{"self_xuid": selfXUID})
 	httpServer.SetReady(true)
