@@ -1,6 +1,6 @@
-// Package plugins holds every concrete Plugin implementation. core is the
-// only one Stage 1 needs end-to-end: !help and !ping, proving the full path
-// from a parsed command through the registry to a reply.
+// Package plugins holds every concrete Plugin implementation: core
+// (!help/!ping), stats (!players), and welcome (event-driven, no
+// commands).
 package plugins
 
 import (

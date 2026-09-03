@@ -32,8 +32,8 @@ import (
 var DefaultDispatchTimeout = 5 * time.Second
 
 // Permission is the minimum privilege level a command requires, resolved
-// from the server's permissions.json (read by mc-console-bridge, wired in
-// a later stage).
+// from the server's permissions.json via mc-console-bridge's
+// GET /permissions (see internal/adapters.PermissionResolver).
 type Permission int
 
 const (
@@ -56,8 +56,9 @@ func (p Permission) String() string {
 }
 
 // Voice is how a plugin speaks - always through the console bridge, never
-// as a player. Implemented against mc-console-bridge starting Stage 2; a
-// no-op implementation is used until then.
+// as a player. Implemented against mc-console-bridge by
+// internal/adapters.BridgeVoice; a no-op implementation remains for tests
+// that exercise dispatch without a bridge.
 type Voice interface {
 	// Tell whispers message to the player identified by xuid.
 	Tell(ctx context.Context, xuid, message string) error
@@ -65,11 +66,17 @@ type Voice interface {
 	Say(ctx context.Context, message string) error
 }
 
-// Facts is how a plugin reads live server state. Its method set grows in
-// later stages as real capabilities (online players, server status, ...)
-// are wired to the bridge and mc-monitor; it is intentionally empty for
-// now so Stage 1 doesn't commit to a shape those stages haven't earned yet.
-type Facts interface{}
+// Facts is how a plugin reads live server state. Grows further in later
+// stages as more capabilities (server status, mc-monitor metrics, ...) are
+// wired in; Stage 2 earns exactly the one capability a real command needs.
+type Facts interface {
+	// PlayersOnline returns mc-console-bridge's raw `list` command output,
+	// unparsed. Bedrock's real console text format for `list` was not
+	// available to verify against in the environment this was built in, so
+	// relaying the server's own exact text is safer than a fragile,
+	// unverified parse into a name slice — see internal/adapters/facts.go.
+	PlayersOnline(ctx context.Context) (string, error)
+}
 
 // Invocation is one player's attempt to run a command.
 type Invocation struct {
