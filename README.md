@@ -106,6 +106,26 @@ go test -race ./...
 gofmt -l .
 ```
 
+## Releases
+
+Pushing a version tag - a `v` followed by a digit, matching `v[0-9]*` -
+publishes a container image to GitHub Container Registry:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+# -> ghcr.io/jdwillmsen/minecraft-server-agent:0.1.0
+```
+
+The leading `v` is stripped, so the git tag `v0.1.0` becomes the image tag
+`0.1.0`. The same release can also be published from the Actions tab via the
+`Release` workflow's manual trigger, which takes the version with or without
+the leading `v`.
+
+No `latest` tag is published - consumers (the Helm chart) pin an exact
+version, so there is no moving tag that could silently upgrade a running
+agent. Images are `linux/amd64` only.
+
 ## Design doc
 
 The full architecture, staged delivery plan, and risk register live in the
