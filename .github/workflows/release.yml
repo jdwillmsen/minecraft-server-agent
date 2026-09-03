@@ -2,11 +2,11 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['v[0-9]*']
   workflow_dispatch:
     inputs:
       tag:
-        description: Image tag to publish
+        description: Version to publish, with or without a leading v
         required: true
 
 permissions:
@@ -27,38 +27,38 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Mirrors minecraft-afk-bot's release.yml: a git tag of v0.1.0
-      # publishes 0.1.0, never `latest` — the chart pins a tag, and a moving
-      # one would reintroduce a silent-upgrade hazard on a stateful,
-      # always-connected process.
+      # A tag of v0.1.0 publishes 0.1.0, never `latest` — the chart pins a tag,
+      # and a moving one would reintroduce a silent-upgrade hazard on a
+      # stateful, always-connected process.
       - id: version
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          fi
+          raw="${TAG:-$GITHUB_REF_NAME}"
+          version="${raw#v}"
+          case "$version" in
+            [0-9]*) ;;
+            *)
+              echo "::error::release version must start with a digit: $version"
+              exit 1
+              ;;
+          esac
+          echo "value=$version" >> "$GITHUB_OUTPUT"
 
       - id: meta
         uses: docker/metadata-action@v6.2.0
         with:
           images: ghcr.io/${{ github.repository_owner }}/minecraft-server-agent
-          tags: type=raw,value=unused
-          labels: |
-            org.opencontainers.image.version=${{ steps.version.outputs.value }}
+          tags: type=raw,value=${{ steps.version.outputs.value }}
 
-      # gophertunnel's RakNet implementation is pure Go (no cgo), unlike
-      # minecraft-afk-bot's native raknet-native addon, but the deployment
-      # target is amd64-only Talos nodes, so a multi-arch build would cost
-      # CI time for a platform nothing pulls.
+      # The deployment target is amd64-only Talos nodes, so a multi-arch build
+      # would cost CI time for a platform nothing pulls.
       - uses: docker/build-push-action@v7.3.0
         with:
           context: .
           push: true
           platforms: linux/amd64
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/minecraft-server-agent:${{ steps.version.outputs.value }}
-            ghcr.io/${{ github.repository_owner }}/minecraft-server-agent:sha-${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
