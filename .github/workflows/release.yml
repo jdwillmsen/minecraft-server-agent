@@ -16,6 +16,8 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -26,18 +28,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Docker Hub is a redundant copy; the cluster keeps pulling from ghcr.io.
-      # It is skipped until a human sets the DOCKERHUB_USERNAME repo variable
-      # and DOCKERHUB_TOKEN secret, so GHCR releases never block on a
-      # credential CI must not mint itself. The username is a variable, not a
-      # secret, because it is part of the image reference and a masked value
-      # would redact the ref from every log line.
-      - if: vars.DOCKERHUB_USERNAME != ''
-        uses: docker/login-action@v4.6.0
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # A tag of v0.1.0 publishes 0.1.0, never `latest` — the chart pins a tag,
       # and a moving one would reintroduce a silent-upgrade hazard on a
@@ -60,9 +50,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v6.2.0
         with:
-          images: |
-            ghcr.io/${{ github.repository_owner }}/minecraft-server-agent
-            name=docker.io/${{ vars.DOCKERHUB_USERNAME }}/minecraft-server-agent,enable=${{ vars.DOCKERHUB_USERNAME != '' }}
+          images: ghcr.io/${{ github.repository_owner }}/minecraft-server-agent
           tags: type=raw,value=${{ steps.version.outputs.value }}
 
       # The deployment target is amd64-only Talos nodes, so a multi-arch build
@@ -77,3 +65,37 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
+
+  # Docker Hub is a redundant copy; the cluster keeps pulling from ghcr.io.
+  # It runs as its own job after the ghcr.io push so a missing credential, a
+  # revoked token, or a Docker Hub outage fails loudly here without ever
+  # blocking the primary publish. It is skipped until a human sets the
+  # DOCKERHUB_USERNAME repo variable and DOCKERHUB_TOKEN secret, because CI
+  # must not mint that credential itself. The username is a variable, not a
+  # secret, because it is part of the image reference and a masked value
+  # would redact the ref from every log line.
+  mirror-dockerhub:
+    needs: publish
+    if: vars.DOCKERHUB_USERNAME != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/login-action@v4.6.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # imagetools copies the manifest and blobs registry-to-registry, so the
+      # Docker Hub tag is byte-identical to the ghcr.io one with no rebuild.
+      - env:
+          SOURCE: ghcr.io/${{ github.repository_owner }}/minecraft-server-agent:${{ needs.publish.outputs.version }}
+          TARGET: docker.io/${{ vars.DOCKERHUB_USERNAME }}/minecraft-server-agent:${{ needs.publish.outputs.version }}
+        run: docker buildx imagetools create --tag "$TARGET" "$SOURCE"

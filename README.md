@@ -156,7 +156,9 @@ git push origin v0.1.0
 The Docker Hub copy needs a `DOCKERHUB_USERNAME` repository variable and a
 `DOCKERHUB_TOKEN` repository secret (a Docker Hub access token). Until the
 variable is set, that half of the publish is skipped and only the ghcr.io
-image is pushed. The Helm chart pulls from ghcr.io either way.
+image is pushed. The copy runs as a separate job after the ghcr.io push, so a
+missing token or a Docker Hub outage fails that job on its own and never
+affects the ghcr.io image. The Helm chart pulls from ghcr.io either way.
 
 The leading `v` is stripped, so the git tag `v0.1.0` becomes the image tag
 `0.1.0`. The same release can also be published from the Actions tab via the
