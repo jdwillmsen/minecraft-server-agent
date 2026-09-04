@@ -27,15 +27,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Docker Hub is the redundant copy, not what the cluster pulls from
-      # (that stays ghcr.io, matching minecraft-afk-bot) - dual-published so
-      # the image survives a GHCR-specific outage or policy change. Requires
-      # DOCKERHUB_USERNAME/DOCKERHUB_TOKEN repo secrets, set by a human
-      # outside CI (an access token is a credential, never minted or pasted
-      # through an agent's shell).
-      - uses: docker/login-action@v4.6.0
+      # Docker Hub is a redundant copy; the cluster keeps pulling from ghcr.io.
+      # It is skipped until a human sets the DOCKERHUB_USERNAME repo variable
+      # and DOCKERHUB_TOKEN secret, so GHCR releases never block on a
+      # credential CI must not mint itself. The username is a variable, not a
+      # secret, because it is part of the image reference and a masked value
+      # would redact the ref from every log line.
+      - if: vars.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v4.6.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # A tag of v0.1.0 publishes 0.1.0, never `latest` — the chart pins a tag,
@@ -61,7 +62,7 @@ jobs:
         with:
           images: |
             ghcr.io/${{ github.repository_owner }}/minecraft-server-agent
-            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/minecraft-server-agent
+            name=docker.io/${{ vars.DOCKERHUB_USERNAME }}/minecraft-server-agent,enable=${{ vars.DOCKERHUB_USERNAME != '' }}
           tags: type=raw,value=${{ steps.version.outputs.value }}
 
       # The deployment target is amd64-only Talos nodes, so a multi-arch build
