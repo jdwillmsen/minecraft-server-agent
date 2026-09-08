@@ -20,6 +20,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
@@ -299,12 +300,51 @@ func TestChatMessagePublishedOnBus(t *testing.T) {
 	}
 }
 
+// A mention is answered on its own goroutine. Held here at the backend so
+// the assertion is about ordering rather than speed: while the answer is
+// still in flight the read loop has already returned and would be handling
+// the next packet, which is what the inline version could not do.
+func TestMentionIsAnsweredWithoutBlockingTheReadLoop(t *testing.T) {
+	release := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.Write([]byte(`{"choices":[{"message":{"content":"Beacons need a nether star."}}]}`))
+	}))
+	defer backend.Close()
+
+	registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
+	log := logging.New("info")
+	ans := testAnswering()
+	ans.llm = adapters.NewLLMClient(backend.URL, "test-model", "", 192, 5*time.Second)
+
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server how do I craft a beacon"),
+		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+
+	if got := voice.output(); len(got) != 0 {
+		t.Fatalf("the read loop waited for the backend: %v", got)
+	}
+	close(release)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(voice.output()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the mention was never answered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := voice.output()[0]; got != "say: Beacons need a nether star." {
+		t.Errorf("answer = %q, want it broadcast to everyone who saw the question", got)
+	}
+}
+
 // testAnswering supplies the chat path's answering dependencies with no LLM
 // backend configured, which is both what these command-path tests need and the
 // production behaviour when LLM_BASE_URL is unset.
 func testAnswering() answering {
 	return answering{
-		limiter: ratelimit.NewPerActor(4, time.Minute),
-		llm:     adapters.NewLLMClient("", "", "", 96, time.Second),
+		limiter:  ratelimit.NewPerActor(4, time.Minute),
+		llm:      adapters.NewLLMClient("", "", "", 192, time.Second),
+		toolsFor: func(p *plugin.Context) *tools.Registry { return buildToolset(p, p.Profiles) },
+		total:    20 * time.Second,
 	}
 }

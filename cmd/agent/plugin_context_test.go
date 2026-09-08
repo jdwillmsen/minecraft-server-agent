@@ -7,9 +7,11 @@ import (
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/config"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
 )
 
 func testPluginContext() *plugin.Context {
@@ -21,6 +23,8 @@ func testPluginContext() *plugin.Context {
 		roster.New(),
 		plugin.NewRegistry(),
 		store.Nop{},
+		knowledge.Nop{},
+		waypoints.Nop{},
 	)
 }
 

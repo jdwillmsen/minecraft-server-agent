@@ -73,6 +73,12 @@ type Config struct {
 	LLMAPIKey    string
 	LLMMaxTokens int
 	LLMTimeoutMs int
+	// LLMTotalTimeoutMs bounds one whole answering attempt including every
+	// tool round trip. Separate from LLMTimeoutMs, which bounds each
+	// individual call: without the per-call bound one stalled request eats
+	// the entire budget, and without this one a model that keeps calling
+	// tools answers arbitrarily late.
+	LLMTotalTimeoutMs int
 	// AnswerMaxPerMinute bounds answers per player, separately from the
 	// command limiter: one LLM call is far more expensive than one console
 	// command, and a shared budget would let questions starve !help.
@@ -119,11 +125,15 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	llmMaxTokens, err := positiveInt("LLM_MAX_TOKENS", 96)
+	llmMaxTokens, err := positiveInt("LLM_MAX_TOKENS", 192)
 	if err != nil {
 		return Config{}, err
 	}
 	llmTimeout, err := positiveInt("LLM_TIMEOUT_MS", 8000)
+	if err != nil {
+		return Config{}, err
+	}
+	llmTotalTimeout, err := positiveInt("LLM_TOTAL_TIMEOUT_MS", 20000)
 	if err != nil {
 		return Config{}, err
 	}
@@ -167,6 +177,7 @@ func Load() (Config, error) {
 		LLMAPIKey:                 stringDefault("LLM_API_KEY", ""),
 		LLMMaxTokens:              llmMaxTokens,
 		LLMTimeoutMs:              llmTimeout,
+		LLMTotalTimeoutMs:         llmTotalTimeout,
 		AnswerMaxPerMinute:        answerRateLimit,
 		MCMonitorURL:              stringDefault("MC_MONITOR_URL", ""),
 		BackupExporterURL:         stringDefault("BACKUP_EXPORTER_URL", ""),

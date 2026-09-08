@@ -36,6 +36,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/liveness"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
@@ -92,6 +93,14 @@ func main() {
 		log.Error("plugin_register_failed", logging.Fields{"plugin": "stats", "error": err.Error()})
 		os.Exit(1)
 	}
+	if err := registry.Register(plugins.NewKnowledge()); err != nil {
+		log.Error("plugin_register_failed", logging.Fields{"plugin": "knowledge", "error": err.Error()})
+		os.Exit(1)
+	}
+	if err := registry.Register(plugins.NewWaypoints()); err != nil {
+		log.Error("plugin_register_failed", logging.Fields{"plugin": "waypoints", "error": err.Error()})
+		os.Exit(1)
+	}
 	welcomePlugin := plugins.NewWelcome(ctx, welcomeDelay, log)
 	if err := registry.Register(welcomePlugin); err != nil {
 		log.Error("plugin_register_failed", logging.Fields{"plugin": "welcome", "error": err.Error()})
@@ -106,7 +115,18 @@ func main() {
 	playerStore := openStore(ctx, cfg, log)
 	defer playerStore.Close()
 
-	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, playerRoster, registry, playerStore)
+	// Both share the profile store's pool rather than opening their own: one
+	// database, one set of connections, and a store that cannot outlive the
+	// pool it borrows.
+	var knowledgeStore knowledge.Store = knowledge.Nop{}
+	var waypointStore waypoints.Store = waypoints.Nop{}
+	if pg, ok := playerStore.(*store.Postgres); ok && pg.Pool() != nil {
+		knowledgeStore = knowledge.NewPostgres(pg.Pool())
+		waypointStore = waypoints.NewPostgres(pg.Pool())
+		log.Info("knowledge_ready", nil)
+	}
+
+	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, playerRoster, registry, playerStore, knowledgeStore, waypointStore)
 	// Every answerable chat message and every roster join is published
 	// here; event-driven plugins (welcome) subscribe via startEventDispatch
 	// rather than touching the connection directly.
@@ -116,11 +136,10 @@ func main() {
 	// than one console command, and sharing a limiter would let a burst of
 	// questions starve !help for the same player.
 	ans := answering{
-		limiter: ratelimit.NewPerActor(cfg.AnswerMaxPerMinute, time.Minute),
-		llm: adapters.NewLLMClient(
-			cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMAPIKey,
-			cfg.LLMMaxTokens, time.Duration(cfg.LLMTimeoutMs)*time.Millisecond,
-		),
+		limiter:  ratelimit.NewPerActor(cfg.AnswerMaxPerMinute, time.Minute),
+		llm:      newLLMClient(cfg, log),
+		toolsFor: func(p *plugin.Context) *tools.Registry { return buildToolset(p, p.Profiles) },
+		total:    time.Duration(cfg.LLMTotalTimeoutMs) * time.Millisecond,
 	}
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
 
@@ -215,6 +234,12 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 type answering struct {
 	limiter *ratelimit.PerActor
 	llm     *adapters.LLMClient
+	// toolsFor is rebuilt per answer rather than cached: it closes over the
+	// plugin context's capabilities, and which of those are usable can
+	// change while the process runs.
+	toolsFor func(*plugin.Context) *tools.Registry
+	// total bounds one whole answering attempt, tool rounds included.
+	total time.Duration
 }
 
 func nextDelay(current, lasted, min, max time.Duration) time.Duration {
@@ -384,7 +409,11 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 	case chat.TriggerCommand:
 		handleCommand(ctx, id, trigger, log, registry, pctx, limiter, permResolver)
 	case chat.TriggerMention:
-		handleMention(ctx, id, trigger, log, pctx, ans, playerRoster)
+		// Answering runs off the read loop. handleMention makes up to three
+		// HTTP calls now, and this function is called from the Bedrock
+		// packet reader: doing it inline stops the agent hearing anything --
+		// including !help and player joins -- for the whole exchange.
+		go handleMention(ctx, id, trigger, log, pctx, ans, playerRoster)
 	}
 }
 
@@ -401,7 +430,7 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 // RecordJoin without reporting anything, and no player arrival was ever
 // persisted. Nothing failed loudly, because the one branch that would have
 // logged is the error path of the call that was not being made.
-func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store) *plugin.Context {
+func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store) *plugin.Context {
 	return &plugin.Context{
 		Voice: adapters.NewBridgeVoice(bridgeClient, playerRoster),
 		Facts: adapters.NewBridgeFacts(bridgeClient),
@@ -416,12 +445,27 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 		// documents Profiles as possibly nil and the plugins guard for it, but
 		// this binary has no reason to hand them one.
 		Profiles: playerStore,
-		// Same reasoning as Profiles: the pool-backed stores land in a later
-		// stage, but this binary can hand out the disabled implementation
-		// today instead of leaving the field at its zero value.
-		Knowledge: knowledge.Nop{},
-		Waypoints: waypoints.Nop{},
+		// Same reasoning as Profiles: pool-backed when a database is
+		// configured, the disabled implementation when not, never nil.
+		Knowledge: knowledgeStore,
+		Waypoints: waypointStore,
 	}
+}
+
+// newLLMClient builds the one production answering client.
+//
+// A function rather than a literal inline so the logger wiring is testable.
+// Without SetLogger the client's tool_invocation_failed events go nowhere:
+// a lookup that fails on every question would be invisible to an operator,
+// and the answer path degrades silently by design -- the model just answers
+// around the missing fact.
+func newLLMClient(cfg config.Config, log *logging.Logger) *adapters.LLMClient {
+	client := adapters.NewLLMClient(
+		cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMAPIKey,
+		cfg.LLMMaxTokens, time.Duration(cfg.LLMTimeoutMs)*time.Millisecond,
+	)
+	client.SetLogger(log)
+	return client
 }
 
 func openStore(ctx context.Context, cfg config.Config, log *logging.Logger) store.Store {
@@ -477,7 +521,13 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 		}
 	}
 
-	reply, err := ans.llm.Answer(ctx, name, trigger.Message)
+	// Bounds the attempt end to end. The per-call timeout inside the client
+	// bounds each request, which a model that keeps calling tools can spend
+	// several of.
+	answerCtx, cancel := context.WithTimeout(ctx, ans.total)
+	defer cancel()
+
+	reply, err := ans.llm.AnswerWithTools(answerCtx, name, actorXUID, trigger.Message, ans.toolsFor(pctx))
 	if err != nil {
 		// Logged, never spoken. A backend timeout is an operator's problem,
 		// and narrating it in chat turns one failure into an audience.
