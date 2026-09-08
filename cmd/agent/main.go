@@ -21,6 +21,7 @@ import (
 
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
+	"github.com/sandertv/gophertunnel/minecraft/protocol/login"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 	"golang.org/x/oauth2"
 
@@ -36,6 +37,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/skin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 )
 
@@ -251,7 +253,21 @@ func jitter(d time.Duration) time.Duration {
 // cancellation surfaced as a read error, which the caller ignores because
 // it checks ctx.Err() itself).
 func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store) error {
-	dialer := minecraft.Dialer{TokenSource: ts}
+	// Without this the agent joins as a solid black silhouette under a
+	// SkinID regenerated every connect: Bedrock skins are uploaded by the
+	// client from its own installation, and a headless client has none, so
+	// gophertunnel substitutes a placeholder. Geometry and the resource patch
+	// are left to the dialer, which supplies working humanoid defaults.
+	agentSkin := skin.For(cfg.MCUsername)
+	dialer := minecraft.Dialer{
+		TokenSource: ts,
+		ClientData: login.ClientData{
+			SkinID:          agentSkin.ID,
+			SkinData:        agentSkin.Data,
+			SkinImageWidth:  agentSkin.Width,
+			SkinImageHeight: agentSkin.Height,
+		},
+	}
 	addr := net.JoinHostPort(cfg.MCHost, strconv.Itoa(cfg.MCPort))
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, 30*time.Second)
