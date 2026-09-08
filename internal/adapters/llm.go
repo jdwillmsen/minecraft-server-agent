@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
 // Bedrock renders long chat lines badly and the server-side line limit is
@@ -52,6 +53,11 @@ type LLMClient struct {
 	maxTokens int
 	timeout   time.Duration
 	http      *http.Client
+	// log is optional: NewLLMClient leaves it nil so every existing caller
+	// (every test, and cmd/agent until it is wired up) keeps working without
+	// one, just without the failed-tool-call events an operator would
+	// otherwise see.
+	log *logging.Logger
 }
 
 // NewLLMClient builds a client. An empty baseURL disables answering: the
@@ -65,6 +71,14 @@ func NewLLMClient(baseURL, model, apiKey string, maxTokens int, timeout time.Dur
 		timeout:   timeout,
 		http:      &http.Client{},
 	}
+}
+
+// SetLogger attaches a logger for operational events (currently: failed tool
+// invocations). A nil logger, or never calling this at all, is a supported
+// state -- the events are simply dropped rather than the client requiring
+// one to function.
+func (c *LLMClient) SetLogger(log *logging.Logger) {
+	c.log = log
 }
 
 // Enabled reports whether a backend is configured at all.
@@ -172,6 +186,17 @@ func ExtractToolCalls(payload []byte) []toolCall {
 	return parsed.Choices[0].Message.ToolCalls
 }
 
+// withNonEmptyIDs filters out tool calls with no id, in place.
+func withNonEmptyIDs(calls []toolCall) []toolCall {
+	out := calls[:0]
+	for _, call := range calls {
+		if call.ID != "" {
+			out = append(out, call)
+		}
+	}
+	return out
+}
+
 // post sends one chat-completions request and returns the raw payload. Each
 // call carries its own timeout: without a per-call bound, one stalled
 // request would consume the whole loop's budget.
@@ -202,7 +227,11 @@ func (c *LLMClient) post(ctx context.Context, body chatRequest) ([]byte, error) 
 	}
 	// Bounded: a backend answering with something enormous must not become
 	// this process's memory problem.
-	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("llm: read response: %w", err)
+	}
+	return payload, nil
 }
 
 // AnswerWithTools asks the model, letting it call read-only tools first.
@@ -232,6 +261,12 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 		}
 
 		calls := ExtractToolCalls(payload)
+		// A call with no id can't be matched back to a role:"tool" reply --
+		// the backend keys the pairing on tool_call_id -- so echoing one
+		// blank produces an orphaned message the backend rejects outright.
+		// Dropping it here costs nothing the model can't recover from on
+		// its next turn.
+		calls = withNonEmptyIDs(calls)
 		if len(calls) == 0 || round >= MaxToolRounds {
 			return ExtractText(payload), nil
 		}
@@ -240,10 +275,17 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 		for _, call := range calls {
 			result, err := registry.Invoke(ctx, call.Function.Name, json.RawMessage(call.Function.Arguments), callerXUID)
 			if err != nil {
+				if c.log != nil {
+					c.log.Error("tool_invocation_failed", logging.Fields{"tool": call.Function.Name, "error": err.Error()})
+				}
 				// Handed back to the model rather than aborting: it can
 				// answer around a missing fact, and an operator reads the
-				// failure in the logs. Never spoken in chat.
-				result = "error: " + err.Error()
+				// failure in the logs above. Fixed and generic on purpose --
+				// unlike a successful result, err.Error() never passes
+				// through the registry's cap or collapse, and a bridge or
+				// database failure can carry a DSN or an internal address.
+				// The model gets only enough to answer around the gap.
+				result = "error: that lookup is unavailable right now"
 			}
 			messages = append(messages, chatMessage{
 				Role: "tool", ToolCallID: call.ID, Content: result,

@@ -1,18 +1,21 @@
 package adapters
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
 func newTestClient(url string) *LLMClient {
@@ -252,5 +255,221 @@ func TestAnswerWithNilRegistryMakesOneCall(t *testing.T) {
 	}
 	if *calls != 1 {
 		t.Errorf("backend calls = %d, want 1 when no tools are offered", *calls)
+	}
+}
+
+// The exact failure the loop's comments warn about -- an orphaned tool
+// message, or a result keyed to the wrong tool_call_id -- would pass every
+// test above, since none of them look inside the follow-up request. This one
+// decodes it and checks the shape directly.
+func TestAnswerWithToolsMessageHistoryIsWellFormed(t *testing.T) {
+	var bodies [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, body)
+		reply := textReply
+		if len(bodies) == 1 {
+			reply = toolCallReply("t", "{}")
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(reply))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	registry := tools.NewRegistry(tools.Tool{
+		Name:   "t",
+		Schema: json.RawMessage(`{"type":"object","properties":{}}`),
+		Invoke: func(context.Context, json.RawMessage, string) (string, error) { return "ok", nil },
+	})
+
+	if _, err := client.AnswerWithTools(context.Background(), "Dot", "xuid-1", "q", registry); err != nil {
+		t.Fatalf("AnswerWithTools: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("backend calls = %d, want 2", len(bodies))
+	}
+
+	var followUp chatRequest
+	if err := json.Unmarshal(bodies[1], &followUp); err != nil {
+		t.Fatalf("decode follow-up request: %v", err)
+	}
+	n := len(followUp.Messages)
+	if n < 2 {
+		t.Fatalf("follow-up has %d messages, want at least an assistant and a tool turn", n)
+	}
+	assistant, toolResult := followUp.Messages[n-2], followUp.Messages[n-1]
+
+	if assistant.Role != "assistant" || len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].ID != "c1" {
+		t.Errorf("assistant turn = %+v, want role assistant with tool_calls[0].id = \"c1\"", assistant)
+	}
+	if toolResult.Role != "tool" || toolResult.ToolCallID != "c1" {
+		t.Errorf("tool-result turn = %+v, want role tool keyed to \"c1\"", toolResult)
+	}
+	if toolResult.Content != "ok" {
+		t.Errorf("tool-result content = %q, want the tool's own return value", toolResult.Content)
+	}
+}
+
+// A tool call with no id has nothing for a role:"tool" reply to key to;
+// sending one anyway would orphan the message and the backend rejects it.
+// It must be dropped rather than invoked or echoed.
+func TestAnswerWithToolsDropsToolCallsWithEmptyID(t *testing.T) {
+	replyNoID := `{"choices":[{"message":{"content":null,"tool_calls":[` +
+		`{"id":"","type":"function","function":{"name":"t","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`
+	var bodies [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, body)
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(replyNoID))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	invoked := false
+	registry := tools.NewRegistry(tools.Tool{
+		Name:   "t",
+		Schema: json.RawMessage(`{"type":"object","properties":{}}`),
+		Invoke: func(context.Context, json.RawMessage, string) (string, error) {
+			invoked = true
+			return "ok", nil
+		},
+	})
+
+	got, err := client.AnswerWithTools(context.Background(), "Dot", "x", "q", registry)
+	if err != nil {
+		t.Fatalf("AnswerWithTools: %v", err)
+	}
+	if invoked {
+		t.Error("a tool call with no id must be dropped, not invoked")
+	}
+	if len(bodies) != 1 {
+		t.Errorf("backend calls = %d, want 1: nothing valid was left to act on", len(bodies))
+	}
+	if got != "" {
+		t.Errorf("answer = %q, want empty: the response had no text and nothing to act on", got)
+	}
+}
+
+// A raw tool error can carry internals (a DSN, an internal address) that
+// must never reach a player's chat via the model's discretion. The model
+// gets a fixed, generic string instead; the real error goes to the log.
+func TestAnswerWithToolsSendsGenericErrorNeverInternals(t *testing.T) {
+	var bodies [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, body)
+		reply := textReply
+		if len(bodies) == 1 {
+			reply = toolCallReply("broken", "{}")
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(reply))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	registry := tools.NewRegistry(tools.Tool{
+		Name:   "broken",
+		Schema: json.RawMessage(`{"type":"object","properties":{}}`),
+		Invoke: func(context.Context, json.RawMessage, string) (string, error) {
+			return "", errors.New("postgres://user:pass@10.0.0.5:5432/db unreachable")
+		},
+	})
+
+	if _, err := client.AnswerWithTools(context.Background(), "Dot", "x", "q", registry); err != nil {
+		t.Fatalf("AnswerWithTools: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("backend calls = %d, want 2", len(bodies))
+	}
+
+	var followUp chatRequest
+	if err := json.Unmarshal(bodies[1], &followUp); err != nil {
+		t.Fatalf("decode follow-up request: %v", err)
+	}
+	toolResult := followUp.Messages[len(followUp.Messages)-1]
+	if toolResult.Role != "tool" {
+		t.Fatalf("last message role = %q, want tool", toolResult.Role)
+	}
+	if strings.Contains(toolResult.Content, "10.0.0.5") || strings.Contains(toolResult.Content, "postgres://") {
+		t.Errorf("tool result leaked internals to the model: %q", toolResult.Content)
+	}
+	if toolResult.Content != "error: that lookup is unavailable right now" {
+		t.Errorf("tool result = %q, want the fixed generic failure string", toolResult.Content)
+	}
+}
+
+// captureStderr swaps os.Stderr for the duration of fn and returns what was
+// written to it, so a logging.Logger built with logging.New (which writes to
+// the process's real stderr) can be asserted on from here.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe: %v", err)
+	}
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	return buf.String()
+}
+
+// The comment beside the tool-error path claims an operator reads the
+// failure in the logs; this is what makes that claim true.
+func TestAnswerWithToolsLogsFailedToolInvocation(t *testing.T) {
+	srv, _ := toolBackend(t, []string{toolCallReply("broken", "{}"), textReply})
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	registry := tools.NewRegistry(tools.Tool{
+		Name:   "broken",
+		Schema: json.RawMessage(`{"type":"object","properties":{}}`),
+		Invoke: func(context.Context, json.RawMessage, string) (string, error) {
+			return "", errors.New("bridge unreachable: dial tcp 10.0.0.5:5432")
+		},
+	})
+
+	// logging.New must be called after os.Stderr is swapped: it captures
+	// the writer at construction time, not at each write.
+	out := captureStderr(t, func() {
+		client.SetLogger(logging.New("info"))
+		if _, err := client.AnswerWithTools(context.Background(), "Dot", "x", "q", registry); err != nil {
+			t.Fatalf("AnswerWithTools: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, `"event":"tool_invocation_failed"`) {
+		t.Errorf("stderr = %q, want a tool_invocation_failed event", out)
+	}
+	if !strings.Contains(out, `"tool":"broken"`) {
+		t.Errorf("stderr = %q, want the failing tool's name logged", out)
+	}
+	if !strings.Contains(out, "bridge unreachable") {
+		t.Errorf("stderr = %q, want the real error logged for an operator", out)
+	}
+}
+
+// A client with no logger attached (every other test in this file) must
+// keep working: SetLogger is optional, not a precondition for answering.
+func TestAnswerWithToolsWorksWithoutALogger(t *testing.T) {
+	srv, _ := toolBackend(t, []string{toolCallReply("broken", "{}"), textReply})
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	registry := tools.NewRegistry(tools.Tool{
+		Name:   "broken",
+		Schema: json.RawMessage(`{"type":"object","properties":{}}`),
+		Invoke: func(context.Context, json.RawMessage, string) (string, error) {
+			return "", errors.New("bridge unreachable")
+		},
+	})
+	if _, err := client.AnswerWithTools(context.Background(), "Dot", "x", "q", registry); err != nil {
+		t.Fatalf("AnswerWithTools without a logger: %v", err)
 	}
 }
