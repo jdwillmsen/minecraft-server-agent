@@ -3,11 +3,16 @@ package adapters
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
 )
 
 func newTestClient(url string) *LLMClient {
@@ -127,5 +132,125 @@ func TestDisabledClientAnswersNothingWithoutError(t *testing.T) {
 	got, err := c.Answer(context.Background(), "a", "b")
 	if err != nil || got != "" {
 		t.Errorf("Answer = (%q, %v), want empty and no error", got, err)
+	}
+}
+
+func toolBackend(t *testing.T, replies []string) (*httptest.Server, *int) {
+	t.Helper()
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if calls >= len(replies) {
+			t.Errorf("backend called %d times, only %d replies scripted", calls+1, len(replies))
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		reply := replies[calls]
+		calls++
+		// The final call must not offer tools -- that is what forces text.
+		if calls == len(replies) && strings.Contains(string(body), `"tools"`) && len(replies) > MaxToolRounds {
+			t.Errorf("final call still offered tools: %s", body)
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(reply))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &calls
+}
+
+const textReply = `{"choices":[{"message":{"content":"The gold farm is under spawn."},"finish_reason":"stop"}]}`
+
+func toolCallReply(name, args string) string {
+	return `{"choices":[{"message":{"content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"` +
+		name + `","arguments":` + strconv.Quote(args) + `}}]},"finish_reason":"tool_calls"}]}`
+}
+
+func TestAnswerWithToolsOneRound(t *testing.T) {
+	srv, calls := toolBackend(t, []string{toolCallReply("knowledge_lookup", `{"query":"gold farm"}`), textReply})
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+
+	var gotCaller string
+	registry := tools.NewRegistry(tools.Tool{
+		Name:   "knowledge_lookup",
+		Schema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+		Invoke: func(_ context.Context, args json.RawMessage, caller string) (string, error) {
+			gotCaller = caller
+			return "gold farm: under spawn at y 12", nil
+		},
+	})
+
+	got, err := client.AnswerWithTools(context.Background(), "Dot", "xuid-1", "where is the gold farm", registry)
+	if err != nil {
+		t.Fatalf("AnswerWithTools: %v", err)
+	}
+	if got != "The gold farm is under spawn." {
+		t.Errorf("answer = %q", got)
+	}
+	if *calls != 2 {
+		t.Errorf("backend calls = %d, want 2", *calls)
+	}
+	if gotCaller != "xuid-1" {
+		t.Errorf("tool caller = %q, want the asking XUID", gotCaller)
+	}
+}
+
+func TestAnswerWithToolsStopsAtRoundCap(t *testing.T) {
+	// Three tool-call replies, but the cap is 2 rounds: the client must stop
+	// asking for tools and take the third call's text.
+	srv, calls := toolBackend(t, []string{
+		toolCallReply("t", "{}"), toolCallReply("t", "{}"), textReply,
+	})
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	registry := tools.NewRegistry(tools.Tool{
+		Name:   "t",
+		Schema: json.RawMessage(`{"type":"object","properties":{}}`),
+		Invoke: func(context.Context, json.RawMessage, string) (string, error) { return "ok", nil },
+	})
+
+	got, err := client.AnswerWithTools(context.Background(), "Dot", "xuid-1", "q", registry)
+	if err != nil {
+		t.Fatalf("AnswerWithTools: %v", err)
+	}
+	if got == "" {
+		t.Error("expected the forced text answer")
+	}
+	if *calls != 3 {
+		t.Errorf("backend calls = %d, want 3 (2 tool rounds + 1 forced)", *calls)
+	}
+}
+
+func TestAnswerWithToolsHandlesToolErrorAndUnknownTool(t *testing.T) {
+	srv, _ := toolBackend(t, []string{toolCallReply("broken", "{}"), textReply})
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	registry := tools.NewRegistry(tools.Tool{
+		Name:   "broken",
+		Schema: json.RawMessage(`{"type":"object","properties":{}}`),
+		Invoke: func(context.Context, json.RawMessage, string) (string, error) {
+			return "", errors.New("bridge unreachable")
+		},
+	})
+	got, err := client.AnswerWithTools(context.Background(), "Dot", "x", "q", registry)
+	if err != nil {
+		t.Fatalf("a failing tool must not fail the answer: %v", err)
+	}
+	if got == "" {
+		t.Error("expected the model's answer despite the tool error")
+	}
+
+	srv2, _ := toolBackend(t, []string{toolCallReply("invented_tool", "{}"), textReply})
+	client2 := NewLLMClient(srv2.URL, "m", "", 192, 5*time.Second)
+	if _, err := client2.AnswerWithTools(context.Background(), "Dot", "x", "q", registry); err != nil {
+		t.Fatalf("an invented tool name must not fail the answer: %v", err)
+	}
+}
+
+func TestAnswerWithNilRegistryMakesOneCall(t *testing.T) {
+	srv, calls := toolBackend(t, []string{textReply})
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	if _, err := client.AnswerWithTools(context.Background(), "Dot", "x", "q", nil); err != nil {
+		t.Fatalf("AnswerWithTools: %v", err)
+	}
+	if *calls != 1 {
+		t.Errorf("backend calls = %d, want 1 when no tools are offered", *calls)
 	}
 }
