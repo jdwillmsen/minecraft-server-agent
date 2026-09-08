@@ -21,12 +21,12 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
-	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
@@ -492,8 +492,8 @@ func TestMentionIsAnsweredWithoutBlockingTheReadLoop(t *testing.T) {
 	close(churnStop)
 	<-churnDone
 
-	if said[0] != "say: Your base waypoint is saved." {
-		t.Errorf("answer = %q, want it broadcast to everyone who saw the question", said[0])
+	if want := "tell " + playerXUID + ": Your base waypoint is saved."; said[0] != want {
+		t.Errorf("answer = %q, want %q -- it was built from the asker's own waypoints", said[0], want)
 	}
 	if seen := waypointStore.seen(); len(seen) != 1 || seen[0] != playerXUID {
 		t.Errorf("waypoint_list callers = %v, want exactly the asker", seen)
@@ -675,9 +675,69 @@ func testAnswering() answering {
 	return answering{
 		limiter:   ratelimit.NewPerActor(4, time.Minute),
 		llm:       adapters.NewLLMClient("", "", "", 192, time.Second, nil),
-		toolsFor:  func(p *plugin.Context) *tools.Registry { return buildToolset(p) },
+		toolsFor:  buildToolset,
 		total:     20 * time.Second,
 		inFlight:  make(chan struct{}, maxConcurrentAnswers),
 		broadcast: 5 * time.Second,
+	}
+}
+
+// stubKnowledge is an enabled fact store, so an answer can be built from a
+// tool that reads nothing belonging to the asker.
+type stubKnowledge struct{ knowledge.Nop }
+
+func (stubKnowledge) Enabled() bool { return true }
+
+func (stubKnowledge) Lookup(context.Context, string, int) ([]knowledge.Entry, error) {
+	return []knowledge.Entry{{Topic: "rules", Body: "be nice"}}, nil
+}
+
+const (
+	knowledgeLookupCall = `{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"knowledge_lookup","arguments":"{\"query\":\"rules\"}"}}]}}]}`
+	rulesAnswer         = `{"choices":[{"message":{"content":"Be nice to each other."}}]}`
+)
+
+// answerMention drives one @server question to completion against a backend
+// that answers the n-th call with replies[n], and returns what the voice
+// recorded.
+func answerMention(t *testing.T, configure func(*plugin.Context), replies ...string) []string {
+	t.Helper()
+	backend := newHeldBackend(t, replies...)
+	backend.serve()
+
+	registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
+	configure(pctx)
+	log := logging.New("info")
+	ans := testAnswering()
+	ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
+
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server where is my base"),
+		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+	return waitForOutput(t, voice)
+}
+
+// Coordinates are personal. !wp whispers them because broadcasting where
+// someone lives is a griefing vector, and the same coordinates read out of
+// the same store by the answer path are no less personal for having been
+// asked for in public.
+func TestAnswerBuiltFromTheAskersOwnDataIsWhispered(t *testing.T) {
+	said := answerMention(t, func(pctx *plugin.Context) { pctx.Waypoints = &stubWaypoints{} },
+		waypointListCall, beaconAnswer)
+
+	want := "tell " + playerXUID + ": Your base waypoint is saved."
+	if said[0] != want {
+		t.Errorf("answer = %q, want %q", said[0], want)
+	}
+}
+
+// Every other answer stays public: an @server question is asked in front of
+// everyone, and an answer only the asker sees reads to the rest of them as
+// no answer at all.
+func TestAnswerFromSharedKnowledgeIsStillBroadcast(t *testing.T) {
+	said := answerMention(t, func(pctx *plugin.Context) { pctx.Knowledge = stubKnowledge{} },
+		knowledgeLookupCall, rulesAnswer)
+
+	if said[0] != "say: Be nice to each other." {
+		t.Errorf("answer = %q, want it broadcast to everyone who saw the question", said[0])
 	}
 }

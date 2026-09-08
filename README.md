@@ -192,6 +192,14 @@ is injected by the answer loop itself and never taken from the model's
 output, which is what stops one player's question from reading another
 player's waypoints.
 
+An answer is broadcast, because an `@server` question is asked in public
+and an answer only the asker sees reads to everyone else as no answer at
+all. The exception is an answer the model built by calling
+`waypoint_lookup` or `waypoint_list`: those read the asker's own
+coordinates, `!wp` whispers them because broadcasting where a player lives
+is a griefing vector, and reaching them through `@server` does not make
+them less personal. Such an answer is whispered to the asker instead.
+
 ## Targeting a reply
 
 `Voice.Tell` only ever receives an XUID, but Bedrock's `tellraw` needs a

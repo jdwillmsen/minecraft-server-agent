@@ -6,9 +6,29 @@ import (
 	"fmt"
 	"strings"
 
+	"sync/atomic"
+
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
 )
+
+// callerScoped records whether a tool that reads the asking player's own
+// data ran while one question was being answered, so the answer can be
+// whispered rather than broadcast.
+//
+// Handed back with the registry it belongs to rather than kept anywhere
+// longer-lived: a registry is built fresh per answer, and a flag that
+// outlived one would carry a privacy decision into the next player's
+// question. Atomic because an answer runs on its own goroutine.
+type callerScoped struct{ used atomic.Bool }
+
+// mark is called on invocation rather than on a successful read: whether
+// the sentence the model finally writes contains someone's coordinates is
+// not something this side can tell, so the trigger is the model having
+// been given them at all.
+func (c *callerScoped) mark() { c.used.Store(true) }
+
+func (c *callerScoped) happened() bool { return c != nil && c.used.Load() }
 
 // noArgs is the schema for a tool that takes nothing. Sent rather than
 // omitted because some OpenAI-compatible backends reject a function with no
@@ -30,8 +50,12 @@ var noArgs = json.RawMessage(`{"type":"object","properties":{}}`)
 // Adding it means a read-only lookup on PlayerStore (a profile by XUID that
 // writes nothing), implemented on store.Postgres and store.Nop, and a tool
 // built on that.
-func buildToolset(pctx *plugin.Context) *tools.Registry {
+//
+// The returned callerScoped reports whether the model was given the asking
+// player's own data, which decides whether the answer is whispered.
+func buildToolset(pctx *plugin.Context) (*tools.Registry, *callerScoped) {
 	var list []tools.Tool
+	scoped := &callerScoped{}
 
 	if pctx.Knowledge != nil && pctx.Knowledge.Enabled() {
 		list = append(list, tools.Tool{
@@ -76,6 +100,7 @@ func buildToolset(pctx *plugin.Context) *tools.Registry {
 					}
 					// caller, never an argument: the model names a waypoint,
 					// it does not choose whose.
+					scoped.mark()
 					wp, found, err := pctx.Waypoints.Get(ctx, caller, a.Name)
 					if err != nil {
 						return "", err
@@ -91,6 +116,7 @@ func buildToolset(pctx *plugin.Context) *tools.Registry {
 				Description: "List the names of the waypoints the asking player has saved.",
 				Schema:      noArgs,
 				Invoke: func(ctx context.Context, _ json.RawMessage, caller string) (string, error) {
+					scoped.mark()
 					saved, err := pctx.Waypoints.List(ctx, caller)
 					if err != nil {
 						return "", err
@@ -158,5 +184,5 @@ func buildToolset(pctx *plugin.Context) *tools.Registry {
 		})
 	}
 
-	return tools.NewRegistry(list...)
+	return tools.NewRegistry(list...), scoped
 }

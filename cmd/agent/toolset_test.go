@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
@@ -16,7 +17,8 @@ func TestBuildToolsetOmitsAbsentCapabilities(t *testing.T) {
 	// A context with nothing configured must produce no tools at all: the
 	// model cannot call what it was never offered, which is stronger than
 	// refusing the call afterwards.
-	if got := buildToolset(&plugin.Context{}).Len(); got != 0 {
+	registry, _ := buildToolset(&plugin.Context{})
+	if got := registry.Len(); got != 0 {
 		t.Errorf("empty context produced %d tools, want 0", got)
 	}
 }
@@ -46,7 +48,7 @@ func (w *recordingWaypoints) List(_ context.Context, xuid string) ([]waypoints.W
 // injected caller.
 func TestWaypointToolsReadOnlyTheInjectedCaller(t *testing.T) {
 	store := &recordingWaypoints{}
-	registry := buildToolset(&plugin.Context{Waypoints: store})
+	registry, _ := buildToolset(&plugin.Context{Waypoints: store})
 
 	args := json.RawMessage(`{"name":"base","xuid":"2535499999999999","caller":"2535499999999999"}`)
 	if _, err := registry.Invoke(t.Context(), "waypoint_lookup", args, "2535411111111111"); err != nil {
@@ -96,7 +98,8 @@ func TestServerInfoToolsFollowTheExporters(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := toolNames(buildToolset(&plugin.Context{ServerInfo: tc.serverInfo}))
+			registry, _ := buildToolset(&plugin.Context{ServerInfo: tc.serverInfo})
+			got := toolNames(registry)
 			if len(got) != len(tc.want) {
 				t.Fatalf("tools = %v, want %v", got, tc.want)
 			}
@@ -107,4 +110,37 @@ func TestServerInfoToolsFollowTheExporters(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Which tools ran decides whether the answer is whispered, so the flag has
+// to follow the data rather than the capability: a context offering both
+// surfaces still broadcasts an answer the model built without asking about
+// the player.
+func TestOnlyCallerScopedToolsMarkAnAnswerAsPersonal(t *testing.T) {
+	pctx := &plugin.Context{Waypoints: &recordingWaypoints{}, Knowledge: enabledKnowledge{}}
+
+	registry, scoped := buildToolset(pctx)
+	if _, err := registry.Invoke(t.Context(), "knowledge_lookup", json.RawMessage(`{"query":"rules"}`), "2535411111111111"); err != nil {
+		t.Fatalf("knowledge_lookup: %v", err)
+	}
+	if scoped.happened() {
+		t.Error("a shared-knowledge answer was marked as the asker's own data")
+	}
+
+	if _, err := registry.Invoke(t.Context(), "waypoint_list", noArgs, "2535411111111111"); err != nil {
+		t.Fatalf("waypoint_list: %v", err)
+	}
+	if !scoped.happened() {
+		t.Error("reading the asker's own waypoints did not mark the answer personal")
+	}
+}
+
+// enabledKnowledge is a fact store with something in it, so the tool it
+// backs actually runs.
+type enabledKnowledge struct{ knowledge.Nop }
+
+func (enabledKnowledge) Enabled() bool { return true }
+
+func (enabledKnowledge) Lookup(context.Context, string, int) ([]knowledge.Entry, error) {
+	return []knowledge.Entry{{Topic: "rules", Body: "be nice"}}, nil
 }

@@ -147,7 +147,7 @@ func main() {
 	ans := answering{
 		limiter:   ratelimit.NewPerActor(cfg.AnswerMaxPerMinute, time.Minute),
 		llm:       newLLMClient(cfg, log),
-		toolsFor:  func(p *plugin.Context) *tools.Registry { return buildToolset(p) },
+		toolsFor:  buildToolset,
 		total:     time.Duration(cfg.LLMTotalTimeoutMs) * time.Millisecond,
 		inFlight:  make(chan struct{}, maxConcurrentAnswers),
 		broadcast: bridgeTimeout,
@@ -244,8 +244,10 @@ type answering struct {
 	llm     *adapters.LLMClient
 	// toolsFor is rebuilt per answer rather than cached: it closes over the
 	// plugin context's capabilities, and which of those are usable can
-	// change while the process runs.
-	toolsFor func(*plugin.Context) *tools.Registry
+	// change while the process runs. The callerScoped it returns belongs to
+	// that one answer and reports whether the model read the asker's own
+	// data -- see buildToolset.
+	toolsFor func(*plugin.Context) (*tools.Registry, *callerScoped)
 	// total bounds one whole answering attempt, tool rounds included.
 	total time.Duration
 	// inFlight is a counting semaphore over answers in progress, capped at
@@ -571,7 +573,8 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	answerCtx, cancel := context.WithTimeout(ctx, ans.total)
 	defer cancel()
 
-	reply, err := ans.llm.AnswerWithTools(answerCtx, name, actorXUID, trigger.Message, ans.toolsFor(pctx))
+	registry, personal := ans.toolsFor(pctx)
+	reply, err := ans.llm.AnswerWithTools(answerCtx, name, actorXUID, trigger.Message, registry)
 	if err != nil {
 		// Logged, never spoken. A backend timeout is an operator's problem,
 		// and narrating it in chat turns one failure into an audience.
@@ -593,6 +596,13 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	// chat, and an answer only the asker can see reads as no answer at all to
 	// everyone else who watched them ask.
 	//
+	// The exception is an answer the model built from the asker's own
+	// waypoints. Those coordinates are personal -- !wp whispers them because
+	// broadcasting where a player lives is a griefing vector -- and they do
+	// not stop being personal because the question reached them through
+	// @server. The console has no player to whisper to, and nothing it asks
+	// about is its own, so it keeps the broadcast.
+	//
 	// Detached from ctx, and bounded by the operator's bridge timeout rather
 	// than a number chosen here: the client applies that same value to every
 	// other call it makes, and a shorter deadline on this one path would be a
@@ -606,11 +616,19 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	// have delivered.
 	sayCtx, sayCancel := context.WithTimeout(context.WithoutCancel(ctx), ans.broadcast)
 	defer sayCancel()
-	if err := pctx.Voice.Say(sayCtx, reply); err != nil {
-		log.Error("mention_answer_send_failed", logging.Fields{"actor": actorXUID, "error": err.Error()})
+
+	private := personal.happened() && actorXUID != chat.ServerOrigin
+	var sendErr error
+	if private {
+		sendErr = pctx.Voice.Tell(sayCtx, actorXUID, reply)
+	} else {
+		sendErr = pctx.Voice.Say(sayCtx, reply)
+	}
+	if sendErr != nil {
+		log.Error("mention_answer_send_failed", logging.Fields{"actor": actorXUID, "error": sendErr.Error()})
 		return
 	}
-	log.Info("mention_answered", logging.Fields{"actor": actorXUID, "reply_chars": len(reply)})
+	log.Info("mention_answered", logging.Fields{"actor": actorXUID, "reply_chars": len(reply), "private": private})
 }
 
 // handlePlayerList updates the live roster from one PlayerList packet and
