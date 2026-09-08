@@ -92,8 +92,14 @@ func main() {
 	}
 
 	pctx := &plugin.Context{
-		Voice:     adapters.NewBridgeVoice(bridgeClient, playerRoster),
-		Facts:     adapters.NewBridgeFacts(bridgeClient),
+		Voice: adapters.NewBridgeVoice(bridgeClient, playerRoster),
+		Facts: adapters.NewBridgeFacts(bridgeClient),
+		// Shares the bridge's timeout: both are "one HTTP call to something
+		// in this namespace", and a second knob for the same property is a
+		// knob that drifts.
+		ServerInfo: adapters.NewMetricsFacts(
+			adapters.NewMetricsClient(cfg.MCMonitorURL, cfg.BackupExporterURL, bridgeTimeout),
+		),
 		Directory: registry,
 	}
 	// Every answerable chat message and every roster join is published
