@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 )
 
 // DefaultDispatchTimeout bounds how long a single command's Run may take
@@ -160,6 +161,23 @@ type Context struct {
 	// ServerInfo may be nil when the exporters are not configured. Commands
 	// that need it must say so rather than panic -- see the stats plugin.
 	ServerInfo ServerInfo
+	// Profiles records presence and reports what is known about a player.
+	//
+	// May be nil. cmd/agent always supplies one -- store.Nop when no database
+	// is configured -- but a plugin must not assume that: an earlier draft
+	// documented it as never nil, and the first caller that believed the
+	// comment panicked the whole event dispatcher on a nil interface. A
+	// greeting is not worth taking the agent down for.
+	Profiles PlayerStore
+}
+
+// PlayerStore is the subset of internal/store a plugin may touch.
+//
+// Narrowed to the read-and-record path a greeting needs: plugins observe
+// players, they do not close orphaned sessions or manage a connection pool.
+type PlayerStore interface {
+	RecordJoin(ctx context.Context, xuid, gamertag string, at time.Time) (store.Profile, error)
+	Enabled() bool
 }
 
 // Registry holds every registered plugin and routes commands to them.

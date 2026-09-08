@@ -28,6 +28,18 @@ type JoinEvent struct {
 // Kind satisfies the bus's Event interface.
 func (JoinEvent) Kind() string { return JoinKind }
 
+// LeaveKind is the bus event kind published when a known player departs.
+const LeaveKind = "roster.leave"
+
+// LeaveEvent is published for each departure the roster observes.
+type LeaveEvent struct {
+	XUID     string
+	Username string
+}
+
+// Kind satisfies the bus's Event interface.
+func (LeaveEvent) Kind() string { return LeaveKind }
+
 // Roster holds the current XUID-to-username mapping. Safe for concurrent
 // use.
 type Roster struct {
@@ -71,13 +83,12 @@ func (r *Roster) BeginSession() {
 // joins. A packet with no usable entry leaves the snapshot unconsumed, so
 // an empty update cannot cause the real snapshot behind it to be mistaken
 // for arrivals.
-func (r *Roster) Apply(entries []PlayerListEntry) []Entry {
+func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves []Entry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	snapshot := !r.snapshotSeen
 
-	var joins []Entry
 	for _, e := range entries {
 		if e.XUID == "" {
 			continue
@@ -85,6 +96,12 @@ func (r *Roster) Apply(entries []PlayerListEntry) []Entry {
 		r.snapshotSeen = true
 		switch {
 		case e.Remove:
+			// Reported, not just forgotten. A departure is half of a play
+			// session, and the roster is the only place the agent learns of
+			// one -- the server sends a removal record, and nothing else does.
+			if name, known := r.players[e.XUID]; known {
+				leaves = append(leaves, Entry{XUID: e.XUID, Username: name})
+			}
 			delete(r.players, e.XUID)
 		default:
 			if _, known := r.players[e.XUID]; !known && !snapshot {
@@ -93,7 +110,7 @@ func (r *Roster) Apply(entries []PlayerListEntry) []Entry {
 			r.players[e.XUID] = e.Username
 		}
 	}
-	return joins
+	return joins, leaves
 }
 
 // NameFor returns the username currently on record for xuid, so a caller
