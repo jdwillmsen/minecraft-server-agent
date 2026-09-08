@@ -13,7 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"unicode/utf8"
+
+	"github.com/jdwillmsen/minecraft-server-agent/internal/text"
 )
 
 // MaxToolResultChars bounds what one tool feeds back into the model's
@@ -122,17 +123,5 @@ func (r *Registry) Invoke(ctx context.Context, name string, args json.RawMessage
 	if err != nil {
 		return "", err
 	}
-	out = strings.Join(strings.Fields(out), " ")
-	if len(out) > MaxToolResultChars {
-		// Gamertags and knowledge-base bodies are free-form UTF-8, so a
-		// plain byte slice at the cap can land inside a multi-byte rune and
-		// hand the model an invalid tail as prompt text. Walk back to the
-		// last full rune instead.
-		cut := MaxToolResultChars
-		for cut > 0 && !utf8.RuneStart(out[cut]) {
-			cut--
-		}
-		out = out[:cut]
-	}
-	return out, nil
+	return text.Truncate(strings.Join(strings.Fields(out), " "), MaxToolResultChars), nil
 }
