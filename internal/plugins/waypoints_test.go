@@ -209,3 +209,66 @@ func TestWPSetMultiWordNameThenGet(t *testing.T) {
 		t.Errorf("reply = %q, want the dimension", reply)
 	}
 }
+
+func TestWPSetAmbiguousAllNumericTailIsRefused(t *testing.T) {
+	cmd := wpCommand(t)
+	fake := newFakeWaypoints()
+	pctx := &plugin.Context{Waypoints: fake}
+
+	// "base 1" could be the name with coordinates 2 3 4, or "base" with a
+	// stray extra number before three coordinates -- both readings are
+	// grammatically valid, so guessing either one risks silently saving the
+	// wrong name at the wrong place. Refusing is the only safe reply.
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"set", "base", "1", "2", "3", "4"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(fake.byOwner["a"]) != 0 {
+		t.Fatalf("an ambiguous set was stored anyway: %v", fake.byOwner["a"])
+	}
+	if strings.Contains(strings.ToLower(reply), "saved") {
+		t.Errorf("reply %q claims a save that must not have happened", reply)
+	}
+}
+
+func TestWPSetMultiWordNameBoundaryStillRoundTrips(t *testing.T) {
+	cmd := wpCommand(t)
+	pctx := &plugin.Context{Waypoints: newFakeWaypoints()}
+
+	if _, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"set", "Home", "Base", "100", "64", "-200"},
+	}); err != nil {
+		t.Fatalf("set without dimension: %v", err)
+	}
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"home", "base"},
+	})
+	if err != nil {
+		t.Fatalf("get without dimension: %v", err)
+	}
+	if !strings.Contains(reply, "100") || !strings.Contains(reply, "-200") {
+		t.Errorf("reply = %q, want the coordinates", reply)
+	}
+
+	if _, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"set", "Home", "Base", "1", "2", "3", "nether"},
+	}); err != nil {
+		t.Fatalf("set with dimension: %v", err)
+	}
+	reply, err = cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"home", "base"},
+	})
+	if err != nil {
+		t.Fatalf("get with dimension: %v", err)
+	}
+	if !strings.Contains(reply, "nether") {
+		t.Errorf("reply = %q, want the dimension", reply)
+	}
+}

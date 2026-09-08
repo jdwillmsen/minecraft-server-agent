@@ -87,6 +87,14 @@ func runWP(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (st
 		if len(nameTokens) == 0 {
 			return setUsage, nil
 		}
+		// A numeric token right where the name ends and the coordinates
+		// begin is genuinely ambiguous: it could be the last word of a name
+		// like "base 1", or a stray extra number the player meant to
+		// remove. Guessing either way risks silently saving the wrong name
+		// at the wrong coordinates, so refuse rather than pick one.
+		if _, err := strconv.Atoi(nameTokens[len(nameTokens)-1]); err == nil {
+			return "I cannot tell where the name ends and the coordinates begin: drop the extra number and try again.", nil
+		}
 
 		coords := make([]int, 3)
 		for i, raw := range coordTokens {
