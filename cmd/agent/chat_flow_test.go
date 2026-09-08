@@ -214,7 +214,7 @@ func TestChatCommandFlow(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
-			handlePacket(context.Background(), tc.pk, selfXUID, siblings, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver)
+			handlePacket(context.Background(), tc.pk, selfXUID, siblings, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering())
 
 			got := voice.output()
 			if len(got) != len(tc.want) {
@@ -240,9 +240,9 @@ func TestHandleCommand_RateLimitBlocksASpammingActorButNotOthers(t *testing.T) {
 
 	const otherPlayer = "2535499999999998"
 	for i := 0; i < 5; i++ {
-		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver)
+		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering())
 	}
-	handlePacket(context.Background(), chatPacket(otherPlayer, "Alex", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver)
+	handlePacket(context.Background(), chatPacket(otherPlayer, "Alex", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering())
 
 	got := voice.output()
 	want := []string{
@@ -268,9 +268,9 @@ func TestChatMessagePublishedOnBus(t *testing.T) {
 	log := logging.New("info")
 	limiter := unlimitedRateLimit()
 
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping now"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver)
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server hello"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver)
-	handlePacket(context.Background(), chatPacket(selfXUID, "Agent", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver)
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping now"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering())
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server hello"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering())
+	handlePacket(context.Background(), chatPacket(selfXUID, "Agent", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering())
 
 	first, ok := (<-events).(chat.MessageEvent)
 	if !ok {
@@ -295,5 +295,15 @@ func TestChatMessagePublishedOnBus(t *testing.T) {
 	case ev := <-events:
 		t.Fatalf("self message was published to the bus: %+v", ev)
 	default:
+	}
+}
+
+// testAnswering supplies the chat path's answering dependencies with no LLM
+// backend configured, which is both what these command-path tests need and the
+// production behaviour when LLM_BASE_URL is unset.
+func testAnswering() answering {
+	return answering{
+		limiter: ratelimit.NewPerActor(4, time.Minute),
+		llm:     adapters.NewLLMClient("", "", "", 96, time.Second),
 	}
 }
