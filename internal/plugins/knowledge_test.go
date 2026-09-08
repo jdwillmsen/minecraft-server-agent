@@ -1,0 +1,127 @@
+package plugins
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
+)
+
+type fakeKnowledge struct {
+	entries  map[string]knowledge.Entry
+	upserted int
+}
+
+func newFakeKnowledge() *fakeKnowledge {
+	return &fakeKnowledge{entries: map[string]knowledge.Entry{}}
+}
+
+func (f *fakeKnowledge) Lookup(_ context.Context, q string, limit int) ([]knowledge.Entry, error) {
+	var out []knowledge.Entry
+	for _, e := range f.entries {
+		if strings.Contains(e.Topic, knowledge.NormalizeTopic(q)) {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+func (f *fakeKnowledge) Get(_ context.Context, topic string) (knowledge.Entry, bool, error) {
+	e, ok := f.entries[knowledge.NormalizeTopic(topic)]
+	return e, ok, nil
+}
+func (f *fakeKnowledge) Upsert(_ context.Context, topic, body, author string) error {
+	f.upserted++
+	f.entries[knowledge.NormalizeTopic(topic)] = knowledge.Entry{
+		Topic: knowledge.NormalizeTopic(topic), Body: body, AuthorXUID: author, UpdatedAt: time.Now(),
+	}
+	return nil
+}
+func (f *fakeKnowledge) Delete(_ context.Context, topic string) error {
+	delete(f.entries, knowledge.NormalizeTopic(topic))
+	return nil
+}
+func (f *fakeKnowledge) List(context.Context) ([]knowledge.Entry, error) {
+	out := make([]knowledge.Entry, 0, len(f.entries))
+	for _, e := range f.entries {
+		out = append(out, e)
+	}
+	return out, nil
+}
+func (f *fakeKnowledge) Enabled() bool { return true }
+
+func kbCommand(t *testing.T) plugin.Command {
+	t.Helper()
+	for _, c := range NewKnowledge().Commands() {
+		if c.Name == "kb" {
+			return c
+		}
+	}
+	t.Fatal("kb command not registered")
+	return plugin.Command{}
+}
+
+func TestKBWriteRequiresOperator(t *testing.T) {
+	cmd := kbCommand(t)
+	if cmd.Permission != plugin.PermissionVisitor {
+		t.Fatalf("kb base permission = %v, want visitor (reads are open)", cmd.Permission)
+	}
+
+	fake := newFakeKnowledge()
+	pctx := &plugin.Context{Knowledge: fake}
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "member",
+		ActorPermission: plugin.PermissionMember,
+		Args:            []string{"set", "rules", "be", "nice"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if fake.upserted != 0 {
+		t.Fatal("a member wrote to the knowledge store")
+	}
+	if !strings.Contains(strings.ToLower(reply), "operator") {
+		t.Errorf("reply %q should say why the write was refused", reply)
+	}
+}
+
+func TestKBSetThenGet(t *testing.T) {
+	cmd := kbCommand(t)
+	fake := newFakeKnowledge()
+	pctx := &plugin.Context{Knowledge: fake}
+
+	if _, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"set", "gold", "farm", "is", "under", "spawn"},
+	}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "visitor",
+		ActorPermission: plugin.PermissionVisitor,
+		Args:            []string{"gold"},
+	})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !strings.Contains(reply, "under spawn") {
+		t.Errorf("reply = %q, want the stored body", reply)
+	}
+}
+
+func TestKBWithoutStore(t *testing.T) {
+	cmd := kbCommand(t)
+	reply, err := cmd.Run(context.Background(), &plugin.Context{}, plugin.Invocation{
+		ActorXUID: "someone", ActorPermission: plugin.PermissionVisitor, Args: []string{"rules"},
+	})
+	if err != nil {
+		t.Fatalf("a nil Knowledge must not error: %v", err)
+	}
+	if reply == "" {
+		t.Error("reply should explain the feature is unconfigured")
+	}
+}
