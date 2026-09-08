@@ -192,3 +192,31 @@ func TestKBDeleteConfirmsARealDelete(t *testing.T) {
 		t.Errorf("entries = %v, want the topic gone", fake.entries)
 	}
 }
+
+// A zero plugin.Context is what an unconfigured binary hands a plugin:
+// Knowledge and Waypoints are nil interfaces, and a command that
+// dereferenced one would take down the dispatcher on a player's first !kb.
+// Dispatched rather than field-checked -- that a zero interface field is
+// nil is a language guarantee and says nothing about these commands --
+// and asserted through the error, since Dispatch turns a panic into
+// ErrCommandPanicked rather than a failed test.
+func TestCommandsSurviveAZeroContext(t *testing.T) {
+	registry := plugin.NewRegistry()
+	for _, p := range []plugin.Plugin{NewKnowledge(), NewWaypoints()} {
+		if err := registry.Register(p); err != nil {
+			t.Fatalf("register %s: %v", p.Name(), err)
+		}
+	}
+
+	for _, name := range []string{"kb", "wp"} {
+		reply, err := registry.Dispatch(context.Background(), &plugin.Context{}, name, plugin.Invocation{
+			ActorXUID: "a", ActorPermission: plugin.PermissionOperator, Args: []string{"del", "anything"},
+		})
+		if err != nil {
+			t.Errorf("!%s against a zero context: %v", name, err)
+		}
+		if reply == "" {
+			t.Errorf("!%s said nothing about being unconfigured", name)
+		}
+	}
+}

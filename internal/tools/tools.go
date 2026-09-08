@@ -59,9 +59,10 @@ type Registry struct {
 }
 
 // NewRegistry builds a registry, silently dropping tools that could not be
-// called anyway (no name, or no Invoke). A malformed tool is a wiring bug,
-// and offering the model a name that panics on call is worse than not
-// offering it.
+// called anyway (no name, no Invoke, or a name an earlier tool already
+// claimed). A malformed tool is a wiring bug, and offering the model a name
+// that panics on call -- or that resolves to whichever duplicate happens to
+// win -- is worse than not offering it.
 func NewRegistry(list ...Tool) *Registry {
 	r := &Registry{byName: make(map[string]Tool, len(list))}
 	for _, t := range list {
