@@ -141,17 +141,12 @@ func main() {
 	// rather than touching the connection directly.
 	eventBus := bus.New()
 	limiter := ratelimit.NewPerActor(cfg.CommandRateLimitPerMinute, time.Minute)
-	// A separate budget from commands on purpose: one LLM call costs far more
-	// than one console command, and sharing a limiter would let a burst of
-	// questions starve !help for the same player.
-	ans := answering{
-		limiter:   ratelimit.NewPerActor(cfg.AnswerMaxPerMinute, time.Minute),
-		llm:       newLLMClient(cfg, log),
-		toolsFor:  buildToolset,
-		total:     time.Duration(cfg.LLMTotalTimeoutMs) * time.Millisecond,
-		inFlight:  make(chan struct{}, maxConcurrentAnswers),
-		broadcast: bridgeTimeout,
-	}
+	ans := newAnswering(
+		newLLMClient(cfg, log),
+		cfg.AnswerMaxPerMinute,
+		time.Duration(cfg.LLMTotalTimeoutMs)*time.Millisecond,
+		bridgeTimeout,
+	)
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
 
 	httpServer, err := httpapi.New(cfg.HTTPAddr)
@@ -258,6 +253,29 @@ type answering struct {
 	// so cannot inherit one; it is the operator's configured bridge timeout,
 	// the same value every other bridge call gets.
 	broadcast time.Duration
+}
+
+// newAnswering assembles the answering dependencies.
+//
+// A constructor rather than a struct literal at each site because three of
+// these fields are silently fatal when left zero, and none of them fail
+// where they were forgotten: a nil inFlight channel never accepts a send,
+// so every answer is dropped as busy while the log reports a cap of 0; a
+// zero total cancels each answer the moment it starts; a zero broadcast
+// does the same to the delivery of one already paid for.
+//
+// The limiter is built here too, on a budget separate from commands: one
+// LLM call costs far more than one console command, and sharing a limiter
+// would let a burst of questions starve !help for the same player.
+func newAnswering(llm *adapters.LLMClient, perMinute int, total, broadcast time.Duration) answering {
+	return answering{
+		limiter:   ratelimit.NewPerActor(perMinute, time.Minute),
+		llm:       llm,
+		toolsFor:  buildToolset,
+		total:     total,
+		inFlight:  make(chan struct{}, maxConcurrentAnswers),
+		broadcast: broadcast,
+	}
 }
 
 // nextDelay is the reconnect backoff step: a session that stayed up at

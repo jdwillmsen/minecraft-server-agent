@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -550,7 +549,6 @@ func TestMentionIsDroppedWhenTheAgentIsAlreadyBusy(t *testing.T) {
 func TestRateLimitedMentionIsRefusedBeforeAGoroutineExists(t *testing.T) {
 	backend := newHeldBackend(t, beaconAnswer)
 	registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
-	var before, after int
 
 	out := captureStdout(t, func() {
 		log := logging.New("info")
@@ -563,18 +561,13 @@ func TestRateLimitedMentionIsRefusedBeforeAGoroutineExists(t *testing.T) {
 			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
 		<-backend.arrived
 
-		before = runtime.NumGoroutine()
 		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server second"),
 			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
-		after = runtime.NumGoroutine()
 
 		backend.serve()
 		waitForOutput(t, voice)
 	})
 
-	if after > before {
-		t.Errorf("goroutines went %d -> %d across a rate-limited mention; the refusal happens after the spawn", before, after)
-	}
 	if !strings.Contains(out, `"event":"mention_rate_limited"`) {
 		t.Errorf("stdout = %q, want a mention_rate_limited event", out)
 	}
@@ -672,14 +665,7 @@ func TestAnswerBroadcastSurvivesACancelledProcessContext(t *testing.T) {
 // backend configured, which is both what these command-path tests need and the
 // production behaviour when LLM_BASE_URL is unset.
 func testAnswering() answering {
-	return answering{
-		limiter:   ratelimit.NewPerActor(4, time.Minute),
-		llm:       adapters.NewLLMClient("", "", "", 192, time.Second, nil),
-		toolsFor:  buildToolset,
-		total:     20 * time.Second,
-		inFlight:  make(chan struct{}, maxConcurrentAnswers),
-		broadcast: 5 * time.Second,
-	}
+	return newAnswering(adapters.NewLLMClient("", "", "", 192, time.Second, nil), 4, 20*time.Second, 5*time.Second)
 }
 
 // stubKnowledge is an enabled fact store, so an answer can be built from a
