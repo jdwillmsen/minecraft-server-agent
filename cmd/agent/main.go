@@ -96,17 +96,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	pctx := &plugin.Context{
-		Voice: adapters.NewBridgeVoice(bridgeClient, playerRoster),
-		Facts: adapters.NewBridgeFacts(bridgeClient),
-		// Shares the bridge's timeout: both are "one HTTP call to something
-		// in this namespace", and a second knob for the same property is a
-		// knob that drifts.
-		ServerInfo: adapters.NewMetricsFacts(
-			adapters.NewMetricsClient(cfg.MCMonitorURL, cfg.BackupExporterURL, bridgeTimeout),
-		),
-		Directory: registry,
-	}
+	// Opened before the game connection so a misconfigured database is a
+	// startup log line rather than a surprise at the first player join, and
+	// before the plugin context because that context needs it. Failure is not
+	// fatal: persistence is the personalisation behind greetings, and losing
+	// it must not cost the agent its commands.
+	playerStore := openStore(ctx, cfg, log)
+	defer playerStore.Close()
+
+	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, playerRoster, registry, playerStore)
 	// Every answerable chat message and every roster join is published
 	// here; event-driven plugins (welcome) subscribe via startEventDispatch
 	// rather than touching the connection directly.
@@ -115,13 +113,6 @@ func main() {
 	// A separate budget from commands on purpose: one LLM call costs far more
 	// than one console command, and sharing a limiter would let a burst of
 	// questions starve !help for the same player.
-	// Opened before the game connection so a misconfigured database is a
-	// startup log line rather than a surprise at the first player join.
-	// Failure is not fatal: persistence is the personalisation behind
-	// greetings, and losing it must not cost the agent its commands.
-	playerStore := openStore(ctx, cfg, log)
-	defer playerStore.Close()
-
 	ans := answering{
 		limiter: ratelimit.NewPerActor(cfg.AnswerMaxPerMinute, time.Minute),
 		llm: adapters.NewLLMClient(
@@ -400,6 +391,32 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 // Deliberately never returns an error. Every failure here -- unset, malformed,
 // unreachable -- lands the agent in the same supported state it ran in through
 // Stages 1-4: greeting players plainly and answering commands.
+// newPluginContext assembles what every plugin is allowed to reach.
+//
+// A function rather than a struct literal inline in main so the wiring can be
+// tested. Profiles was declared on plugin.Context and never assigned in an
+// earlier version: plugins saw a nil interface, the welcome plugin skipped
+// RecordJoin without reporting anything, and no player arrival was ever
+// persisted. Nothing failed loudly, because the one branch that would have
+// logged is the error path of the call that was not being made.
+func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store) *plugin.Context {
+	return &plugin.Context{
+		Voice: adapters.NewBridgeVoice(bridgeClient, playerRoster),
+		Facts: adapters.NewBridgeFacts(bridgeClient),
+		// Shares the bridge's timeout: both are "one HTTP call to something
+		// in this namespace", and a second knob for the same property is a
+		// knob that drifts.
+		ServerInfo: adapters.NewMetricsFacts(
+			adapters.NewMetricsClient(cfg.MCMonitorURL, cfg.BackupExporterURL, bridgeTimeout),
+		),
+		Directory: registry,
+		// store.Nop when no database is configured, never nil -- plugin.Context
+		// documents Profiles as possibly nil and the plugins guard for it, but
+		// this binary has no reason to hand them one.
+		Profiles: playerStore,
+	}
+}
+
 func openStore(ctx context.Context, cfg config.Config, log *logging.Logger) store.Store {
 	dsn := cfg.PostgresDSN()
 	if dsn == "" {
