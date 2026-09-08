@@ -40,6 +40,17 @@ type Config struct {
 	// ConsoleBridgeToken authenticates every bridge request as a bearer
 	// token; the bridge rejects anything else.
 	ConsoleBridgeToken string
+	// MCMonitorURL and BackupExporterURL are the Prometheus exposition
+	// endpoints behind !online, !version and !backup. Both are optional:
+	// unset means those commands report themselves unconfigured rather than
+	// erroring, so an agent can run without the exporters.
+	//
+	// Note the backup exporter serves /metrics.txt, not /metrics -- the full
+	// path belongs in the value, not assembled here, so a future exporter with
+	// a different path needs no code change.
+	MCMonitorURL      string
+	BackupExporterURL string
+
 	// ConsoleBridgeTimeoutMs bounds every individual bridge HTTP call.
 	ConsoleBridgeTimeoutMs int
 
@@ -98,6 +109,8 @@ func Load() (Config, error) {
 		ReconnectMaxMs:            reconnectMax,
 		HTTPAddr:                  stringDefault("HTTP_ADDR", ":8080"),
 		AuthCacheDir:              stringDefault("AUTH_CACHE_DIR", "/data/auth"),
+		MCMonitorURL:              stringDefault("MC_MONITOR_URL", ""),
+		BackupExporterURL:         stringDefault("BACKUP_EXPORTER_URL", ""),
 		CommandRateLimitPerMinute: commandRateLimit,
 		ConsoleBridgeURL:          bridgeURL,
 		ConsoleBridgeToken:        bridgeToken,

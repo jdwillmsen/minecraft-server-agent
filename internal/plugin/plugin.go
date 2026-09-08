@@ -78,6 +78,25 @@ type Facts interface {
 	PlayersOnline(ctx context.Context) (string, error)
 }
 
+// ServerInfo is how a plugin reads state the game console cannot answer for.
+//
+// Separate from Facts rather than folded into it because the two are backed
+// by different transports and either can be absent: Facts speaks to the
+// console through mc-console-bridge, ServerInfo scrapes the mc-monitor and
+// backup exporters. Merging them would force the console-backed
+// implementation to carry three methods it has no way to answer.
+type ServerInfo interface {
+	// ServerStatus reports player counts, health and responsiveness in one
+	// line -- the "is the server ok" question, as distinct from PlayersOnline's
+	// list of who is here.
+	ServerStatus(ctx context.Context) (string, error)
+	// Version reports the Bedrock build the server is running.
+	Version(ctx context.Context) (string, error)
+	// BackupStatus reports how recently the world was saved, how large that
+	// archive was, and whether it was taken with the world held.
+	BackupStatus(ctx context.Context) (string, error)
+}
+
 // Invocation is one player's attempt to run a command.
 type Invocation struct {
 	// ActorXUID identifies who issued the command (never a gamertag - see
@@ -138,6 +157,9 @@ type Context struct {
 	Voice     Voice
 	Facts     Facts
 	Directory Directory
+	// ServerInfo may be nil when the exporters are not configured. Commands
+	// that need it must say so rather than panic -- see the stats plugin.
+	ServerInfo ServerInfo
 }
 
 // Registry holds every registered plugin and routes commands to them.
