@@ -5,8 +5,16 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 )
+
+// reservedTopics collides with the subcommand names runKB switches on. A
+// fact stored under one would be unreadable through !kb <topic> (the switch
+// would treat it as list/set/del) while the LLM's lookup path reads the
+// store directly and would still find it -- refusing the write keeps both
+// surfaces agreeing on what the agent knows.
+var reservedTopics = map[string]bool{"list": true, "set": true, "del": true}
 
 // Knowledge exposes the curated fact store in chat.
 //
@@ -64,6 +72,9 @@ func runKB(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (st
 			return "Usage: !kb set <topic> <text>.", nil
 		}
 		topic, body := inv.Args[1], strings.Join(inv.Args[2:], " ")
+		if reservedTopics[knowledge.NormalizeTopic(topic)] {
+			return "That name is reserved: pick another topic.", nil
+		}
 		if err := pctx.Knowledge.Upsert(ctx, topic, body, inv.ActorXUID); err != nil {
 			return "", fmt.Errorf("knowledge: !kb set: %w", err)
 		}

@@ -57,14 +57,15 @@ func (p *Postgres) Set(ctx context.Context, xuid string, wp Waypoint) error {
 	return nil
 }
 
-func (p *Postgres) Delete(ctx context.Context, xuid, name string) error {
-	if _, err := p.pool.Exec(ctx,
+func (p *Postgres) Delete(ctx context.Context, xuid, name string) (bool, error) {
+	tag, err := p.pool.Exec(ctx,
 		`DELETE FROM minecraft.waypoints WHERE xuid = $1 AND name = $2`,
 		xuid, NormalizeName(name),
-	); err != nil {
-		return fmt.Errorf("waypoints: delete: %w", err)
+	)
+	if err != nil {
+		return false, fmt.Errorf("waypoints: delete: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
 func (p *Postgres) List(ctx context.Context, xuid string) ([]Waypoint, error) {

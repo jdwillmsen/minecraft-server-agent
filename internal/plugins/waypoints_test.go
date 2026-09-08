@@ -34,9 +34,13 @@ func (f *fakeWaypoints) Set(_ context.Context, xuid string, wp waypoints.Waypoin
 	f.byOwner[xuid][wp.Name] = wp
 	return nil
 }
-func (f *fakeWaypoints) Delete(_ context.Context, xuid, name string) error {
-	delete(f.byOwner[xuid], waypoints.NormalizeName(name))
-	return nil
+func (f *fakeWaypoints) Delete(_ context.Context, xuid, name string) (bool, error) {
+	key := waypoints.NormalizeName(name)
+	if _, ok := f.byOwner[xuid][key]; !ok {
+		return false, nil
+	}
+	delete(f.byOwner[xuid], key)
+	return true, nil
 }
 func (f *fakeWaypoints) List(_ context.Context, xuid string) ([]waypoints.Waypoint, error) {
 	out := make([]waypoints.Waypoint, 0, len(f.byOwner[xuid]))
@@ -128,5 +132,80 @@ func TestWPWithoutStore(t *testing.T) {
 	}
 	if reply == "" {
 		t.Error("reply should explain the feature is unconfigured")
+	}
+}
+
+func TestWPSetRefusesReservedName(t *testing.T) {
+	cmd := wpCommand(t)
+	fake := newFakeWaypoints()
+	pctx := &plugin.Context{Waypoints: fake}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"set", "del", "100", "64", "-200"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(fake.byOwner["a"]) != 0 {
+		t.Fatal("a reserved waypoint name was stored")
+	}
+	if !strings.Contains(strings.ToLower(reply), "reserved") {
+		t.Errorf("reply %q should say the name is reserved", reply)
+	}
+}
+
+func TestWPDeleteReportsWhenNothingExisted(t *testing.T) {
+	cmd := wpCommand(t)
+	pctx := &plugin.Context{Waypoints: newFakeWaypoints()}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"del", "nope"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.Contains(strings.ToLower(reply), "deleted") {
+		t.Errorf("reply %q claims a delete that never happened", reply)
+	}
+}
+
+func TestWPSetMultiWordNameThenGet(t *testing.T) {
+	cmd := wpCommand(t)
+	pctx := &plugin.Context{Waypoints: newFakeWaypoints()}
+
+	if _, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"set", "Home", "Base", "100", "64", "-200"},
+	}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"home", "base"},
+	})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !strings.Contains(reply, "100") || !strings.Contains(reply, "-200") {
+		t.Errorf("reply = %q, want the coordinates", reply)
+	}
+
+	if _, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"set", "Far", "Base", "1", "2", "3", "nether"},
+	}); err != nil {
+		t.Fatalf("set with dimension: %v", err)
+	}
+	reply, err = cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"far", "base"},
+	})
+	if err != nil {
+		t.Fatalf("get with dimension: %v", err)
+	}
+	if !strings.Contains(reply, "nether") {
+		t.Errorf("reply = %q, want the dimension", reply)
 	}
 }

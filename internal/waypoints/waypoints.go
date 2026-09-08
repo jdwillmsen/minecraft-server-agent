@@ -26,7 +26,11 @@ type Waypoint struct {
 type Store interface {
 	Get(ctx context.Context, xuid, name string) (wp Waypoint, found bool, err error)
 	Set(ctx context.Context, xuid string, wp Waypoint) error
-	Delete(ctx context.Context, xuid, name string) error
+	// Delete removes the named waypoint and reports whether one existed to
+	// remove. A caller that only sees an error would have no way to tell a
+	// delete of nothing from a delete of something, and the chat reply for
+	// those two cases must differ.
+	Delete(ctx context.Context, xuid, name string) (removed bool, err error)
 	List(ctx context.Context, xuid string) ([]Waypoint, error)
 	Enabled() bool
 }
@@ -70,7 +74,7 @@ func (Nop) Get(context.Context, string, string) (Waypoint, bool, error) {
 
 func (Nop) Set(context.Context, string, Waypoint) error { return nil }
 
-func (Nop) Delete(context.Context, string, string) error { return nil }
+func (Nop) Delete(context.Context, string, string) (bool, error) { return false, nil }
 
 func (Nop) List(context.Context, string) ([]Waypoint, error) { return nil, nil }
 

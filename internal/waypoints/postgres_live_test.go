@@ -74,7 +74,7 @@ func TestWaypointsAreScopedToTheirOwner(t *testing.T) {
 	pool := livePool(t)
 	s := NewPostgres(pool)
 	owner, other := twoRecentPlayers(t, pool)
-	t.Cleanup(func() { _ = s.Delete(ctx, owner, "__test base") })
+	t.Cleanup(func() { _, _ = s.Delete(ctx, owner, "__test base") })
 
 	if err := s.Set(ctx, owner, Waypoint{Name: "__TEST Base", X: 100, Y: 64, Z: -200}); err != nil {
 		t.Fatalf("Set: %v", err)

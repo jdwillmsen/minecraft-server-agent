@@ -125,3 +125,24 @@ func TestKBWithoutStore(t *testing.T) {
 		t.Error("reply should explain the feature is unconfigured")
 	}
 }
+
+func TestKBSetRefusesReservedTopic(t *testing.T) {
+	cmd := kbCommand(t)
+	fake := newFakeKnowledge()
+	pctx := &plugin.Context{Knowledge: fake}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"set", "list", "not", "actually", "a", "subcommand"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if fake.upserted != 0 {
+		t.Fatal("a reserved topic name was stored")
+	}
+	if !strings.Contains(strings.ToLower(reply), "reserved") {
+		t.Errorf("reply %q should say the name is reserved", reply)
+	}
+}

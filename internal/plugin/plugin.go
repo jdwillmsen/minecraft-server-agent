@@ -204,7 +204,7 @@ type KnowledgeStore interface {
 type WaypointStore interface {
 	Get(ctx context.Context, xuid, name string) (waypoints.Waypoint, bool, error)
 	Set(ctx context.Context, xuid string, wp waypoints.Waypoint) error
-	Delete(ctx context.Context, xuid, name string) error
+	Delete(ctx context.Context, xuid, name string) (removed bool, err error)
 	List(ctx context.Context, xuid string) ([]waypoints.Waypoint, error)
 	Enabled() bool
 }
