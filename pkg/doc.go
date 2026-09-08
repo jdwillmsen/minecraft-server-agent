@@ -6,13 +6,13 @@
 // program in a separate repository, so a breaking change here breaks a
 // deployment that this repository's tests do not cover.
 //
-// Four packages live here, chosen because they are small, finished, and solve
-// problems every headless Bedrock client has rather than problems this agent
-// has:
+// The packages here are small, finished, and solve problems every headless
+// Bedrock client has rather than problems this agent has:
 //
 //   - mcauth   device-code login and token caching
 //   - liveness respawn on death, and knowing whether the client is alive
 //   - logging  structured JSON logging
+//   - mcproto  staying connectable across protocol-number-only bumps
 //   - skin     a generated appearance, since a headless client has none
 //
 // Anything specific to being an agent -- plugins, chat dispatch, the LLM

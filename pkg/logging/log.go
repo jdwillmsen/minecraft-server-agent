@@ -88,6 +88,18 @@ func (l *Logger) Debug(event string, fields Fields) {
 	l.write(l.stdout, "debug", event, fields)
 }
 
+// Warn logs a noteworthy but handled event to stdout.
+//
+// Stdout rather than stderr on purpose: a warning means the program adapted
+// to something unexpected and carried on, so routing it to stderr would put
+// it in the same stream as the failures that stop work, and inflate every
+// error-rate alert built on that stream. The level was already part of the
+// field shape this package inherited from the TypeScript bot, so existing
+// Loki queries for it keep working.
+func (l *Logger) Warn(event string, fields Fields) {
+	l.write(l.stdout, "warn", event, fields)
+}
+
 // Error logs an error event to stderr.
 func (l *Logger) Error(event string, fields Fields) {
 	l.write(l.stderr, "error", event, fields)
