@@ -96,13 +96,14 @@ func (p *Postgres) Upsert(ctx context.Context, topic, body, authorXUID string) e
 	return nil
 }
 
-func (p *Postgres) Delete(ctx context.Context, topic string) error {
-	if _, err := p.pool.Exec(ctx,
+func (p *Postgres) Delete(ctx context.Context, topic string) (bool, error) {
+	tag, err := p.pool.Exec(ctx,
 		`DELETE FROM minecraft.knowledge WHERE topic = $1`, NormalizeTopic(topic),
-	); err != nil {
-		return fmt.Errorf("knowledge: delete: %w", err)
+	)
+	if err != nil {
+		return false, fmt.Errorf("knowledge: delete: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
 func (p *Postgres) List(ctx context.Context) ([]Entry, error) {

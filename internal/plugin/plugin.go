@@ -204,7 +204,7 @@ type KnowledgeStore interface {
 	Lookup(ctx context.Context, query string, limit int) ([]knowledge.Entry, error)
 	Get(ctx context.Context, topic string) (knowledge.Entry, bool, error)
 	Upsert(ctx context.Context, topic, body, authorXUID string) error
-	Delete(ctx context.Context, topic string) error
+	Delete(ctx context.Context, topic string) (removed bool, err error)
 	List(ctx context.Context) ([]knowledge.Entry, error)
 	Enabled() bool
 }

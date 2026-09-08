@@ -41,7 +41,7 @@ func TestPostgresRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := NewPostgres(livePool(t))
 	topic := "__test gold farm"
-	t.Cleanup(func() { _ = s.Delete(ctx, topic) })
+	t.Cleanup(func() { _, _ = s.Delete(ctx, topic) })
 
 	if err := s.Upsert(ctx, "__TEST  Gold Farm", "It is under spawn at y 12.", ""); err != nil {
 		t.Fatalf("Upsert: %v", err)

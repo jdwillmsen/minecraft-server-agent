@@ -87,10 +87,15 @@ func runKB(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (st
 		if len(inv.Args) < 2 {
 			return "Usage: !kb del <topic>.", nil
 		}
-		if err := pctx.Knowledge.Delete(ctx, inv.Args[1]); err != nil {
+		topic := knowledge.NormalizeTopic(inv.Args[1])
+		removed, err := pctx.Knowledge.Delete(ctx, topic)
+		if err != nil {
 			return "", fmt.Errorf("knowledge: !kb del: %w", err)
 		}
-		return "Forgotten: " + inv.Args[1] + ".", nil
+		if !removed {
+			return "I know nothing about " + topic + ", so there is nothing to forget.", nil
+		}
+		return "Forgotten: " + topic + ".", nil
 
 	default:
 		query := strings.Join(inv.Args, " ")

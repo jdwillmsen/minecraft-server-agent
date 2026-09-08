@@ -32,7 +32,11 @@ type Store interface {
 	// such topic, which is not an error.
 	Get(ctx context.Context, topic string) (entry Entry, found bool, err error)
 	Upsert(ctx context.Context, topic, body, authorXUID string) error
-	Delete(ctx context.Context, topic string) error
+	// Delete removes one topic. removed is false when there was no such
+	// topic, which is not an error: a caller that confirms a delete it
+	// never made teaches an operator the fact is gone while it is still
+	// being quoted at players.
+	Delete(ctx context.Context, topic string) (removed bool, err error)
 	List(ctx context.Context) ([]Entry, error)
 	Enabled() bool
 }
@@ -52,6 +56,6 @@ var _ Store = Nop{}
 func (Nop) Lookup(context.Context, string, int) ([]Entry, error) { return nil, nil }
 func (Nop) Get(context.Context, string) (Entry, bool, error)     { return Entry{}, false, nil }
 func (Nop) Upsert(context.Context, string, string, string) error { return nil }
-func (Nop) Delete(context.Context, string) error                 { return nil }
+func (Nop) Delete(context.Context, string) (bool, error)         { return false, nil }
 func (Nop) List(context.Context) ([]Entry, error)                { return nil, nil }
 func (Nop) Enabled() bool                                        { return false }

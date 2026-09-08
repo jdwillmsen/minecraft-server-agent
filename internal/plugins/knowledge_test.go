@@ -39,9 +39,13 @@ func (f *fakeKnowledge) Upsert(_ context.Context, topic, body, author string) er
 	}
 	return nil
 }
-func (f *fakeKnowledge) Delete(_ context.Context, topic string) error {
-	delete(f.entries, knowledge.NormalizeTopic(topic))
-	return nil
+func (f *fakeKnowledge) Delete(_ context.Context, topic string) (bool, error) {
+	key := knowledge.NormalizeTopic(topic)
+	if _, ok := f.entries[key]; !ok {
+		return false, nil
+	}
+	delete(f.entries, key)
+	return true, nil
 }
 func (f *fakeKnowledge) List(context.Context) ([]knowledge.Entry, error) {
 	out := make([]knowledge.Entry, 0, len(f.entries))
@@ -144,5 +148,51 @@ func TestKBSetRefusesReservedTopic(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(reply), "reserved") {
 		t.Errorf("reply %q should say the name is reserved", reply)
+	}
+}
+
+// A confirmed delete of a topic that was never there teaches an operator
+// that the fact is gone, so the one that is still being quoted at players
+// goes unexamined. The waypoint store already reports this honestly.
+func TestKBDeleteReportsWhenNothingExisted(t *testing.T) {
+	cmd := kbCommand(t)
+	pctx := &plugin.Context{Knowledge: newFakeKnowledge()}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"del", "nope"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.Contains(strings.ToLower(reply), "forgotten") {
+		t.Errorf("reply %q claims a delete that never happened", reply)
+	}
+}
+
+func TestKBDeleteConfirmsARealDelete(t *testing.T) {
+	cmd := kbCommand(t)
+	fake := newFakeKnowledge()
+	pctx := &plugin.Context{Knowledge: fake}
+	op := plugin.Invocation{ActorXUID: "op", ActorPermission: plugin.PermissionOperator}
+
+	set := op
+	set.Args = []string{"set", "rules", "be", "nice"}
+	if _, err := cmd.Run(context.Background(), pctx, set); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	del := op
+	del.Args = []string{"del", "Rules"}
+	reply, err := cmd.Run(context.Background(), pctx, del)
+	if err != nil {
+		t.Fatalf("del: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(reply), "forgotten") {
+		t.Errorf("reply = %q, want it to confirm the delete", reply)
+	}
+	if len(fake.entries) != 0 {
+		t.Errorf("entries = %v, want the topic gone", fake.entries)
 	}
 }
