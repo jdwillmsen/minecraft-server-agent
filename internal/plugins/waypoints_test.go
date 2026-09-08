@@ -272,3 +272,38 @@ func TestWPSetMultiWordNameBoundaryStillRoundTrips(t *testing.T) {
 		t.Errorf("reply = %q, want the dimension", reply)
 	}
 }
+
+// !wp del names a waypoint the same way every other path does. Taking one
+// token instead deleted whichever waypoint happened to share that first
+// word, and then reported that name back as the one the player asked for.
+func TestWPDeleteMultiWordNameLeavesTheShorterOneAlone(t *testing.T) {
+	cmd := wpCommand(t)
+	fake := newFakeWaypoints()
+	pctx := &plugin.Context{Waypoints: fake}
+
+	for _, name := range [][]string{{"gold"}, {"gold", "farm"}} {
+		args := append(append([]string{"set"}, name...), "1", "2", "3")
+		if _, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+			ActorXUID: "a", ActorPermission: plugin.PermissionMember, Args: args,
+		}); err != nil {
+			t.Fatalf("set %v: %v", name, err)
+		}
+	}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"del", "gold", "farm"},
+	})
+	if err != nil {
+		t.Fatalf("del: %v", err)
+	}
+	if _, ok := fake.byOwner["a"]["gold"]; !ok {
+		t.Error(`"!wp del gold farm" deleted "gold"`)
+	}
+	if _, ok := fake.byOwner["a"]["gold farm"]; ok {
+		t.Error(`"gold farm" survived its own deletion`)
+	}
+	if !strings.Contains(reply, "gold farm") {
+		t.Errorf("reply = %q, want it to name the waypoint the player asked to delete", reply)
+	}
+}

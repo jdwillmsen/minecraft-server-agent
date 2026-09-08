@@ -125,14 +125,19 @@ func runWP(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (st
 		if len(inv.Args) < 2 {
 			return "Usage: !wp del <name>.", nil
 		}
-		removed, err := pctx.Waypoints.Delete(ctx, inv.ActorXUID, inv.Args[1])
+		// Every argument, joined, exactly as the read path below builds a
+		// name: taking one token instead deletes whichever waypoint shares
+		// its first word, so a player holding both "gold" and "gold farm"
+		// loses the wrong one and is told the right one is gone.
+		name := waypoints.NormalizeName(strings.Join(inv.Args[1:], " "))
+		removed, err := pctx.Waypoints.Delete(ctx, inv.ActorXUID, name)
 		if err != nil {
 			return "", fmt.Errorf("waypoints: !wp del: %w", err)
 		}
 		if !removed {
-			return "You have no waypoint called " + waypoints.NormalizeName(inv.Args[1]) + ".", nil
+			return "You have no waypoint called " + name + ".", nil
 		}
-		return "Deleted " + waypoints.NormalizeName(inv.Args[1]) + ".", nil
+		return "Deleted " + name + ".", nil
 
 	default:
 		name := strings.Join(inv.Args, " ")
