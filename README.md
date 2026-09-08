@@ -40,10 +40,11 @@ of it since:
   (`!wp`, member level, whispered like every other command's reply because
   coordinates are personal, not something the rest of chat should see), and
   a bounded tool-calling loop: before answering an `@server` question the
-  model may call a small set of read-only tools - knowledge lookup, waypoint
-  lookup, players online, server status - for up to two rounds before the
-  next request withholds tools entirely, which is what forces it to answer
-  in text instead of calling forever.
+  model may call read-only tools such as knowledge lookup or waypoint lookup
+  - see "Answering with tools" below for the full surface and how it's
+  gated - for up to two rounds before the next request withholds tools
+  entirely, which is what forces it to answer in text instead of calling
+  forever.
 
 There is a database and an LLM now; both remain optional, and the agent's
 core loop - connect, dispatch `!` commands, welcome joiners - runs the same
@@ -155,10 +156,31 @@ granted more trust than a stranger, and a bridge outage fails closed.
 ## Answering with tools
 
 An `@server` question is not a single completion: the model may call tools
-from `internal/tools` - knowledge lookup, waypoint lookup, players online,
-server status - for up to two rounds before the next request withholds
-tools entirely, which is what forces text out of a model that would
-otherwise keep calling them instead of answering.
+from `internal/tools` for up to two rounds before the next request
+withholds tools entirely, which is what forces text out of a model that
+would otherwise keep calling them instead of answering. The full surface,
+as wired in `cmd/agent/toolset.go`:
+
+- `knowledge_lookup` - look up a recorded topic
+- `waypoint_lookup` - the asker's own coordinates saved under a name
+- `waypoint_list` - the names of the asker's own saved waypoints
+- `players_online` - who is currently connected
+- `server_status` - health, player count, and responsiveness
+- `server_version` - the Bedrock build the server runs
+- `backup_status` - how recently the world was backed up and how large
+  that backup was
+
+A tool whose backing capability is not configured is not offered to the
+model at all - not offered-but-erroring, not offered-but-answering
+"unconfigured". `knowledge_lookup`, `waypoint_lookup`, and `waypoint_list`
+need `PG_HOST`; `server_status` and `server_version` need
+`MC_MONITOR_URL`; `backup_status` needs its own `BACKUP_EXPORTER_URL`,
+checked separately since the backup exporter is a different deployment
+from mc-monitor. `players_online` has no such gate - it rides
+`mc-console-bridge`, which every deployment already requires. Run with
+none of the optional variables set and `@server` answers with no tools at
+all, rather than spending a tool round asking a model to discover an
+absence the wiring already knows about.
 
 The security property this rests on: there is no write tool. Every tool
 answers a question and changes nothing, so a prompt-injection attempt
