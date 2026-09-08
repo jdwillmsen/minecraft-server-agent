@@ -126,8 +126,8 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 | `LLM_MODEL` | *(empty)* | Model name sent with each request |
 | `LLM_API_KEY` | *(empty)* | Bearer token for the LLM backend, if it requires one |
 | `LLM_MAX_TOKENS` | `192` | Max tokens per LLM call |
-| `LLM_TIMEOUT_MS` | `8000` | Timeout for each individual LLM call |
-| `LLM_TOTAL_TIMEOUT_MS` | `20000` | Bounds one whole `@server` answering attempt, including every tool round trip - separate from `LLM_TIMEOUT_MS` so one stalled call can't eat the entire budget, and separate from having no bound so a model that keeps calling tools can't answer arbitrarily late |
+| `LLM_TIMEOUT_MS` | `8000` | Timeout for each individual LLM call; one answer makes up to three of them (two tool rounds plus the final answer), so `LLM_TOTAL_TIMEOUT_MS` has to leave room for three of these |
+| `LLM_TOTAL_TIMEOUT_MS` | `30000` | Bounds one whole `@server` answering attempt, including every tool round trip - separate from `LLM_TIMEOUT_MS` so one stalled call can't eat the entire budget, and separate from having no bound so a model that keeps calling tools can't answer arbitrarily late. Must be at least three times `LLM_TIMEOUT_MS` (two tool rounds plus the answer), with margin; below that a model that uses both tool rounds is cut off mid-answer and the asker hears nothing |
 | `ANSWER_MAX_PER_MINUTE` | `4` | Max `@server` answers a single actor may trigger per rolling minute, tracked separately from `COMMAND_RATE_LIMIT_PER_MINUTE` since one LLM call costs far more than one console command |
 | `MC_MONITOR_URL` | *(empty)* | mc-monitor Prometheus endpoint behind `!online`; unset reports the command unconfigured rather than erroring |
 | `BACKUP_EXPORTER_URL` | *(empty)* | Backup exporter's `/metrics.txt` behind `!backup`; unset reports the command unconfigured rather than erroring |

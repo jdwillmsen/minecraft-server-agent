@@ -228,8 +228,11 @@ func TestLoad_LLMAnswerBudgetDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.LLMTotalTimeoutMs != 20000 {
-		t.Errorf("LLMTotalTimeoutMs = %d, want 20000", cfg.LLMTotalTimeoutMs)
+	// At least (MaxToolRounds + 1) x LLM_TIMEOUT_MS, with margin: three
+	// sequential 8s calls fit in the shipped default, and a model that uses
+	// both tool rounds still gets to answer.
+	if cfg.LLMTotalTimeoutMs != 30000 {
+		t.Errorf("LLMTotalTimeoutMs = %d, want 30000", cfg.LLMTotalTimeoutMs)
 	}
 	if cfg.LLMMaxTokens != 192 {
 		t.Errorf("LLMMaxTokens = %d, want 192 -- 96 cannot hold tool arguments plus an answer", cfg.LLMMaxTokens)
