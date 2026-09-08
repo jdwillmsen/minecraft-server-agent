@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -340,9 +341,17 @@ type heldBackend struct {
 	srv      *httptest.Server
 	arrived  chan struct{}
 	release  chan struct{}
+	served   sync.Once
 	mu       sync.Mutex
 	requests int
 }
+
+// serve releases every held request. Idempotent, because it is both what a
+// test calls to let an answer through and what cleanup calls to make sure a
+// failed assertion does not leave a handler parked -- httptest.Server.Close
+// waits for outstanding requests, so a test that gave up while holding one
+// would hang instead of failing.
+func (b *heldBackend) serve() { b.served.Do(func() { close(b.release) }) }
 
 // newHeldBackend replies with replies[n] to the n-th request, repeating the
 // last one thereafter.
@@ -362,7 +371,9 @@ func newHeldBackend(t *testing.T, replies ...string) *heldBackend {
 		}
 		w.Write([]byte(replies[n]))
 	}))
+	// Registered after the server's own cleanup so it runs before it: LIFO.
 	t.Cleanup(b.srv.Close)
+	t.Cleanup(b.serve)
 	return b
 }
 
@@ -433,6 +444,10 @@ func TestMentionIsAnsweredWithoutBlockingTheReadLoop(t *testing.T) {
 	ans := testAnswering()
 	ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
 
+	// Paced rather than spun: the roster write is the point, one every few
+	// milliseconds proves it, and an unthrottled loop only buys a core's
+	// worth of CPU and tens of thousands of join/leave log lines.
+	var churns atomic.Int64
 	churnDone := make(chan struct{})
 	churnStop := make(chan struct{})
 	go func() {
@@ -441,13 +456,14 @@ func TestMentionIsAnsweredWithoutBlockingTheReadLoop(t *testing.T) {
 			select {
 			case <-churnStop:
 				return
-			default:
+			case <-time.After(time.Millisecond):
 			}
 			pk := &packet.PlayerList{Entries: []protocol.PlayerListEntry{addEntry(playerXUID, "Steve"), addEntry(bystanderXUID, "Alex")}}
 			if i%2 == 1 {
 				pk = &packet.PlayerList{Entries: []protocol.PlayerListEntry{removeEntry(bystanderXUID)}}
 			}
 			handlePacket(context.Background(), pk, selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+			churns.Add(1)
 		}
 	}()
 
@@ -458,7 +474,19 @@ func TestMentionIsAnsweredWithoutBlockingTheReadLoop(t *testing.T) {
 	if got := voice.output(); len(got) != 0 {
 		t.Fatalf("the read loop waited for the backend: %v", got)
 	}
-	close(backend.release)
+
+	// The answer is parked at the backend, so anything the churn does now is
+	// a roster write concurrent with an answer in flight. Waiting for two of
+	// them is what makes that a fact of this run rather than a hope.
+	held := churns.Load()
+	deadline := time.Now().Add(5 * time.Second)
+	for churns.Load() < held+2 {
+		if time.Now().After(deadline) {
+			t.Fatal("no roster write happened while the answer was in flight")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	backend.serve()
 
 	said := waitForOutput(t, voice)
 	close(churnStop)
@@ -500,7 +528,7 @@ func TestMentionIsDroppedWhenTheAgentIsAlreadyBusy(t *testing.T) {
 		handlePacket(context.Background(), chatPacket(otherPlayerXUID, "Alex", "@server second"),
 			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
 
-		close(backend.release)
+		backend.serve()
 		waitForOutput(t, voice)
 	})
 
@@ -540,7 +568,7 @@ func TestRateLimitedMentionIsRefusedBeforeAGoroutineExists(t *testing.T) {
 			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
 		after = runtime.NumGoroutine()
 
-		close(backend.release)
+		backend.serve()
 		waitForOutput(t, voice)
 	})
 
@@ -558,15 +586,98 @@ func TestRateLimitedMentionIsRefusedBeforeAGoroutineExists(t *testing.T) {
 	}
 }
 
+// broadcastVoice inspects the context an answer is broadcast on: the deadline
+// it carries, and whether cancelling the process context reaches it.
+type broadcastVoice struct {
+	recordingVoice
+	onSay  func()
+	mu     sync.Mutex
+	budget time.Duration
+	err    error
+}
+
+func (v *broadcastVoice) Say(ctx context.Context, message string) error {
+	if v.onSay != nil {
+		v.onSay()
+	}
+	v.mu.Lock()
+	if deadline, ok := ctx.Deadline(); ok {
+		v.budget = time.Until(deadline)
+	}
+	v.err = ctx.Err()
+	v.mu.Unlock()
+	return v.recordingVoice.Say(ctx, message)
+}
+
+func (v *broadcastVoice) observed() (time.Duration, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.budget, v.err
+}
+
+// answerOnce drives one mention to completion against a backend that replies
+// immediately, and returns what the voice saw.
+func answerOnce(t *testing.T, ctx context.Context, voice *broadcastVoice, adjust func(*answering)) {
+	t.Helper()
+	backend := newHeldBackend(t, beaconAnswer)
+	backend.serve()
+
+	registry, pctx, _, eventBus, _, playerRoster, permResolver := newHarness(t)
+	pctx.Voice = voice
+	log := logging.New("info")
+	ans := testAnswering()
+	ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
+	adjust(&ans)
+
+	handlePacket(ctx, chatPacket(playerXUID, "Steve", "@server hello"),
+		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+	waitForOutput(t, &voice.recordingVoice)
+}
+
+// The bridge client bounds every call it makes by CONSOLE_BRIDGE_TIMEOUT_MS,
+// and takes the tighter of that and its caller's deadline. A deadline chosen
+// here instead would therefore be the one that applies, and raising the
+// configured value to rescue a slow bridge would fix every path except the one
+// carrying an answer that has already been paid for.
+func TestAnswerBroadcastUsesTheConfiguredBridgeTimeout(t *testing.T) {
+	const configured = 9 * time.Second
+	voice := &broadcastVoice{}
+
+	answerOnce(t, context.Background(), voice, func(ans *answering) { ans.broadcast = configured })
+
+	budget, _ := voice.observed()
+	if budget <= configured-time.Second || budget > configured {
+		t.Errorf("broadcast deadline = %v, want the configured %v", budget, configured)
+	}
+}
+
+// A SIGTERM landing between the model replying and the broadcast must not
+// discard an answer the bridge could still deliver.
+func TestAnswerBroadcastSurvivesACancelledProcessContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Cancelled from inside Say, which is the exact gap being defended:
+	// cancel propagates to every derived context before it returns, so a
+	// broadcast context that was not detached would already be done here.
+	voice := &broadcastVoice{onSay: cancel}
+
+	answerOnce(t, ctx, voice, func(ans *answering) { ans.broadcast = 5 * time.Second })
+
+	if _, err := voice.observed(); err != nil {
+		t.Errorf("broadcast context was already %v: shutdown discarded a computed answer", err)
+	}
+}
+
 // testAnswering supplies the chat path's answering dependencies with no LLM
 // backend configured, which is both what these command-path tests need and the
 // production behaviour when LLM_BASE_URL is unset.
 func testAnswering() answering {
 	return answering{
-		limiter:  ratelimit.NewPerActor(4, time.Minute),
-		llm:      adapters.NewLLMClient("", "", "", 192, time.Second, nil),
-		toolsFor: func(p *plugin.Context) *tools.Registry { return buildToolset(p, p.Profiles) },
-		total:    20 * time.Second,
-		inFlight: make(chan struct{}, maxConcurrentAnswers),
+		limiter:   ratelimit.NewPerActor(4, time.Minute),
+		llm:       adapters.NewLLMClient("", "", "", 192, time.Second, nil),
+		toolsFor:  func(p *plugin.Context) *tools.Registry { return buildToolset(p, p.Profiles) },
+		total:     20 * time.Second,
+		inFlight:  make(chan struct{}, maxConcurrentAnswers),
+		broadcast: 5 * time.Second,
 	}
 }

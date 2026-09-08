@@ -66,10 +66,6 @@ const stableSessionThreshold = 60 * time.Second
 // alone cannot.
 const maxConcurrentAnswers = 3
 
-// broadcastTimeout bounds the one bridge call that delivers an answer, on a
-// context detached from shutdown -- see handleMention.
-const broadcastTimeout = 2 * time.Second
-
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -149,11 +145,12 @@ func main() {
 	// than one console command, and sharing a limiter would let a burst of
 	// questions starve !help for the same player.
 	ans := answering{
-		limiter:  ratelimit.NewPerActor(cfg.AnswerMaxPerMinute, time.Minute),
-		llm:      newLLMClient(cfg, log),
-		toolsFor: func(p *plugin.Context) *tools.Registry { return buildToolset(p, p.Profiles) },
-		total:    time.Duration(cfg.LLMTotalTimeoutMs) * time.Millisecond,
-		inFlight: make(chan struct{}, maxConcurrentAnswers),
+		limiter:   ratelimit.NewPerActor(cfg.AnswerMaxPerMinute, time.Minute),
+		llm:       newLLMClient(cfg, log),
+		toolsFor:  func(p *plugin.Context) *tools.Registry { return buildToolset(p, p.Profiles) },
+		total:     time.Duration(cfg.LLMTotalTimeoutMs) * time.Millisecond,
+		inFlight:  make(chan struct{}, maxConcurrentAnswers),
+		broadcast: bridgeTimeout,
 	}
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
 
@@ -254,6 +251,11 @@ type answering struct {
 	// inFlight is a counting semaphore over answers in progress, capped at
 	// maxConcurrentAnswers.
 	inFlight chan struct{}
+	// broadcast bounds the bridge call that delivers the answer. Carried
+	// here because that call is made on a context detached from shutdown and
+	// so cannot inherit one; it is the operator's configured bridge timeout,
+	// the same value every other bridge call gets.
+	broadcast time.Duration
 }
 
 // nextDelay is the reconnect backoff step: a session that stayed up at
@@ -591,13 +593,18 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	// chat, and an answer only the asker can see reads as no answer at all to
 	// everyone else who watched them ask.
 	//
-	// Detached from ctx with its own deadline. The answer is already computed
-	// and paid for, and SIGTERM landing in the gap between the backend
-	// replying and this line would otherwise throw it away. This does not
-	// outrun the process exit that follows a signal -- nothing waits for these
-	// goroutines -- it only stops a cancelled context discarding a reply the
-	// bridge could still have delivered.
-	sayCtx, sayCancel := context.WithTimeout(context.WithoutCancel(ctx), broadcastTimeout)
+	// Detached from ctx, and bounded by the operator's bridge timeout rather
+	// than a number chosen here: the client applies that same value to every
+	// other call it makes, and a shorter deadline on this one path would be a
+	// configuration knob that silently stops working where it matters most.
+	//
+	// Detached because the answer is already computed and paid for, and
+	// SIGTERM landing in the gap between the backend replying and this line
+	// would otherwise throw it away. This does not outrun the process exit
+	// that follows a signal -- nothing waits for these goroutines -- it only
+	// stops a cancelled context discarding a reply the bridge could still
+	// have delivered.
+	sayCtx, sayCancel := context.WithTimeout(context.WithoutCancel(ctx), ans.broadcast)
 	defer sayCancel()
 	if err := pctx.Voice.Say(sayCtx, reply); err != nil {
 		log.Error("mention_answer_send_failed", logging.Fields{"actor": actorXUID, "error": err.Error()})
