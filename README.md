@@ -140,6 +140,34 @@ go test -race ./...
 gofmt -l .
 ```
 
+### Testing the store against a real database
+
+`internal/store/postgres.go` talks to PostgreSQL, and the default suite does
+not: it covers `store.Nop` and the pure profile helpers. Nothing in CI has ever
+executed the SQL.
+
+That gap hid a real fault. The runtime role held no privileges on any table in
+the `minecraft` schema, so every write failed — while the agent logged
+`store_ready` and reported itself healthy, because that only checks the
+connection.
+
+The `livedb` tests exercise the real queries as the runtime role:
+
+```sh
+docker run -d --name mcstore -e POSTGRES_PASSWORD=pw -p 55432:5432 postgres:16.14
+docker exec mcstore psql -U postgres -c "CREATE ROLE app LOGIN PASSWORD 'apppw'"
+docker exec mcstore psql -U postgres -c "CREATE DATABASE jdwillmsen_prd OWNER postgres"
+# apply V1 and V2 from jdwlabs/platform's jdwillmsen-migrations ConfigMap, then:
+MC_TEST_DSN='postgres://app:apppw@127.0.0.1:55432/jdwillmsen_prd?sslmode=disable' \
+  go test -tags livedb ./internal/store/
+```
+
+Deliberately not wired into CI. The schema lives in `jdwlabs/platform`, and a
+copy of it here would be a second source of truth that drifts silently — a
+green CI run against a stale copy is worse than no run at all. Connect these
+to a database whose schema came from the real migrations, which is what the
+setup above does.
+
 ## Releases
 
 Pushing a version tag - a `v` followed by a digit, matching `v[0-9]*` -
