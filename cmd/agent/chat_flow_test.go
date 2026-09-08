@@ -20,6 +20,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 )
 
 // unlimitedRateLimit is a generous limiter for tests that exercise chat flow
@@ -214,7 +215,7 @@ func TestChatCommandFlow(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
-			handlePacket(context.Background(), tc.pk, selfXUID, siblings, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering())
+			handlePacket(context.Background(), tc.pk, selfXUID, siblings, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering(), store.Nop{})
 
 			got := voice.output()
 			if len(got) != len(tc.want) {
@@ -240,9 +241,9 @@ func TestHandleCommand_RateLimitBlocksASpammingActorButNotOthers(t *testing.T) {
 
 	const otherPlayer = "2535499999999998"
 	for i := 0; i < 5; i++ {
-		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering())
+		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{})
 	}
-	handlePacket(context.Background(), chatPacket(otherPlayer, "Alex", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering())
+	handlePacket(context.Background(), chatPacket(otherPlayer, "Alex", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{})
 
 	got := voice.output()
 	want := []string{
@@ -268,9 +269,9 @@ func TestChatMessagePublishedOnBus(t *testing.T) {
 	log := logging.New("info")
 	limiter := unlimitedRateLimit()
 
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping now"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering())
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server hello"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering())
-	handlePacket(context.Background(), chatPacket(selfXUID, "Agent", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering())
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping now"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{})
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server hello"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{})
+	handlePacket(context.Background(), chatPacket(selfXUID, "Agent", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{})
 
 	first, ok := (<-events).(chat.MessageEvent)
 	if !ok {

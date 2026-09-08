@@ -35,6 +35,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 )
 
 // welcomeDelay is how long the welcome plugin waits after a join before
@@ -110,6 +111,13 @@ func main() {
 	// A separate budget from commands on purpose: one LLM call costs far more
 	// than one console command, and sharing a limiter would let a burst of
 	// questions starve !help for the same player.
+	// Opened before the game connection so a misconfigured database is a
+	// startup log line rather than a surprise at the first player join.
+	// Failure is not fatal: persistence is the personalisation behind
+	// greetings, and losing it must not cost the agent its commands.
+	playerStore := openStore(ctx, cfg, log)
+	defer playerStore.Close()
+
 	ans := answering{
 		limiter: ratelimit.NewPerActor(cfg.AnswerMaxPerMinute, time.Minute),
 		llm: adapters.NewLLMClient(
@@ -150,7 +158,7 @@ func main() {
 	}
 
 	log.Info("starting", logging.Fields{"mc_host": cfg.MCHost, "mc_port": cfg.MCPort})
-	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver, ans)
+	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver, ans, playerStore)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
@@ -162,7 +170,7 @@ func main() {
 
 // runConnectLoop owns the reconnect/backoff policy. Each iteration runs one
 // session to completion (or failure), then waits before trying again.
-func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering) {
+func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store) {
 	minDelay := time.Duration(cfg.ReconnectMinMs) * time.Millisecond
 	maxDelay := time.Duration(cfg.ReconnectMaxMs) * time.Millisecond
 	delay := minDelay
@@ -175,7 +183,7 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		firstAttempt = false
 
 		started := time.Now()
-		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver, ans)
+		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver, ans, playerStore)
 		lasted := time.Since(started)
 		httpServer.SetReady(false)
 
@@ -241,7 +249,7 @@ func jitter(d time.Duration) time.Duration {
 // clean disconnect and a non-nil error on anything else (including ctx
 // cancellation surfaced as a read error, which the caller ignores because
 // it checks ctx.Err() itself).
-func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering) error {
+func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store) error {
 	dialer := minecraft.Dialer{TokenSource: ts}
 	addr := net.JoinHostPort(cfg.MCHost, strconv.Itoa(cfg.MCPort))
 
@@ -299,16 +307,16 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		if err != nil {
 			return err
 		}
-		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, ans)
+		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, ans, playerStore)
 	}
 }
 
-func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering) {
+func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store) {
 	switch pk := pk.(type) {
 	case *packet.Text:
 		handleText(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, permResolver, ans, playerRoster)
 	case *packet.PlayerList:
-		handlePlayerList(pk, selfXUID, siblingXUIDs, log, eventBus, playerRoster)
+		handlePlayerList(ctx, pk, selfXUID, siblingXUIDs, log, eventBus, playerRoster, playerStore)
 	}
 }
 
@@ -334,6 +342,34 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 	case chat.TriggerMention:
 		handleMention(ctx, id, trigger, log, pctx, ans, playerRoster)
 	}
+}
+
+// openStore connects to Postgres if configured, and degrades to Nop if not.
+//
+// Deliberately never returns an error. Every failure here -- unset, malformed,
+// unreachable -- lands the agent in the same supported state it ran in through
+// Stages 1-4: greeting players plainly and answering commands.
+func openStore(ctx context.Context, cfg config.Config, log *logging.Logger) store.Store {
+	dsn := cfg.PostgresDSN()
+	if dsn == "" {
+		log.Info("store_disabled", logging.Fields{"reason": "PG_HOST unset"})
+		return store.Nop{}
+	}
+	pg, err := store.Open(ctx, dsn, time.Duration(cfg.PGConnectTimeoutMs)*time.Millisecond)
+	if err != nil {
+		log.Error("store_open_failed", logging.Fields{"error": err.Error()})
+		return store.Nop{}
+	}
+	// Sessions still open belong to a previous run: the agent learns of a
+	// departure by being connected, so anything open at startup ended while
+	// it was away.
+	if n, err := pg.CloseOrphans(ctx, time.Now()); err != nil {
+		log.Error("store_close_orphans_failed", logging.Fields{"error": err.Error()})
+	} else if n > 0 {
+		log.Info("store_closed_orphans", logging.Fields{"sessions": n})
+	}
+	log.Info("store_ready", logging.Fields{"database": cfg.PGDatabase})
+	return pg
 }
 
 // handleMention answers an @server question.
@@ -400,7 +436,7 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 // handleText filters chat before publishing chat.MessageEvent, so every
 // event-driven plugin downstream can assume it never sees this agent's own
 // presence or a sibling bot's.
-func handlePlayerList(pk *packet.PlayerList, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, eventBus *bus.Bus, playerRoster *roster.Roster) {
+func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, eventBus *bus.Bus, playerRoster *roster.Roster, playerStore store.Store) {
 	entries := make([]roster.PlayerListEntry, len(pk.Entries))
 	for i, e := range pk.Entries {
 		entries[i] = roster.PlayerListEntry{
@@ -410,12 +446,27 @@ func handlePlayerList(pk *packet.PlayerList, selfXUID string, siblingXUIDs map[s
 		}
 	}
 
-	for _, join := range playerRoster.Apply(entries) {
+	joins, leaves := playerRoster.Apply(entries)
+	for _, join := range joins {
 		if chat.IsSelfOrSibling(join.XUID, selfXUID, siblingXUIDs) {
 			continue
 		}
 		log.Info("player_joined", logging.Fields{"xuid": join.XUID, "username": join.Username})
 		eventBus.Publish(roster.JoinEvent{Entry: join})
+	}
+	// Departures close a session rather than reaching a plugin. Nothing
+	// greets a player for leaving, and publishing an event no handler wants
+	// would be scaffolding for its own sake.
+	for _, leave := range leaves {
+		if chat.IsSelfOrSibling(leave.XUID, selfXUID, siblingXUIDs) {
+			continue
+		}
+		log.Info("player_left", logging.Fields{"xuid": leave.XUID, "username": leave.Username})
+		if err := playerStore.RecordLeave(ctx, leave.XUID, time.Now()); err != nil {
+			// Logged, never fatal: an unclosed session is recoverable at the
+			// next startup, and a database problem must not disturb the game.
+			log.Error("store_record_leave_failed", logging.Fields{"xuid": leave.XUID, "error": err.Error()})
+		}
 	}
 }
 

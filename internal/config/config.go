@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -50,6 +51,19 @@ type Config struct {
 	// a different path needs no code change.
 	MCMonitorURL      string
 	BackupExporterURL string
+
+	// Postgres, for player profiles and playtime. An empty PGHost disables
+	// persistence entirely: the agent then greets players the way it did
+	// before Stage 3, which is a supported state rather than a degraded one.
+	PGHost     string
+	PGPort     int
+	PGDatabase string
+	PGUser     string
+	PGPassword string
+	// PGConnectTimeoutMs bounds the startup connection check. A database that
+	// is slow to answer must not hold the agent out of the game: it connects,
+	// answers commands and greets players without persistence.
+	PGConnectTimeoutMs int
 
 	// The LLM backend behind @server answering. An empty LLMBaseURL disables
 	// answering entirely -- the mention is logged and nothing else happens,
@@ -97,6 +111,14 @@ func Load() (Config, error) {
 	if reconnectMax < reconnectMin {
 		return Config{}, fmt.Errorf("RECONNECT_MAX_MS (%d) must be >= RECONNECT_MIN_MS (%d)", reconnectMax, reconnectMin)
 	}
+	pgPort, err := positiveInt("PG_PORT", 5432)
+	if err != nil {
+		return Config{}, err
+	}
+	pgConnectTimeout, err := positiveInt("PG_CONNECT_TIMEOUT_MS", 5000)
+	if err != nil {
+		return Config{}, err
+	}
 	llmMaxTokens, err := positiveInt("LLM_MAX_TOKENS", 96)
 	if err != nil {
 		return Config{}, err
@@ -134,6 +156,12 @@ func Load() (Config, error) {
 		ReconnectMaxMs:            reconnectMax,
 		HTTPAddr:                  stringDefault("HTTP_ADDR", ":8080"),
 		AuthCacheDir:              stringDefault("AUTH_CACHE_DIR", "/data/auth"),
+		PGHost:                    stringDefault("PG_HOST", ""),
+		PGPort:                    pgPort,
+		PGDatabase:                stringDefault("PG_DATABASE", ""),
+		PGUser:                    stringDefault("PG_USERNAME", ""),
+		PGPassword:                stringDefault("PG_PASSWORD", ""),
+		PGConnectTimeoutMs:        pgConnectTimeout,
 		LLMBaseURL:                stringDefault("LLM_BASE_URL", ""),
 		LLMModel:                  stringDefault("LLM_MODEL", ""),
 		LLMAPIKey:                 stringDefault("LLM_API_KEY", ""),
@@ -194,4 +222,22 @@ func portNumber(name string, def int) (int, error) {
 		return 0, fmt.Errorf("environment variable %s must be a valid port (1-65535), got %d", name, n)
 	}
 	return n, nil
+}
+
+// PostgresDSN assembles a connection string from the parts above.
+//
+// Assembled rather than taken whole so the password can arrive from a Secret
+// reference on its own: a single DATABASE_URL would put the password into the
+// Deployment's plain environment, readable by anyone who can get the object.
+//
+// url.UserPassword percent-encodes both halves, so a generated password
+// containing a slash or an at-sign cannot silently produce a DSN that parses
+// as a different host.
+func (c Config) PostgresDSN() string {
+	if c.PGHost == "" {
+		return ""
+	}
+	return fmt.Sprintf("postgres://%s@%s:%d/%s?sslmode=require",
+		url.UserPassword(c.PGUser, c.PGPassword).String(),
+		c.PGHost, c.PGPort, c.PGDatabase)
 }
