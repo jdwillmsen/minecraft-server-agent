@@ -29,6 +29,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/config"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/httpapi"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/liveness"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/logging"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/mcauth"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
@@ -291,6 +292,9 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 
 	selfXUID := conn.IdentityData().XUID
 	log.Info("spawned", logging.Fields{"self_xuid": selfXUID})
+	// Runtime ID rather than XUID: the respawn exchange identifies the player
+	// by the id that is unique to this world session, not the account.
+	respawner := liveness.New(conn.GameData().EntityRuntimeID)
 	httpServer.SetReady(true)
 	httpapi.SetConnected(true)
 	defer httpapi.SetConnected(false)
@@ -307,6 +311,22 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		if err != nil {
 			return err
 		}
+		// Before anything else: a dead agent answers no commands and holds no
+		// chunks, and nothing outside this loop can tell that it is dead.
+		if handled, err := respawner.Handle(pk, conn); err != nil {
+			log.Error("respawn_failed", logging.Fields{"error": err.Error()})
+		} else if handled {
+			if respawner.Dead() {
+				log.Info("died", logging.Fields{"requesting_respawn": true})
+			} else {
+				log.Info("respawned", nil)
+			}
+			// Readiness follows aliveness, not just the session. An agent on
+			// a death screen is connected and useless; reporting ready would
+			// be the lie that made this invisible in the first place.
+			httpServer.SetReady(!respawner.Dead())
+		}
+
 		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, ans, playerStore)
 	}
 }
