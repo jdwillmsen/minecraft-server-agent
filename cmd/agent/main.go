@@ -30,11 +30,13 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/config"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/httpapi"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/liveness"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/mcauth"
@@ -414,6 +416,11 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 		// documents Profiles as possibly nil and the plugins guard for it, but
 		// this binary has no reason to hand them one.
 		Profiles: playerStore,
+		// Same reasoning as Profiles: the pool-backed stores land in a later
+		// stage, but this binary can hand out the disabled implementation
+		// today instead of leaving the field at its zero value.
+		Knowledge: knowledge.Nop{},
+		Waypoints: waypoints.Nop{},
 	}
 }
 
