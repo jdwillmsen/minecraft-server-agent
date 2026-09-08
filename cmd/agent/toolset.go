@@ -22,11 +22,15 @@ var noArgs = json.RawMessage(`{"type":"object","properties":{}}`)
 // available actions are exactly what this function registers, and none of
 // them write.
 //
-// The playtime parameter is accepted and unused: plugin.PlayerStore offers
+// There is deliberately no player_playtime tool: plugin.PlayerStore offers
 // only RecordJoin and Enabled, so every path to a playtime figure also
 // records a join, and a read tool that writes is exactly what the paragraph
-// above rules out. Widening the store interface is a separate change.
-func buildToolset(pctx *plugin.Context, _ plugin.PlayerStore) *tools.Registry {
+// above rules out. Deferred rather than ruled out -- this same branch
+// widened plugin.ServerInfo by two methods for the same class of reason.
+// Adding it means a read-only lookup on PlayerStore (a profile by XUID that
+// writes nothing), implemented on store.Postgres and store.Nop, and a tool
+// built on that.
+func buildToolset(pctx *plugin.Context) *tools.Registry {
 	var list []tools.Tool
 
 	if pctx.Knowledge != nil && pctx.Knowledge.Enabled() {

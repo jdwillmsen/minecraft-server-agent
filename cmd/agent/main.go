@@ -147,7 +147,7 @@ func main() {
 	ans := answering{
 		limiter:   ratelimit.NewPerActor(cfg.AnswerMaxPerMinute, time.Minute),
 		llm:       newLLMClient(cfg, log),
-		toolsFor:  func(p *plugin.Context) *tools.Registry { return buildToolset(p, p.Profiles) },
+		toolsFor:  func(p *plugin.Context) *tools.Registry { return buildToolset(p) },
 		total:     time.Duration(cfg.LLMTotalTimeoutMs) * time.Millisecond,
 		inFlight:  make(chan struct{}, maxConcurrentAnswers),
 		broadcast: bridgeTimeout,

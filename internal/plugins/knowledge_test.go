@@ -28,10 +28,6 @@ func (f *fakeKnowledge) Lookup(_ context.Context, q string, limit int) ([]knowle
 	}
 	return out, nil
 }
-func (f *fakeKnowledge) Get(_ context.Context, topic string) (knowledge.Entry, bool, error) {
-	e, ok := f.entries[knowledge.NormalizeTopic(topic)]
-	return e, ok, nil
-}
 func (f *fakeKnowledge) Upsert(_ context.Context, topic, body, author string) error {
 	f.upserted++
 	f.entries[knowledge.NormalizeTopic(topic)] = knowledge.Entry{

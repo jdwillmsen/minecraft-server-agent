@@ -16,7 +16,7 @@ func TestBuildToolsetOmitsAbsentCapabilities(t *testing.T) {
 	// A context with nothing configured must produce no tools at all: the
 	// model cannot call what it was never offered, which is stronger than
 	// refusing the call afterwards.
-	if got := buildToolset(&plugin.Context{}, nil).Len(); got != 0 {
+	if got := buildToolset(&plugin.Context{}).Len(); got != 0 {
 		t.Errorf("empty context produced %d tools, want 0", got)
 	}
 }
@@ -46,7 +46,7 @@ func (w *recordingWaypoints) List(_ context.Context, xuid string) ([]waypoints.W
 // injected caller.
 func TestWaypointToolsReadOnlyTheInjectedCaller(t *testing.T) {
 	store := &recordingWaypoints{}
-	registry := buildToolset(&plugin.Context{Waypoints: store}, nil)
+	registry := buildToolset(&plugin.Context{Waypoints: store})
 
 	args := json.RawMessage(`{"name":"base","xuid":"2535499999999999","caller":"2535499999999999"}`)
 	if _, err := registry.Invoke(t.Context(), "waypoint_lookup", args, "2535411111111111"); err != nil {
@@ -96,7 +96,7 @@ func TestServerInfoToolsFollowTheExporters(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := toolNames(buildToolset(&plugin.Context{ServerInfo: tc.serverInfo}, nil))
+			got := toolNames(buildToolset(&plugin.Context{ServerInfo: tc.serverInfo}))
 			if len(got) != len(tc.want) {
 				t.Fatalf("tools = %v, want %v", got, tc.want)
 			}

@@ -675,7 +675,7 @@ func testAnswering() answering {
 	return answering{
 		limiter:   ratelimit.NewPerActor(4, time.Minute),
 		llm:       adapters.NewLLMClient("", "", "", 192, time.Second, nil),
-		toolsFor:  func(p *plugin.Context) *tools.Registry { return buildToolset(p, p.Profiles) },
+		toolsFor:  func(p *plugin.Context) *tools.Registry { return buildToolset(p) },
 		total:     20 * time.Second,
 		inFlight:  make(chan struct{}, maxConcurrentAnswers),
 		broadcast: 5 * time.Second,
