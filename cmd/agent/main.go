@@ -107,6 +107,16 @@ func main() {
 	// rather than touching the connection directly.
 	eventBus := bus.New()
 	limiter := ratelimit.NewPerActor(cfg.CommandRateLimitPerMinute, time.Minute)
+	// A separate budget from commands on purpose: one LLM call costs far more
+	// than one console command, and sharing a limiter would let a burst of
+	// questions starve !help for the same player.
+	ans := answering{
+		limiter: ratelimit.NewPerActor(cfg.AnswerMaxPerMinute, time.Minute),
+		llm: adapters.NewLLMClient(
+			cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMAPIKey,
+			cfg.LLMMaxTokens, time.Duration(cfg.LLMTimeoutMs)*time.Millisecond,
+		),
+	}
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
 
 	httpServer, err := httpapi.New(cfg.HTTPAddr)
@@ -140,7 +150,7 @@ func main() {
 	}
 
 	log.Info("starting", logging.Fields{"mc_host": cfg.MCHost, "mc_port": cfg.MCPort})
-	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver)
+	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver, ans)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
@@ -152,7 +162,7 @@ func main() {
 
 // runConnectLoop owns the reconnect/backoff policy. Each iteration runs one
 // session to completion (or failure), then waits before trying again.
-func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver) {
+func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering) {
 	minDelay := time.Duration(cfg.ReconnectMinMs) * time.Millisecond
 	maxDelay := time.Duration(cfg.ReconnectMaxMs) * time.Millisecond
 	delay := minDelay
@@ -165,7 +175,7 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		firstAttempt = false
 
 		started := time.Now()
-		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver)
+		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver, ans)
 		lasted := time.Since(started)
 		httpServer.SetReady(false)
 
@@ -193,6 +203,15 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 // nextDelay is the reconnect backoff step: a session that stayed up at
 // least stableSessionThreshold is treated as healthy and resets the delay
 // to min, while anything shorter doubles the previous delay up to max.
+// answering bundles what @server handling needs, so enabling this feature
+// costs one parameter on the chat path rather than two on each of five
+// functions. Both live for the process rather than the session: a rate limit
+// that reset on every reconnect would be a rate limit a reconnect clears.
+type answering struct {
+	limiter *ratelimit.PerActor
+	llm     *adapters.LLMClient
+}
+
 func nextDelay(current, lasted, min, max time.Duration) time.Duration {
 	if lasted >= stableSessionThreshold {
 		return min
@@ -222,7 +241,7 @@ func jitter(d time.Duration) time.Duration {
 // clean disconnect and a non-nil error on anything else (including ctx
 // cancellation surfaced as a read error, which the caller ignores because
 // it checks ctx.Err() itself).
-func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver) error {
+func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering) error {
 	dialer := minecraft.Dialer{TokenSource: ts}
 	addr := net.JoinHostPort(cfg.MCHost, strconv.Itoa(cfg.MCPort))
 
@@ -280,20 +299,20 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		if err != nil {
 			return err
 		}
-		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver)
+		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, ans)
 	}
 }
 
-func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver) {
+func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering) {
 	switch pk := pk.(type) {
 	case *packet.Text:
-		handleText(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, permResolver)
+		handleText(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, permResolver, ans, playerRoster)
 	case *packet.PlayerList:
 		handlePlayerList(pk, selfXUID, siblingXUIDs, log, eventBus, playerRoster)
 	}
 }
 
-func handleText(ctx context.Context, text *packet.Text, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, permResolver *adapters.PermissionResolver) {
+func handleText(ctx context.Context, text *packet.Text, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, permResolver *adapters.PermissionResolver, ans answering, playerRoster *roster.Roster) {
 	if !chat.IsAnswerableType(text.TextType) {
 		return
 	}
@@ -313,10 +332,66 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 	case chat.TriggerCommand:
 		handleCommand(ctx, id, trigger, log, registry, pctx, limiter, permResolver)
 	case chat.TriggerMention:
-		// Stage 4 wires this to the LLM tool-calling loop; Stage 1 only
-		// proves the detection path end-to-end.
-		log.Info("mention_received", logging.Fields{"actor": id, "message": trigger.Message})
+		handleMention(ctx, id, trigger, log, pctx, ans, playerRoster)
 	}
+}
+
+// handleMention answers an @server question.
+//
+// Everything that makes this safe is upstream or in the prompt rather than
+// here: handleText has already dropped this agent's own messages and its
+// sibling bots' (chat.IsSelfOrSibling), and the system prompt refuses to end a
+// reply with a question. Both matter because the answering AFK bot is still
+// running alongside this agent, and two automated speakers in one chat is the
+// shape of a loop.
+func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, pctx *plugin.Context, ans answering, playerRoster *roster.Roster) {
+	if ans.llm == nil || !ans.llm.Enabled() {
+		// Stage 1-3 behaviour, kept as the unconfigured path: detection is
+		// proven, nothing is answered.
+		log.Info("mention_received", logging.Fields{"actor": actorXUID, "message": trigger.Message})
+		return
+	}
+
+	if !ans.limiter.Allow(actorXUID, time.Now()) {
+		// Silent on purpose. Telling a player they are rate limited is itself
+		// a chat line, so a spammer would still get one message per attempt.
+		log.Info("mention_rate_limited", logging.Fields{"actor": actorXUID})
+		return
+	}
+
+	name := actorXUID
+	if playerRoster != nil {
+		if resolved, ok := playerRoster.NameFor(actorXUID); ok && resolved != "" {
+			name = resolved
+		}
+	}
+
+	reply, err := ans.llm.Answer(ctx, name, trigger.Message)
+	if err != nil {
+		// Logged, never spoken. A backend timeout is an operator's problem,
+		// and narrating it in chat turns one failure into an audience.
+		log.Error("mention_answer_failed", logging.Fields{"actor": actorXUID, "error": err.Error()})
+		return
+	}
+	if reply == "" {
+		// An empty completion broadcast as a blank line reads to players as
+		// the server glitching -- a bug minecraft-afk-bot shipped and fixed.
+		log.Info("mention_answer_empty", logging.Fields{"actor": actorXUID})
+		return
+	}
+
+	if pctx.Voice == nil {
+		log.Error("mention_answer_undeliverable", logging.Fields{"actor": actorXUID})
+		return
+	}
+	// Broadcast rather than whispered: an @server question is asked in public
+	// chat, and an answer only the asker can see reads as no answer at all to
+	// everyone else who watched them ask.
+	if err := pctx.Voice.Say(ctx, reply); err != nil {
+		log.Error("mention_answer_send_failed", logging.Fields{"actor": actorXUID, "error": err.Error()})
+		return
+	}
+	log.Info("mention_answered", logging.Fields{"actor": actorXUID, "reply_chars": len(reply)})
 }
 
 // handlePlayerList updates the live roster from one PlayerList packet and

@@ -51,6 +51,19 @@ type Config struct {
 	MCMonitorURL      string
 	BackupExporterURL string
 
+	// The LLM backend behind @server answering. An empty LLMBaseURL disables
+	// answering entirely -- the mention is logged and nothing else happens,
+	// which is the Stage 1-3 behaviour.
+	LLMBaseURL   string
+	LLMModel     string
+	LLMAPIKey    string
+	LLMMaxTokens int
+	LLMTimeoutMs int
+	// AnswerMaxPerMinute bounds answers per player, separately from the
+	// command limiter: one LLM call is far more expensive than one console
+	// command, and a shared budget would let questions starve !help.
+	AnswerMaxPerMinute int
+
 	// ConsoleBridgeTimeoutMs bounds every individual bridge HTTP call.
 	ConsoleBridgeTimeoutMs int
 
@@ -84,6 +97,18 @@ func Load() (Config, error) {
 	if reconnectMax < reconnectMin {
 		return Config{}, fmt.Errorf("RECONNECT_MAX_MS (%d) must be >= RECONNECT_MIN_MS (%d)", reconnectMax, reconnectMin)
 	}
+	llmMaxTokens, err := positiveInt("LLM_MAX_TOKENS", 96)
+	if err != nil {
+		return Config{}, err
+	}
+	llmTimeout, err := positiveInt("LLM_TIMEOUT_MS", 8000)
+	if err != nil {
+		return Config{}, err
+	}
+	answerRateLimit, err := positiveInt("ANSWER_MAX_PER_MINUTE", 4)
+	if err != nil {
+		return Config{}, err
+	}
 	commandRateLimit, err := positiveInt("COMMAND_RATE_LIMIT_PER_MINUTE", 10)
 	if err != nil {
 		return Config{}, err
@@ -109,6 +134,12 @@ func Load() (Config, error) {
 		ReconnectMaxMs:            reconnectMax,
 		HTTPAddr:                  stringDefault("HTTP_ADDR", ":8080"),
 		AuthCacheDir:              stringDefault("AUTH_CACHE_DIR", "/data/auth"),
+		LLMBaseURL:                stringDefault("LLM_BASE_URL", ""),
+		LLMModel:                  stringDefault("LLM_MODEL", ""),
+		LLMAPIKey:                 stringDefault("LLM_API_KEY", ""),
+		LLMMaxTokens:              llmMaxTokens,
+		LLMTimeoutMs:              llmTimeout,
+		AnswerMaxPerMinute:        answerRateLimit,
 		MCMonitorURL:              stringDefault("MC_MONITOR_URL", ""),
 		BackupExporterURL:         stringDefault("BACKUP_EXPORTER_URL", ""),
 		CommandRateLimitPerMinute: commandRateLimit,
