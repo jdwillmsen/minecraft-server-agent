@@ -87,15 +87,15 @@ func buildToolset(pctx *plugin.Context, _ plugin.PlayerStore) *tools.Registry {
 				Description: "List the names of the waypoints the asking player has saved.",
 				Schema:      noArgs,
 				Invoke: func(ctx context.Context, _ json.RawMessage, caller string) (string, error) {
-					list, err := pctx.Waypoints.List(ctx, caller)
+					saved, err := pctx.Waypoints.List(ctx, caller)
 					if err != nil {
 						return "", err
 					}
-					if len(list) == 0 {
+					if len(saved) == 0 {
 						return "no saved waypoints", nil
 					}
-					names := make([]string, 0, len(list))
-					for _, wp := range list {
+					names := make([]string, 0, len(saved))
+					for _, wp := range saved {
 						names = append(names, wp.Name)
 					}
 					return strings.Join(names, ", "), nil
@@ -115,7 +115,12 @@ func buildToolset(pctx *plugin.Context, _ plugin.PlayerStore) *tools.Registry {
 		})
 	}
 
-	if pctx.ServerInfo != nil {
+	// Gated on the exporters, not merely on ServerInfo being present:
+	// production always constructs it, and an unconfigured exporter can only
+	// answer that it is unconfigured. Offering that tool spends one of two
+	// tool rounds and part of a small model's prompt budget to discover an
+	// absence the wiring already knows about.
+	if pctx.ServerInfo != nil && pctx.ServerInfo.StatusEnabled() {
 		list = append(list,
 			tools.Tool{
 				Name:        "server_status",
@@ -133,15 +138,20 @@ func buildToolset(pctx *plugin.Context, _ plugin.PlayerStore) *tools.Registry {
 					return pctx.ServerInfo.Version(ctx)
 				},
 			},
-			tools.Tool{
-				Name:        "backup_status",
-				Description: "How recently the world was backed up and how large that backup was.",
-				Schema:      noArgs,
-				Invoke: func(ctx context.Context, _ json.RawMessage, _ string) (string, error) {
-					return pctx.ServerInfo.BackupStatus(ctx)
-				},
-			},
 		)
+	}
+
+	// The backup exporter is a separate deployment from mc-monitor, so it is
+	// separately absent.
+	if pctx.ServerInfo != nil && pctx.ServerInfo.BackupEnabled() {
+		list = append(list, tools.Tool{
+			Name:        "backup_status",
+			Description: "How recently the world was backed up and how large that backup was.",
+			Schema:      noArgs,
+			Invoke: func(ctx context.Context, _ json.RawMessage, _ string) (string, error) {
+				return pctx.ServerInfo.BackupStatus(ctx)
+			},
+		})
 	}
 
 	return tools.NewRegistry(list...)

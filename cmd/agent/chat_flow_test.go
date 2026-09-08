@@ -1,15 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/sandertv/gophertunnel/minecraft/protocol"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
@@ -21,6 +26,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
@@ -79,6 +85,10 @@ const (
 	playerXUID = "2535412345678901"
 	selfXUID   = "2535499999999999"
 	siblingBot = "2535488888888888"
+	// bystanderXUID joins and leaves in the background of the concurrency
+	// tests, so the roster is being written while an answer reads it.
+	bystanderXUID   = "2535477777777777"
+	otherPlayerXUID = "2535466666666666"
 )
 
 func newHarness(t *testing.T) (*plugin.Registry, *plugin.Context, *recordingVoice, *bus.Bus, <-chan bus.Event, *roster.Roster, *adapters.PermissionResolver) {
@@ -300,40 +310,251 @@ func TestChatMessagePublishedOnBus(t *testing.T) {
 	}
 }
 
-// A mention is answered on its own goroutine. Held here at the backend so
-// the assertion is about ordering rather than speed: while the answer is
-// still in flight the read loop has already returned and would be handling
-// the next packet, which is what the inline version could not do.
-func TestMentionIsAnsweredWithoutBlockingTheReadLoop(t *testing.T) {
-	release := make(chan struct{})
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-release
-		w.Write([]byte(`{"choices":[{"message":{"content":"Beacons need a nether star."}}]}`))
+// stubWaypoints is an enabled waypoint store, so the answer path under test
+// actually offers and runs a tool rather than a bare completion.
+type stubWaypoints struct {
+	waypoints.Nop
+	mu      sync.Mutex
+	callers []string
+}
+
+func (w *stubWaypoints) Enabled() bool { return true }
+
+func (w *stubWaypoints) List(_ context.Context, xuid string) ([]waypoints.Waypoint, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.callers = append(w.callers, xuid)
+	return []waypoints.Waypoint{{Name: "base"}}, nil
+}
+
+func (w *stubWaypoints) seen() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.callers...)
+}
+
+// heldBackend is an LLM backend that reports when a request arrives and
+// serves it only once the test releases it, so a test can assert what is
+// true while an answer is in flight.
+type heldBackend struct {
+	srv      *httptest.Server
+	arrived  chan struct{}
+	release  chan struct{}
+	mu       sync.Mutex
+	requests int
+}
+
+// newHeldBackend replies with replies[n] to the n-th request, repeating the
+// last one thereafter.
+func newHeldBackend(t *testing.T, replies ...string) *heldBackend {
+	t.Helper()
+	b := &heldBackend{arrived: make(chan struct{}, 8), release: make(chan struct{})}
+	b.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b.mu.Lock()
+		n := b.requests
+		b.requests++
+		b.mu.Unlock()
+
+		b.arrived <- struct{}{}
+		<-b.release
+		if n >= len(replies) {
+			n = len(replies) - 1
+		}
+		w.Write([]byte(replies[n]))
 	}))
-	defer backend.Close()
+	t.Cleanup(b.srv.Close)
+	return b
+}
 
-	registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
-	log := logging.New("info")
-	ans := testAnswering()
-	ans.llm = adapters.NewLLMClient(backend.URL, "test-model", "", 192, 5*time.Second)
+func (b *heldBackend) count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.requests
+}
 
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server how do I craft a beacon"),
-		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+const (
+	waypointListCall = `{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"waypoint_list","arguments":"{}"}}]}}]}`
+	beaconAnswer     = `{"choices":[{"message":{"content":"Your base waypoint is saved."}}]}`
+)
 
-	if got := voice.output(); len(got) != 0 {
-		t.Fatalf("the read loop waited for the backend: %v", got)
+// captureStdout returns everything fn writes to stdout, which is where the
+// logger puts info-level events. A logger captures its writers at
+// construction, so any logger whose output matters must be built inside fn.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
 	}
-	close(release)
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
 
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe: %v", err)
+	}
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	return buf.String()
+}
+
+// waitForOutput polls the recorded voice until something was said.
+func waitForOutput(t *testing.T, voice *recordingVoice) []string {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for len(voice.output()) == 0 {
+	for {
+		if got := voice.output(); len(got) > 0 {
+			return got
+		}
 		if time.Now().After(deadline) {
-			t.Fatal("the mention was never answered")
+			t.Fatal("nothing was ever said")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := voice.output()[0]; got != "say: Beacons need a nether star." {
-		t.Errorf("answer = %q, want it broadcast to everyone who saw the question", got)
+}
+
+// A mention is answered on its own goroutine. Held at the backend so the
+// assertion is about ordering rather than speed: while the answer is still in
+// flight the read loop has already returned and is handling further packets,
+// which is what the inline version could not do.
+//
+// The whole exchange runs concurrently with a stream of PlayerList packets:
+// the answer resolves the asker's gamertag from the same roster those packets
+// rewrite, and the tool round reads a store the read loop can also reach, so
+// this is the shared state the goroutine actually exposes.
+func TestMentionIsAnsweredWithoutBlockingTheReadLoop(t *testing.T) {
+	backend := newHeldBackend(t, waypointListCall, beaconAnswer)
+	registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
+	waypointStore := &stubWaypoints{}
+	pctx.Waypoints = waypointStore
+	log := logging.New("info")
+	ans := testAnswering()
+	ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
+
+	churnDone := make(chan struct{})
+	churnStop := make(chan struct{})
+	go func() {
+		defer close(churnDone)
+		for i := 0; ; i++ {
+			select {
+			case <-churnStop:
+				return
+			default:
+			}
+			pk := &packet.PlayerList{Entries: []protocol.PlayerListEntry{addEntry(playerXUID, "Steve"), addEntry(bystanderXUID, "Alex")}}
+			if i%2 == 1 {
+				pk = &packet.PlayerList{Entries: []protocol.PlayerListEntry{removeEntry(bystanderXUID)}}
+			}
+			handlePacket(context.Background(), pk, selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+		}
+	}()
+
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server where is my base"),
+		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+
+	<-backend.arrived
+	if got := voice.output(); len(got) != 0 {
+		t.Fatalf("the read loop waited for the backend: %v", got)
+	}
+	close(backend.release)
+
+	said := waitForOutput(t, voice)
+	close(churnStop)
+	<-churnDone
+
+	if said[0] != "say: Your base waypoint is saved." {
+		t.Errorf("answer = %q, want it broadcast to everyone who saw the question", said[0])
+	}
+	if seen := waypointStore.seen(); len(seen) != 1 || seen[0] != playerXUID {
+		t.Errorf("waypoint_list callers = %v, want exactly the asker", seen)
+	}
+	if n := backend.count(); n != 2 {
+		t.Errorf("backend calls = %d, want 2 (the tool round and the answer)", n)
+	}
+}
+
+// The per-player limiter is a rolling-minute budget, so it cannot bound how
+// many answers run at once -- four questions in one second are four allowed
+// answers. Without a global cap those became four concurrent exchanges
+// against one small backend and four interleaved broadcasts.
+func TestMentionIsDroppedWhenTheAgentIsAlreadyBusy(t *testing.T) {
+	backend := newHeldBackend(t, beaconAnswer)
+	registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
+
+	out := captureStdout(t, func() {
+		log := logging.New("info")
+		ans := testAnswering()
+		ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
+		// One slot, so the second question meets a full agent rather than
+		// waiting on a real backend to be slow.
+		ans.inFlight = make(chan struct{}, 1)
+
+		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server first"),
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+		<-backend.arrived
+
+		// A different player, so the per-player limiter has nothing to say
+		// about this one: only the global cap can refuse it.
+		handlePacket(context.Background(), chatPacket(otherPlayerXUID, "Alex", "@server second"),
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+
+		close(backend.release)
+		waitForOutput(t, voice)
+	})
+
+	if !strings.Contains(out, `"event":"mention_answer_dropped_busy"`) {
+		t.Errorf("stdout = %q, want a mention_answer_dropped_busy event", out)
+	}
+	if n := backend.count(); n != 1 {
+		t.Errorf("backend calls = %d, want 1 -- the dropped answer reached the model anyway", n)
+	}
+	if got := voice.output(); len(got) != 1 {
+		t.Errorf("broadcasts = %v, want only the answer that held the slot", got)
+	}
+}
+
+// The limiter has to run before the spawn, not inside it. Proved by which
+// refusal is logged: the slot is already taken by the held answer, so a
+// startAnswer that acquired the semaphore first would report this as a busy
+// agent instead of a rate-limited player.
+func TestRateLimitedMentionIsRefusedBeforeAGoroutineExists(t *testing.T) {
+	backend := newHeldBackend(t, beaconAnswer)
+	registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
+	var before, after int
+
+	out := captureStdout(t, func() {
+		log := logging.New("info")
+		ans := testAnswering()
+		ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
+		ans.limiter = ratelimit.NewPerActor(1, time.Minute)
+		ans.inFlight = make(chan struct{}, 1)
+
+		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server first"),
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+		<-backend.arrived
+
+		before = runtime.NumGoroutine()
+		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server second"),
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+		after = runtime.NumGoroutine()
+
+		close(backend.release)
+		waitForOutput(t, voice)
+	})
+
+	if after > before {
+		t.Errorf("goroutines went %d -> %d across a rate-limited mention; the refusal happens after the spawn", before, after)
+	}
+	if !strings.Contains(out, `"event":"mention_rate_limited"`) {
+		t.Errorf("stdout = %q, want a mention_rate_limited event", out)
+	}
+	if strings.Contains(out, `"event":"mention_answer_dropped_busy"`) {
+		t.Errorf("stdout = %q: the concurrency cap answered before the rate limiter did", out)
+	}
+	if n := backend.count(); n != 1 {
+		t.Errorf("backend calls = %d, want 1 -- the rate-limited question reached the model anyway", n)
 	}
 }
 
@@ -343,8 +564,9 @@ func TestMentionIsAnsweredWithoutBlockingTheReadLoop(t *testing.T) {
 func testAnswering() answering {
 	return answering{
 		limiter:  ratelimit.NewPerActor(4, time.Minute),
-		llm:      adapters.NewLLMClient("", "", "", 192, time.Second),
+		llm:      adapters.NewLLMClient("", "", "", 192, time.Second, nil),
 		toolsFor: func(p *plugin.Context) *tools.Registry { return buildToolset(p, p.Profiles) },
 		total:    20 * time.Second,
+		inFlight: make(chan struct{}, maxConcurrentAnswers),
 	}
 }

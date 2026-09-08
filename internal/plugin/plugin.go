@@ -98,6 +98,17 @@ type ServerInfo interface {
 	// BackupStatus reports how recently the world was saved, how large that
 	// archive was, and whether it was taken with the world held.
 	BackupStatus(ctx context.Context) (string, error)
+	// StatusEnabled and BackupEnabled report whether the exporter behind
+	// each answer is configured. Split because they are two exporters: an
+	// agent can have monitoring without backup metrics or the reverse.
+	//
+	// A command asked for an unconfigured capability says so, which is the
+	// right answer to a player. A caller that chooses what to offer -- the
+	// LLM toolset -- needs to know before it asks, because offering a tool
+	// whose only possible reply is "not configured" spends a tool round and
+	// prompt budget to learn nothing.
+	StatusEnabled() bool
+	BackupEnabled() bool
 }
 
 // Invocation is one player's attempt to run a command.

@@ -19,7 +19,7 @@ import (
 )
 
 func newTestClient(url string) *LLMClient {
-	return NewLLMClient(url, "test-model", "", 96, 2*time.Second)
+	return NewLLMClient(url, "test-model", "", 96, 2*time.Second, nil)
 }
 
 func okResponse(t *testing.T, content string) *httptest.Server {
@@ -82,11 +82,11 @@ func TestBuildRequestTruncatesTheQuestion(t *testing.T) {
 // OpenAI-compatible backends reject the former, and the cluster's vLLM needs
 // neither.
 func TestBuildRequestOmitsEmptyAuthHeader(t *testing.T) {
-	_, headers, _ := NewLLMClient("http://x", "m", "", 96, time.Second).BuildRequest("a", "b")
+	_, headers, _ := NewLLMClient("http://x", "m", "", 96, time.Second, nil).BuildRequest("a", "b")
 	if _, present := headers["authorization"]; present {
 		t.Error("authorization header present despite an empty API key")
 	}
-	_, headers, _ = NewLLMClient("http://x", "m", "secret", 96, time.Second).BuildRequest("a", "b")
+	_, headers, _ = NewLLMClient("http://x", "m", "secret", 96, time.Second, nil).BuildRequest("a", "b")
 	if headers["authorization"] != "Bearer secret" {
 		t.Errorf("authorization = %q", headers["authorization"])
 	}
@@ -128,7 +128,7 @@ func TestAnswerReportsBackendErrors(t *testing.T) {
 // No backend configured is a supported state, not a failure: it is how the
 // agent runs before this feature is switched on.
 func TestDisabledClientAnswersNothingWithoutError(t *testing.T) {
-	c := NewLLMClient("", "m", "", 96, time.Second)
+	c := NewLLMClient("", "m", "", 96, time.Second, nil)
 	if c.Enabled() {
 		t.Error("Enabled() true for an empty base URL")
 	}
@@ -170,7 +170,7 @@ func toolCallReply(name, args string) string {
 
 func TestAnswerWithToolsOneRound(t *testing.T) {
 	srv, calls := toolBackend(t, []string{toolCallReply("knowledge_lookup", `{"query":"gold farm"}`), textReply})
-	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
 
 	var gotCaller string
 	registry := tools.NewRegistry(tools.Tool{
@@ -203,7 +203,7 @@ func TestAnswerWithToolsStopsAtRoundCap(t *testing.T) {
 	srv, calls := toolBackend(t, []string{
 		toolCallReply("t", "{}"), toolCallReply("t", "{}"), textReply,
 	})
-	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
 	registry := tools.NewRegistry(tools.Tool{
 		Name:   "t",
 		Schema: json.RawMessage(`{"type":"object","properties":{}}`),
@@ -224,7 +224,7 @@ func TestAnswerWithToolsStopsAtRoundCap(t *testing.T) {
 
 func TestAnswerWithToolsHandlesToolErrorAndUnknownTool(t *testing.T) {
 	srv, _ := toolBackend(t, []string{toolCallReply("broken", "{}"), textReply})
-	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
 	registry := tools.NewRegistry(tools.Tool{
 		Name:   "broken",
 		Schema: json.RawMessage(`{"type":"object","properties":{}}`),
@@ -241,7 +241,7 @@ func TestAnswerWithToolsHandlesToolErrorAndUnknownTool(t *testing.T) {
 	}
 
 	srv2, _ := toolBackend(t, []string{toolCallReply("invented_tool", "{}"), textReply})
-	client2 := NewLLMClient(srv2.URL, "m", "", 192, 5*time.Second)
+	client2 := NewLLMClient(srv2.URL, "m", "", 192, 5*time.Second, nil)
 	if _, err := client2.AnswerWithTools(context.Background(), "Dot", "x", "q", registry); err != nil {
 		t.Fatalf("an invented tool name must not fail the answer: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestAnswerWithToolsHandlesToolErrorAndUnknownTool(t *testing.T) {
 
 func TestAnswerWithNilRegistryMakesOneCall(t *testing.T) {
 	srv, calls := toolBackend(t, []string{textReply})
-	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
 	if _, err := client.AnswerWithTools(context.Background(), "Dot", "x", "q", nil); err != nil {
 		t.Fatalf("AnswerWithTools: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestAnswerWithToolsMessageHistoryIsWellFormed(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
 	registry := tools.NewRegistry(tools.Tool{
 		Name:   "t",
 		Schema: json.RawMessage(`{"type":"object","properties":{}}`),
@@ -326,7 +326,7 @@ func TestAnswerWithToolsDropsToolCallsWithEmptyID(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
 	invoked := false
 	registry := tools.NewRegistry(tools.Tool{
 		Name:   "t",
@@ -369,7 +369,7 @@ func TestAnswerWithToolsSendsGenericErrorNeverInternals(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
 	registry := tools.NewRegistry(tools.Tool{
 		Name:   "broken",
 		Schema: json.RawMessage(`{"type":"object","properties":{}}`),
@@ -428,7 +428,6 @@ func captureStderr(t *testing.T, fn func()) string {
 // failure in the logs; this is what makes that claim true.
 func TestAnswerWithToolsLogsFailedToolInvocation(t *testing.T) {
 	srv, _ := toolBackend(t, []string{toolCallReply("broken", "{}"), textReply})
-	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
 	registry := tools.NewRegistry(tools.Tool{
 		Name:   "broken",
 		Schema: json.RawMessage(`{"type":"object","properties":{}}`),
@@ -440,7 +439,7 @@ func TestAnswerWithToolsLogsFailedToolInvocation(t *testing.T) {
 	// logging.New must be called after os.Stderr is swapped: it captures
 	// the writer at construction time, not at each write.
 	out := captureStderr(t, func() {
-		client.SetLogger(logging.New("info"))
+		client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, logging.New("info"))
 		if _, err := client.AnswerWithTools(context.Background(), "Dot", "x", "q", registry); err != nil {
 			t.Fatalf("AnswerWithTools: %v", err)
 		}
@@ -457,11 +456,11 @@ func TestAnswerWithToolsLogsFailedToolInvocation(t *testing.T) {
 	}
 }
 
-// A client with no logger attached (every other test in this file) must
-// keep working: SetLogger is optional, not a precondition for answering.
+// A client built with a nil logger (every other test in this file) must
+// keep working: the logger is optional, not a precondition for answering.
 func TestAnswerWithToolsWorksWithoutALogger(t *testing.T) {
 	srv, _ := toolBackend(t, []string{toolCallReply("broken", "{}"), textReply})
-	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second)
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
 	registry := tools.NewRegistry(tools.Tool{
 		Name:   "broken",
 		Schema: json.RawMessage(`{"type":"object","properties":{}}`),

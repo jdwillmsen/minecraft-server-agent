@@ -57,6 +57,19 @@ const welcomeDelay = 5 * time.Second
 // storm at full speed.
 const stableSessionThreshold = 60 * time.Second
 
+// maxConcurrentAnswers caps @server answers in flight across every player.
+//
+// Small on purpose: the backend is one self-hosted model, and beyond a
+// handful of simultaneous exchanges the same throughput simply arrives
+// later, into a chat that has moved on. It also bounds what a coordinated
+// group of players can make this agent spend, which the per-player limiter
+// alone cannot.
+const maxConcurrentAnswers = 3
+
+// broadcastTimeout bounds the one bridge call that delivers an answer, on a
+// context detached from shutdown -- see handleMention.
+const broadcastTimeout = 2 * time.Second
+
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -140,6 +153,7 @@ func main() {
 		llm:      newLLMClient(cfg, log),
 		toolsFor: func(p *plugin.Context) *tools.Registry { return buildToolset(p, p.Profiles) },
 		total:    time.Duration(cfg.LLMTotalTimeoutMs) * time.Millisecond,
+		inFlight: make(chan struct{}, maxConcurrentAnswers),
 	}
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
 
@@ -224,9 +238,6 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 	}
 }
 
-// nextDelay is the reconnect backoff step: a session that stayed up at
-// least stableSessionThreshold is treated as healthy and resets the delay
-// to min, while anything shorter doubles the previous delay up to max.
 // answering bundles what @server handling needs, so enabling this feature
 // costs one parameter on the chat path rather than two on each of five
 // functions. Both live for the process rather than the session: a rate limit
@@ -240,8 +251,14 @@ type answering struct {
 	toolsFor func(*plugin.Context) *tools.Registry
 	// total bounds one whole answering attempt, tool rounds included.
 	total time.Duration
+	// inFlight is a counting semaphore over answers in progress, capped at
+	// maxConcurrentAnswers.
+	inFlight chan struct{}
 }
 
+// nextDelay is the reconnect backoff step: a session that stayed up at
+// least stableSessionThreshold is treated as healthy and resets the delay
+// to min, while anything shorter doubles the previous delay up to max.
 func nextDelay(current, lasted, min, max time.Duration) time.Duration {
 	if lasted >= stableSessionThreshold {
 		return min
@@ -409,19 +426,10 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 	case chat.TriggerCommand:
 		handleCommand(ctx, id, trigger, log, registry, pctx, limiter, permResolver)
 	case chat.TriggerMention:
-		// Answering runs off the read loop. handleMention makes up to three
-		// HTTP calls now, and this function is called from the Bedrock
-		// packet reader: doing it inline stops the agent hearing anything --
-		// including !help and player joins -- for the whole exchange.
-		go handleMention(ctx, id, trigger, log, pctx, ans, playerRoster)
+		startAnswer(ctx, id, trigger, log, pctx, ans, playerRoster)
 	}
 }
 
-// openStore connects to Postgres if configured, and degrades to Nop if not.
-//
-// Deliberately never returns an error. Every failure here -- unset, malformed,
-// unreachable -- lands the agent in the same supported state it ran in through
-// Stages 1-4: greeting players plainly and answering commands.
 // newPluginContext assembles what every plugin is allowed to reach.
 //
 // A function rather than a struct literal inline in main so the wiring can be
@@ -455,19 +463,23 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 // newLLMClient builds the one production answering client.
 //
 // A function rather than a literal inline so the logger wiring is testable.
-// Without SetLogger the client's tool_invocation_failed events go nowhere:
+// Passed a nil logger the client's tool_invocation_failed events go nowhere:
 // a lookup that fails on every question would be invisible to an operator,
 // and the answer path degrades silently by design -- the model just answers
 // around the missing fact.
 func newLLMClient(cfg config.Config, log *logging.Logger) *adapters.LLMClient {
-	client := adapters.NewLLMClient(
+	return adapters.NewLLMClient(
 		cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMAPIKey,
 		cfg.LLMMaxTokens, time.Duration(cfg.LLMTimeoutMs)*time.Millisecond,
+		log,
 	)
-	client.SetLogger(log)
-	return client
 }
 
+// openStore connects to Postgres if configured, and degrades to Nop if not.
+//
+// Deliberately never returns an error. Every failure here -- unset, malformed,
+// unreachable -- lands the agent in the same supported state it ran in through
+// Stages 1-4: greeting players plainly and answering commands.
 func openStore(ctx context.Context, cfg config.Config, log *logging.Logger) store.Store {
 	dsn := cfg.PostgresDSN()
 	if dsn == "" {
@@ -491,15 +503,15 @@ func openStore(ctx context.Context, cfg config.Config, log *logging.Logger) stor
 	return pg
 }
 
-// handleMention answers an @server question.
+// startAnswer decides whether an @server question is answered, then answers
+// it off the read loop.
 //
-// Everything that makes this safe is upstream or in the prompt rather than
-// here: handleText has already dropped this agent's own messages and its
-// sibling bots' (chat.IsSelfOrSibling), and the system prompt refuses to end a
-// reply with a question. Both matter because the answering AFK bot is still
-// running alongside this agent, and two automated speakers in one chat is the
-// shape of a loop.
-func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, pctx *plugin.Context, ans answering, playerRoster *roster.Roster) {
+// Every refusal is made here, on the caller's goroutine, and each is a mutex
+// or a channel rather than a network call. The rate limiter especially: its
+// budget is per rolling minute, so four questions in one second are four
+// allowed answers, and spawning each one concurrently would interleave four
+// broadcasts. Running inline used to serialise them; nothing else does now.
+func startAnswer(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, pctx *plugin.Context, ans answering, playerRoster *roster.Roster) {
 	if ans.llm == nil || !ans.llm.Enabled() {
 		// Stage 1-3 behaviour, kept as the unconfigured path: detection is
 		// proven, nothing is answered.
@@ -514,6 +526,36 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 		return
 	}
 
+	select {
+	case ans.inFlight <- struct{}{}:
+	default:
+		// Dropped, not queued: an answer that waits for a slot arrives after
+		// the conversation it belongs to has moved on, and the asker has by
+		// then read the silence as the answer.
+		log.Info("mention_answer_dropped_busy", logging.Fields{"actor": actorXUID, "max_concurrent": cap(ans.inFlight)})
+		return
+	}
+
+	// ctx is the process's, not the session's, and deliberately: the reply is
+	// delivered through the console bridge, which is a separate service from
+	// the Bedrock connection, so a reconnect mid-answer does not invalidate
+	// it. ans.total bounds how stale it can be.
+	go func() {
+		defer func() { <-ans.inFlight }()
+		handleMention(ctx, actorXUID, trigger, log, pctx, ans, playerRoster)
+	}()
+}
+
+// handleMention answers one @server question. Its caller has already decided
+// that this question gets answered -- see startAnswer.
+//
+// Everything that makes this safe is upstream or in the prompt rather than
+// here: handleText has already dropped this agent's own messages and its
+// sibling bots' (chat.IsSelfOrSibling), and the system prompt refuses to end a
+// reply with a question. Both matter because the answering AFK bot is still
+// running alongside this agent, and two automated speakers in one chat is the
+// shape of a loop.
+func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, pctx *plugin.Context, ans answering, playerRoster *roster.Roster) {
 	name := actorXUID
 	if playerRoster != nil {
 		if resolved, ok := playerRoster.NameFor(actorXUID); ok && resolved != "" {
@@ -548,7 +590,16 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	// Broadcast rather than whispered: an @server question is asked in public
 	// chat, and an answer only the asker can see reads as no answer at all to
 	// everyone else who watched them ask.
-	if err := pctx.Voice.Say(ctx, reply); err != nil {
+	//
+	// Detached from ctx with its own deadline. The answer is already computed
+	// and paid for, and SIGTERM landing in the gap between the backend
+	// replying and this line would otherwise throw it away. This does not
+	// outrun the process exit that follows a signal -- nothing waits for these
+	// goroutines -- it only stops a cancelled context discarding a reply the
+	// bridge could still have delivered.
+	sayCtx, sayCancel := context.WithTimeout(context.WithoutCancel(ctx), broadcastTimeout)
+	defer sayCancel()
+	if err := pctx.Voice.Say(sayCtx, reply); err != nil {
 		log.Error("mention_answer_send_failed", logging.Fields{"actor": actorXUID, "error": err.Error()})
 		return
 	}

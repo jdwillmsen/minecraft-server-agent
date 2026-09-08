@@ -53,16 +53,19 @@ type LLMClient struct {
 	maxTokens int
 	timeout   time.Duration
 	http      *http.Client
-	// log is optional: NewLLMClient leaves it nil so every existing caller
-	// (every test, and cmd/agent until it is wired up) keeps working without
-	// one, just without the failed-tool-call events an operator would
-	// otherwise see.
+	// log carries operational events (currently: failed tool invocations).
+	// May be nil, which drops them; set at construction and never written
+	// again, because AnswerWithTools is called from one goroutine per
+	// answer and a setter would be a data race waiting for its first
+	// concurrent caller.
 	log *logging.Logger
 }
 
 // NewLLMClient builds a client. An empty baseURL disables answering: the
-// caller checks Enabled rather than discovering it through a failed call.
-func NewLLMClient(baseURL, model, apiKey string, maxTokens int, timeout time.Duration) *LLMClient {
+// caller checks Enabled rather than discovering it through a failed call. A
+// nil log is supported -- the events are dropped rather than the client
+// requiring one to function.
+func NewLLMClient(baseURL, model, apiKey string, maxTokens int, timeout time.Duration, log *logging.Logger) *LLMClient {
 	return &LLMClient{
 		baseURL:   strings.TrimRight(baseURL, "/"),
 		model:     model,
@@ -70,15 +73,8 @@ func NewLLMClient(baseURL, model, apiKey string, maxTokens int, timeout time.Dur
 		maxTokens: maxTokens,
 		timeout:   timeout,
 		http:      &http.Client{},
+		log:       log,
 	}
-}
-
-// SetLogger attaches a logger for operational events (currently: failed tool
-// invocations). A nil logger, or never calling this at all, is a supported
-// state -- the events are simply dropped rather than the client requiring
-// one to function.
-func (c *LLMClient) SetLogger(log *logging.Logger) {
-	c.log = log
 }
 
 // Enabled reports whether a backend is configured at all.

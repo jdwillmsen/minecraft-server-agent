@@ -24,6 +24,13 @@ func NewMetricsFacts(client *MetricsClient) *MetricsFacts {
 
 const notConfigured = "That command isn't configured on this server."
 
+// StatusEnabled reports whether mc-monitor is configured; it backs both
+// ServerStatus and Version, which read the same exposition.
+func (f *MetricsFacts) StatusEnabled() bool { return f.client != nil && f.client.mcMonitorURL != "" }
+
+// BackupEnabled reports whether the backup exporter is configured.
+func (f *MetricsFacts) BackupEnabled() bool { return f.client != nil && f.client.backupURL != "" }
+
 // ServerStatus answers !online: how many players, whether the server is
 // answering, and how quickly.
 //
