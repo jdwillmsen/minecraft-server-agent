@@ -30,15 +30,15 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/config"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/httpapi"
-	"github.com/jdwillmsen/minecraft-server-agent/internal/liveness"
-	"github.com/jdwillmsen/minecraft-server-agent/internal/logging"
-	"github.com/jdwillmsen/minecraft-server-agent/internal/mcauth"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
-	"github.com/jdwillmsen/minecraft-server-agent/internal/skin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/liveness"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/mcauth"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/skin"
 )
 
 // welcomeDelay is how long the welcome plugin waits after a join before

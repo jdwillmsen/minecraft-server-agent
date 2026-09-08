@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jdwillmsen/minecraft-server-agent/internal/logging"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
 // NoopVoice logs what it would have said instead of actually reaching the

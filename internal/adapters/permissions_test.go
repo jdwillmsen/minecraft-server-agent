@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
-	"github.com/jdwillmsen/minecraft-server-agent/internal/logging"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
 // permsServer serves perms and counts how many times it was asked, so a
