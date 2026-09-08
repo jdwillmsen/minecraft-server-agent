@@ -35,12 +35,12 @@ func okResponse(t *testing.T, content string) *httptest.Server {
 
 func TestAnswerReturnsTheReply(t *testing.T) {
 	got, err := newTestClient(okResponse(t, "Diamonds spawn below Y level 16.").URL).
-		Answer(context.Background(), "Steve", "where is diamond")
+		AnswerWithTools(context.Background(), "Steve", "", "where is diamond", nil)
 	if err != nil {
-		t.Fatalf("Answer: %v", err)
+		t.Fatalf("AnswerWithTools: %v", err)
 	}
 	if got != "Diamonds spawn below Y level 16." {
-		t.Errorf("Answer = %q", got)
+		t.Errorf("AnswerWithTools = %q", got)
 	}
 }
 
@@ -48,23 +48,23 @@ func TestAnswerReturnsTheReply(t *testing.T) {
 // multi-line chat message.
 func TestAnswerCollapsesWhitespace(t *testing.T) {
 	got, err := newTestClient(okResponse(t, "line one\n\n  line two\ttabbed").URL).
-		Answer(context.Background(), "Steve", "q")
+		AnswerWithTools(context.Background(), "Steve", "", "q", nil)
 	if err != nil {
-		t.Fatalf("Answer: %v", err)
+		t.Fatalf("AnswerWithTools: %v", err)
 	}
 	if strings.ContainsAny(got, "\n\t") || strings.Contains(got, "  ") {
-		t.Errorf("Answer = %q, want a single collapsed line", got)
+		t.Errorf("AnswerWithTools = %q, want a single collapsed line", got)
 	}
 }
 
 func TestAnswerTruncatesLongReplies(t *testing.T) {
 	got, err := newTestClient(okResponse(t, strings.Repeat("x", 500)).URL).
-		Answer(context.Background(), "Steve", "q")
+		AnswerWithTools(context.Background(), "Steve", "", "q", nil)
 	if err != nil {
-		t.Fatalf("Answer: %v", err)
+		t.Fatalf("AnswerWithTools: %v", err)
 	}
 	if len(got) != MaxReplyChars {
-		t.Errorf("len(Answer) = %d, want %d", len(got), MaxReplyChars)
+		t.Errorf("len(AnswerWithTools) = %d, want %d", len(got), MaxReplyChars)
 	}
 }
 
@@ -120,7 +120,7 @@ func TestAnswerReportsBackendErrors(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	t.Cleanup(srv.Close)
-	if _, err := newTestClient(srv.URL).Answer(context.Background(), "a", "b"); err == nil {
+	if _, err := newTestClient(srv.URL).AnswerWithTools(context.Background(), "a", "", "b", nil); err == nil {
 		t.Fatal("want an error for a 500 backend, got none")
 	}
 }
@@ -132,9 +132,9 @@ func TestDisabledClientAnswersNothingWithoutError(t *testing.T) {
 	if c.Enabled() {
 		t.Error("Enabled() true for an empty base URL")
 	}
-	got, err := c.Answer(context.Background(), "a", "b")
+	got, err := c.AnswerWithTools(context.Background(), "a", "", "b", nil)
 	if err != nil || got != "" {
-		t.Errorf("Answer = (%q, %v), want empty and no error", got, err)
+		t.Errorf("AnswerWithTools = (%q, %v), want empty and no error", got, err)
 	}
 }
 

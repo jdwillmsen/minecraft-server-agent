@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jdwillmsen/minecraft-server-agent/internal/text"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
@@ -120,15 +121,19 @@ func (c *LLMClient) headers() map[string]string {
 	return headers
 }
 
+// endpoint is the one place the URL this client posts to is spelled, for
+// the same reason headers is the one place the auth rule is decided:
+// BuildRequest and post both need it, and two spellings are two things to
+// keep in step.
+func (c *LLMClient) endpoint() string { return c.baseURL + "/chat/completions" }
+
 // BuildRequest is the pure request shape, separated from the call so the
 // truncation and auth-header rules are testable without a network.
 func (c *LLMClient) BuildRequest(asker, question string) (url string, headers map[string]string, body chatRequest) {
 	headers = c.headers()
 
-	if len(question) > MaxQuestionChars {
-		question = question[:MaxQuestionChars]
-	}
-	return c.baseURL + "/chat/completions",
+	question = text.Truncate(question, MaxQuestionChars)
+	return c.endpoint(),
 		headers,
 		chatRequest{
 			Model:     c.model,
@@ -158,11 +163,7 @@ func ExtractText(payload []byte) string {
 		return ""
 	}
 	// Bedrock chat is single-line; collapse anything the model wrapped.
-	text := strings.Join(strings.Fields(parsed.Choices[0].Message.Content), " ")
-	if len(text) > MaxReplyChars {
-		text = text[:MaxReplyChars]
-	}
-	return text
+	return text.Truncate(strings.Join(strings.Fields(parsed.Choices[0].Message.Content), " "), MaxReplyChars)
 }
 
 // ExtractToolCalls returns the tool calls in a completion, or nil when the
@@ -204,7 +205,7 @@ func (c *LLMClient) post(ctx context.Context, body chatRequest) ([]byte, error) 
 	if err != nil {
 		return nil, fmt.Errorf("llm: encode request: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(encoded))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(), bytes.NewReader(encoded))
 	if err != nil {
 		return nil, fmt.Errorf("llm: build request: %w", err)
 	}
@@ -231,6 +232,11 @@ func (c *LLMClient) post(ctx context.Context, body chatRequest) ([]byte, error) 
 }
 
 // AnswerWithTools asks the model, letting it call read-only tools first.
+//
+// An empty reply is returned as empty rather than as an error, and callers
+// must not broadcast it: minecraft-afk-bot shipped a bug where an empty
+// completion was broadcast as a blank chat line, which reads to players as
+// the server glitching.
 //
 // callerXUID is passed to every tool the model invokes and is never taken
 // from the model's own arguments: that is what keeps waypoint_lookup from
@@ -288,15 +294,4 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 			})
 		}
 	}
-}
-
-// Answer asks the model and returns its reply, or "" when there is nothing
-// worth saying.
-//
-// An empty reply is returned as empty rather than as an error, and callers
-// must not broadcast it: minecraft-afk-bot shipped a bug where an empty
-// completion was broadcast as a blank chat line, which reads to players as the
-// server glitching.
-func (c *LLMClient) Answer(ctx context.Context, asker, question string) (string, error) {
-	return c.AnswerWithTools(ctx, asker, "", question, nil)
 }
