@@ -38,6 +38,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/liveness"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/mcauth"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/mcproto"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/skin"
 )
 
@@ -259,8 +260,23 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 	// gophertunnel substitutes a placeholder. Geometry and the resource patch
 	// are left to the dialer, which supplies working humanoid defaults.
 	agentSkin := skin.For(cfg.MCUsername)
+	addr := net.JoinHostPort(cfg.MCHost, strconv.Itoa(cfg.MCPort))
+
+	// The server upgrades itself to Mojang's latest on restart, and a point
+	// release that only bumps the protocol number still gets this client
+	// kicked before login. Asking the server what it speaks costs one ping per
+	// session and keeps the agent connectable until the library catches up.
+	proto := mcproto.Negotiate(ctx, addr, func(ad mcproto.Advertisement) {
+		log.Warn("protocol_spoofed", logging.Fields{
+			"compiled_protocol":   minecraft.DefaultProtocol.ID(),
+			"advertised_protocol": ad.Protocol,
+			"server_version":      ad.Version,
+		})
+	})
+
 	dialer := minecraft.Dialer{
 		TokenSource: ts,
+		Protocol:    proto,
 		ClientData: login.ClientData{
 			SkinID:          agentSkin.ID,
 			SkinData:        agentSkin.Data,
@@ -268,7 +284,6 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 			SkinImageHeight: agentSkin.Height,
 		},
 	}
-	addr := net.JoinHostPort(cfg.MCHost, strconv.Itoa(cfg.MCPort))
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, 30*time.Second)
 	conn, err := dialer.DialContext(dialCtx, "raknet", addr)

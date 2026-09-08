@@ -128,3 +128,28 @@ func (w syncedWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 	return w.buf.Write(p)
 }
+
+// A warning means "handled, carried on". Routing it to stderr would mix it
+// into the stream that error-rate alerting watches, so the stream matters as
+// much as the level string.
+func TestWarnGoesToStdoutNotStderr(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	newWithWriters("info", &stdout, &stderr).Warn("protocol_spoofed", Fields{"advertised_protocol": 2170})
+
+	if stderr.Len() != 0 {
+		t.Errorf("warning went to stderr: %s", stderr.String())
+	}
+	var line map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &line); err != nil {
+		t.Fatalf("warning was not valid JSON: %v", err)
+	}
+	if line["level"] != "warn" {
+		t.Errorf("level = %v, want \"warn\"", line["level"])
+	}
+	if line["event"] != "protocol_spoofed" {
+		t.Errorf("event = %v, want \"protocol_spoofed\"", line["event"])
+	}
+	if line["advertised_protocol"] != float64(2170) {
+		t.Errorf("fields were dropped: %v", line)
+	}
+}
