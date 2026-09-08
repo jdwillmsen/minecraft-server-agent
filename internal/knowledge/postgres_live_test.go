@@ -1,30 +1,36 @@
+//go:build livedb
+
+// Exercises the real SQL against a real PostgreSQL, as the runtime role.
+//
+// Everything else in this package's tests runs against Nop or pure helpers, so
+// until now no query in postgres.go had ever been executed by the test suite.
+// The permissions bug that left minecraft.players empty in production hid
+// behind exactly that gap: the SQL was never run, so nothing could tell
+// whether it was even correct.
+//
+// Behind a build tag because it needs a database. Run it with:
+//
+//	MC_TEST_DSN=postgres://app:...@127.0.0.1:55432/jdwillmsen_prd go test -tags livedb ./internal/knowledge/
 package knowledge
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// livePool opens a pool from PG_* env vars rather than reuse store.Postgres's
-// pool: Task 5 has not added the accessor yet, so this is the only way this
-// test can reach a real database until then.
+// livePool opens a pool from the runtime role's DSN rather than reuse
+// store.Postgres's pool: Task 5 has not added the accessor yet, so this is
+// the only way this test can reach a real database until then.
 func livePool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	host := os.Getenv("PG_HOST")
-	if host == "" {
-		t.Skip("PG_HOST not set; skipping live database test")
+	dsn := os.Getenv("MC_TEST_DSN")
+	if dsn == "" {
+		t.Skip("MC_TEST_DSN unset")
 	}
-	dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s",
-		os.Getenv("PG_USERNAME"), os.Getenv("PG_PASSWORD"),
-		host, os.Getenv("PG_PORT"), os.Getenv("PG_DATABASE"))
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	pool, err := pgxpool.New(ctx, dsn)
+	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
