@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func testTool(name string, out string, err error) Tool {
@@ -62,6 +63,26 @@ func TestInvokePassesCallerAndTruncates(t *testing.T) {
 	}
 	if len(out) != MaxToolResultChars {
 		t.Errorf("result len = %d, want it truncated to %d", len(out), MaxToolResultChars)
+	}
+}
+
+func TestInvokeTruncatesOnRuneBoundary(t *testing.T) {
+	// Place a two-byte rune ("é") straddling the cap so a byte-index slice
+	// lands on its second byte: prefix fills bytes 0-398, the rune's first
+	// byte sits at 399, its second byte at 400 -- exactly where the old
+	// out[:400] slice cut.
+	prefix := strings.Repeat("x", MaxToolResultChars-1)
+	out := prefix + "é" + strings.Repeat("y", 50)
+	r := NewRegistry(testTool("multibyte", out, nil))
+	got, err := r.Invoke(context.Background(), "multibyte", nil, "xuid")
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("result is not valid UTF-8: %q", got)
+	}
+	if len(got) > MaxToolResultChars {
+		t.Errorf("result len = %d, want <= %d", len(got), MaxToolResultChars)
 	}
 }
 
