@@ -57,6 +57,17 @@ func (p *Postgres) Close() {
 	}
 }
 
+// Pool exposes the connection pool so the knowledge and waypoint stores can
+// share it. One pool, not three: this whole workload is a few rows per
+// player visit, and extra pools would reserve connections on a shared
+// cluster to sit idle. Returns nil for a zero-valued Postgres.
+func (p *Postgres) Pool() *pgxpool.Pool {
+	if p == nil {
+		return nil
+	}
+	return p.pool
+}
+
 // RecordJoin reads the prior profile and opens a session in one transaction.
 //
 // One transaction because the two halves contradict each other otherwise: the

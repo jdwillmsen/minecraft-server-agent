@@ -19,7 +19,9 @@ import (
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
 )
 
 // DefaultDispatchTimeout bounds how long a single command's Run may take
@@ -169,6 +171,10 @@ type Context struct {
 	// comment panicked the whole event dispatcher on a nil interface. A
 	// greeting is not worth taking the agent down for.
 	Profiles PlayerStore
+	// Knowledge and Waypoints are nil when no database is configured. Both
+	// are guarded at every use for the same reason Profiles is.
+	Knowledge KnowledgeStore
+	Waypoints WaypointStore
 }
 
 // PlayerStore is the subset of internal/store a plugin may touch.
@@ -177,6 +183,29 @@ type Context struct {
 // players, they do not close orphaned sessions or manage a connection pool.
 type PlayerStore interface {
 	RecordJoin(ctx context.Context, xuid, gamertag string, at time.Time) (store.Profile, error)
+	Enabled() bool
+}
+
+// KnowledgeStore is the curated-fact surface a plugin may touch. Identical
+// to knowledge.Store today; declared here so the plugin package states its
+// own dependency rather than inheriting whatever that package grows.
+type KnowledgeStore interface {
+	Lookup(ctx context.Context, query string, limit int) ([]knowledge.Entry, error)
+	Get(ctx context.Context, topic string) (knowledge.Entry, bool, error)
+	Upsert(ctx context.Context, topic, body, authorXUID string) error
+	Delete(ctx context.Context, topic string) error
+	List(ctx context.Context) ([]knowledge.Entry, error)
+	Enabled() bool
+}
+
+// WaypointStore is the per-player coordinate surface a plugin may touch.
+// Every method takes the owning XUID: there is no "all waypoints" read,
+// because no command and no tool has a reason for one.
+type WaypointStore interface {
+	Get(ctx context.Context, xuid, name string) (waypoints.Waypoint, bool, error)
+	Set(ctx context.Context, xuid string, wp waypoints.Waypoint) error
+	Delete(ctx context.Context, xuid, name string) error
+	List(ctx context.Context, xuid string) ([]waypoints.Waypoint, error)
 	Enabled() bool
 }
 

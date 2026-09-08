@@ -361,3 +361,15 @@ func TestDispatch_PanicIsCheckedAfterPermission(t *testing.T) {
 		t.Errorf("err = %v, want ErrPermissionDenied", err)
 	}
 }
+
+func TestContextKnowledgeAndWaypointsMayBeNil(t *testing.T) {
+	// The zero Context is what a test or an unconfigured binary hands a
+	// plugin. Reading these fields must not panic; plugins guard.
+	var pctx Context
+	if pctx.Knowledge != nil {
+		t.Error("zero Context.Knowledge should be nil")
+	}
+	if pctx.Waypoints != nil {
+		t.Error("zero Context.Waypoints should be nil")
+	}
+}
