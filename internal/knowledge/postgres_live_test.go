@@ -3,10 +3,9 @@
 // Exercises the real SQL against a real PostgreSQL, as the runtime role.
 //
 // Everything else in this package's tests runs against Nop or pure helpers, so
-// until now no query in postgres.go had ever been executed by the test suite.
-// The permissions bug that left minecraft.players empty in production hid
-// behind exactly that gap: the SQL was never run, so nothing could tell
-// whether it was even correct.
+// no query in postgres.go has ever been executed against a real database: the
+// full-text lookup and the NULL author_xuid handling on Upsert are both
+// unverified until this test runs.
 //
 // Behind a build tag because it needs a database. Run it with:
 //
