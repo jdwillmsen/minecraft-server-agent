@@ -30,11 +30,14 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/config"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/httpapi"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/liveness"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/mcauth"
@@ -53,6 +56,15 @@ const welcomeDelay = 5 * time.Second
 // (e.g. the documented upstream join crash) doesn't cause a reconnect
 // storm at full speed.
 const stableSessionThreshold = 60 * time.Second
+
+// maxConcurrentAnswers caps @server answers in flight across every player.
+//
+// Small on purpose: the backend is one self-hosted model, and beyond a
+// handful of simultaneous exchanges the same throughput simply arrives
+// later, into a chat that has moved on. It also bounds what a coordinated
+// group of players can make this agent spend, which the per-player limiter
+// alone cannot.
+const maxConcurrentAnswers = 3
 
 func main() {
 	cfg, err := config.Load()
@@ -90,6 +102,14 @@ func main() {
 		log.Error("plugin_register_failed", logging.Fields{"plugin": "stats", "error": err.Error()})
 		os.Exit(1)
 	}
+	if err := registry.Register(plugins.NewKnowledge()); err != nil {
+		log.Error("plugin_register_failed", logging.Fields{"plugin": "knowledge", "error": err.Error()})
+		os.Exit(1)
+	}
+	if err := registry.Register(plugins.NewWaypoints()); err != nil {
+		log.Error("plugin_register_failed", logging.Fields{"plugin": "waypoints", "error": err.Error()})
+		os.Exit(1)
+	}
 	welcomePlugin := plugins.NewWelcome(ctx, welcomeDelay, log)
 	if err := registry.Register(welcomePlugin); err != nil {
 		log.Error("plugin_register_failed", logging.Fields{"plugin": "welcome", "error": err.Error()})
@@ -104,22 +124,29 @@ func main() {
 	playerStore := openStore(ctx, cfg, log)
 	defer playerStore.Close()
 
-	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, playerRoster, registry, playerStore)
+	// Both share the profile store's pool rather than opening their own: one
+	// database, one set of connections, and a store that cannot outlive the
+	// pool it borrows.
+	var knowledgeStore knowledge.Store = knowledge.Nop{}
+	var waypointStore waypoints.Store = waypoints.Nop{}
+	if pg, ok := playerStore.(*store.Postgres); ok && pg.Pool() != nil {
+		knowledgeStore = knowledge.NewPostgres(pg.Pool())
+		waypointStore = waypoints.NewPostgres(pg.Pool())
+		log.Info("knowledge_ready", nil)
+	}
+
+	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, playerRoster, registry, playerStore, knowledgeStore, waypointStore)
 	// Every answerable chat message and every roster join is published
 	// here; event-driven plugins (welcome) subscribe via startEventDispatch
 	// rather than touching the connection directly.
 	eventBus := bus.New()
 	limiter := ratelimit.NewPerActor(cfg.CommandRateLimitPerMinute, time.Minute)
-	// A separate budget from commands on purpose: one LLM call costs far more
-	// than one console command, and sharing a limiter would let a burst of
-	// questions starve !help for the same player.
-	ans := answering{
-		limiter: ratelimit.NewPerActor(cfg.AnswerMaxPerMinute, time.Minute),
-		llm: adapters.NewLLMClient(
-			cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMAPIKey,
-			cfg.LLMMaxTokens, time.Duration(cfg.LLMTimeoutMs)*time.Millisecond,
-		),
-	}
+	ans := newAnswering(
+		newLLMClient(cfg, log),
+		cfg.AnswerMaxPerMinute,
+		time.Duration(cfg.LLMTotalTimeoutMs)*time.Millisecond,
+		bridgeTimeout,
+	)
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
 
 	httpServer, err := httpapi.New(cfg.HTTPAddr)
@@ -203,9 +230,6 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 	}
 }
 
-// nextDelay is the reconnect backoff step: a session that stayed up at
-// least stableSessionThreshold is treated as healthy and resets the delay
-// to min, while anything shorter doubles the previous delay up to max.
 // answering bundles what @server handling needs, so enabling this feature
 // costs one parameter on the chat path rather than two on each of five
 // functions. Both live for the process rather than the session: a rate limit
@@ -213,8 +237,50 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 type answering struct {
 	limiter *ratelimit.PerActor
 	llm     *adapters.LLMClient
+	// toolsFor is rebuilt per answer rather than cached: it closes over the
+	// plugin context's capabilities, and which of those are usable can
+	// change while the process runs. The callerScoped it returns belongs to
+	// that one answer and reports whether the model read the asker's own
+	// data -- see buildToolset.
+	toolsFor func(*plugin.Context) (*tools.Registry, *callerScoped)
+	// total bounds one whole answering attempt, tool rounds included.
+	total time.Duration
+	// inFlight is a counting semaphore over answers in progress, capped at
+	// maxConcurrentAnswers.
+	inFlight chan struct{}
+	// broadcast bounds the bridge call that delivers the answer. Carried
+	// here because that call is made on a context detached from shutdown and
+	// so cannot inherit one; it is the operator's configured bridge timeout,
+	// the same value every other bridge call gets.
+	broadcast time.Duration
 }
 
+// newAnswering assembles the answering dependencies.
+//
+// A constructor rather than a struct literal at each site because three of
+// these fields are silently fatal when left zero, and none of them fail
+// where they were forgotten: a nil inFlight channel never accepts a send,
+// so every answer is dropped as busy while the log reports a cap of 0; a
+// zero total cancels each answer the moment it starts; a zero broadcast
+// does the same to the delivery of one already paid for.
+//
+// The limiter is built here too, on a budget separate from commands: one
+// LLM call costs far more than one console command, and sharing a limiter
+// would let a burst of questions starve !help for the same player.
+func newAnswering(llm *adapters.LLMClient, perMinute int, total, broadcast time.Duration) answering {
+	return answering{
+		limiter:   ratelimit.NewPerActor(perMinute, time.Minute),
+		llm:       llm,
+		toolsFor:  buildToolset,
+		total:     total,
+		inFlight:  make(chan struct{}, maxConcurrentAnswers),
+		broadcast: broadcast,
+	}
+}
+
+// nextDelay is the reconnect backoff step: a session that stayed up at
+// least stableSessionThreshold is treated as healthy and resets the delay
+// to min, while anything shorter doubles the previous delay up to max.
 func nextDelay(current, lasted, min, max time.Duration) time.Duration {
 	if lasted >= stableSessionThreshold {
 		return min
@@ -382,15 +448,10 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 	case chat.TriggerCommand:
 		handleCommand(ctx, id, trigger, log, registry, pctx, limiter, permResolver)
 	case chat.TriggerMention:
-		handleMention(ctx, id, trigger, log, pctx, ans, playerRoster)
+		startAnswer(ctx, id, trigger, log, pctx, ans, playerRoster)
 	}
 }
 
-// openStore connects to Postgres if configured, and degrades to Nop if not.
-//
-// Deliberately never returns an error. Every failure here -- unset, malformed,
-// unreachable -- lands the agent in the same supported state it ran in through
-// Stages 1-4: greeting players plainly and answering commands.
 // newPluginContext assembles what every plugin is allowed to reach.
 //
 // A function rather than a struct literal inline in main so the wiring can be
@@ -399,7 +460,7 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 // RecordJoin without reporting anything, and no player arrival was ever
 // persisted. Nothing failed loudly, because the one branch that would have
 // logged is the error path of the call that was not being made.
-func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store) *plugin.Context {
+func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store) *plugin.Context {
 	return &plugin.Context{
 		Voice: adapters.NewBridgeVoice(bridgeClient, playerRoster),
 		Facts: adapters.NewBridgeFacts(bridgeClient),
@@ -414,9 +475,33 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 		// documents Profiles as possibly nil and the plugins guard for it, but
 		// this binary has no reason to hand them one.
 		Profiles: playerStore,
+		// Same reasoning as Profiles: pool-backed when a database is
+		// configured, the disabled implementation when not, never nil.
+		Knowledge: knowledgeStore,
+		Waypoints: waypointStore,
 	}
 }
 
+// newLLMClient builds the one production answering client.
+//
+// A function rather than a literal inline so the logger wiring is testable.
+// Passed a nil logger the client's tool_invocation_failed events go nowhere:
+// a lookup that fails on every question would be invisible to an operator,
+// and the answer path degrades silently by design -- the model just answers
+// around the missing fact.
+func newLLMClient(cfg config.Config, log *logging.Logger) *adapters.LLMClient {
+	return adapters.NewLLMClient(
+		cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMAPIKey,
+		cfg.LLMMaxTokens, time.Duration(cfg.LLMTimeoutMs)*time.Millisecond,
+		log,
+	)
+}
+
+// openStore connects to Postgres if configured, and degrades to Nop if not.
+//
+// Deliberately never returns an error. Every failure here -- unset, malformed,
+// unreachable -- lands the agent in the same supported state it ran in through
+// Stages 1-4: greeting players plainly and answering commands.
 func openStore(ctx context.Context, cfg config.Config, log *logging.Logger) store.Store {
 	dsn := cfg.PostgresDSN()
 	if dsn == "" {
@@ -440,15 +525,15 @@ func openStore(ctx context.Context, cfg config.Config, log *logging.Logger) stor
 	return pg
 }
 
-// handleMention answers an @server question.
+// startAnswer decides whether an @server question is answered, then answers
+// it off the read loop.
 //
-// Everything that makes this safe is upstream or in the prompt rather than
-// here: handleText has already dropped this agent's own messages and its
-// sibling bots' (chat.IsSelfOrSibling), and the system prompt refuses to end a
-// reply with a question. Both matter because the answering AFK bot is still
-// running alongside this agent, and two automated speakers in one chat is the
-// shape of a loop.
-func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, pctx *plugin.Context, ans answering, playerRoster *roster.Roster) {
+// Every refusal is made here, on the caller's goroutine, and each is a mutex
+// or a channel rather than a network call. The rate limiter especially: its
+// budget is per rolling minute, so four questions in one second are four
+// allowed answers, and spawning each one concurrently would interleave four
+// broadcasts. Running inline used to serialise them; nothing else does now.
+func startAnswer(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, pctx *plugin.Context, ans answering, playerRoster *roster.Roster) {
 	if ans.llm == nil || !ans.llm.Enabled() {
 		// Stage 1-3 behaviour, kept as the unconfigured path: detection is
 		// proven, nothing is answered.
@@ -463,6 +548,36 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 		return
 	}
 
+	select {
+	case ans.inFlight <- struct{}{}:
+	default:
+		// Dropped, not queued: an answer that waits for a slot arrives after
+		// the conversation it belongs to has moved on, and the asker has by
+		// then read the silence as the answer.
+		log.Info("mention_answer_dropped_busy", logging.Fields{"actor": actorXUID, "max_concurrent": cap(ans.inFlight)})
+		return
+	}
+
+	// ctx is the process's, not the session's, and deliberately: the reply is
+	// delivered through the console bridge, which is a separate service from
+	// the Bedrock connection, so a reconnect mid-answer does not invalidate
+	// it. ans.total bounds how stale it can be.
+	go func() {
+		defer func() { <-ans.inFlight }()
+		handleMention(ctx, actorXUID, trigger, log, pctx, ans, playerRoster)
+	}()
+}
+
+// handleMention answers one @server question. Its caller has already decided
+// that this question gets answered -- see startAnswer.
+//
+// Everything that makes this safe is upstream or in the prompt rather than
+// here: handleText has already dropped this agent's own messages and its
+// sibling bots' (chat.IsSelfOrSibling), and the system prompt refuses to end a
+// reply with a question. Both matter because the answering AFK bot is still
+// running alongside this agent, and two automated speakers in one chat is the
+// shape of a loop.
+func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, pctx *plugin.Context, ans answering, playerRoster *roster.Roster) {
 	name := actorXUID
 	if playerRoster != nil {
 		if resolved, ok := playerRoster.NameFor(actorXUID); ok && resolved != "" {
@@ -470,7 +585,14 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 		}
 	}
 
-	reply, err := ans.llm.Answer(ctx, name, trigger.Message)
+	// Bounds the attempt end to end. The per-call timeout inside the client
+	// bounds each request, which a model that keeps calling tools can spend
+	// several of.
+	answerCtx, cancel := context.WithTimeout(ctx, ans.total)
+	defer cancel()
+
+	registry, personal := ans.toolsFor(pctx)
+	reply, err := ans.llm.AnswerWithTools(answerCtx, name, actorXUID, trigger.Message, registry)
 	if err != nil {
 		// Logged, never spoken. A backend timeout is an operator's problem,
 		// and narrating it in chat turns one failure into an audience.
@@ -491,11 +613,40 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	// Broadcast rather than whispered: an @server question is asked in public
 	// chat, and an answer only the asker can see reads as no answer at all to
 	// everyone else who watched them ask.
-	if err := pctx.Voice.Say(ctx, reply); err != nil {
-		log.Error("mention_answer_send_failed", logging.Fields{"actor": actorXUID, "error": err.Error()})
+	//
+	// The exception is an answer the model built from the asker's own
+	// waypoints. Those coordinates are personal -- !wp whispers them because
+	// broadcasting where a player lives is a griefing vector -- and they do
+	// not stop being personal because the question reached them through
+	// @server. The console has no player to whisper to, and nothing it asks
+	// about is its own, so it keeps the broadcast.
+	//
+	// Detached from ctx, and bounded by the operator's bridge timeout rather
+	// than a number chosen here: the client applies that same value to every
+	// other call it makes, and a shorter deadline on this one path would be a
+	// configuration knob that silently stops working where it matters most.
+	//
+	// Detached because the answer is already computed and paid for, and
+	// SIGTERM landing in the gap between the backend replying and this line
+	// would otherwise throw it away. This does not outrun the process exit
+	// that follows a signal -- nothing waits for these goroutines -- it only
+	// stops a cancelled context discarding a reply the bridge could still
+	// have delivered.
+	sayCtx, sayCancel := context.WithTimeout(context.WithoutCancel(ctx), ans.broadcast)
+	defer sayCancel()
+
+	private := personal.happened() && actorXUID != chat.ServerOrigin
+	var sendErr error
+	if private {
+		sendErr = pctx.Voice.Tell(sayCtx, actorXUID, reply)
+	} else {
+		sendErr = pctx.Voice.Say(sayCtx, reply)
+	}
+	if sendErr != nil {
+		log.Error("mention_answer_send_failed", logging.Fields{"actor": actorXUID, "error": sendErr.Error()})
 		return
 	}
-	log.Info("mention_answered", logging.Fields{"actor": actorXUID, "reply_chars": len(reply)})
+	log.Info("mention_answered", logging.Fields{"actor": actorXUID, "reply_chars": len(reply), "private": private})
 }
 
 // handlePlayerList updates the live roster from one PlayerList packet and

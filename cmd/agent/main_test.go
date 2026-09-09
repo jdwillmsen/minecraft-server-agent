@@ -1,8 +1,12 @@
 package main
 
 import (
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/jdwillmsen/minecraft-server-agent/internal/config"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
 func TestNextDelay_ResetsAfterAStableSession(t *testing.T) {
@@ -98,4 +102,17 @@ func TestJitter_VariesAcrossCalls(t *testing.T) {
 		}
 	}
 	t.Errorf("jitter(%v) returned %v on 101 consecutive calls; backoff is not randomised", d, first)
+}
+
+// The client keeps its logger optional so every test can build one without
+// wiring, which makes the production omission silent: a client with no
+// logger drops every tool_invocation_failed event, and the only symptom is
+// an answer that quietly lacks a fact. Reaching for the unexported field is
+// the point -- nothing exported reports whether the logger was attached.
+func TestProductionLLMClientLogsToolFailures(t *testing.T) {
+	client := newLLMClient(config.Config{LLMBaseURL: "http://llm.invalid"}, logging.New("info"))
+
+	if reflect.ValueOf(client).Elem().FieldByName("log").IsNil() {
+		t.Error("the production LLM client has no logger: failed tool invocations would be dropped")
+	}
 }

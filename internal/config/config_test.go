@@ -12,6 +12,7 @@ func clearEnv(t *testing.T) {
 		"RECONNECT_MIN_MS", "RECONNECT_MAX_MS", "HTTP_ADDR", "AUTH_CACHE_DIR",
 		"COMMAND_RATE_LIMIT_PER_MINUTE", "LOG_LEVEL",
 		"CONSOLE_BRIDGE_URL", "CONSOLE_BRIDGE_TOKEN", "CONSOLE_BRIDGE_TIMEOUT_MS",
+		"LLM_MAX_TOKENS", "LLM_TIMEOUT_MS", "LLM_TOTAL_TIMEOUT_MS",
 	} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
@@ -216,5 +217,24 @@ func TestLoad_HostAndUsernameAreTrimmed(t *testing.T) {
 	}
 	if cfg.MCUsername != "agent-bot" {
 		t.Errorf("MCUsername = %q, want trimmed", cfg.MCUsername)
+	}
+}
+
+func TestLoad_LLMAnswerBudgetDefaults(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// At least (MaxToolRounds + 1) x LLM_TIMEOUT_MS, with margin: three
+	// sequential 8s calls fit in the shipped default, and a model that uses
+	// both tool rounds still gets to answer.
+	if cfg.LLMTotalTimeoutMs != 30000 {
+		t.Errorf("LLMTotalTimeoutMs = %d, want 30000", cfg.LLMTotalTimeoutMs)
+	}
+	if cfg.LLMMaxTokens != 192 {
+		t.Errorf("LLMMaxTokens = %d, want 192 -- 96 cannot hold tool arguments plus an answer", cfg.LLMMaxTokens)
 	}
 }

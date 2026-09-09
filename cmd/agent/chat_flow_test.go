@@ -1,25 +1,32 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/sandertv/gophertunnel/minecraft/protocol"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
@@ -78,6 +85,10 @@ const (
 	playerXUID = "2535412345678901"
 	selfXUID   = "2535499999999999"
 	siblingBot = "2535488888888888"
+	// bystanderXUID joins and leaves in the background of the concurrency
+	// tests, so the roster is being written while an answer reads it.
+	bystanderXUID   = "2535477777777777"
+	otherPlayerXUID = "2535466666666666"
 )
 
 func newHarness(t *testing.T) (*plugin.Registry, *plugin.Context, *recordingVoice, *bus.Bus, <-chan bus.Event, *roster.Roster, *adapters.PermissionResolver) {
@@ -299,12 +310,420 @@ func TestChatMessagePublishedOnBus(t *testing.T) {
 	}
 }
 
+// stubWaypoints is an enabled waypoint store, so the answer path under test
+// actually offers and runs a tool rather than a bare completion.
+type stubWaypoints struct {
+	waypoints.Nop
+	mu      sync.Mutex
+	callers []string
+}
+
+func (w *stubWaypoints) Enabled() bool { return true }
+
+func (w *stubWaypoints) List(_ context.Context, xuid string) ([]waypoints.Waypoint, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.callers = append(w.callers, xuid)
+	return []waypoints.Waypoint{{Name: "base"}}, nil
+}
+
+func (w *stubWaypoints) seen() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.callers...)
+}
+
+// heldBackend is an LLM backend that reports when a request arrives and
+// serves it only once the test releases it, so a test can assert what is
+// true while an answer is in flight.
+type heldBackend struct {
+	srv      *httptest.Server
+	arrived  chan struct{}
+	release  chan struct{}
+	served   sync.Once
+	mu       sync.Mutex
+	requests int
+}
+
+// serve releases every held request. Idempotent, because it is both what a
+// test calls to let an answer through and what cleanup calls to make sure a
+// failed assertion does not leave a handler parked -- httptest.Server.Close
+// waits for outstanding requests, so a test that gave up while holding one
+// would hang instead of failing.
+func (b *heldBackend) serve() { b.served.Do(func() { close(b.release) }) }
+
+// newHeldBackend replies with replies[n] to the n-th request, repeating the
+// last one thereafter.
+func newHeldBackend(t *testing.T, replies ...string) *heldBackend {
+	t.Helper()
+	b := &heldBackend{arrived: make(chan struct{}, 8), release: make(chan struct{})}
+	b.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b.mu.Lock()
+		n := b.requests
+		b.requests++
+		b.mu.Unlock()
+
+		b.arrived <- struct{}{}
+		<-b.release
+		if n >= len(replies) {
+			n = len(replies) - 1
+		}
+		w.Write([]byte(replies[n]))
+	}))
+	// Registered after the server's own cleanup so it runs before it: LIFO.
+	t.Cleanup(b.srv.Close)
+	t.Cleanup(b.serve)
+	return b
+}
+
+func (b *heldBackend) count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.requests
+}
+
+const (
+	waypointListCall = `{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"waypoint_list","arguments":"{}"}}]}}]}`
+	beaconAnswer     = `{"choices":[{"message":{"content":"Your base waypoint is saved."}}]}`
+)
+
+// captureStdout returns everything fn writes to stdout, which is where the
+// logger puts info-level events. A logger captures its writers at
+// construction, so any logger whose output matters must be built inside fn.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe: %v", err)
+	}
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	return buf.String()
+}
+
+// waitForOutput polls the recorded voice until something was said.
+func waitForOutput(t *testing.T, voice *recordingVoice) []string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if got := voice.output(); len(got) > 0 {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("nothing was ever said")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A mention is answered on its own goroutine. Held at the backend so the
+// assertion is about ordering rather than speed: while the answer is still in
+// flight the read loop has already returned and is handling further packets,
+// which is what the inline version could not do.
+//
+// The whole exchange runs concurrently with a stream of PlayerList packets:
+// the answer resolves the asker's gamertag from the same roster those packets
+// rewrite, and the tool round reads a store the read loop can also reach, so
+// this is the shared state the goroutine actually exposes.
+func TestMentionIsAnsweredWithoutBlockingTheReadLoop(t *testing.T) {
+	backend := newHeldBackend(t, waypointListCall, beaconAnswer)
+	registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
+	waypointStore := &stubWaypoints{}
+	pctx.Waypoints = waypointStore
+	log := logging.New("info")
+	ans := testAnswering()
+	ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
+
+	// Paced rather than spun: the roster write is the point, one every few
+	// milliseconds proves it, and an unthrottled loop only buys a core's
+	// worth of CPU and tens of thousands of join/leave log lines.
+	var churns atomic.Int64
+	churnDone := make(chan struct{})
+	churnStop := make(chan struct{})
+	go func() {
+		defer close(churnDone)
+		for i := 0; ; i++ {
+			select {
+			case <-churnStop:
+				return
+			case <-time.After(time.Millisecond):
+			}
+			pk := &packet.PlayerList{Entries: []protocol.PlayerListEntry{addEntry(playerXUID, "Steve"), addEntry(bystanderXUID, "Alex")}}
+			if i%2 == 1 {
+				pk = &packet.PlayerList{Entries: []protocol.PlayerListEntry{removeEntry(bystanderXUID)}}
+			}
+			handlePacket(context.Background(), pk, selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+			churns.Add(1)
+		}
+	}()
+
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server where is my base"),
+		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+
+	<-backend.arrived
+	if got := voice.output(); len(got) != 0 {
+		t.Fatalf("the read loop waited for the backend: %v", got)
+	}
+
+	// The answer is parked at the backend, so anything the churn does now is
+	// a roster write concurrent with an answer in flight. Waiting for two of
+	// them is what makes that a fact of this run rather than a hope.
+	held := churns.Load()
+	deadline := time.Now().Add(5 * time.Second)
+	for churns.Load() < held+2 {
+		if time.Now().After(deadline) {
+			t.Fatal("no roster write happened while the answer was in flight")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	backend.serve()
+
+	said := waitForOutput(t, voice)
+	close(churnStop)
+	<-churnDone
+
+	if want := "tell " + playerXUID + ": Your base waypoint is saved."; said[0] != want {
+		t.Errorf("answer = %q, want %q -- it was built from the asker's own waypoints", said[0], want)
+	}
+	if seen := waypointStore.seen(); len(seen) != 1 || seen[0] != playerXUID {
+		t.Errorf("waypoint_list callers = %v, want exactly the asker", seen)
+	}
+	if n := backend.count(); n != 2 {
+		t.Errorf("backend calls = %d, want 2 (the tool round and the answer)", n)
+	}
+}
+
+// The per-player limiter is a rolling-minute budget, so it cannot bound how
+// many answers run at once -- four questions in one second are four allowed
+// answers. Without a global cap those became four concurrent exchanges
+// against one small backend and four interleaved broadcasts.
+func TestMentionIsDroppedWhenTheAgentIsAlreadyBusy(t *testing.T) {
+	backend := newHeldBackend(t, beaconAnswer)
+	registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
+
+	out := captureStdout(t, func() {
+		log := logging.New("info")
+		ans := testAnswering()
+		ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
+		// One slot, so the second question meets a full agent rather than
+		// waiting on a real backend to be slow.
+		ans.inFlight = make(chan struct{}, 1)
+
+		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server first"),
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+		<-backend.arrived
+
+		// A different player, so the per-player limiter has nothing to say
+		// about this one: only the global cap can refuse it.
+		handlePacket(context.Background(), chatPacket(otherPlayerXUID, "Alex", "@server second"),
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+
+		backend.serve()
+		waitForOutput(t, voice)
+	})
+
+	if !strings.Contains(out, `"event":"mention_answer_dropped_busy"`) {
+		t.Errorf("stdout = %q, want a mention_answer_dropped_busy event", out)
+	}
+	if n := backend.count(); n != 1 {
+		t.Errorf("backend calls = %d, want 1 -- the dropped answer reached the model anyway", n)
+	}
+	if got := voice.output(); len(got) != 1 {
+		t.Errorf("broadcasts = %v, want only the answer that held the slot", got)
+	}
+}
+
+// The limiter has to run before the spawn, not inside it. Proved by which
+// refusal is logged: the slot is already taken by the held answer, so a
+// startAnswer that acquired the semaphore first would report this as a busy
+// agent instead of a rate-limited player.
+func TestRateLimitedMentionIsRefusedBeforeAGoroutineExists(t *testing.T) {
+	backend := newHeldBackend(t, beaconAnswer)
+	registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
+
+	out := captureStdout(t, func() {
+		log := logging.New("info")
+		ans := testAnswering()
+		ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
+		ans.limiter = ratelimit.NewPerActor(1, time.Minute)
+		ans.inFlight = make(chan struct{}, 1)
+
+		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server first"),
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+		<-backend.arrived
+
+		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server second"),
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+
+		backend.serve()
+		waitForOutput(t, voice)
+	})
+
+	if !strings.Contains(out, `"event":"mention_rate_limited"`) {
+		t.Errorf("stdout = %q, want a mention_rate_limited event", out)
+	}
+	if strings.Contains(out, `"event":"mention_answer_dropped_busy"`) {
+		t.Errorf("stdout = %q: the concurrency cap answered before the rate limiter did", out)
+	}
+	if n := backend.count(); n != 1 {
+		t.Errorf("backend calls = %d, want 1 -- the rate-limited question reached the model anyway", n)
+	}
+}
+
+// broadcastVoice inspects the context an answer is broadcast on: the deadline
+// it carries, and whether cancelling the process context reaches it.
+type broadcastVoice struct {
+	recordingVoice
+	onSay  func()
+	mu     sync.Mutex
+	budget time.Duration
+	err    error
+}
+
+func (v *broadcastVoice) Say(ctx context.Context, message string) error {
+	if v.onSay != nil {
+		v.onSay()
+	}
+	v.mu.Lock()
+	if deadline, ok := ctx.Deadline(); ok {
+		v.budget = time.Until(deadline)
+	}
+	v.err = ctx.Err()
+	v.mu.Unlock()
+	return v.recordingVoice.Say(ctx, message)
+}
+
+func (v *broadcastVoice) observed() (time.Duration, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.budget, v.err
+}
+
+// answerOnce drives one mention to completion against a backend that replies
+// immediately, and returns what the voice saw.
+func answerOnce(t *testing.T, ctx context.Context, voice *broadcastVoice, adjust func(*answering)) {
+	t.Helper()
+	backend := newHeldBackend(t, beaconAnswer)
+	backend.serve()
+
+	registry, pctx, _, eventBus, _, playerRoster, permResolver := newHarness(t)
+	pctx.Voice = voice
+	log := logging.New("info")
+	ans := testAnswering()
+	ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
+	adjust(&ans)
+
+	handlePacket(ctx, chatPacket(playerXUID, "Steve", "@server hello"),
+		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+	waitForOutput(t, &voice.recordingVoice)
+}
+
+// The bridge client bounds every call it makes by CONSOLE_BRIDGE_TIMEOUT_MS,
+// and takes the tighter of that and its caller's deadline. A deadline chosen
+// here instead would therefore be the one that applies, and raising the
+// configured value to rescue a slow bridge would fix every path except the one
+// carrying an answer that has already been paid for.
+func TestAnswerBroadcastUsesTheConfiguredBridgeTimeout(t *testing.T) {
+	const configured = 9 * time.Second
+	voice := &broadcastVoice{}
+
+	answerOnce(t, context.Background(), voice, func(ans *answering) { ans.broadcast = configured })
+
+	budget, _ := voice.observed()
+	if budget <= configured-time.Second || budget > configured {
+		t.Errorf("broadcast deadline = %v, want the configured %v", budget, configured)
+	}
+}
+
+// A SIGTERM landing between the model replying and the broadcast must not
+// discard an answer the bridge could still deliver.
+func TestAnswerBroadcastSurvivesACancelledProcessContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Cancelled from inside Say, which is the exact gap being defended:
+	// cancel propagates to every derived context before it returns, so a
+	// broadcast context that was not detached would already be done here.
+	voice := &broadcastVoice{onSay: cancel}
+
+	answerOnce(t, ctx, voice, func(ans *answering) { ans.broadcast = 5 * time.Second })
+
+	if _, err := voice.observed(); err != nil {
+		t.Errorf("broadcast context was already %v: shutdown discarded a computed answer", err)
+	}
+}
+
 // testAnswering supplies the chat path's answering dependencies with no LLM
 // backend configured, which is both what these command-path tests need and the
 // production behaviour when LLM_BASE_URL is unset.
 func testAnswering() answering {
-	return answering{
-		limiter: ratelimit.NewPerActor(4, time.Minute),
-		llm:     adapters.NewLLMClient("", "", "", 96, time.Second),
+	return newAnswering(adapters.NewLLMClient("", "", "", 192, time.Second, nil), 4, 20*time.Second, 5*time.Second)
+}
+
+// stubKnowledge is an enabled fact store, so an answer can be built from a
+// tool that reads nothing belonging to the asker.
+type stubKnowledge struct{ knowledge.Nop }
+
+func (stubKnowledge) Enabled() bool { return true }
+
+func (stubKnowledge) Lookup(context.Context, string, int) ([]knowledge.Entry, error) {
+	return []knowledge.Entry{{Topic: "rules", Body: "be nice"}}, nil
+}
+
+const (
+	knowledgeLookupCall = `{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"knowledge_lookup","arguments":"{\"query\":\"rules\"}"}}]}}]}`
+	rulesAnswer         = `{"choices":[{"message":{"content":"Be nice to each other."}}]}`
+)
+
+// answerMention drives one @server question to completion against a backend
+// that answers the n-th call with replies[n], and returns what the voice
+// recorded.
+func answerMention(t *testing.T, configure func(*plugin.Context), replies ...string) []string {
+	t.Helper()
+	backend := newHeldBackend(t, replies...)
+	backend.serve()
+
+	registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
+	configure(pctx)
+	log := logging.New("info")
+	ans := testAnswering()
+	ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
+
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server where is my base"),
+		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+	return waitForOutput(t, voice)
+}
+
+// Coordinates are personal. !wp whispers them because broadcasting where
+// someone lives is a griefing vector, and the same coordinates read out of
+// the same store by the answer path are no less personal for having been
+// asked for in public.
+func TestAnswerBuiltFromTheAskersOwnDataIsWhispered(t *testing.T) {
+	said := answerMention(t, func(pctx *plugin.Context) { pctx.Waypoints = &stubWaypoints{} },
+		waypointListCall, beaconAnswer)
+
+	want := "tell " + playerXUID + ": Your base waypoint is saved."
+	if said[0] != want {
+		t.Errorf("answer = %q, want %q", said[0], want)
+	}
+}
+
+// Every other answer stays public: an @server question is asked in front of
+// everyone, and an answer only the asker sees reads to the rest of them as
+// no answer at all.
+func TestAnswerFromSharedKnowledgeIsStillBroadcast(t *testing.T) {
+	said := answerMention(t, func(pctx *plugin.Context) { pctx.Knowledge = stubKnowledge{} },
+		knowledgeLookupCall, rulesAnswer)
+
+	if said[0] != "say: Be nice to each other." {
+		t.Errorf("answer = %q, want it broadcast to everyone who saw the question", said[0])
 	}
 }
