@@ -103,13 +103,9 @@ func runWP(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (st
 			return "I cannot tell where the name ends and the coordinates begin: drop the extra number and try again.", nil
 		}
 
-		coords := make([]int, 3)
-		for i, raw := range coordTokens {
-			n, err := parseCoord(raw)
-			if err != nil {
-				return "Coordinates must be whole numbers: " + raw + " is not a number.", nil
-			}
-			coords[i] = n
+		x, y, z, reply := resolveCoordinates([3]string{coordTokens[0], coordTokens[1], coordTokens[2]})
+		if reply != "" {
+			return reply, nil
 		}
 
 		name := strings.Join(nameTokens, " ")
@@ -118,7 +114,7 @@ func runWP(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (st
 		}
 
 		wp := waypoints.Waypoint{
-			Name: name, X: coords[0], Y: coords[1], Z: coords[2], Dimension: dimension,
+			Name: name, X: x, Y: y, Z: z, Dimension: dimension,
 		}
 		if err := pctx.Waypoints.Set(ctx, inv.ActorXUID, wp); err != nil {
 			if errors.Is(err, waypoints.ErrUnknownDimension) {
@@ -159,31 +155,114 @@ func runWP(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (st
 	}
 }
 
-// stripCoordPrefix strips a leading "x=", "y=" or "z=" (case-insensitive)
-// from a coordinate token, matching the form Minecraft's own F3 coordinate
-// display uses. Not tied to axis -- a player pasting from that screen can
-// mix which coordinate keeps its letter, and rejecting a mismatched letter
-// a human would never notice is not a safety net worth building.
-func stripCoordPrefix(s string) string {
+// splitCoordLabel splits a leading "x=", "y=" or "z=" (case-insensitive)
+// off a coordinate token, matching the form Minecraft's own F3 coordinate
+// display uses. label is 0 when s carries no such prefix.
+func splitCoordLabel(s string) (label byte, rest string) {
 	if len(s) >= 2 {
 		switch s[0] {
-		case 'x', 'X', 'y', 'Y', 'z', 'Z':
+		case 'x', 'X':
 			if s[1] == '=' {
-				return s[2:]
+				return 'x', s[2:]
+			}
+		case 'y', 'Y':
+			if s[1] == '=' {
+				return 'y', s[2:]
+			}
+		case 'z', 'Z':
+			if s[1] == '=' {
+				return 'z', s[2:]
 			}
 		}
 	}
-	return s
+	return 0, s
 }
 
 // parseCoord parses a coordinate token that may carry the "x="/"y="/"z="
-// prefix stripCoordPrefix understands. Every place that needs to know
-// whether a token is coordinate-shaped -- the name/coordinate boundary
-// detection and the ambiguity guard right below it in the "set" case above
-// -- goes through this one function, so a prefixed token reads as numeric
-// consistently everywhere rather than in some checks and not others.
+// prefix splitCoordLabel understands, without regard for which letter it
+// is. Every place that needs to know whether a token is coordinate-shaped
+// at all -- the name/coordinate boundary detection and the ambiguity guard
+// right below it in the "set" case above -- goes through this one
+// function, so a prefixed token reads as numeric consistently everywhere.
+// Which axis a label names only matters once resolveCoordinates decides the
+// three coordinate tokens are worth reading as labels in the first place.
 func parseCoord(s string) (int, error) {
-	return strconv.Atoi(stripCoordPrefix(s))
+	_, rest := splitCoordLabel(s)
+	return strconv.Atoi(rest)
+}
+
+// ambiguousCoordLabelsReply is returned by resolveCoordinates when the
+// three coordinate tokens carry labels that don't resolve safely -- see
+// its doc comment for what "safely" means here.
+const ambiguousCoordLabelsReply = "I can't tell which number is x, y, or z: label all three, e.g. x=1 y=2 z=3, or give three plain numbers in x y z order."
+
+// resolveCoordinates turns the three tokens !wp set identified as
+// coordinates into x, y and z. reply is empty on success; on failure it is
+// the chat line to send back, and x, y, z are meaningless.
+//
+// Three cases, matched to how confident position alone can be:
+//
+//   - No token is labelled: read positionally, exactly as this command
+//     always has. This is the overwhelming common case.
+//   - All three tokens are labelled and the labels are exactly x, y and z
+//     in some order: the labels decide, not position. A player reading
+//     coordinates off Minecraft's own F3 display can copy them down in
+//     whatever order the game shows them, and there is only one way to
+//     read three distinct axis labels.
+//   - Anything else -- a duplicate label, a label on only some of the
+//     tokens -- is refused rather than guessed. Silently assigning a
+//     labelled y to the x slot, or guessing which axis an unlabelled token
+//     next to a labelled one belongs to, is the same silent wrong-place
+//     failure the ambiguity guard above already exists to prevent; a
+//     player who has gone to the trouble of labelling anything deserves an
+//     exact read, not a best effort.
+func resolveCoordinates(tokens [3]string) (x, y, z int, reply string) {
+	var labels [3]byte
+	labelCount := 0
+	for i, t := range tokens {
+		if l, _ := splitCoordLabel(t); l != 0 {
+			labels[i] = l
+			labelCount++
+		}
+	}
+
+	switch labelCount {
+	case 0:
+		vals := [3]int{}
+		for i, t := range tokens {
+			n, err := strconv.Atoi(t)
+			if err != nil {
+				return 0, 0, 0, "Coordinates must be whole numbers: " + t + " is not a number."
+			}
+			vals[i] = n
+		}
+		return vals[0], vals[1], vals[2], ""
+
+	case 3:
+		seen := map[byte]bool{}
+		for _, l := range labels {
+			if seen[l] {
+				return 0, 0, 0, ambiguousCoordLabelsReply
+			}
+			seen[l] = true
+		}
+		if !seen['x'] || !seen['y'] || !seen['z'] {
+			return 0, 0, 0, ambiguousCoordLabelsReply
+		}
+		byAxis := map[byte]int{}
+		for i, t := range tokens {
+			_, num := splitCoordLabel(t)
+			n, err := strconv.Atoi(num)
+			if err != nil {
+				return 0, 0, 0, "Coordinates must be whole numbers: " + t + " is not a number."
+			}
+			byAxis[labels[i]] = n
+		}
+		return byAxis['x'], byAxis['y'], byAxis['z'], ""
+
+	default:
+		return 0, 0, 0, ambiguousCoordLabelsReply
+	}
 }
 
 // waypointListEntry formats one waypoint for !wp's summary line. The

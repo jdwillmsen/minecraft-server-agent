@@ -389,17 +389,19 @@ func TestWPSetAcceptsMinecraftCoordinateDisplayForm(t *testing.T) {
 	}
 }
 
-// Mixed forms -- some coordinates carry the display's letter, some don't --
-// must resolve to the same coordinates as either pure form. Case is not
-// significant either.
-func TestWPSetAcceptsMixedCaseAndMixedCoordinateForms(t *testing.T) {
+// A player reading coordinates off Minecraft's own F3 display can copy them
+// down in a different order than x y z. When every token is labelled and
+// the labels are exactly x, y and z, the labels decide which number is
+// which, not position -- that is unambiguous, so guessing anything else
+// here would be pedantry, not safety.
+func TestWPSetLabelledPermutationOutOfOrderRoundTrips(t *testing.T) {
 	cmd := wpCommand(t)
 	fake := newFakeWaypoints()
 	pctx := &plugin.Context{Waypoints: fake}
 
 	if _, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
 		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
-		Args: []string{"set", "base", "X=180", "68", "Z=268"},
+		Args: []string{"set", "base", "y=68", "x=180", "z=260"},
 	}); err != nil {
 		t.Fatalf("set: %v", err)
 	}
@@ -407,8 +409,80 @@ func TestWPSetAcceptsMixedCaseAndMixedCoordinateForms(t *testing.T) {
 	if !ok {
 		t.Fatal("base was not saved")
 	}
-	if wp.X != 180 || wp.Y != 68 || wp.Z != 268 {
-		t.Errorf("wp = %+v, want X=180 Y=68 Z=268", wp)
+	if wp.X != 180 || wp.Y != 68 || wp.Z != 260 {
+		t.Errorf("wp = %+v, want X=180 Y=68 Z=260", wp)
+	}
+}
+
+// A duplicated label (two "x="s, no "y=" anywhere) is not a permutation of
+// x, y, z even though all three tokens are labelled, and there is no
+// reading of it that is obviously what the player meant.
+func TestWPSetDuplicatedCoordinateLabelIsRefused(t *testing.T) {
+	cmd := wpCommand(t)
+	fake := newFakeWaypoints()
+	pctx := &plugin.Context{Waypoints: fake}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"set", "base", "x=180", "x=68", "z=260"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if _, ok := fake.byOwner["a"]["base"]; ok {
+		t.Fatal("a duplicated-label set was stored anyway")
+	}
+	if strings.Contains(strings.ToLower(reply), "saved") {
+		t.Errorf("reply %q claims a save that must not have happened", reply)
+	}
+}
+
+// Some coordinates labelled and some not -- even when the labelled ones sit
+// in their own slot -- is not the same as every token being labelled, and
+// guessing which axis the bare token belongs to is exactly the silent
+// wrong-place failure this parser already has scars from. Refuse rather
+// than guess.
+func TestWPSetPartiallyLabelledCoordinatesAreRefused(t *testing.T) {
+	cmd := wpCommand(t)
+	fake := newFakeWaypoints()
+	pctx := &plugin.Context{Waypoints: fake}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"set", "base", "X=180", "68", "Z=268"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if _, ok := fake.byOwner["a"]["base"]; ok {
+		t.Fatal("a partially-labelled set was stored anyway")
+	}
+	if strings.Contains(strings.ToLower(reply), "saved") {
+		t.Errorf("reply %q claims a save that must not have happened", reply)
+	}
+}
+
+// A single label sitting on the wrong slot ("z=260" first) with the other
+// two tokens bare is the same partial-labelling case as above, just with
+// the labelled token out of position rather than in it -- neither reading
+// is safe to guess.
+func TestWPSetPartiallyLabelledOutOfPositionIsRefused(t *testing.T) {
+	cmd := wpCommand(t)
+	fake := newFakeWaypoints()
+	pctx := &plugin.Context{Waypoints: fake}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"set", "base", "z=260", "68", "180"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if _, ok := fake.byOwner["a"]["base"]; ok {
+		t.Fatal("a partially-labelled set was stored anyway")
+	}
+	if strings.Contains(strings.ToLower(reply), "saved") {
+		t.Errorf("reply %q claims a save that must not have happened", reply)
 	}
 }
 
