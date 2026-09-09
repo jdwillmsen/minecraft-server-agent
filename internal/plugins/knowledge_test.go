@@ -113,6 +113,48 @@ func TestKBSetThenGet(t *testing.T) {
 	}
 }
 
+// A fallback-only match (ts_rank 0, found by substring alone rather than
+// full-text) is a guess, not a lookup of the topic the player actually
+// meant, and !kb must say so rather than state it with the same confidence
+// as a real answer.
+func TestKBHedgesAFallbackOnlyMatch(t *testing.T) {
+	cmd := kbCommand(t)
+	fake := newFakeKnowledge()
+	fake.entries["weather"] = knowledge.Entry{
+		Topic: "weather", Body: "ask an operator", Matched: knowledge.MatchFallback,
+	}
+	pctx := &plugin.Context{Knowledge: fake}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "visitor", ActorPermission: plugin.PermissionVisitor,
+		Args: []string{"weather"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(reply, "Closest I have is") {
+		t.Errorf("reply = %q, want it to hedge a fallback-only match", reply)
+	}
+}
+
+func TestKBDoesNotHedgeAConfirmedMatch(t *testing.T) {
+	cmd := kbCommand(t)
+	fake := newFakeKnowledge()
+	fake.entries["rules"] = knowledge.Entry{Topic: "rules", Body: "be nice"}
+	pctx := &plugin.Context{Knowledge: fake}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "visitor", ActorPermission: plugin.PermissionVisitor,
+		Args: []string{"rules"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.Contains(reply, "Closest I have is") {
+		t.Errorf("reply = %q, a confirmed match should not be hedged", reply)
+	}
+}
+
 func TestKBWithoutStore(t *testing.T) {
 	cmd := kbCommand(t)
 	reply, err := cmd.Run(context.Background(), &plugin.Context{}, plugin.Invocation{

@@ -8,6 +8,7 @@ import (
 
 	"sync/atomic"
 
+	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
 )
@@ -81,7 +82,16 @@ func buildToolset(pctx *plugin.Context) (*tools.Registry, *callerScoped) {
 				}
 				parts := make([]string, 0, len(entries))
 				for _, e := range entries {
-					parts = append(parts, e.Topic+": "+e.Body)
+					line := e.Topic + ": " + e.Body
+					// A fallback-only match has no full-text overlap with
+					// the query at all -- flagged here rather than left
+					// looking identical to a confirmed hit, so the model
+					// doesn't state someone else's fact as a settled answer
+					// to this question.
+					if e.Matched == knowledge.MatchFallback {
+						line = "possible match, " + line
+					}
+					parts = append(parts, line)
 				}
 				return strings.Join(parts, " | "), nil
 			},

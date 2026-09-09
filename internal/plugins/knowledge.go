@@ -106,6 +106,15 @@ func runKB(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (st
 		if len(entries) == 0 {
 			return "I don't know anything about " + query + ".", nil
 		}
-		return entries[0].Topic + ": " + entries[0].Body, nil
+		// A fallback-only match (ts_rank 0, found by substring alone) is a
+		// guess, not a lookup by the topic the player actually meant --
+		// stating it as fact the way an exact or full-text hit deserves
+		// would hand a player an unrelated fact with the same confidence as
+		// a real answer.
+		e := entries[0]
+		if e.Matched == knowledge.MatchFallback {
+			return "Closest I have is " + e.Topic + ": " + e.Body, nil
+		}
+		return e.Topic + ": " + e.Body, nil
 	}
 }
