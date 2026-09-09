@@ -369,7 +369,13 @@ func TestWPListManyWaypointsStaysWithinReplyCapAndSummarizes(t *testing.T) {
 // A player typing "!wp set base x=180 y=68 z=268" is pasting exactly what
 // Minecraft's own coordinate display shows them -- that form must be
 // accepted, not just the bare numbers.
-func TestWPSetAcceptsMinecraftCoordinateDisplayForm(t *testing.T) {
+//
+// The labels here are already in x, y, z order, so this alone does not
+// prove labels are read as labels rather than just stripped and read
+// positionally -- it would pass identically under either implementation.
+// TestWPSetLabelledPermutationOutOfOrderRoundTrips below is the test that
+// actually guards the label-order regression.
+func TestWPSetAcceptsMinecraftCoordinateDisplayFormAlreadyInOrder(t *testing.T) {
 	cmd := wpCommand(t)
 	fake := newFakeWaypoints()
 	pctx := &plugin.Context{Waypoints: fake}
