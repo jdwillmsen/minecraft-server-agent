@@ -62,3 +62,55 @@ func TestPostgresRoundTrip(t *testing.T) {
 		t.Fatal("Lookup found nothing for a topic that exists")
 	}
 }
+
+// TestLookupFindsCompoundTopicByAnyPhrasing reproduces the bug reported
+// against production: an operator wrote a fact under a single compound
+// word ("goldfarm"), and every plausible way a player might ask for it --
+// the bare topic, the topic spaced into two words, and either of those with
+// extra words tacked on -- came back "no record found" even though the row
+// was there the whole time. It also checks the inverse: a query sharing no
+// word and no substring with the topic must still find nothing, so the fix
+// is a real match, not "return everything".
+func TestLookupFindsCompoundTopicByAnyPhrasing(t *testing.T) {
+	ctx := context.Background()
+	s := NewPostgres(livePool(t))
+	topic := "__test goldfarm"
+	t.Cleanup(func() { _, _ = s.Delete(ctx, topic) })
+
+	if err := s.Upsert(ctx, topic, "It is at x=232 y=89 z=275", ""); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	matching := []string{
+		"goldfarm",
+		"gold farm",
+		"goldfarm location",
+		"gold farm location",
+	}
+	for _, q := range matching {
+		entries, err := s.Lookup(ctx, q, 3)
+		if err != nil {
+			t.Fatalf("Lookup(%q): %v", q, err)
+		}
+		if !containsTopic(entries, topic) {
+			t.Errorf("Lookup(%q) did not find %q", q, topic)
+		}
+	}
+
+	entries, err := s.Lookup(ctx, "zzznonexistentqueryzzz", 3)
+	if err != nil {
+		t.Fatalf("Lookup(nonsense query): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("Lookup(nonsense query) = %v, want no results", entries)
+	}
+}
+
+func containsTopic(entries []Entry, topic string) bool {
+	for _, e := range entries {
+		if e.Topic == topic {
+			return true
+		}
+	}
+	return false
+}

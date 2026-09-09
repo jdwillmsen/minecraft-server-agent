@@ -61,7 +61,10 @@ func buildToolset(pctx *plugin.Context) (*tools.Registry, *callerScoped) {
 		list = append(list, tools.Tool{
 			Name:        "knowledge_lookup",
 			Description: "Look up what this server's operators have recorded about a topic: rules, farm locations, build sites.",
-			Schema:      json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"What to look up"}},"required":["query"]}`),
+			// A short, topic-like query ("gold farm") matches best, but the
+			// search also matches on any word in a longer phrase, so a
+			// query that repeats the player's whole question still works.
+			Schema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"What to look up. A short topic works best, e.g. 'gold farm', but a longer phrase also matches."}},"required":["query"]}`),
 			Invoke: func(ctx context.Context, args json.RawMessage, _ string) (string, error) {
 				var a struct {
 					Query string `json:"query"`
