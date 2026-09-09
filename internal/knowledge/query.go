@@ -13,25 +13,55 @@ import (
 // avoid rather than cause.
 const minFallbackTokenLen = 3
 
+// fallbackStopwords holds common short English function words that clear
+// minFallbackTokenLen despite carrying no topic-identifying meaning. "the"
+// is a substring of "nether", "weather", "feather" and "gather" -- all
+// plausible Minecraft topics -- so without this list a question like
+// "where is the nether portal" can substring-match a completely unrelated
+// topic, and !kb states the top result as fact with no hedge for anything
+// but a fallback-only match.
+//
+// This is deliberately a curated word list, not a lower length floor: "tnt"
+// and "end" are exactly three characters and real topic words on this kind
+// of server, so raising minFallbackTokenLen to exclude "the" would throw
+// them out too. The two mechanisms guard against different things -- the
+// floor against short fragments in general, this list against specific
+// words that are long enough to pass the floor but still meaningless -- and
+// collapsing them into one loses the "tnt"/"end" case. Do not "simplify"
+// this list away in favor of a taller floor.
+var fallbackStopwords = map[string]bool{
+	"the": true, "and": true, "for": true, "are": true, "was": true,
+	"were": true, "how": true, "any": true, "but": true, "not": true,
+	"all": true, "can": true, "has": true, "had": true, "that": true,
+	"this": true, "with": true, "from": true, "will": true, "what": true,
+	"when": true, "where": true, "who": true, "why": true, "does": true,
+	"did": true, "been": true, "being": true, "into": true, "than": true,
+	"then": true, "they": true, "them": true, "their": true, "there": true,
+	"here": true, "its": true, "our": true, "out": true, "you": true,
+	"your": true,
+}
+
 // queryTokens breaks a normalized lookup query into the words used to build
 // both the full-text search and the substring fallback in Lookup.
 //
-// Each token is trimmed of leading/trailing punctuation rather than split
-// on it: the query reaching Lookup can be a whole question forwarded
-// verbatim by the model ("wheres the goldfarm?"), and a stray "?" stuck to
-// "farm?" would quietly defeat both the OR'd tsquery and the substring
-// fallback below, while an internal apostrophe ("don't") still belongs to
-// one word.
+// Split on every run of non-alphanumeric characters, not just trimmed at
+// each field's edges: the query reaching Lookup can be a whole question
+// forwarded verbatim by the model ("wheres the goldfarm?", "gold farm
+// x=232"), and an edge-only trim leaves an interior "=" or "'" glued into
+// one token. That matters for more than cosmetics -- Postgres's own parser
+// treats "=" as a word boundary too, so a query built by joining tokens
+// with " or " and one whole "x=232" survives will hand websearch_to_tsquery
+// a chunk it reads as 'x' followed immediately by '232' (a phrase, not an
+// OR), silently reintroducing the ANDing this whole fix exists to remove.
+// Splitting here keeps every emitted token a single run of letters/digits,
+// so every one of them joins the OR on equal footing.
 func queryTokens(normalized string) []string {
-	fields := strings.Fields(normalized)
-	out := make([]string, 0, len(fields))
-	for _, f := range fields {
-		f = strings.TrimFunc(f, func(r rune) bool {
-			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-		})
-		if f != "" {
-			out = append(out, f)
-		}
+	var out []string
+	isSeparator := func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}
+	for _, field := range strings.Fields(normalized) {
+		out = append(out, strings.FieldsFunc(field, isSeparator)...)
 	}
 	return out
 }
@@ -52,11 +82,12 @@ func searchQuery(tokens []string) string {
 }
 
 // fallbackTokens is the subset of query tokens worth testing as a plain
-// substring against a topic -- see minFallbackTokenLen.
+// substring against a topic -- see minFallbackTokenLen and
+// fallbackStopwords.
 func fallbackTokens(tokens []string) []string {
 	out := make([]string, 0, len(tokens))
 	for _, t := range tokens {
-		if len(t) >= minFallbackTokenLen {
+		if len(t) >= minFallbackTokenLen && !fallbackStopwords[t] {
 			out = append(out, t)
 		}
 	}

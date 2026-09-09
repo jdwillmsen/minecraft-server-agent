@@ -106,6 +106,59 @@ func TestLookupFindsCompoundTopicByAnyPhrasing(t *testing.T) {
 	}
 }
 
+// TestLookupFallbackStopwordsDoNotFabricateAMatch reproduces a bug in the
+// substring fallback: minFallbackTokenLen alone let a common English word
+// like "the" into the fallback because it's three characters, and "the" is
+// a substring of "nether", "weather", "feather" and "gather" -- all
+// plausible Minecraft topics. Without also filtering stopwords, a totally
+// unrelated topic could satisfy the fallback and come back as though it
+// answered the question, with no full-text overlap at all.
+func TestLookupFallbackStopwordsDoNotFabricateAMatch(t *testing.T) {
+	ctx := context.Background()
+	s := NewPostgres(livePool(t))
+	topic := "__test weather"
+	t.Cleanup(func() { _, _ = s.Delete(ctx, topic) })
+
+	if err := s.Upsert(ctx, topic, "ask an operator, the weather cannot be changed here", ""); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	entries, err := s.Lookup(ctx, "where is the nether portal", 3)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if containsTopic(entries, topic) {
+		t.Errorf(`Lookup("where is the nether portal") matched %q through "the" alone: %v`, topic, entries)
+	}
+}
+
+// TestLookupMatchesQueryContainingEqualsSign reproduces a bug in the query
+// tokenizer: trimming only a field's edges left an interior "=" glued into
+// one token ("x=232"), and Postgres's own parser treats "=" as a word
+// boundary too, so that chunk reached websearch_to_tsquery as a phrase
+// ('x' immediately followed by '232') rather than joining the OR like every
+// other token. A stored fact containing "232" on its own, with no "x"
+// immediately before it, could then be missed entirely by a query that
+// happened to carry "x=232" as one of its words.
+func TestLookupMatchesQueryContainingEqualsSign(t *testing.T) {
+	ctx := context.Background()
+	s := NewPostgres(livePool(t))
+	topic := "__test heightmark"
+	t.Cleanup(func() { _, _ = s.Delete(ctx, topic) })
+
+	if err := s.Upsert(ctx, topic, "roughly 232 blocks up", ""); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	entries, err := s.Lookup(ctx, "zzzznonsensequery x=232", 3)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if !containsTopic(entries, topic) {
+		t.Errorf(`Lookup("zzzznonsensequery x=232") did not find %q`, topic)
+	}
+}
+
 func containsTopic(entries []Entry, topic string) bool {
 	for _, e := range entries {
 		if e.Topic == topic {
