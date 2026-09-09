@@ -110,6 +110,7 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 | `MC_PORT` | `19132` | Bedrock server port |
 | `RECONNECT_MIN_MS` | `5000` | Initial reconnect backoff |
 | `RECONNECT_MAX_MS` | `300000` | Reconnect backoff ceiling |
+| `AUTH_RETRY_DELAY_MS` | `900000` | Flat wait before retrying after Xbox Live rejects the account itself (e.g. `invalid_grant`), instead of the reconnect ladder above |
 | `HTTP_ADDR` | `:8080` | `/healthz` + `/readyz` + `/metrics` listen address |
 | `AUTH_CACHE_DIR` | `/data/auth` | Where the Xbox Live token is cached, one file per `MC_USERNAME` |
 | `COMMAND_RATE_LIMIT_PER_MINUTE` | `10` | Max `!` commands a single actor (XUID) may trigger per rolling minute |

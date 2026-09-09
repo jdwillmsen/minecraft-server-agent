@@ -9,7 +9,7 @@ func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
 		"MC_HOST", "MC_USERNAME", "MC_PORT",
-		"RECONNECT_MIN_MS", "RECONNECT_MAX_MS", "HTTP_ADDR", "AUTH_CACHE_DIR",
+		"RECONNECT_MIN_MS", "RECONNECT_MAX_MS", "AUTH_RETRY_DELAY_MS", "HTTP_ADDR", "AUTH_CACHE_DIR",
 		"COMMAND_RATE_LIMIT_PER_MINUTE", "LOG_LEVEL",
 		"CONSOLE_BRIDGE_URL", "CONSOLE_BRIDGE_TOKEN", "CONSOLE_BRIDGE_TIMEOUT_MS",
 		"LLM_MAX_TOKENS", "LLM_TIMEOUT_MS", "LLM_TOTAL_TIMEOUT_MS",
@@ -85,6 +85,9 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.ReconnectMaxMs != 300000 {
 		t.Errorf("ReconnectMaxMs = %d, want 300000", cfg.ReconnectMaxMs)
+	}
+	if cfg.AuthRetryDelayMs != 900000 {
+		t.Errorf("AuthRetryDelayMs = %d, want 900000", cfg.AuthRetryDelayMs)
 	}
 	if cfg.HTTPAddr != ":8080" {
 		t.Errorf("HTTPAddr = %q, want :8080", cfg.HTTPAddr)
@@ -199,6 +202,30 @@ func TestLoad_ReconnectMaxBelowMinFails(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error when RECONNECT_MAX_MS < RECONNECT_MIN_MS")
+	}
+}
+
+func TestLoad_AuthRetryDelayOverride(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("AUTH_RETRY_DELAY_MS", "60000")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AuthRetryDelayMs != 60000 {
+		t.Errorf("AuthRetryDelayMs = %d, want 60000", cfg.AuthRetryDelayMs)
+	}
+}
+
+func TestLoad_AuthRetryDelayZeroFails(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("AUTH_RETRY_DELAY_MS", "0")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for a zero AUTH_RETRY_DELAY_MS")
 	}
 }
 

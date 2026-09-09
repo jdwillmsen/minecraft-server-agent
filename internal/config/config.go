@@ -21,6 +21,13 @@ type Config struct {
 	// Reconnect backoff, in milliseconds.
 	ReconnectMinMs int
 	ReconnectMaxMs int
+	// AuthRetryDelayMs is the floor waited after Xbox Live rejects the
+	// account itself rather than kicking the session for an ordinary
+	// reason. Retrying at ReconnectMaxMs only feeds more failed logins to
+	// whatever hold the account is under, which is what stretched a real
+	// rejection out over dozens of attempts; this default is long enough to
+	// plausibly outlast that hold instead.
+	AuthRetryDelayMs int
 
 	// HTTP server for /healthz, /readyz, and /metrics.
 	HTTPAddr string
@@ -125,6 +132,10 @@ func Load() (Config, error) {
 	if reconnectMax < reconnectMin {
 		return Config{}, fmt.Errorf("RECONNECT_MAX_MS (%d) must be >= RECONNECT_MIN_MS (%d)", reconnectMax, reconnectMin)
 	}
+	authRetryDelay, err := positiveInt("AUTH_RETRY_DELAY_MS", 900000)
+	if err != nil {
+		return Config{}, err
+	}
 	pgPort, err := positiveInt("PG_PORT", 5432)
 	if err != nil {
 		return Config{}, err
@@ -172,6 +183,7 @@ func Load() (Config, error) {
 		MCUsername:                username,
 		ReconnectMinMs:            reconnectMin,
 		ReconnectMaxMs:            reconnectMax,
+		AuthRetryDelayMs:          authRetryDelay,
 		HTTPAddr:                  stringDefault("HTTP_ADDR", ":8080"),
 		AuthCacheDir:              stringDefault("AUTH_CACHE_DIR", "/data/auth"),
 		PGHost:                    stringDefault("PG_HOST", ""),
