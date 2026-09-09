@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -65,6 +66,13 @@ const stableSessionThreshold = 60 * time.Second
 // group of players can make this agent spend, which the per-player limiter
 // alone cannot.
 const maxConcurrentAnswers = 3
+
+// authRejectionCode is the OAuth error code Microsoft returns when Xbox
+// Live refuses a login because of the account itself -- an abuse-mode hold,
+// a ban -- rather than a network or protocol problem. It is the only code
+// this agent has ever seen an account get flagged with, so it is the only
+// one isAuthRejection treats as a rejection.
+const authRejectionCode = "invalid_grant"
 
 func main() {
 	cfg, err := config.Load()
@@ -195,6 +203,12 @@ func main() {
 func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store) {
 	minDelay := time.Duration(cfg.ReconnectMinMs) * time.Millisecond
 	maxDelay := time.Duration(cfg.ReconnectMaxMs) * time.Millisecond
+	// authDelay does not enter the doubling ladder: nextDelay never sees it.
+	// A rejected account stays rejected until the account holder clears
+	// whatever flag caused it, on a timeline the doubling schedule knows
+	// nothing about, so every rejection waits this same floor rather than
+	// climbing toward maxDelay or resetting toward minDelay.
+	authDelay := time.Duration(cfg.AuthRetryDelayMs) * time.Millisecond
 	delay := minDelay
 	firstAttempt := true
 
@@ -212,22 +226,50 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		if ctx.Err() != nil {
 			return
 		}
-		if err != nil {
+
+		var rejected bool
+		delay, rejected = reconnectDelay(err, lasted, delay, minDelay, maxDelay, authDelay)
+		wait := jitter(delay)
+
+		switch {
+		case rejected:
+			log.Error("auth_rejected", logging.Fields{"error": err.Error(), "session_lasted_ms": lasted.Milliseconds(), "delay_ms": wait.Milliseconds()})
+		case err != nil:
 			log.Error("session_error", logging.Fields{"error": err.Error(), "session_lasted_ms": lasted.Milliseconds()})
-		} else {
+		default:
 			log.Info("disconnected", logging.Fields{"session_lasted_ms": lasted.Milliseconds()})
 		}
-
-		delay = nextDelay(delay, lasted, minDelay, maxDelay)
-		wait := jitter(delay)
 		log.Info("reconnecting", logging.Fields{"delay_ms": wait.Milliseconds()})
 
-		select {
-		case <-ctx.Done():
+		if !waitOrShutdown(ctx, wait) {
 			return
-		case <-time.After(wait):
 		}
 	}
+}
+
+// waitOrShutdown pauses for wait, reporting false the moment ctx is
+// cancelled instead of letting a long auth-rejection floor or a maxed-out
+// reconnect delay hold up shutdown.
+func waitOrShutdown(ctx context.Context, wait time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(wait):
+		return true
+	}
+}
+
+// reconnectDelay picks the unjittered wait before the next connection
+// attempt. An authentication rejection always waits authDelay flat: it
+// skips nextDelay entirely so a run of rejections neither climbs toward max
+// nor collapses toward min, because neither bound means anything to an
+// account-level hold. Everything else -- success or an ordinary failure --
+// keeps exactly nextDelay's ladder.
+func reconnectDelay(err error, lasted, current, min, max, authDelay time.Duration) (delay time.Duration, rejected bool) {
+	if err != nil && isAuthRejection(err) {
+		return authDelay, true
+	}
+	return nextDelay(current, lasted, min, max), false
 }
 
 // answering bundles what @server handling needs, so enabling this feature
@@ -303,6 +345,32 @@ func jitter(d time.Duration) time.Duration {
 	}
 	half := d / 2
 	return half + time.Duration(rand.Int63n(int64(half)+1))
+}
+
+// isAuthRejection reports whether err is Xbox Live rejecting the account
+// itself, as opposed to a transient dial, protocol, or server-side failure.
+// The distinction matters for backoff: retrying a rejected account on the
+// normal doubling ladder does nothing to recover it and, per the incident
+// that added this check, can extend whatever hold Microsoft has the account
+// under -- so a rejection needs a floor long enough to plausibly outlast
+// that hold, not a faster retry.
+func isAuthRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	var retrieveErr *oauth2.RetrieveError
+	if errors.As(err, &retrieveErr) {
+		return retrieveErr.ErrorCode == authRejectionCode
+	}
+	// The error crosses gophertunnel, xal and x/oauth2 before it reaches
+	// here, and nothing in any of those layers guarantees it goes on
+	// wrapping with %w forever -- a version bump anywhere in that chain that
+	// starts formatting the error into a plain string instead would quietly
+	// turn a real rejection back into an ordinary session_error. Matching
+	// the text the account was actually rejected with is the honest
+	// belt-and-braces for that gap, not a substitute for the typed check
+	// above.
+	return strings.Contains(err.Error(), authRejectionCode)
 }
 
 // session runs one connection to the server from login through to
