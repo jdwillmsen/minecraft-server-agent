@@ -203,11 +203,14 @@ func main() {
 func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store) {
 	minDelay := time.Duration(cfg.ReconnectMinMs) * time.Millisecond
 	maxDelay := time.Duration(cfg.ReconnectMaxMs) * time.Millisecond
-	// authDelay does not enter the doubling ladder: nextDelay never sees it.
-	// A rejected account stays rejected until the account holder clears
-	// whatever flag caused it, on a timeline the doubling schedule knows
-	// nothing about, so every rejection waits this same floor rather than
-	// climbing toward maxDelay or resetting toward minDelay.
+	// authDelay does not enter the doubling ladder: nextDelay never sees it,
+	// and delay (the ladder position) is never overwritten by a rejection --
+	// see reconnectDelay. A rejected account stays rejected until the
+	// account holder clears whatever flag caused it, on a timeline the
+	// doubling schedule knows nothing about, so every rejection waits this
+	// same floor rather than climbing toward maxDelay or resetting toward
+	// minDelay, and the ordinary failure that eventually follows one still
+	// resumes the ladder from wherever it actually was.
 	authDelay := time.Duration(cfg.AuthRetryDelayMs) * time.Millisecond
 	delay := minDelay
 	firstAttempt := true
@@ -228,12 +231,13 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		}
 
 		var rejected bool
-		delay, rejected = reconnectDelay(err, lasted, delay, minDelay, maxDelay, authDelay)
-		wait := jitter(delay)
+		var rawWait time.Duration
+		rawWait, delay, rejected = reconnectDelay(err, lasted, delay, minDelay, maxDelay, authDelay)
+		wait := jitter(rawWait)
 
 		switch {
 		case rejected:
-			log.Error("auth_rejected", logging.Fields{"error": err.Error(), "session_lasted_ms": lasted.Milliseconds(), "delay_ms": wait.Milliseconds()})
+			log.Error("auth_rejected", logging.Fields{"username": cfg.MCUsername, "error": err.Error(), "session_lasted_ms": lasted.Milliseconds(), "delay_ms": wait.Milliseconds()})
 		case err != nil:
 			log.Error("session_error", logging.Fields{"error": err.Error(), "session_lasted_ms": lasted.Milliseconds()})
 		default:
@@ -260,16 +264,25 @@ func waitOrShutdown(ctx context.Context, wait time.Duration) bool {
 }
 
 // reconnectDelay picks the unjittered wait before the next connection
-// attempt. An authentication rejection always waits authDelay flat: it
-// skips nextDelay entirely so a run of rejections neither climbs toward max
-// nor collapses toward min, because neither bound means anything to an
-// account-level hold. Everything else -- success or an ordinary failure --
-// keeps exactly nextDelay's ladder.
-func reconnectDelay(err error, lasted, current, min, max, authDelay time.Duration) (delay time.Duration, rejected bool) {
+// attempt, and the ladder position (nextLadder) the caller should carry
+// into its next call as current.
+//
+// An authentication rejection always waits authDelay flat and passes
+// current straight back out as nextLadder: it skips nextDelay entirely, so
+// a run of rejections neither climbs toward max nor collapses toward min
+// (neither bound means anything to an account-level hold), and critically
+// it leaves the ladder exactly where it was -- current must stay in
+// [min, max] for nextDelay's own invariant to hold, and authDelay is
+// chosen independently of both bounds, so feeding it back in as current
+// would violate that invariant on the very next ordinary failure.
+// Everything else -- success or an ordinary failure -- calls nextDelay and
+// returns its result as both wait and nextLadder, exactly today's ladder.
+func reconnectDelay(err error, lasted, current, min, max, authDelay time.Duration) (wait, nextLadder time.Duration, rejected bool) {
 	if err != nil && isAuthRejection(err) {
-		return authDelay, true
+		return authDelay, current, true
 	}
-	return nextDelay(current, lasted, min, max), false
+	next := nextDelay(current, lasted, min, max)
+	return next, next, false
 }
 
 // answering bundles what @server handling needs, so enabling this feature

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -110,13 +111,15 @@ func TestJitter_VariesAcrossCalls(t *testing.T) {
 	t.Errorf("jitter(%v) returned %v on 101 consecutive calls; backoff is not randomised", d, first)
 }
 
-// abuseModeRejectionError reproduces the exact error shape the incident
-// produced: an *oauth2.RetrieveError joined with a plain status-line error
-// (the way go-xsapi's token refresher actually returns a rejected refresh),
-// then wrapped with %w up through xal, a gophertunnel net.OpError, and
-// finally this package's own "dial: %w" in session. Constructing it this
-// way, rather than a hand-picked string, is what proves the classifier
-// survives the real wrapping rather than a convenient approximation of it.
+// abuseModeRejectionError reproduces the exact error text the incident
+// produced: an *oauth2.RetrieveError wrapped with %w up through xal, a
+// gophertunnel net.OpError, and finally this package's own "dial: %w" in
+// session -- every real layer in that chain wraps with %w and returns the
+// RetrieveError bare, with no errors.Join anywhere in it. The errors.Join
+// of a status-line error around it here is a deliberate superset, not a
+// claim about how the vendored libraries behave: it proves errors.As finds
+// the RetrieveError even through a join, which is a strictly harder case
+// than the real chain, not a different one.
 func abuseModeRejectionError() error {
 	retrieveErr := &oauth2.RetrieveError{
 		Response:         &http.Response{Status: "400 Bad Request", StatusCode: http.StatusBadRequest},
@@ -193,12 +196,12 @@ func TestReconnectDelay_AuthRejectionUsesTheFlatFloorNotTheLadder(t *testing.T) 
 
 	// current is deliberately already near max: an auth rejection must not
 	// inherit or extend the doubling ladder's position.
-	delay, rejected := reconnectDelay(abuseModeRejectionError(), time.Second, 200*time.Second, min, max, authDelay)
+	wait, _, rejected := reconnectDelay(abuseModeRejectionError(), time.Second, 200*time.Second, min, max, authDelay)
 	if !rejected {
 		t.Fatal("reconnectDelay reported rejected = false for an auth rejection")
 	}
-	if delay != authDelay {
-		t.Errorf("delay = %v, want the auth floor %v", delay, authDelay)
+	if wait != authDelay {
+		t.Errorf("wait = %v, want the auth floor %v", wait, authDelay)
 	}
 }
 
@@ -207,13 +210,48 @@ func TestReconnectDelay_RepeatedRejectionsDoNotClimb(t *testing.T) {
 	max := 300 * time.Second
 	authDelay := 900 * time.Second
 
-	delay := min
+	ladder := min
 	for i := 0; i < 5; i++ {
+		var wait time.Duration
 		var rejected bool
-		delay, rejected = reconnectDelay(abuseModeRejectionError(), time.Second, delay, min, max, authDelay)
-		if !rejected || delay != authDelay {
-			t.Fatalf("iteration %d: delay=%v rejected=%v, want %v/true every time", i, delay, rejected, authDelay)
+		wait, ladder, rejected = reconnectDelay(abuseModeRejectionError(), time.Second, ladder, min, max, authDelay)
+		if !rejected || wait != authDelay {
+			t.Fatalf("iteration %d: wait=%v rejected=%v, want %v/true every time", i, wait, rejected, authDelay)
 		}
+	}
+	if ladder != min {
+		t.Errorf("ladder position after 5 rejections = %v, want it to stay at %v", ladder, min)
+	}
+}
+
+// TestReconnectDelay_LadderResumesWhereItLeftOffAfterARejection is the
+// regression test for the bug where reconnectDelay's rejection branch fed
+// authDelay back in as the caller's next current: nextDelay's invariant is
+// that current stays within [min, max], and authDelay is chosen
+// independently of both bounds, so a rejection followed by an ordinary
+// failure computed nextDelay(authDelay, ...) instead of resuming from
+// wherever the ladder actually was. It must fail if reconnectDelay ever
+// starts returning the rejection floor as the next ladder position again.
+func TestReconnectDelay_LadderResumesWhereItLeftOffAfterARejection(t *testing.T) {
+	min := 5 * time.Second
+	max := 300 * time.Second
+	authDelay := 900 * time.Second
+	ladderBeforeRejection := 40 * time.Second
+
+	_, ladder, rejected := reconnectDelay(abuseModeRejectionError(), time.Second, ladderBeforeRejection, min, max, authDelay)
+	if !rejected {
+		t.Fatal("reconnectDelay reported rejected = false for an auth rejection")
+	}
+
+	transient := errors.New("disconnect: You have been kicked: Please reconnect")
+	wait, _, rejected := reconnectDelay(transient, time.Second, ladder, min, max, authDelay)
+	if rejected {
+		t.Fatal("reconnectDelay reported rejected = true for a transient error")
+	}
+
+	want := nextDelay(ladderBeforeRejection, time.Second, min, max)
+	if wait != want {
+		t.Errorf("wait after the rejection episode = %v, want %v (nextDelay(%v, ...), as if the rejection had never happened)", wait, want, ladderBeforeRejection)
 	}
 }
 
@@ -223,12 +261,16 @@ func TestReconnectDelay_TransientErrorFollowsTheExistingLadder(t *testing.T) {
 	authDelay := 900 * time.Second
 	transient := errors.New("disconnect: You have been kicked: Please reconnect")
 
-	delay, rejected := reconnectDelay(transient, time.Second, 10*time.Second, min, max, authDelay)
+	wait, ladder, rejected := reconnectDelay(transient, time.Second, 10*time.Second, min, max, authDelay)
 	if rejected {
 		t.Error("reconnectDelay reported rejected = true for a transient error")
 	}
-	if want := nextDelay(10*time.Second, time.Second, min, max); delay != want {
-		t.Errorf("delay = %v, want nextDelay's %v", delay, want)
+	want := nextDelay(10*time.Second, time.Second, min, max)
+	if wait != want {
+		t.Errorf("wait = %v, want nextDelay's %v", wait, want)
+	}
+	if ladder != want {
+		t.Errorf("ladder = %v, want it to match wait (%v) for a non-rejection", ladder, want)
 	}
 }
 
@@ -238,12 +280,12 @@ func TestReconnectDelay_TransientErrorStillResetsOnAStableSession(t *testing.T) 
 	authDelay := 900 * time.Second
 	transient := errors.New("disconnect: server closed the connection")
 
-	delay, rejected := reconnectDelay(transient, stableSessionThreshold, 120*time.Second, min, max, authDelay)
+	wait, _, rejected := reconnectDelay(transient, stableSessionThreshold, 120*time.Second, min, max, authDelay)
 	if rejected {
 		t.Error("reconnectDelay reported rejected = true for a transient error")
 	}
-	if delay != min {
-		t.Errorf("delay after a stable session = %v, want the min %v", delay, min)
+	if wait != min {
+		t.Errorf("wait after a stable session = %v, want the min %v", wait, min)
 	}
 }
 
@@ -252,12 +294,36 @@ func TestReconnectDelay_NoErrorFollowsTheExistingLadder(t *testing.T) {
 	max := 300 * time.Second
 	authDelay := 900 * time.Second
 
-	delay, rejected := reconnectDelay(nil, time.Second, 10*time.Second, min, max, authDelay)
+	wait, _, rejected := reconnectDelay(nil, time.Second, 10*time.Second, min, max, authDelay)
 	if rejected {
 		t.Error("reconnectDelay reported rejected = true for a clean disconnect")
 	}
-	if want := nextDelay(10*time.Second, time.Second, min, max); delay != want {
-		t.Errorf("delay = %v, want nextDelay's %v", delay, want)
+	if want := nextDelay(10*time.Second, time.Second, min, max); wait != want {
+		t.Errorf("wait = %v, want nextDelay's %v", wait, want)
+	}
+}
+
+func TestWaitOrShutdown_ReturnsPromptlyOnContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+
+	started := time.Now()
+	// A wait far longer than the incident's own 15-minute floor: this must
+	// not actually be waited out just because shutdown was requested early.
+	if waitOrShutdown(ctx, time.Hour) {
+		t.Error("waitOrShutdown = true, want false when ctx is cancelled first")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Errorf("waitOrShutdown took %v to notice cancellation, want well under a second", elapsed)
+	}
+}
+
+func TestWaitOrShutdown_ReturnsTrueWhenTheWaitElapsesFirst(t *testing.T) {
+	if !waitOrShutdown(context.Background(), time.Millisecond) {
+		t.Error("waitOrShutdown = false, want true when the wait elapses before ctx is ever cancelled")
 	}
 }
 
