@@ -367,3 +367,144 @@ func TestDisabledStoreReturnsZeroAndNoError(t *testing.T) {
 		t.Errorf("a disabled store must short-circuit before touching Voice at all")
 	}
 }
+
+// raceStore is a Store whose PendingFor gives a second, genuinely
+// concurrent caller a real chance to read the same undelivered snapshot
+// before either side records anything -- reproducing the non-atomic
+// PendingFor-then-MarkDelivered race a rapid leave-and-rejoin (or a join
+// landing alongside that same player's own !inbox) can hit.
+//
+// The first PendingFor call waits (bounded by rendezvousWindow) for a
+// second call to arrive; the second call, on arrival, releases the first
+// immediately. Guarded (the fix under test), only one call is ever in
+// PendingFor at a time, so the wait simply times out unused and each call
+// sees whatever the previous one already marked delivered. Unguarded, both
+// calls reach PendingFor back to back, both see the same fully-pending
+// snapshot, and both go on to send every message in it.
+type raceStore struct {
+	mu        sync.Mutex
+	items     []Announcement
+	delivered map[int64]bool
+
+	calls      int
+	rendezvous chan struct{}
+}
+
+const rendezvousWindow = 200 * time.Millisecond
+
+func newRaceStore(items []Announcement) *raceStore {
+	return &raceStore{items: items, delivered: map[int64]bool{}, rendezvous: make(chan struct{})}
+}
+
+var _ Store = (*raceStore)(nil)
+
+func (s *raceStore) Enabled() bool                                       { return true }
+func (s *raceStore) Insert(context.Context, Announcement) (int64, error) { return 0, nil }
+
+func (s *raceStore) PendingFor(_ context.Context, _, _ string, _ time.Time) ([]Announcement, error) {
+	s.mu.Lock()
+	var out []Announcement
+	for _, a := range s.items {
+		if !s.delivered[a.ID] {
+			out = append(out, a)
+		}
+	}
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+
+	switch call {
+	case 1:
+		select {
+		case <-s.rendezvous:
+		case <-time.After(rendezvousWindow):
+		}
+	case 2:
+		close(s.rendezvous)
+	}
+	return out, nil
+}
+
+func (s *raceStore) MarkDelivered(_ context.Context, id int64, _ string, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.delivered[id] = true
+	return nil
+}
+
+// countTells reports how many times xuid was told each distinct message
+// body -- a value above 1 anywhere means that message was heard twice.
+func countTells(v *fakeVoice, xuid string) map[string]int {
+	counts := make(map[string]int)
+	for i, d := range v.tells {
+		if d.xuid == xuid {
+			counts[v.tellMsg[i]]++
+		}
+	}
+	return counts
+}
+
+func TestConcurrentDrainForJoinCallsForSameXUIDEachSendOnlyOnce(t *testing.T) {
+	pending := []Announcement{
+		{ID: 1, Body: "one", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
+		{ID: 2, Body: "two", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
+	}
+	store := newRaceStore(pending)
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer wg.Done()
+			if _, _, err := d.DrainForJoin(context.Background(), "xuid-1", time.Now()); err != nil {
+				t.Errorf("DrainForJoin: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	counts := countTells(voice, "xuid-1")
+	for _, a := range pending {
+		if n := counts[a.Body]; n != 1 {
+			t.Errorf("xuid-1 was told %q %d times, want exactly 1 -- two concurrent joins must not repeat a message", a.Body, n)
+		}
+	}
+}
+
+func TestConcurrentDrainForJoinAndDrainAllForSameXUIDEachSendOnlyOnce(t *testing.T) {
+	// The same race, but between a join drain and that same player's own
+	// !inbox -- two different plugins reaching one Deliverer, which is
+	// exactly why the guard has to live here rather than in either caller.
+	pending := []Announcement{
+		{ID: 1, Body: "one", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
+		{ID: 2, Body: "two", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
+	}
+	store := newRaceStore(pending)
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if _, _, err := d.DrainForJoin(context.Background(), "xuid-1", time.Now()); err != nil {
+			t.Errorf("DrainForJoin: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if _, err := d.DrainAll(context.Background(), "xuid-1", time.Now()); err != nil {
+			t.Errorf("DrainAll: %v", err)
+		}
+	}()
+	wg.Wait()
+
+	counts := countTells(voice, "xuid-1")
+	for _, a := range pending {
+		if n := counts[a.Body]; n != 1 {
+			t.Errorf("xuid-1 was told %q %d times, want exactly 1 -- a concurrent join and !inbox must not repeat a message", a.Body, n)
+		}
+	}
+}

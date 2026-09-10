@@ -2,6 +2,7 @@ package announce
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
@@ -45,6 +46,18 @@ type Deliverer struct {
 	roster Roster
 	perms  Permissions
 	log    *logging.Logger
+	// xuidLocks serialises DrainForJoin and DrainAll per xuid. PendingFor
+	// and MarkDelivered are two separate store calls, not one transaction,
+	// so a rapid leave-and-rejoin (or a join landing alongside that same
+	// player's own !inbox) can run two drains that both read the same
+	// pending rows before either records a delivery -- each then sends
+	// every one of them, and MarkDelivered's ON CONFLICT DO NOTHING makes
+	// the bookkeeping right afterward but does nothing to un-send a message
+	// the player already heard twice. It lives here rather than in a
+	// caller because DrainForJoin (a join) and DrainAll (!inbox) are two
+	// different plugins reaching this one store for the same player -- a
+	// guard placed in either plugin cannot see the other's call.
+	xuidLocks sync.Map // xuid string -> *sync.Mutex
 }
 
 // NewDeliverer builds a Deliverer over the given Store, Voice, Roster and
@@ -186,6 +199,15 @@ func (d *Deliverer) sendPending(ctx context.Context, xuid string, now time.Time,
 	return delivered
 }
 
+// lockXUID returns the mutex guarding xuid's own drains, creating it on
+// first use. Never removed from xuidLocks: the set of distinct players who
+// ever drain is bounded and small next to a process lifetime, and deleting
+// entries would only reopen the race against whichever call is mid-Lock.
+func (d *Deliverer) lockXUID(xuid string) *sync.Mutex {
+	m, _ := d.xuidLocks.LoadOrStore(xuid, &sync.Mutex{})
+	return m.(*sync.Mutex)
+}
+
 // splitByPriority separates pending into expedited and normal, preserving
 // PendingFor's ordering within each (expedited-first, then oldest-first)
 // since that ordering is what "oldest first" and "uncapped" both rely on.
@@ -212,6 +234,13 @@ func splitByPriority(pending []Announcement) (expedited, normal []Announcement) 
 // decide whether to point the player at !inbox instead of dumping the
 // whole backlog into their first moments in the world.
 func (d *Deliverer) DrainForJoin(ctx context.Context, xuid string, now time.Time) (delivered, remaining int, err error) {
+	// Acquired before anything else, released on every return (including a
+	// panic unwinding through here): see xuidLocks' doc comment for why a
+	// per-xuid guard belongs at this layer rather than in a caller.
+	mu := d.lockXUID(xuid)
+	mu.Lock()
+	defer mu.Unlock()
+
 	if !d.store.Enabled() {
 		return 0, 0, nil
 	}
@@ -242,6 +271,13 @@ func (d *Deliverer) DrainForJoin(ctx context.Context, xuid string, now time.Time
 // command's job, for a player who has explicitly asked for the rest rather
 // than having it trickle in a few at a time across future joins.
 func (d *Deliverer) DrainAll(ctx context.Context, xuid string, now time.Time) (int, error) {
+	// Same guard as DrainForJoin, over the same per-xuid lock: this is the
+	// other half of the race xuidLocks exists for -- a player's !inbox
+	// landing while their own join drain is still in flight.
+	mu := d.lockXUID(xuid)
+	mu.Lock()
+	defer mu.Unlock()
+
 	if !d.store.Enabled() {
 		return 0, nil
 	}

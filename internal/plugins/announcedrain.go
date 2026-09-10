@@ -27,6 +27,18 @@ type AnnounceDeliverer interface {
 // bridge connection open forever.
 const drainTimeout = 30 * time.Second
 
+// maxConcurrentDrains caps join drains in flight across every player, the
+// same shape startAnswer uses to cap @server answers (cmd/agent/main.go).
+//
+// Kept smaller than that budget on purpose: an answer that misses its slot
+// is lost outright, so that cap is sized for throughput. A dropped drain
+// merely defers those messages to the player's next join or their own
+// !inbox -- nothing is lost -- so this only needs to be big enough that an
+// ordinary handful of simultaneous arrivals isn't shed, while still giving
+// a reconnect storm (a restart, a network blip) somewhere to stop opening
+// one bridge connection per returning player.
+const maxConcurrentDrains = 5
+
 // AnnounceDrain hands a newly-joined player everything queued for them, then
 // — only when the per-join cap left something behind — says one line
 // pointing at !inbox. Kept separate from Welcome even though both react to
@@ -40,12 +52,17 @@ type AnnounceDrain struct {
 	rootCtx   context.Context
 	deliverer AnnounceDeliverer
 	log       *logging.Logger
+	// inFlight is a counting semaphore over drains in progress, capped at
+	// maxConcurrentDrains. Acquired non-blockingly in HandleEvent, before
+	// the goroutine is even spawned: a caller that blocked here would stall
+	// the dispatcher this plugin exists to get off of.
+	inFlight chan struct{}
 }
 
 // NewAnnounceDrain builds the announce-drain plugin. rootCtx should be the
 // process lifetime context (cancelled on shutdown), not a per-request one.
 func NewAnnounceDrain(rootCtx context.Context, deliverer AnnounceDeliverer, log *logging.Logger) *AnnounceDrain {
-	return &AnnounceDrain{rootCtx: rootCtx, deliverer: deliverer, log: log}
+	return &AnnounceDrain{rootCtx: rootCtx, deliverer: deliverer, log: log, inFlight: make(chan struct{}, maxConcurrentDrains)}
 }
 
 func (*AnnounceDrain) Name() string { return "announce-drain" }
@@ -75,8 +92,22 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 		return nil
 	}
 
+	select {
+	case a.inFlight <- struct{}{}:
+	default:
+		// Dropped, not queued: queued announcements aren't urgent, so
+		// deferring them to this player's next join or their own !inbox
+		// costs nothing that a wait would preserve -- unlike startAnswer's
+		// drop, there is no reply being discarded here, only a delay.
+		a.log.Info("announce_drain_dropped_busy", logging.Fields{"xuid": join.XUID, "max_concurrent": cap(a.inFlight)})
+		return nil
+	}
+
 	voice := pctx.Voice
-	go a.drain(voice, join.XUID)
+	go func() {
+		defer func() { <-a.inFlight }()
+		a.drain(voice, join.XUID)
+	}()
 	return nil
 }
 

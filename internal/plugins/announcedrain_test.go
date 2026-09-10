@@ -1,8 +1,11 @@
 package plugins
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -137,8 +140,11 @@ func TestJoinWithNothingPendingSaysNothing(t *testing.T) {
 
 func TestDrainRunsOffTheReadLoop(t *testing.T) {
 	// HandleEvent must return promptly even when delivery is slow, because
-	// the dispatcher that calls it is on the packet read loop.
-	deliverer := &fakeJoinDeliverer{delivered: 1, remaining: 1, delay: 200 * time.Millisecond}
+	// the dispatcher that calls it is on the packet read loop. The delay is
+	// well past the assertion threshold -- a wide gap so this doesn't flake
+	// under -race on a loaded machine, while still failing hard if
+	// HandleEvent ever starts waiting on the drain itself.
+	deliverer := &fakeJoinDeliverer{delivered: 1, remaining: 1, delay: 500 * time.Millisecond}
 	voice := newRecordingTellVoice()
 	d := NewAnnounceDrain(context.Background(), deliverer, logging.New("info"))
 	pctx := &plugin.Context{Voice: voice}
@@ -147,7 +153,7 @@ func TestDrainRunsOffTheReadLoop(t *testing.T) {
 	if err := d.HandleEvent(context.Background(), pctx, joinEvent("xuid-1")); err != nil {
 		t.Fatalf("HandleEvent: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
 		t.Errorf("HandleEvent took %v, want it to return immediately regardless of delivery time", elapsed)
 	}
 
@@ -226,5 +232,59 @@ func TestAnnounceDrain_RootCtxCancelledStopsTheDrain(t *testing.T) {
 		t.Errorf("Tell was called with %q after shutdown was signalled mid-drain", msg)
 	case <-time.After(50 * time.Millisecond):
 		// expected: no summary sent, the drain's context died with rootCtx
+	}
+}
+
+// captureStdout redirects the process's real stdout for the duration of fn,
+// so a test can assert on a *logging.Logger's line without a writer seam --
+// the same technique cmd/agent's chat-flow tests use for the same reason.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe: %v", err)
+	}
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	return buf.String()
+}
+
+func TestAnnounceDrain_DroppedWhenAlreadyAtTheConcurrencyCap(t *testing.T) {
+	// A reconnect storm (a restart, a network blip) spawns one drain per
+	// returning player; without a cap that's one open bridge connection per
+	// arrival. One slot, pre-occupied here exactly like startAnswer's own
+	// busy-agent test occupies its inFlight channel, so the next join meets
+	// a full drain plugin rather than a real held goroutine.
+	deliverer := &fakeJoinDeliverer{delivered: 0, remaining: 0}
+	voice := newRecordingTellVoice()
+	pctx := &plugin.Context{Voice: voice}
+
+	out := captureStdout(t, func() {
+		// Built inside the capture, not before it: *logging.Logger resolves
+		// os.Stdout at construction, so a logger built before the swap would
+		// keep writing to the real stdout regardless of the redirect.
+		d := NewAnnounceDrain(context.Background(), deliverer, logging.New("info"))
+		d.inFlight = make(chan struct{}, 1)
+		d.inFlight <- struct{}{} // the one slot is already taken
+
+		if err := d.HandleEvent(context.Background(), pctx, joinEvent("xuid-1")); err != nil {
+			t.Fatalf("HandleEvent: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, `"event":"announce_drain_dropped_busy"`) {
+		t.Errorf("stdout = %q, want an announce_drain_dropped_busy event", out)
+	}
+	if deliverer.xuid != "" {
+		t.Errorf("DrainForJoin was called with xuid %q, want the dropped join never to reach the deliverer", deliverer.xuid)
 	}
 }
