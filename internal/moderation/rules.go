@@ -30,11 +30,14 @@ type Flag struct {
 	Detail string
 }
 
-// notWord is what may sit either side of a term: anything but a letter or
-// digit of any script. Not \b, which in RE2 is ASCII-only -- it would find
-// a boundary between "x" and "ü" and match "über" inside "xüber", and it
-// can never anchor a term that itself begins or ends with punctuation.
-const notWord = `[^\p{L}\p{N}_]`
+// notWord is what may sit either side of a term: anything but a letter, a
+// combining mark, a digit or an underscore, in any script. Not \b, which in
+// RE2 is ASCII-only -- it would find a boundary between "x" and "ü" and
+// match "über" inside "xüber", and it can never anchor a term that itself
+// begins or ends with punctuation. Marks count as part of the word because
+// a decomposed "café" is "cafe" followed by a combining accent, and a
+// boundary there would let "cafe" match the accented word.
+const notWord = `[^\p{L}\p{M}\p{N}_]`
 
 // Terms matches the configured terms against a message, case-insensitively
 // and only as whole words, so a short term never fires inside an innocent

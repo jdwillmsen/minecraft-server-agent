@@ -51,6 +51,23 @@ func TestTermsBoundariesAreUnicodeAware(t *testing.T) {
 	}
 }
 
+// A combining mark belongs to the word it follows: "cafe" plus U+0301 is a
+// decomposed "café", not "cafe" followed by a boundary.
+func TestTermsDoNotEndBeforeACombiningMark(t *testing.T) {
+	terms := mustTerms(t, "cafe")
+	// Escapes rather than literals: a decomposed accent is invisible in
+	// source, and a precomposed one is a letter under any class.
+	if _, ok := terms.Match("meet at the cafe\u0301 later"); ok {
+		t.Error(`"cafe" matched a decomposed "café"`)
+	}
+	if _, ok := terms.Match("meet at the cafe later"); !ok {
+		t.Error(`"cafe" no longer matches itself`)
+	}
+	if _, ok := mustTerms(t, "cafe\u0301").Match("the CAFE\u0301!"); !ok {
+		t.Error("a decomposed term did not match itself")
+	}
+}
+
 // A configured term is text to find, never a pattern: unquoted, "a.b" would
 // match "axb" and "(" would fail to compile and take startup with it.
 func TestTermsAreQuotedNotInterpreted(t *testing.T) {
