@@ -56,7 +56,12 @@ var _ plugin.Plugin = (*Announce)(nil)
 // announcement whose body happens to contain those words, rather than a
 // silent reinterpretation of it as urgent: the same ambiguity !wp set
 // refuses to guess at for its own trailing numeric token.
-func parseAnnounceFlags(args []string) (now, urgent bool, player string, body []string) {
+// multiplePlayers is reported rather than resolved: a second leading
+// "@player" token is just as structurally shaped as the first one, so
+// nothing here distinguishes "the operator retargeted" from "the operator
+// meant to say @A, @B, ..." -- taking the last one silently drops the first
+// name from both the target and the body, with no trace it was ever there.
+func parseAnnounceFlags(args []string) (now, urgent bool, player string, multiplePlayers bool, body []string) {
 	i := 0
 loop:
 	for ; i < len(args); i++ {
@@ -66,12 +71,16 @@ loop:
 		case tok == "!urgent":
 			urgent = true
 		case strings.HasPrefix(tok, "@") && len(tok) > 1:
+			if player != "" {
+				multiplePlayers = true
+				continue
+			}
 			player = tok[1:]
 		default:
 			break loop
 		}
 	}
-	return now, urgent, player, args[i:]
+	return now, urgent, player, multiplePlayers, args[i:]
 }
 
 func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (string, error) {
@@ -85,9 +94,12 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 		return announceUsage, nil
 	}
 
-	isNow, isUrgent, playerName, body := parseAnnounceFlags(inv.Args)
+	isNow, isUrgent, playerName, multiplePlayers, body := parseAnnounceFlags(inv.Args)
 	if len(body) == 0 {
 		return announceUsage, nil
+	}
+	if multiplePlayers {
+		return "An announcement can only go to one player at a time.", nil
 	}
 	if isNow && playerName != "" {
 		// online_only means "everyone connected right now"; a player target

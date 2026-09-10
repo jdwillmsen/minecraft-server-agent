@@ -27,6 +27,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/audit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
@@ -564,6 +565,22 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 		// configured, the disabled implementation when not, never nil.
 		Knowledge: knowledgeStore,
 		Waypoints: waypointStore,
+		// announce.Nop{} until the wiring task builds a pool-backed store;
+		// same reasoning as Profiles again -- never nil, even though the
+		// field is documented as possibly nil for tests that construct a
+		// bare Context.
+		Announcements: announce.Nop{},
+		// A Deliverer backed by a disabled store returns zero and no error
+		// from every method before it ever touches its voice, roster or
+		// permissions dependency (see internal/announce's own doc comment),
+		// so nil is safe here rather than a placeholder that has to be
+		// remembered and replaced later.
+		Deliverer: announce.NewDeliverer(announce.Nop{}, nil, nil, nil, nil),
+		// The same roster every other capability that needs live presence
+		// reads from -- this binary always constructs one, regardless of
+		// whether a database is configured, so !announce's @player
+		// resolution never has to treat "no roster" as a real case.
+		Roster: playerRoster,
 	}
 }
 

@@ -240,13 +240,14 @@ func TestInboxWithNothingPendingSaysSo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if reply == "" {
-		t.Error("reply should say there was nothing new")
+	if !strings.Contains(strings.ToLower(reply), "nothing new") {
+		t.Errorf("reply %q should say there was nothing new", reply)
 	}
 }
 
 func TestAnnounceWithoutAStoreSaysSo(t *testing.T) {
 	cmd := announceCommand(t, "announce")
+	const wantSubstring = "store configured"
 
 	reply, err := cmd.Run(context.Background(), &plugin.Context{}, plugin.Invocation{
 		ActorXUID:       "op",
@@ -256,8 +257,8 @@ func TestAnnounceWithoutAStoreSaysSo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a nil Announcements store must not error: %v", err)
 	}
-	if reply == "" {
-		t.Error("reply should explain the feature is unconfigured")
+	if !strings.Contains(strings.ToLower(reply), wantSubstring) {
+		t.Errorf("reply %q should explain the feature is unconfigured", reply)
 	}
 
 	disabled := &fakeAnnounceStore{enabled: false}
@@ -269,8 +270,8 @@ func TestAnnounceWithoutAStoreSaysSo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a disabled store must not error: %v", err)
 	}
-	if reply == "" {
-		t.Error("reply should explain the feature is unconfigured")
+	if !strings.Contains(strings.ToLower(reply), wantSubstring) {
+		t.Errorf("reply %q should explain the feature is unconfigured", reply)
 	}
 	if len(disabled.inserted) != 0 {
 		t.Error("a disabled store should not receive an insert")
@@ -286,8 +287,8 @@ func TestInboxWithoutAStoreSaysSo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a nil Deliverer must not error: %v", err)
 	}
-	if reply == "" {
-		t.Error("reply should explain the feature is unconfigured")
+	if !strings.Contains(strings.ToLower(reply), "store configured") {
+		t.Errorf("reply %q should explain the feature is unconfigured", reply)
 	}
 }
 
@@ -331,5 +332,27 @@ func TestAnnounceNowAndPlayerTargetIsRefused(t *testing.T) {
 	}
 	if reply == "" {
 		t.Error("reply should explain the conflict rather than guess")
+	}
+}
+
+func TestAnnounceRefusesASecondPlayerToken(t *testing.T) {
+	cmd := announceCommand(t, "announce")
+	store := &fakeAnnounceStore{enabled: true}
+	roster := fakeAnnounceRoster{byName: map[string]string{"A": "xuid-a", "B": "xuid-b"}}
+	pctx := &plugin.Context{Announcements: store, Roster: roster}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"@A", "@B", "the", "farm", "moved"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(store.inserted) != 0 {
+		t.Error("an announcement with two @player tokens was stored -- one target must have been silently dropped")
+	}
+	if !strings.Contains(strings.ToLower(reply), "one player") {
+		t.Errorf("reply %q should say an announcement goes to one player at a time", reply)
 	}
 }
