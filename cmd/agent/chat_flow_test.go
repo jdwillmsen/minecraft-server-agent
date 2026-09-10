@@ -109,6 +109,39 @@ func (opOnlyPlugin) Commands() []plugin.Command {
 	}}
 }
 
+// flakyPlugin exists so the error and timeout audit outcomes can be pinned
+// directly, rather than trusted by inspection: "boom" always fails, and
+// "slow" never returns before the dispatch timeout does.
+//
+// Kept out of newHarness's registry rather than added there: newHarness
+// backs TestChatCommandFlow's exact "Available: !help, !ping" assertion, and
+// a third visitor-permission command would silently change what it lists.
+type flakyPlugin struct{}
+
+func (flakyPlugin) Name() string { return "flaky" }
+
+func (flakyPlugin) Commands() []plugin.Command {
+	return []plugin.Command{
+		{
+			Name:        "boom",
+			Description: "Test command that always errors.",
+			Permission:  plugin.PermissionVisitor,
+			Run: func(context.Context, *plugin.Context, plugin.Invocation) (string, error) {
+				return "", errors.New("boom")
+			},
+		},
+		{
+			Name:        "slow",
+			Description: "Test command that outlives the dispatch timeout.",
+			Permission:  plugin.PermissionVisitor,
+			Run: func(ctx context.Context, _ *plugin.Context, _ plugin.Invocation) (string, error) {
+				<-ctx.Done()
+				return "", ctx.Err()
+			},
+		},
+	}
+}
+
 const (
 	playerXUID = "2535412345678901"
 	selfXUID   = "2535499999999999"
@@ -827,5 +860,83 @@ func TestAFailingAuditWriteDoesNotFailTheCommand(t *testing.T) {
 	}
 	if n := len(rec.all()); n != 1 {
 		t.Errorf("got %d audit records, want exactly 1 (the write is attempted and its failure logged, not skipped)", n)
+	}
+}
+
+// TestRateLimitedCommandIsAudited proves the limiter's refusal is itself
+// audited. This path produces no chat reply, so before Task 3 it was
+// invisible outside stdout -- exactly the gap an audit trail exists to close.
+func TestRateLimitedCommandIsAudited(t *testing.T) {
+	registry, pctx, _, _, _, playerRoster, permResolver := newHarness(t)
+	log := logging.New("info")
+	rec := &recordingAudit{}
+	// max=0: Allow refuses every actor on every call, so the command never
+	// reaches Dispatch.
+	deniedLimiter := ratelimit.NewPerActor(0, time.Minute)
+
+	handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!ping"), log,
+		registry, pctx, deniedLimiter, permResolver, rec, playerRoster)
+
+	records := rec.all()
+	if len(records) != 1 {
+		t.Fatalf("got %d audit records, want exactly 1", len(records))
+	}
+	if records[0].Outcome != audit.OutcomeRateLimited {
+		t.Errorf("outcome = %q, want %q", records[0].Outcome, audit.OutcomeRateLimited)
+	}
+}
+
+// TestErroredCommandIsAudited proves a plugin's own failure is recorded as
+// OutcomeError, distinct from the unknown/denied/timeout cases the switch in
+// handleCommand also handles.
+func TestErroredCommandIsAudited(t *testing.T) {
+	registry := plugin.NewRegistry()
+	if err := registry.Register(flakyPlugin{}); err != nil {
+		t.Fatalf("register flaky: %v", err)
+	}
+	pctx := &plugin.Context{Voice: &recordingVoice{}, Directory: registry}
+	log := logging.New("info")
+	rec := &recordingAudit{}
+
+	handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!boom"), log,
+		registry, pctx, unlimitedRateLimit(), fakePermResolver(t, nil), rec, roster.New())
+
+	records := rec.all()
+	if len(records) != 1 {
+		t.Fatalf("got %d audit records, want exactly 1", len(records))
+	}
+	if records[0].Outcome != audit.OutcomeError {
+		t.Errorf("outcome = %q, want %q", records[0].Outcome, audit.OutcomeError)
+	}
+}
+
+// TestTimedOutCommandIsAudited pins the branch ordering handleCommand
+// depends on: ErrCommandTimedOut must be checked ahead of the generic
+// err != nil case, or a timeout silently records as OutcomeError instead.
+// Driving a command that genuinely outlives DefaultDispatchTimeout is the
+// honest way to reach that branch -- it is a var precisely so a test can
+// shorten it rather than waiting out the real production value.
+func TestTimedOutCommandIsAudited(t *testing.T) {
+	registry := plugin.NewRegistry()
+	if err := registry.Register(flakyPlugin{}); err != nil {
+		t.Fatalf("register flaky: %v", err)
+	}
+	pctx := &plugin.Context{Voice: &recordingVoice{}, Directory: registry}
+	log := logging.New("info")
+	rec := &recordingAudit{}
+
+	orig := plugin.DefaultDispatchTimeout
+	plugin.DefaultDispatchTimeout = 10 * time.Millisecond
+	defer func() { plugin.DefaultDispatchTimeout = orig }()
+
+	handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!slow"), log,
+		registry, pctx, unlimitedRateLimit(), fakePermResolver(t, nil), rec, roster.New())
+
+	records := rec.all()
+	if len(records) != 1 {
+		t.Fatalf("got %d audit records, want exactly 1", len(records))
+	}
+	if records[0].Outcome != audit.OutcomeTimeout {
+		t.Errorf("outcome = %q, want %q", records[0].Outcome, audit.OutcomeTimeout)
 	}
 }

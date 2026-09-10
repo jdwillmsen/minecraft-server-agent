@@ -800,7 +800,14 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 		if auditor == nil || !auditor.Enabled() {
 			return
 		}
-		if err := auditor.Write(ctx, audit.Record{
+		// Bounded like the permission lookup and the reply below: this call
+		// reaches a database from the same read-loop goroutine, and with no
+		// deadline of its own a slow or hung one would stall every player's
+		// commands behind it -- exactly what "never blocks the command" rules
+		// out.
+		auditCtx, auditCancel := context.WithTimeout(ctx, plugin.DefaultDispatchTimeout)
+		defer auditCancel()
+		if err := auditor.Write(auditCtx, audit.Record{
 			XUID:       actorXUID,
 			Gamertag:   gamertag,
 			Permission: permission,
@@ -810,7 +817,7 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 			At:         time.Now(),
 		}); err != nil {
 			log.Error("audit_write_failed", logging.Fields{
-				"command": trigger.Command, "actor": actorXUID, "error": err.Error(),
+				"command": trigger.Command, "actor": actorXUID, "outcome": string(outcome), "error": err.Error(),
 			})
 		}
 	}
