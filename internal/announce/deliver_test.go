@@ -24,13 +24,16 @@ type delivery struct {
 // fakeStore is a small in-memory stand-in for Store: PendingFor always
 // returns the same fixed slice regardless of xuid/permission, and every
 // MarkDelivered call is recorded so a test can assert exactly who was
-// marked, rather than just how many.
+// marked, rather than just how many. markErr is keyed by xuid rather than a
+// single flag, so a test can make one recipient's row fail to record while
+// the rest still land — the only way to exercise SendNow's per-row
+// continue.
 type fakeStore struct {
 	mu         sync.Mutex
 	enabled    bool
 	pending    []Announcement
 	pendingErr error
-	markErr    error
+	markErr    map[string]error
 	delivered  []delivery
 }
 
@@ -45,8 +48,8 @@ func (s *fakeStore) PendingFor(context.Context, string, string, time.Time) ([]An
 func (s *fakeStore) MarkDelivered(_ context.Context, id int64, xuid string, _ time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.markErr != nil {
-		return s.markErr
+	if err, ok := s.markErr[xuid]; ok && err != nil {
+		return err
 	}
 	s.delivered = append(s.delivered, delivery{id: id, xuid: xuid})
 	return nil
@@ -128,6 +131,19 @@ func TestDrainForJoinCapsNormalButNotExpedited(t *testing.T) {
 	if len(store.delivered) != 5 {
 		t.Errorf("store recorded %d deliveries, want 5", len(store.delivered))
 	}
+	// "Oldest first" is inherited from the store's ORDER BY and is
+	// load-bearing (a reversal would bury the older normal message behind
+	// a newer one); assert the exact sequence Tell was called in, not just
+	// how many calls happened.
+	wantOrder := []string{"urgent one", "urgent two", "normal one", "normal two", "normal three"}
+	if len(voice.tellMsg) != len(wantOrder) {
+		t.Fatalf("Tell called with %v, want %v", voice.tellMsg, wantOrder)
+	}
+	for i, want := range wantOrder {
+		if voice.tellMsg[i] != want {
+			t.Errorf("Tell[%d] = %q, want %q (order: %v)", i, voice.tellMsg[i], want, voice.tellMsg)
+		}
+	}
 }
 
 func TestAFailedSendIsNotRecordedAsDelivered(t *testing.T) {
@@ -147,8 +163,11 @@ func TestAFailedSendIsNotRecordedAsDelivered(t *testing.T) {
 	if delivered != 0 {
 		t.Errorf("delivered = %d, want 0", delivered)
 	}
-	if remaining != 0 {
-		t.Errorf("remaining = %d, want 0 (the one message was attempted, just failed)", remaining)
+	// remaining is pending minus delivered, not "normal messages never
+	// attempted": a message that was attempted and failed is still owed,
+	// so it must still count here rather than vanish from the total.
+	if remaining != 1 {
+		t.Errorf("remaining = %d, want 1 — the one message failed to send and is still queued", remaining)
 	}
 	if len(store.delivered) != 0 {
 		t.Errorf("store recorded %d deliveries, want 0 — a failed Tell must not be marked delivered", len(store.delivered))
@@ -184,6 +203,39 @@ func TestSendNowWritesOneDeliveryRowPerOnlinePlayerForABroadcast(t *testing.T) {
 	}
 }
 
+func TestSendNowBroadcastStillRecordsOtherRowsWhenOneMarkDeliveredFails(t *testing.T) {
+	// The per-row continue after a failed MarkDelivered is the entire
+	// substance of "a broadcast writes a row per online player" surviving
+	// a partial failure; exercise it with a store that fails exactly one
+	// recipient's row.
+	a := Announcement{Body: "server restarting soon", TargetKind: TargetEveryone, Delivery: DeliveryBroadcast}
+	store := &fakeStore{enabled: true, markErr: map[string]error{"xuid-2": errors.New("db unavailable")}}
+	voice := &fakeVoice{}
+	roster := fakeRoster{online: []string{"xuid-1", "xuid-2", "xuid-3"}}
+	d := NewDeliverer(store, voice, roster, fakePermissions{}, testLogger())
+
+	delivered, err := d.SendNow(context.Background(), a, 42)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if delivered != 2 {
+		t.Errorf("delivered = %d, want 2 (xuid-2's row failed, xuid-1 and xuid-3 still land)", delivered)
+	}
+	if len(voice.says) != 1 {
+		t.Errorf("Say called %d times, want 1 — one row failing to record must not trigger a second broadcast", len(voice.says))
+	}
+	got := map[string]bool{}
+	for _, row := range store.delivered {
+		got[row.xuid] = true
+	}
+	if got["xuid-2"] {
+		t.Errorf("store.delivered = %+v, want xuid-2 absent since its MarkDelivered failed", store.delivered)
+	}
+	if !got["xuid-1"] || !got["xuid-3"] {
+		t.Errorf("store.delivered = %+v, want xuid-1 and xuid-3 present", store.delivered)
+	}
+}
+
 func TestSendNowSkipsPlayersWhoseTargetDoesNotIncludeThem(t *testing.T) {
 	// A permission-targeted announcement reaches only players resolving to
 	// that level.
@@ -206,6 +258,91 @@ func TestSendNowSkipsPlayersWhoseTargetDoesNotIncludeThem(t *testing.T) {
 	}
 	if len(store.delivered) != 1 || store.delivered[0].xuid != "op-1" {
 		t.Errorf("store.delivered = %+v, want exactly one row for op-1", store.delivered)
+	}
+}
+
+func TestSendNowDerivesDeliveryFromTargetNotPersistedField(t *testing.T) {
+	// announce.go's DeliveryFor exists precisely so a player-targeted
+	// message can never broadcast; SendNow must derive delivery itself
+	// rather than trust whatever the row's own Delivery field says. Nothing
+	// writes a mismatched Delivery today, but a future source or a bad row
+	// PendingFor reads back must not turn into a private message read out
+	// to the whole server.
+	a := Announcement{
+		Body:        "you have received a waypoint",
+		TargetKind:  TargetPlayer,
+		TargetValue: "xuid-1",
+		Delivery:    DeliveryBroadcast, // deliberately disagrees with TargetPlayer
+	}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	roster := fakeRoster{online: []string{"xuid-1", "xuid-2"}}
+	d := NewDeliverer(store, voice, roster, fakePermissions{}, testLogger())
+
+	delivered, err := d.SendNow(context.Background(), a, 99)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 0 {
+		t.Errorf("Say called %d times, want 0 — a player-targeted message must whisper even if its persisted Delivery says broadcast", len(voice.says))
+	}
+	if delivered != 1 || len(voice.tells) != 1 || voice.tells[0].xuid != "xuid-1" {
+		t.Errorf("tells = %+v, delivered = %d, want exactly one Tell to xuid-1", voice.tells, delivered)
+	}
+	if len(store.delivered) != 1 || store.delivered[0].xuid != "xuid-1" {
+		t.Errorf("store.delivered = %+v, want exactly one row for xuid-1", store.delivered)
+	}
+}
+
+func TestSendNowStopsWhenContextAlreadyCancelled(t *testing.T) {
+	// A cancelled context must not turn a multi-recipient send into that
+	// many doomed bridge attempts and error lines.
+	a := Announcement{Body: "ops only", TargetKind: TargetPermission, TargetValue: "operator", Delivery: DeliveryWhisper}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	roster := fakeRoster{online: []string{"op-1", "op-2"}}
+	perms := fakePermissions{levels: map[string]string{"op-1": "operator", "op-2": "operator"}}
+	d := NewDeliverer(store, voice, roster, perms, testLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	delivered, err := d.SendNow(ctx, a, 7)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if delivered != 0 {
+		t.Errorf("delivered = %d, want 0", delivered)
+	}
+	if len(voice.tells) != 0 {
+		t.Errorf("Tell called %d times against a cancelled context, want 0", len(voice.tells))
+	}
+}
+
+func TestDrainForJoinStopsWhenContextAlreadyCancelled(t *testing.T) {
+	pending := []Announcement{
+		{ID: 1, Body: "one", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
+		{ID: 2, Body: "two", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
+	}
+	store := &fakeStore{enabled: true, pending: pending}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	delivered, remaining, err := d.DrainForJoin(ctx, "xuid-1", time.Now())
+	if err != nil {
+		t.Fatalf("DrainForJoin: %v", err)
+	}
+	if delivered != 0 {
+		t.Errorf("delivered = %d, want 0", delivered)
+	}
+	if remaining != len(pending) {
+		t.Errorf("remaining = %d, want %d — nothing was attempted, both are still owed", remaining, len(pending))
+	}
+	if len(voice.tells) != 0 {
+		t.Errorf("Tell called %d times against a cancelled context, want 0", len(voice.tells))
 	}
 }
 

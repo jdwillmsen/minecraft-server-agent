@@ -101,7 +101,13 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 	}
 	now := time.Now()
 
-	if a.Delivery == DeliveryBroadcast {
+	// Delivery is derived from the target, never trusted off the row: this
+	// is exactly the guard announce.go's DeliveryFor exists for. Nothing
+	// writes a.Delivery today, but the moment something does — a future
+	// source, or a row PendingFor reads back after a bad write — a
+	// TargetPlayer row that happened to carry DeliveryBroadcast must still
+	// whisper, not broadcast a private message to the whole server.
+	if DeliveryFor(a.TargetKind) == DeliveryBroadcast {
 		if err := d.voice.Say(ctx, a.Body); err != nil {
 			// Say never went out, so nothing was heard — recording a
 			// delivery here would make an online player's next join
@@ -116,6 +122,11 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 		// their next join.
 		delivered := 0
 		for _, xuid := range targets {
+			if ctx.Err() != nil {
+				// Cancelled: stop rather than attempt (and log) a store
+				// write for every remaining recipient that would fail anyway.
+				break
+			}
 			if err := d.store.MarkDelivered(ctx, id, xuid, now); err != nil {
 				d.log.Error("announce_mark_delivered_failed", logging.Fields{"announcement_id": id, "xuid": xuid, "error": err.Error()})
 				continue
@@ -132,6 +143,11 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 	// nothing else retries it.
 	delivered := 0
 	for _, xuid := range targets {
+		if ctx.Err() != nil {
+			// Cancelled: stop rather than run up a failed bridge attempt
+			// (and an error line) for every recipient still left to try.
+			break
+		}
 		if err := d.voice.Tell(ctx, xuid, a.Body); err != nil {
 			d.log.Error("announce_tell_failed", logging.Fields{"announcement_id": id, "xuid": xuid, "error": err.Error()})
 			continue
@@ -152,6 +168,11 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 func (d *Deliverer) sendPending(ctx context.Context, xuid string, now time.Time, msgs []Announcement) int {
 	delivered := 0
 	for _, a := range msgs {
+		if ctx.Err() != nil {
+			// Cancelled: stop here rather than turn the rest of a backlog
+			// into that many more failed bridge attempts and error lines.
+			break
+		}
 		if err := d.voice.Tell(ctx, xuid, a.Body); err != nil {
 			d.log.Error("announce_tell_failed", logging.Fields{"announcement_id": a.ID, "xuid": xuid, "error": err.Error()})
 			continue
@@ -181,8 +202,14 @@ func splitByPriority(pending []Announcement) (expedited, normal []Announcement) 
 
 // DrainForJoin sends xuid everything they're owed on login: every expedited
 // message, uncapped, then up to MaxNormalPerJoin normal ones oldest-first.
-// remaining reports how many normal messages were left unsent so the caller
-// can decide whether to point the player at !inbox instead of dumping the
+// remaining reports how many of everything pending — expedited or normal —
+// is still owed after this call: total pending minus however many were
+// actually delivered. That equals the unsent-normal-message count in the
+// ordinary case, but it also has to hold when a send is attempted and
+// fails: a message that failed to send is not delivered, so it must still
+// count as remaining rather than silently drop out of the total just
+// because this call already had a turn at it. The caller uses this to
+// decide whether to point the player at !inbox instead of dumping the
 // whole backlog into their first moments in the world.
 func (d *Deliverer) DrainForJoin(ctx context.Context, xuid string, now time.Time) (delivered, remaining int, err error) {
 	if !d.store.Enabled() {
@@ -207,7 +234,7 @@ func (d *Deliverer) DrainForJoin(ctx context.Context, xuid string, now time.Time
 	toSend = append(toSend, normal[:limit]...)
 
 	delivered = d.sendPending(ctx, xuid, now, toSend)
-	remaining = len(normal) - limit
+	remaining = len(pending) - delivered
 	return delivered, remaining, nil
 }
 
