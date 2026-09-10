@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 )
 
@@ -359,5 +360,56 @@ func TestDispatch_PanicIsCheckedAfterPermission(t *testing.T) {
 	}
 	if _, err := r.Dispatch(context.Background(), &Context{}, "op-explode", Invocation{ActorPermission: PermissionVisitor}); !errors.Is(err, ErrPermissionDenied) {
 		t.Errorf("err = %v, want ErrPermissionDenied", err)
+	}
+}
+
+// stubAnnounceStore reports whatever a test wired in for Enabled.
+type stubAnnounceStore struct{ enabled bool }
+
+var _ AnnounceStore = stubAnnounceStore{}
+
+func (stubAnnounceStore) Insert(context.Context, announce.Announcement) (int64, error) {
+	return 0, nil
+}
+func (s stubAnnounceStore) Enabled() bool { return s.enabled }
+
+// stubDeliverer is a deliverer that is present and does nothing.
+type stubDeliverer struct{}
+
+var _ AnnounceDeliverer = stubDeliverer{}
+
+func (stubDeliverer) SendNow(context.Context, announce.Announcement, int64) (int, error) {
+	return 0, nil
+}
+func (stubDeliverer) DrainAll(context.Context, string, time.Time) (int, int, error) {
+	return 0, 0, nil
+}
+
+// Every way announcements can be unavailable has to give the same answer,
+// because the commands built on this ask it once and answer a person with
+// the result.
+func TestAnnouncementsReadyNeedsBothHalves(t *testing.T) {
+	cases := map[string]struct {
+		ctx  *Context
+		want bool
+	}{
+		"nothing wired":     {ctx: &Context{}},
+		"no context at all": {ctx: nil},
+		"store only":        {ctx: &Context{Announcements: stubAnnounceStore{enabled: true}}},
+		"deliverer only":    {ctx: &Context{Deliverer: stubDeliverer{}}},
+		"store disabled": {ctx: &Context{
+			Announcements: stubAnnounceStore{enabled: false},
+			Deliverer:     stubDeliverer{},
+		}},
+		"both, store enabled": {ctx: &Context{
+			Announcements: stubAnnounceStore{enabled: true},
+			Deliverer:     stubDeliverer{},
+		}, want: true},
+	}
+
+	for name, tc := range cases {
+		if got := tc.ctx.AnnouncementsReady(); got != tc.want {
+			t.Errorf("%s: AnnouncementsReady = %v, want %v", name, got, tc.want)
+		}
 	}
 }

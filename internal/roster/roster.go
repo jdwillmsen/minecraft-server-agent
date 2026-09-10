@@ -1,9 +1,12 @@
 // Package roster tracks the server's live player roster from PlayerList
 // packets, the authoritative source for who is actually connected —
 // unlike chat, which is only ever present when someone types. It serves
-// two needs: join detection (for the welcome plugin) and XUID-to-gamertag
+// four needs: join/leave detection (for the welcome plugin), XUID-to-gamertag
 // resolution (for targeting a tellraw reply at a specific player, since
-// Voice.Tell only carries the XUID).
+// Voice.Tell only carries the XUID), gamertag-to-XUID resolution (the
+// reverse, for turning a typed "@PlayerName" reference back into the
+// identity everything else keys on), and reporting who is online at all
+// (for an announcement deciding who actually hears it).
 package roster
 
 import "sync"
@@ -121,6 +124,53 @@ func (r *Roster) NameFor(xuid string) (name string, ok bool) {
 	defer r.mu.Unlock()
 	name, ok = r.players[xuid]
 	return name, ok
+}
+
+// Online returns the XUIDs currently on the roster, so a caller deciding
+// who actually hears a broadcast doesn't have to re-derive "connected" from
+// join/leave events itself. The load-bearing property is that this builds
+// a fresh slice under the lock rather than returning anything that aliases
+// the internal map: the map is mutated by Apply from the packet-read
+// goroutine, so a caller iterating a returned reference to it — instead of
+// a copy — would be racing that goroutine. The order is unspecified;
+// callers that need a deterministic order sort it themselves.
+func (r *Roster) Online() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.players))
+	for xuid := range r.players {
+		out = append(out, xuid)
+	}
+	return out
+}
+
+// XUIDFor is NameFor's reverse: it resolves a gamertag back to the XUID
+// currently on record for it, so a caller that only has a display name
+// (e.g. a "@PlayerName" reference typed into a command) can turn it into
+// the identity Voice.Tell and the announcement store actually key on. ok is
+// false if name isn't the current username of anyone on the roster.
+//
+// This assumes gamertags are unique per server, same as NameFor's map
+// already assumes in the other direction. If that were ever violated —
+// two entries on the roster sharing a name — whichever is encountered
+// first during the scan wins, with no significance attached to which that
+// is; this is a documented tie-break for a case that should not occur, not
+// a guarantee callers should rely on.
+//
+// This is a linear scan rather than a second index: the roster is sized to
+// a Bedrock server's concurrent player count, not a lookup table, and the
+// map already gives O(1) resolution the other direction (NameFor), which is
+// the hot path (every Tell). A reverse index would double the bookkeeping
+// Apply has to keep consistent for a lookup that isn't on that hot path.
+func (r *Roster) XUIDFor(name string) (xuid string, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for x, n := range r.players {
+		if n == name {
+			return x, true
+		}
+	}
+	return "", false
 }
 
 // PlayerListEntry is the subset of protocol.PlayerListEntry this package

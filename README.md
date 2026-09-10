@@ -50,6 +50,13 @@ There is a database and an LLM now; both remain optional, and the agent's
 core loop - connect, dispatch `!` commands, welcome joiners - runs the same
 with either turned off.
 
+A separate slice adds announcements and a command audit trail: `!announce`
+(operator-only) and `!inbox` (member level) give the server a way to say
+something without waiting for a question, and every command dispatch is now
+recorded durably rather than only to stdout. See "Announcements and the
+command audit trail" below for the delivery rules, the expiry rules, and
+what the audit trail does and doesn't record.
+
 ## Architecture
 
 ```
@@ -74,7 +81,8 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 - `internal/plugin` - the `Plugin`/`Context`/`Registry` extension surface
 - `internal/plugins` - concrete plugins: `core` (`!help`/`!ping`), `stats`
   (`!players`, `!online`, `!version`, `!backup`), `welcome` (event-driven, no
-  commands), `knowledge` (`!kb`), `waypoints` (`!wp`)
+  commands), `knowledge` (`!kb`), `waypoints` (`!wp`), `announce`
+  (`!announce`, `!inbox`)
 - `internal/store` - Postgres-backed player profiles and playtime, behind a
   `store.Nop` no-op so an unset `PG_HOST` is a supported state rather than a
   crash; a plugin only ever sees the narrow `PlayerStore` read-and-record
@@ -87,6 +95,25 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   keyed per-XUID by design: a shared namespace would both collide on names
   and hand every player everyone else's coordinates. Same `Nop` fallback as
   `internal/knowledge`
+- `internal/announce` - the outbox behind `!announce` and `!inbox`. A
+  source's whole job is to describe an announcement correctly; whether it's
+  whispered or broadcast is derived from the target rather than chosen
+  freely, so a player- or permission-targeted row can never be sent to the
+  whole server even if something upstream got that wrong. An announcement
+  for someone offline waits rather than vanishing, but not forever - that's
+  what keeps this an outbox instead of a growing pile nobody prunes
+- `internal/audit` - one row per command dispatch, whatever the outcome:
+  the actor's XUID and gamertag, the permission they resolved at, the
+  command and its arguments. Never the reply - a reply can name things
+  nobody typed, and copying those into a durable trail would expose more
+  than the dispatch it records. A
+  write that fails is logged and swallowed rather than allowed to block the
+  command it describes
+- `internal/pgerr` - recognises the two ways a configured database refuses a
+  statement for a reason a deploy is responsible for: the tables are not
+  migrated yet, or the role was never granted access to them. Both are
+  states a command can answer for and an operator can fix, so neither
+  reaches a player as silence
 - `internal/tools` - the read-only capability surface the `@server` answer
   path may call. Every tool answers a question; none of them change
   anything, so a prompt-injection attempt sitting in player chat has nothing
@@ -201,6 +228,98 @@ coordinates, `!wp` whispers them because broadcasting where a player lives
 is a griefing vector, and reaching them through `@server` does not make
 them less personal. Such an answer is whispered to the asker instead.
 
+## Announcements and the command audit trail
+
+`!announce` is operator-only. A bare message broadcasts to everyone;
+`@player` whispers to one player and, if they're offline, queues for them
+instead of being lost; `!now` sends only to whoever is online right now and
+never queues, even for a player who would otherwise have received it later;
+`!urgent` marks the message expedited, which only changes anything for a
+message that ends up queued - see join delivery below. `!now` and `@player`
+can't both be chosen: a message for whoever happens to be online right now
+and a message for one specific person are different targets, and guessing
+which was meant risks either broadcasting something meant for one player or
+silently dropping a message nobody else was ever supposed to see. The flags
+and `@player` are read only from the front of the command - parsing stops at
+the first word that isn't one of them - so a message that happens to contain
+the word `!urgent` in its body is just text, not a reinterpretation of the
+whole message as urgent. A second `@player` is refused with an error rather
+than resolved to either name: nothing distinguishes "the operator retargeted"
+from "the operator meant to send to two people," and guessing would silently
+drop one of the two names from both the target and the body.
+
+`@player` resolves against the live roster first and the profile store
+second, so a player who is offline - which is precisely who a queued
+announcement is for - is still a name the agent knows. Only a name neither
+has ever seen is refused, because an announcement aimed at an XUID nobody
+holds could never be delivered or drained. A gamertag freed by a rename can
+be taken by another account, so whoever answers to it now wins over whoever
+used to. The reply says what actually happened: `Told X.` only when the
+whisper went out, `Queued for X.` when it is waiting for them instead.
+
+`!inbox` is member level and only ever drains the caller's own queue - no
+argument names another player's, the same restriction `!wp` places on whose
+coordinates a command can touch. It delivers up to five messages per
+invocation and says how many are still waiting: the command is answered
+inside a dispatch timeout, and an uncapped drain of a real backlog spends
+that budget mid-delivery, leaving the player with a partial trickle and no
+reply at all. Saying `!inbox` again collects the next few. The console has
+no player identity and so has no queue; it is told that rather than drained.
+
+A command that fails or outlives its timeout answers with a plain line
+saying so. Silence is the one reply nobody can interpret - it is exactly
+what a command that worked and had nothing to say looks like.
+
+A queued message doesn't wait forever. Every announcement in this slice
+comes from `!announce`, and its expiry today depends on target, not source -
+a `Source` is recorded on the row for when a scheduled or API-sourced
+announcement earns its own window later, but every source shares these same
+durations for now. A message aimed at one player keeps for a week, since
+it's still true for that specific person a week from now; a message aimed at
+everyone or at a permission level keeps for a day, since a permission is a
+role rather than a person and whoever holds it next may not be who the
+message was written for. `!now` never queues in the first place, so it has
+no expiry to speak of. Expiry is what keeps this a queue instead of a nag:
+without it, a message would eventually reach whoever logs in next no matter
+how stale it had gone.
+
+Join delivery sends every expedited message first, uncapped, then up to
+three ordinary ones, oldest first, then - only if something is still left -
+one summary line naming how many messages remain and pointing at `!inbox`.
+The cap on ordinary messages exists because the welcome message lands in
+that same moment; an uncapped backlog delivered alongside it would bury the
+greeting instead of adding to it. Expedited bypasses the cap entirely, which
+is the reason it exists: something urgent - a restart countdown, say - must
+never wait behind routine text a player hasn't asked to see yet.
+
+Join delivery and the welcome do not currently tell a player apart from a
+sibling AFK bot. The agent has a filter for its own kind, but the set of
+sibling bot identities it excludes is empty today - filling it in needs each
+bot's XUID, and this agent currently only learns an XUID by watching that
+identity join, the same way it learns a player's. Until that's wired up, a
+sibling bot is welcomed, drained, and whispered to exactly like a player.
+
+Every command dispatch, whatever happened to it, writes one row to the audit
+trail: the actor's XUID and gamertag, the permission they resolved at when
+the command ran (not their level now), the command name, its arguments, and
+the outcome (`ok`, `denied`, `unknown`, `error`, `rate_limited`, or
+`timeout`). The one exception to the permission is `rate_limited`: that
+dispatch is refused before the actor's level is ever resolved, so its row
+records an empty permission. Asking the bridge for a level on a request
+already being thrown away is exactly the work the limiter exists to avoid,
+so the order stays as it is and the row says what was known at refusal.
+
+It deliberately never records the reply. That is narrower than it sounds and
+worth being exact about: the arguments are stored verbatim, so `!wp set base
+100 64 -200` puts those coordinates in the trail, and so does the body of a
+private `!announce @player`. What the exclusion keeps out is everything a
+reply says that nobody typed - the answer to a bare `!wp` lists every
+waypoint a player owns, including ones this command never mentioned. That is
+a privacy decision, not an oversight. A failed audit write is logged and
+never blocks the command it describes; a table that has not been migrated
+yet, or one the agent's role was never granted, is reported once at INFO
+rather than once per command.
+
 ## Targeting a reply
 
 `Voice.Tell` only ever receives an XUID, but Bedrock's `tellraw` needs a
@@ -268,6 +387,16 @@ copy of it here would be a second source of truth that drifts silently — a
 green CI run against a stale copy is worse than no run at all. Connect these
 to a database whose schema came from the real migrations, which is what the
 setup above does.
+
+`internal/announce` and `internal/audit` follow the same pattern - a
+`livedb`-tagged test in each package that has never run against a real
+database either. Their three tables (`minecraft.announcements`,
+`minecraft.announcement_deliveries`, `minecraft.command_audit`) come from a
+fourth migration, `V4__minecraft_announcements.sql`, in that same
+`jdwlabs/platform` ConfigMap. Unlike V1 through V3 above, V4 has not merged
+or synced yet, so there is no schema today for `MC_TEST_DSN` to point at.
+Once it has, `go test -tags livedb ./internal/announce/ ./internal/audit/`
+follows the same setup as `internal/store` above.
 
 ## Releases
 

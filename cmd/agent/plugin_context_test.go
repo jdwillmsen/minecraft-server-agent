@@ -1,30 +1,51 @@
 package main
 
 import (
+	"context"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/config"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
+// testPluginContext builds the context exactly as main does with no database
+// configured: every capability present, every one of them the disabled
+// implementation. Anything main assembles for itself (the voice, the
+// deliverer) is assembled the same way here, so a field this test proves is
+// wired is a field production actually gets.
 func testPluginContext() *plugin.Context {
 	cfg := config.Config{}
+	bridgeClient := adapters.NewBridgeClient("http://bridge.invalid", "token", time.Second)
+	playerRoster := roster.New()
+	voice := adapters.NewBridgeVoice(bridgeClient, playerRoster)
+	deliverer := announce.NewDeliverer(
+		announce.Nop{},
+		voice,
+		newDeliveryAudience(playerRoster, siblingBotXUIDs()),
+		announcePermissions{resolver: adapters.NewPermissionResolver(bridgeClient, time.Second, logging.New("error"))},
+		logging.New("error"),
+	)
 	return newPluginContext(
 		cfg,
-		adapters.NewBridgeClient("http://bridge.invalid", "token", time.Second),
+		bridgeClient,
 		time.Second,
-		roster.New(),
+		voice,
+		playerRoster,
 		plugin.NewRegistry(),
 		store.Nop{},
 		knowledge.Nop{},
 		waypoints.Nop{},
+		announce.Nop{},
+		deliverer,
 	)
 }
 
@@ -69,5 +90,19 @@ func TestProfilesIsUsableWithoutADatabase(t *testing.T) {
 	}
 	if _, err := profiles.RecordJoin(t.Context(), "2535400000000000", "SomePlayer", time.Now()); err != nil {
 		t.Errorf("recording a join against the no-op store failed: %v", err)
+	}
+}
+
+// With no database configured the durable tier answers "never seen", so
+// "@player" refuses exactly as it did before there was one -- rather than
+// panicking on a nil archive, which is what a context wired with a bare
+// roster would have done the moment the lookup grew a second tier.
+func TestRosterLookupIsUsableWithoutADatabase(t *testing.T) {
+	xuid, ok, err := testPluginContext().Roster.XUIDFor(context.Background(), "SomePlayer")
+	if err != nil {
+		t.Fatalf("resolving a name with no database configured failed: %v", err)
+	}
+	if ok || xuid != "" {
+		t.Errorf("XUIDFor = (%q, %v), want not found", xuid, ok)
 	}
 }

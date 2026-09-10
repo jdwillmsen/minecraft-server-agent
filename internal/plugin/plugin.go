@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
@@ -182,10 +183,33 @@ type Context struct {
 	// comment panicked the whole event dispatcher on a nil interface. A
 	// greeting is not worth taking the agent down for.
 	Profiles PlayerStore
-	// Knowledge and Waypoints are nil when no database is configured. Both
-	// are guarded at every use for the same reason Profiles is.
+	// Knowledge and Waypoints may be nil. cmd/agent always supplies both --
+	// the disabled implementation when no database is configured -- and
+	// both are guarded at every use for the same reason Profiles is.
 	Knowledge KnowledgeStore
 	Waypoints WaypointStore
+	// Announcements and Deliverer may be nil, on the same terms: cmd/agent
+	// always supplies both, and every use asks AnnouncementsReady rather
+	// than assuming it.
+	Announcements AnnounceStore
+	Deliverer     AnnounceDeliverer
+	// Roster resolves a "@player" reference in a command (!announce) to the
+	// XUID every other capability keys on. May be nil -- a command that
+	// needs it must refuse plainly rather than assume it can resolve one.
+	Roster Roster
+}
+
+// AnnouncementsReady reports whether an announcement can actually be stored
+// and sent: a store that persists, and a deliverer to send through.
+//
+// One predicate rather than a check per call site. The two were being asked
+// four different ways across this package and the plugins built on it --
+// nil-or-Enabled here, a bare nil there -- and the version that only tested
+// the deliverer let !inbox answer "you have nothing new" with no database
+// behind it at all: a claim about a player's queue made by something that
+// had never been able to read one.
+func (c *Context) AnnouncementsReady() bool {
+	return c != nil && c.Deliverer != nil && c.Announcements != nil && c.Announcements.Enabled()
 }
 
 // PlayerStore is the subset of internal/store a plugin may touch.
@@ -217,6 +241,39 @@ type WaypointStore interface {
 	Delete(ctx context.Context, xuid, name string) (removed bool, err error)
 	List(ctx context.Context, xuid string) ([]waypoints.Waypoint, error)
 	Enabled() bool
+}
+
+// AnnounceStore is the outbox surface a plugin may touch: enough to create
+// an announcement, and nothing else. Reading what is pending and marking it
+// delivered both belong to the deliverer, which is the only thing that
+// actually sends a message, so it is the only thing allowed to decide what
+// is owed or record that one arrived.
+type AnnounceStore interface {
+	Insert(ctx context.Context, a announce.Announcement) (int64, error)
+	Enabled() bool
+}
+
+// AnnounceDeliverer is how a command sends an announcement immediately and
+// drains a player's own queue on request. Narrowed to what !announce and
+// !inbox need -- not announce.Deliverer's full method set, since join-time
+// draining is the announce-drain event handler's job, not a chat command's.
+type AnnounceDeliverer interface {
+	SendNow(ctx context.Context, a announce.Announcement, id int64) (int, error)
+	DrainAll(ctx context.Context, xuid string, now time.Time) (delivered, remaining int, err error)
+}
+
+// Roster resolves a player's XUID from a gamertag typed into a command,
+// turning an "@player" reference into the identity every other capability
+// keys on.
+//
+// It carries a context and an error because the answer is not always in
+// memory: a player who is offline is exactly who a queued announcement is
+// for, and only a durable record can name them. ok false means nobody by
+// that name has ever been seen -- the only case in which a command should
+// refuse. An error means the lookup itself could not be made, which is not
+// the same as an answer of no.
+type Roster interface {
+	XUIDFor(ctx context.Context, name string) (xuid string, ok bool, err error)
 }
 
 // Registry holds every registered plugin and routes commands to them.

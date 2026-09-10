@@ -129,6 +129,67 @@ func TestBothGamertagsSurviveARename(t *testing.T) {
 	}
 }
 
+// The lookup !announce leans on, against the real SQL: a player who has
+// logged out is still resolvable, and so is the name they used to answer to
+// -- neither of which the live roster can say anything about.
+func TestXUIDForNameResolvesOfflineAndRenamedPlayers(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := "2535400000000007"
+
+	if _, err := pg.RecordJoin(ctx, xuid, "WasCalledThis", time.Now().UTC().Add(-time.Hour)); err != nil {
+		t.Fatalf("join under the old name: %v", err)
+	}
+	if _, err := pg.RecordJoin(ctx, xuid, "CalledThisNow", time.Now().UTC()); err != nil {
+		t.Fatalf("join under the new name: %v", err)
+	}
+	if err := pg.RecordLeave(ctx, xuid, time.Now().UTC()); err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+
+	for _, name := range []string{"CalledThisNow", "WasCalledThis"} {
+		got, ok, err := pg.XUIDForName(ctx, name)
+		if err != nil {
+			t.Fatalf("resolve %s: %v", name, err)
+		}
+		if !ok || got != xuid {
+			t.Errorf("XUIDForName(%s) = (%q, %v), want %q -- an offline player is still a known one", name, got, ok, xuid)
+		}
+	}
+
+	if got, ok, err := pg.XUIDForName(ctx, "NobodyHasEverBeenCalledThis"); err != nil || ok || got != "" {
+		t.Errorf("XUIDForName(unknown) = (%q, %v, %v), want an empty not-found", got, ok, err)
+	}
+}
+
+// A gamertag freed by a rename can be taken by a different account, so the
+// player answering to it now must win over the one who merely used to.
+// Getting this backwards aims a private message at the wrong person.
+func TestXUIDForNamePrefersTheCurrentHolderOfAName(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	const shared = "SharedName"
+	previous, current := "2535400000000008", "2535400000000009"
+
+	if _, err := pg.RecordJoin(ctx, previous, shared, time.Now().UTC().Add(-2*time.Hour)); err != nil {
+		t.Fatalf("first holder joins: %v", err)
+	}
+	if _, err := pg.RecordJoin(ctx, previous, "RenamedAway", time.Now().UTC().Add(-time.Hour)); err != nil {
+		t.Fatalf("first holder renames: %v", err)
+	}
+	if _, err := pg.RecordJoin(ctx, current, shared, time.Now().UTC()); err != nil {
+		t.Fatalf("second holder joins: %v", err)
+	}
+
+	got, ok, err := pg.XUIDForName(ctx, shared)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if !ok || got != current {
+		t.Errorf("XUIDForName(%s) = (%q, %v), want %q -- the player who answers to it now", shared, got, ok, current)
+	}
+}
+
 // Sessions left open by a previous run are the agent's normal state after any
 // restart, so this runs on every startup and was the one place the missing
 // grant actually surfaced.
@@ -153,5 +214,61 @@ func TestCloseOrphansClosesOnlyOpenSessions(t *testing.T) {
 	}
 	if again != 0 {
 		t.Errorf("closed %d sessions on a second pass, want 0 -- closing is not idempotent", again)
+	}
+}
+
+// EnsurePlayer exists so an announcement can be recorded as delivered to
+// someone the agent never watched arrive. What it must not do is look like
+// an arrival: the greeting a player gets on their next real join is read
+// from a row this may have created first.
+func TestEnsurePlayerCreatesARowWithoutCountingAJoin(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := "2535400000000005"
+	at := time.Now().UTC()
+
+	if err := pg.EnsurePlayer(ctx, xuid, "AlreadyOnline", at); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	var joins int
+	if err := pg.pool.QueryRow(ctx, `SELECT join_count FROM minecraft.players WHERE xuid = $1`, xuid).Scan(&joins); err != nil {
+		t.Fatalf("read join_count: %v", err)
+	}
+	if joins != 0 {
+		t.Errorf("join_count = %d after an ensure, want 0; a delivery is not an arrival", joins)
+	}
+
+	profile, err := pg.RecordJoin(ctx, xuid, "AlreadyOnline", at.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if !profile.New() {
+		t.Error("the first observed join of an ensured player reported as a return; they would be greeted as a regular")
+	}
+}
+
+// Ensuring is idempotent and never rewrites a real profile: a returning
+// player's history must survive an announcement being delivered to them.
+func TestEnsurePlayerLeavesAnExistingProfileAlone(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := "2535400000000006"
+
+	if _, err := pg.RecordJoin(ctx, xuid, "Regular", time.Now().UTC().Add(-time.Hour)); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if err := pg.EnsurePlayer(ctx, xuid, "SomethingElse", time.Now().UTC()); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+
+	var gamertag string
+	var joins int
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT current_gamertag, join_count FROM minecraft.players WHERE xuid = $1`, xuid,
+	).Scan(&gamertag, &joins); err != nil {
+		t.Fatalf("read player: %v", err)
+	}
+	if gamertag != "Regular" || joins != 1 {
+		t.Errorf("player is (%q, %d) after an ensure, want (\"Regular\", 1)", gamertag, joins)
 	}
 }

@@ -27,6 +27,8 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/audit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/config"
@@ -100,50 +102,60 @@ func main() {
 	bridgeTimeout := time.Duration(cfg.ConsoleBridgeTimeoutMs) * time.Millisecond
 	bridgeClient := adapters.NewBridgeClient(cfg.ConsoleBridgeURL, cfg.ConsoleBridgeToken, bridgeTimeout)
 	permResolver := adapters.NewPermissionResolver(bridgeClient, adapters.DefaultPermissionsCacheTTL, log)
-
-	registry := plugin.NewRegistry()
-	if err := registry.Register(plugins.NewCore()); err != nil {
-		log.Error("plugin_register_failed", logging.Fields{"plugin": "core", "error": err.Error()})
-		os.Exit(1)
-	}
-	if err := registry.Register(plugins.NewStats()); err != nil {
-		log.Error("plugin_register_failed", logging.Fields{"plugin": "stats", "error": err.Error()})
-		os.Exit(1)
-	}
-	if err := registry.Register(plugins.NewKnowledge()); err != nil {
-		log.Error("plugin_register_failed", logging.Fields{"plugin": "knowledge", "error": err.Error()})
-		os.Exit(1)
-	}
-	if err := registry.Register(plugins.NewWaypoints()); err != nil {
-		log.Error("plugin_register_failed", logging.Fields{"plugin": "waypoints", "error": err.Error()})
-		os.Exit(1)
-	}
-	welcomePlugin := plugins.NewWelcome(ctx, welcomeDelay, log)
-	if err := registry.Register(welcomePlugin); err != nil {
-		log.Error("plugin_register_failed", logging.Fields{"plugin": "welcome", "error": err.Error()})
-		os.Exit(1)
-	}
+	siblings := siblingBotXUIDs()
 
 	// Opened before the game connection so a misconfigured database is a
 	// startup log line rather than a surprise at the first player join, and
-	// before the plugin context because that context needs it. Failure is not
-	// fatal: persistence is the personalisation behind greetings, and losing
-	// it must not cost the agent its commands.
+	// before the plugins because two of them are constructed from it. Failure
+	// is not fatal: persistence is the personalisation behind greetings, and
+	// losing it must not cost the agent its commands.
 	playerStore := openStore(ctx, cfg, log)
 	defer playerStore.Close()
 
-	// Both share the profile store's pool rather than opening their own: one
-	// database, one set of connections, and a store that cannot outlive the
-	// pool it borrows.
+	// All four share the profile store's pool rather than opening their own:
+	// one database, one set of connections, and a store that cannot outlive
+	// the pool it borrows.
 	var knowledgeStore knowledge.Store = knowledge.Nop{}
 	var waypointStore waypoints.Store = waypoints.Nop{}
+	var announceStore announce.Store = announce.Nop{}
+	var auditor audit.Store = audit.Nop{}
 	if pg, ok := playerStore.(*store.Postgres); ok && pg.Pool() != nil {
 		knowledgeStore = knowledge.NewPostgres(pg.Pool())
 		waypointStore = waypoints.NewPostgres(pg.Pool())
+		auditor = newAuditTrail(audit.NewPostgres(pg.Pool()), log)
+		// Wrapped rather than used directly: every announcement row names a
+		// player that minecraft.players must already hold -- see outbox.
+		announceStore = newOutbox(announce.NewPostgres(pg.Pool()), pg, playerRoster, log)
 		log.Info("knowledge_ready", nil)
 	}
 
-	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, playerRoster, registry, playerStore, knowledgeStore, waypointStore)
+	voice := adapters.NewBridgeVoice(bridgeClient, playerRoster)
+	audience := newDeliveryAudience(playerRoster, siblings)
+
+	// One Deliverer for the process, reached two ways: plugin.Context narrows
+	// it to what !announce and !inbox need, while the drain plugin needs
+	// DrainForJoin, which that interface deliberately does not carry. Two
+	// instances would be two views of one outbox with no reason to differ.
+	//
+	// Every dependency is real. A Deliverer over a disabled store returns
+	// before it touches any of them, which made a nil safe here while this
+	// was a placeholder -- and would have made it a nil dereference the first
+	// time those early returns moved.
+	deliverer := announce.NewDeliverer(
+		announceStore,
+		voice,
+		audience,
+		announcePermissions{resolver: permResolver},
+		log,
+	)
+
+	registry := plugin.NewRegistry()
+	if err := registerPlugins(ctx, registry, deliverer, log); err != nil {
+		log.Error("plugin_register_failed", logging.Fields{"error": err.Error()})
+		os.Exit(1)
+	}
+
+	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, voice, playerRoster, registry, playerStore, knowledgeStore, waypointStore, announceStore, deliverer)
 	// Every answerable chat message and every roster join is published
 	// here; event-driven plugins (welcome) subscribe via startEventDispatch
 	// rather than touching the connection directly.
@@ -188,7 +200,7 @@ func main() {
 	}
 
 	log.Info("starting", logging.Fields{"mc_host": cfg.MCHost, "mc_port": cfg.MCPort})
-	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver, ans, playerStore)
+	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblings, permResolver, ans, playerStore, auditor)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
@@ -198,9 +210,59 @@ func main() {
 	log.Info("stopped", nil)
 }
 
+// registerPlugins registers every plugin this binary serves.
+//
+// A function rather than a run of Register calls inside main so a test can
+// hold the finished registry and say what it must contain. Nothing else in
+// the process knows this set: a plugin dropped from here takes its commands
+// with it, compiles, and leaves every test green -- the same shape as the
+// Profiles field that was declared, never assigned, and only noticed in
+// production.
+//
+// The error carries the plugin's own name, because "registration failed" on
+// its own does not say which one.
+func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer plugins.AnnounceDeliverer, log *logging.Logger) error {
+	for _, p := range []plugin.Plugin{
+		plugins.NewCore(),
+		plugins.NewStats(),
+		plugins.NewKnowledge(),
+		plugins.NewWaypoints(),
+		plugins.NewWelcome(ctx, welcomeDelay, log),
+		plugins.NewAnnounce(),
+		plugins.NewAnnounceDrain(ctx, deliverer, log),
+	} {
+		if err := registry.Register(p); err != nil {
+			return fmt.Errorf("%s: %w", p.Name(), err)
+		}
+	}
+	return nil
+}
+
+// siblingBotXUIDs is the set of bot identities this agent treats as its own
+// kind: never answered in chat, never welcomed, never announced to.
+//
+// It is empty, and nothing populates it. Read that plainly: every filter
+// built on it — handleText, handlePlayerList, the delivery audience —
+// currently excludes this agent and nobody else, so a sibling AFK bot is
+// welcomed, drained and whispered to exactly like a player. It leaves no
+// error behind either: the roster can name a bot, so the outbox creates a
+// minecraft.players row for one and records its deliveries as if a person
+// had heard them. The gap is silent in the database as well as in chat.
+//
+// Populating it is not a line of code here. The AFK bots are identified by
+// gamertag in their own deployment, not by XUID, and this binary is given
+// neither: an XUID is only learned by watching a PlayerList entry for that
+// name arrive, so the set would have to be rebuilt per session from
+// configuration this agent does not yet receive. Stated in one place rather
+// than implied at three call sites, so nobody reads a filter that consults
+// it and concludes the bots are handled.
+func siblingBotXUIDs() map[string]struct{} {
+	return map[string]struct{}{}
+}
+
 // runConnectLoop owns the reconnect/backoff policy. Each iteration runs one
 // session to completion (or failure), then waits before trying again.
-func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store) {
+func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store) {
 	minDelay := time.Duration(cfg.ReconnectMinMs) * time.Millisecond
 	maxDelay := time.Duration(cfg.ReconnectMaxMs) * time.Millisecond
 	// authDelay does not enter the doubling ladder: nextDelay never sees it,
@@ -222,7 +284,7 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		firstAttempt = false
 
 		started := time.Now()
-		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver, ans, playerStore)
+		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblingXUIDs, permResolver, ans, playerStore, auditor)
 		lasted := time.Since(started)
 		httpServer.SetReady(false)
 
@@ -391,7 +453,7 @@ func isAuthRejection(err error) bool {
 // clean disconnect and a non-nil error on anything else (including ctx
 // cancellation surfaced as a read error, which the caller ignores because
 // it checks ctx.Err() itself).
-func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store) error {
+func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store) error {
 	// Without this the agent joins as a solid black silhouette under a
 	// SkinID regenerated every connect: Bedrock skins are uploaded by the
 	// client from its own installation, and a headless client has none, so
@@ -461,16 +523,16 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 
 	selfXUID := conn.IdentityData().XUID
 	log.Info("spawned", logging.Fields{"self_xuid": selfXUID})
+	// The agent is on the roster like any other player, so the announcement
+	// audience has to be told which entry is its own before anything is
+	// delivered -- see deliveryAudience.
+	audience.beginSession(selfXUID)
 	// Runtime ID rather than XUID: the respawn exchange identifies the player
 	// by the id that is unique to this world session, not the account.
 	respawner := liveness.New(conn.GameData().EntityRuntimeID)
 	httpServer.SetReady(true)
 	httpapi.SetConnected(true)
 	defer httpapi.SetConnected(false)
-
-	// TODO(stage 2+): populate from a real sibling-bot roster (e.g. the
-	// AFK bots) once one exists, rather than an empty set.
-	siblingXUIDs := map[string]struct{}{}
 
 	for {
 		if ctx.Err() != nil {
@@ -496,20 +558,20 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 			httpServer.SetReady(!respawner.Dead())
 		}
 
-		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, ans, playerStore)
+		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, ans, playerStore, auditor)
 	}
 }
 
-func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store) {
+func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store) {
 	switch pk := pk.(type) {
 	case *packet.Text:
-		handleText(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, permResolver, ans, playerRoster)
+		handleText(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, permResolver, ans, playerRoster, auditor)
 	case *packet.PlayerList:
 		handlePlayerList(ctx, pk, selfXUID, siblingXUIDs, log, eventBus, playerRoster, playerStore)
 	}
 }
 
-func handleText(ctx context.Context, text *packet.Text, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, permResolver *adapters.PermissionResolver, ans answering, playerRoster *roster.Roster) {
+func handleText(ctx context.Context, text *packet.Text, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, permResolver *adapters.PermissionResolver, ans answering, playerRoster *roster.Roster, auditor audit.Store) {
 	if !chat.IsAnswerableType(text.TextType) {
 		return
 	}
@@ -527,7 +589,7 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 
 	switch trigger.Kind {
 	case chat.TriggerCommand:
-		handleCommand(ctx, id, trigger, log, registry, pctx, limiter, permResolver)
+		handleCommand(ctx, id, trigger, log, registry, pctx, limiter, permResolver, auditor, playerRoster)
 	case chat.TriggerMention:
 		startAnswer(ctx, id, trigger, log, pctx, ans, playerRoster)
 	}
@@ -541,9 +603,13 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 // RecordJoin without reporting anything, and no player arrival was ever
 // persisted. Nothing failed loudly, because the one branch that would have
 // logged is the error path of the call that was not being made.
-func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store) *plugin.Context {
+func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, voice plugin.Voice, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store, announceStore plugin.AnnounceStore, deliverer plugin.AnnounceDeliverer) *plugin.Context {
 	return &plugin.Context{
-		Voice: adapters.NewBridgeVoice(bridgeClient, playerRoster),
+		// The same Voice the Deliverer speaks through, passed in rather than
+		// built here: an announcement and a command reply are the same console
+		// bridge saying the same kind of thing, and a second instance would be
+		// a second place for that to stop being true.
+		Voice: voice,
 		Facts: adapters.NewBridgeFacts(bridgeClient),
 		// Shares the bridge's timeout: both are "one HTTP call to something
 		// in this namespace", and a second knob for the same property is a
@@ -560,6 +626,18 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 		// configured, the disabled implementation when not, never nil.
 		Knowledge: knowledgeStore,
 		Waypoints: waypointStore,
+		// Same reasoning as Profiles again -- pool-backed when a database is
+		// configured, the disabled implementation when not, never nil, even
+		// though the field is documented as possibly nil for tests that
+		// construct a bare Context.
+		Announcements: announceStore,
+		Deliverer:     deliverer,
+		// The live roster backed by the profile store, so "@player" resolves
+		// for someone who is offline -- which is precisely who a queued
+		// announcement is for. With no database configured the second tier
+		// answers "never seen", and !announce refuses exactly as it did
+		// before there was one.
+		Roster: playerLookup{live: playerRoster, archive: playerStore},
 	}
 }
 
@@ -770,9 +848,57 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 	}
 }
 
-func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, limiter *ratelimit.PerActor, permResolver *adapters.PermissionResolver) {
+func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, limiter *ratelimit.PerActor, permResolver *adapters.PermissionResolver, auditor audit.Store, playerRoster *roster.Roster) {
+	// Mirrors handleMention's resolution exactly: the roster is the one place
+	// an XUID becomes a name, and a second lookup path here would be a second
+	// place for that mapping to drift from the first.
+	gamertag := actorXUID
+	if playerRoster != nil {
+		if resolved, ok := playerRoster.NameFor(actorXUID); ok && resolved != "" {
+			gamertag = resolved
+		}
+	}
+
+	// Filled in once permission resolution below actually runs. A
+	// rate-limited dispatch never reaches that point, so its record shows
+	// what was known at refusal rather than a resolved level the bridge was
+	// never asked for.
+	var permission string
+
+	// One record per dispatch, whatever happened. Every exit path below calls
+	// this exactly once, and it must never be what makes that path slow: a
+	// compliance record that can delay or fail a command is a worse liability
+	// than a gap in the record, so a write failure is logged and swallowed
+	// rather than surfaced to the caller.
+	writeAudit := func(outcome audit.Outcome) {
+		if auditor == nil || !auditor.Enabled() {
+			return
+		}
+		// Bounded like the permission lookup and the reply below: this call
+		// reaches a database from the same read-loop goroutine, and with no
+		// deadline of its own a slow or hung one would stall every player's
+		// commands behind it -- exactly what "never blocks the command" rules
+		// out.
+		auditCtx, auditCancel := context.WithTimeout(ctx, plugin.DefaultDispatchTimeout)
+		defer auditCancel()
+		if err := auditor.Write(auditCtx, audit.Record{
+			XUID:       actorXUID,
+			Gamertag:   gamertag,
+			Permission: permission,
+			Command:    trigger.Command,
+			Args:       strings.Join(trigger.Args, " "),
+			Outcome:    outcome,
+			At:         time.Now(),
+		}); err != nil {
+			log.Error("audit_write_failed", logging.Fields{
+				"command": trigger.Command, "actor": actorXUID, "outcome": string(outcome), "error": err.Error(),
+			})
+		}
+	}
+
 	if !limiter.Allow(actorXUID, time.Now()) {
 		log.Info("command_rate_limited", logging.Fields{"command": trigger.Command, "actor": actorXUID})
+		writeAudit(audit.OutcomeRateLimited)
 		return
 	}
 
@@ -782,6 +908,7 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	permCtx, permCancel := context.WithTimeout(ctx, plugin.DefaultDispatchTimeout)
 	actorPermission := permResolver.Resolve(permCtx, actorXUID)
 	permCancel()
+	permission = actorPermission.String()
 
 	inv := plugin.Invocation{ActorXUID: actorXUID, ActorPermission: actorPermission, Args: trigger.Args}
 
@@ -789,31 +916,68 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	switch {
 	case errors.Is(err, plugin.ErrUnknownCommand):
 		log.Debug("command_unknown", logging.Fields{"command": trigger.Command, "actor": actorXUID})
+		writeAudit(audit.OutcomeUnknown)
 		return
 	case errors.Is(err, plugin.ErrPermissionDenied):
 		log.Info("command_denied", logging.Fields{"command": trigger.Command, "actor": actorXUID})
+		writeAudit(audit.OutcomeDenied)
+		return
+	case errors.Is(err, plugin.ErrCommandTimedOut):
+		// Checked ahead of the generic err != nil case below: ErrCommandTimedOut
+		// wraps into that branch too, and a timeout recorded as a plain error
+		// loses exactly the distinction the schema draws between them.
+		log.Error("command_timed_out", logging.Fields{"command": trigger.Command, "actor": actorXUID})
+		speak(ctx, log, pctx, actorXUID, trigger.Command, commandTimedOutReply)
+		writeAudit(audit.OutcomeTimeout)
 		return
 	case err != nil:
 		log.Error("command_failed", logging.Fields{"command": trigger.Command, "actor": actorXUID, "error": err.Error()})
+		speak(ctx, log, pctx, actorXUID, trigger.Command, commandFailedReply)
+		writeAudit(audit.OutcomeError)
 		return
 	}
 
 	log.Info("command_replied", logging.Fields{"command": trigger.Command, "actor": actorXUID, "reply": reply})
 
-	// The reply runs on the packet-read goroutine just like Dispatch does,
-	// so it needs the same bound: a hung Voice implementation must not be
-	// able to stall the read loop indefinitely.
+	speak(ctx, log, pctx, actorXUID, trigger.Command, reply)
+	// Written after the reply is sent, not before: the record must never be
+	// in front of what the player is waiting on.
+	writeAudit(audit.OutcomeOK)
+}
+
+// commandFailedReply and commandTimedOutReply are what a dispatch that
+// produced no reply of its own says instead of nothing.
+//
+// A command that errors is a command whose author never got to write an
+// answer for what went wrong, and every one of those used to end in
+// silence: the player or operator sees their own typed line and then
+// nothing, which reads exactly like a command that worked and had nothing
+// to say. The two are separated because they call for different next steps
+// -- one is a failure already in the log, the other is something still
+// running that outlasted its budget.
+const (
+	commandFailedReply   = "That didn't work - the failure is in my log."
+	commandTimedOutReply = "That took too long, so I stopped waiting on it."
+)
+
+// speak sends one reply back the way the command came in: broadcast for the
+// console, which has no player to whisper to, and a whisper for anyone else.
+//
+// Bounded like Dispatch is, and for the same reason: this runs on the
+// packet-read goroutine, so a hung Voice implementation must not be able to
+// stall the read loop indefinitely.
+func speak(ctx context.Context, log *logging.Logger, pctx *plugin.Context, actorXUID, command, reply string) {
 	replyCtx, cancel := context.WithTimeout(ctx, plugin.DefaultDispatchTimeout)
 	defer cancel()
 
 	if actorXUID == chat.ServerOrigin {
 		if err := pctx.Voice.Say(replyCtx, reply); err != nil {
-			log.Error("voice_say_failed", logging.Fields{"command": trigger.Command, "error": err.Error()})
+			log.Error("voice_say_failed", logging.Fields{"command": command, "error": err.Error()})
 		}
 		return
 	}
 	if err := pctx.Voice.Tell(replyCtx, actorXUID, reply); err != nil {
-		log.Error("voice_tell_failed", logging.Fields{"command": trigger.Command, "actor": actorXUID, "error": err.Error()})
+		log.Error("voice_tell_failed", logging.Fields{"command": command, "actor": actorXUID, "error": err.Error()})
 	}
 }
 
