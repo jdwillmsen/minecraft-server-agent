@@ -161,11 +161,21 @@ func TestServerPinger_ConsoleFailuresAreReported(t *testing.T) {
 			t.Errorf("got known=%v err=%v, want an error", got.TPSKnown, got.TPSErr)
 		}
 	})
-	t.Run("no Gametime line captured", func(t *testing.T) {
+	// A lagging server prints its answer after the bridge stops listening;
+	// that must read as a late answer, not as the output format changing.
+	t.Run("nothing captured in the window", func(t *testing.T) {
 		p := NewServerPinger(gametimeBridge(t, ""), nil, quietLog)
 
-		if got := p.Ping(context.Background()); got.TPSErr == nil || got.TPSKnown {
-			t.Errorf("got known=%v err=%v, want an error", got.TPSKnown, got.TPSErr)
+		got := p.Ping(context.Background())
+		if !errors.Is(got.TPSErr, errNoAnswer) || errors.Is(got.TPSErr, errNoGametime) || got.TPSKnown {
+			t.Errorf("got known=%v err=%v, want errNoAnswer and not errNoGametime", got.TPSKnown, got.TPSErr)
+		}
+	})
+	t.Run("an answer without a Gametime line", func(t *testing.T) {
+		p := NewServerPinger(gametimeBridge(t, "[2026-09-10 08:00:00:000 INFO] Unknown command: time\n"), nil, quietLog)
+
+		if got := p.Ping(context.Background()); !errors.Is(got.TPSErr, errNoGametime) || got.TPSKnown {
+			t.Errorf("got known=%v err=%v, want errNoGametime", got.TPSKnown, got.TPSErr)
 		}
 	})
 }
