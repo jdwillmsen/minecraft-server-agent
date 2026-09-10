@@ -12,6 +12,7 @@ import (
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics/metricstest"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/moderation"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
@@ -577,5 +578,21 @@ func TestModlogFormatsNewestFirstWithATruncatedMessage(t *testing.T) {
 	if !strings.HasPrefix(entries[1], `09-09 08:00 UTC Alex flood (6 messages in 10s): "spam spam`) ||
 		!strings.HasSuffix(entries[1], `..."`) || strings.Contains(entries[1], "second line") || strings.Contains(entries[1], "\n") {
 		t.Errorf("entry 1 = %q, want a one-line message cut short", entries[1])
+	}
+}
+
+// The counter must track what was written, so deleting the recording call
+// beside the write is a failure here, not a quietly flat dashboard.
+func TestModerationCountsEveryFlagItRecords(t *testing.T) {
+	r := newModRig(t, "griefer")
+	got := metricstest.Delta(t, func() {
+		r.say(t, modPlayer, "griefer")
+		r.waitRecorded(t, 1)
+	}, "mc_agent_moderation_flags_total", "rule", "term", "action", "warned")
+	// At least rather than exactly: the series is process-global, and another
+	// test's worker may still be finishing. Nothing else can move it if the
+	// recording call is gone.
+	if got < 1 {
+		t.Errorf("term/warned moved by %v after a recorded warning, want at least 1", got)
 	}
 }

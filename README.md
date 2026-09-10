@@ -197,6 +197,7 @@ breaking change.
 | `mc_agent_audit_write_failures_total` | counter | none | per dispatch the audit trail did not record |
 | `mc_agent_auth_rejections_total` | counter | none | per Xbox Live account rejection |
 | `mc_agent_deaths_total` | counter | none | per death the respawner handles |
+| `mc_agent_moderation_flags_total` | counter | `rule`, `action` | per flag written to the moderation record; every pair starts at zero |
 | `mc_agent_server_tps` | gauge | none | per successful TPS measurement, background or `!ping` |
 | `mc_agent_tps_last_success_timestamp_seconds` | gauge | none | same moment |
 | `mc_agent_link_rtt_seconds` | gauge | none | per background sample while a session exists |

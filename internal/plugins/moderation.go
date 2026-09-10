@@ -10,6 +10,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/moderation"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/pgerr"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
@@ -223,6 +224,7 @@ func (m *Moderation) act(j moderationJob) {
 			}
 			continue
 		}
+		metrics.ModerationFlag(f.Rule, action)
 		recorded++
 	}
 
