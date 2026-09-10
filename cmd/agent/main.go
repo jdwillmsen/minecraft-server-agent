@@ -102,6 +102,52 @@ func main() {
 	bridgeTimeout := time.Duration(cfg.ConsoleBridgeTimeoutMs) * time.Millisecond
 	bridgeClient := adapters.NewBridgeClient(cfg.ConsoleBridgeURL, cfg.ConsoleBridgeToken, bridgeTimeout)
 	permResolver := adapters.NewPermissionResolver(bridgeClient, adapters.DefaultPermissionsCacheTTL, log)
+	siblings := siblingBotXUIDs()
+
+	// Opened before the game connection so a misconfigured database is a
+	// startup log line rather than a surprise at the first player join, and
+	// before the plugins because two of them are constructed from it. Failure
+	// is not fatal: persistence is the personalisation behind greetings, and
+	// losing it must not cost the agent its commands.
+	playerStore := openStore(ctx, cfg, log)
+	defer playerStore.Close()
+
+	// All four share the profile store's pool rather than opening their own:
+	// one database, one set of connections, and a store that cannot outlive
+	// the pool it borrows.
+	var knowledgeStore knowledge.Store = knowledge.Nop{}
+	var waypointStore waypoints.Store = waypoints.Nop{}
+	var announceStore announce.Store = announce.Nop{}
+	var auditor audit.Store = audit.Nop{}
+	if pg, ok := playerStore.(*store.Postgres); ok && pg.Pool() != nil {
+		knowledgeStore = knowledge.NewPostgres(pg.Pool())
+		waypointStore = waypoints.NewPostgres(pg.Pool())
+		auditor = audit.NewPostgres(pg.Pool())
+		// Wrapped rather than used directly: every announcement row names a
+		// player that minecraft.players must already hold -- see outbox.
+		announceStore = newOutbox(announce.NewPostgres(pg.Pool()), pg, playerRoster, log)
+		log.Info("knowledge_ready", nil)
+	}
+
+	voice := adapters.NewBridgeVoice(bridgeClient, playerRoster)
+	audience := newDeliveryAudience(playerRoster, siblings)
+
+	// One Deliverer for the process, reached two ways: plugin.Context narrows
+	// it to what !announce and !inbox need, while the drain plugin needs
+	// DrainForJoin, which that interface deliberately does not carry. Two
+	// instances would be two views of one outbox with no reason to differ.
+	//
+	// Every dependency is real. A Deliverer over a disabled store returns
+	// before it touches any of them, which made a nil safe here while this
+	// was a placeholder -- and would have made it a nil dereference the first
+	// time those early returns moved.
+	deliverer := announce.NewDeliverer(
+		announceStore,
+		voice,
+		audience,
+		announcePermissions{resolver: permResolver},
+		log,
+	)
 
 	registry := plugin.NewRegistry()
 	if err := registry.Register(plugins.NewCore()); err != nil {
@@ -125,30 +171,16 @@ func main() {
 		log.Error("plugin_register_failed", logging.Fields{"plugin": "welcome", "error": err.Error()})
 		os.Exit(1)
 	}
-
-	// Opened before the game connection so a misconfigured database is a
-	// startup log line rather than a surprise at the first player join, and
-	// before the plugin context because that context needs it. Failure is not
-	// fatal: persistence is the personalisation behind greetings, and losing
-	// it must not cost the agent its commands.
-	playerStore := openStore(ctx, cfg, log)
-	defer playerStore.Close()
-
-	// Both share the profile store's pool rather than opening their own: one
-	// database, one set of connections, and a store that cannot outlive the
-	// pool it borrows.
-	var knowledgeStore knowledge.Store = knowledge.Nop{}
-	var waypointStore waypoints.Store = waypoints.Nop{}
-	if pg, ok := playerStore.(*store.Postgres); ok && pg.Pool() != nil {
-		knowledgeStore = knowledge.NewPostgres(pg.Pool())
-		waypointStore = waypoints.NewPostgres(pg.Pool())
-		log.Info("knowledge_ready", nil)
+	if err := registry.Register(plugins.NewAnnounce()); err != nil {
+		log.Error("plugin_register_failed", logging.Fields{"plugin": "announce", "error": err.Error()})
+		os.Exit(1)
 	}
-	// Nop for now: no database-backed implementation is wired to the pool
-	// yet, and the dispatch path below calls this unconditionally either way.
-	var auditor audit.Store = audit.Nop{}
+	if err := registry.Register(plugins.NewAnnounceDrain(ctx, deliverer, log)); err != nil {
+		log.Error("plugin_register_failed", logging.Fields{"plugin": "announce-drain", "error": err.Error()})
+		os.Exit(1)
+	}
 
-	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, playerRoster, registry, playerStore, knowledgeStore, waypointStore)
+	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, voice, playerRoster, registry, playerStore, knowledgeStore, waypointStore, announceStore, deliverer)
 	// Every answerable chat message and every roster join is published
 	// here; event-driven plugins (welcome) subscribe via startEventDispatch
 	// rather than touching the connection directly.
@@ -193,7 +225,7 @@ func main() {
 	}
 
 	log.Info("starting", logging.Fields{"mc_host": cfg.MCHost, "mc_port": cfg.MCPort})
-	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver, ans, playerStore, auditor)
+	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblings, permResolver, ans, playerStore, auditor)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
@@ -203,9 +235,29 @@ func main() {
 	log.Info("stopped", nil)
 }
 
+// siblingBotXUIDs is the set of bot identities this agent treats as its own
+// kind: never answered in chat, never welcomed, never announced to.
+//
+// It is empty, and nothing populates it. Read that plainly: every filter
+// built on it — handleText, handlePlayerList, the delivery audience —
+// currently excludes this agent and nobody else, so a sibling AFK bot is
+// welcomed, drained and whispered to exactly like a player, and its
+// deliveries are recorded against an XUID minecraft.players has no row for.
+//
+// Populating it is not a line of code here. The AFK bots are identified by
+// gamertag in their own deployment, not by XUID, and this binary is given
+// neither: an XUID is only learned by watching a PlayerList entry for that
+// name arrive, so the set would have to be rebuilt per session from
+// configuration this agent does not yet receive. Stated in one place rather
+// than implied at three call sites, so nobody reads a filter that consults
+// it and concludes the bots are handled.
+func siblingBotXUIDs() map[string]struct{} {
+	return map[string]struct{}{}
+}
+
 // runConnectLoop owns the reconnect/backoff policy. Each iteration runs one
 // session to completion (or failure), then waits before trying again.
-func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store) {
+func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store) {
 	minDelay := time.Duration(cfg.ReconnectMinMs) * time.Millisecond
 	maxDelay := time.Duration(cfg.ReconnectMaxMs) * time.Millisecond
 	// authDelay does not enter the doubling ladder: nextDelay never sees it,
@@ -227,7 +279,7 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		firstAttempt = false
 
 		started := time.Now()
-		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, permResolver, ans, playerStore, auditor)
+		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblingXUIDs, permResolver, ans, playerStore, auditor)
 		lasted := time.Since(started)
 		httpServer.SetReady(false)
 
@@ -396,7 +448,7 @@ func isAuthRejection(err error) bool {
 // clean disconnect and a non-nil error on anything else (including ctx
 // cancellation surfaced as a read error, which the caller ignores because
 // it checks ctx.Err() itself).
-func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store) error {
+func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store) error {
 	// Without this the agent joins as a solid black silhouette under a
 	// SkinID regenerated every connect: Bedrock skins are uploaded by the
 	// client from its own installation, and a headless client has none, so
@@ -466,16 +518,16 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 
 	selfXUID := conn.IdentityData().XUID
 	log.Info("spawned", logging.Fields{"self_xuid": selfXUID})
+	// The agent is on the roster like any other player, so the announcement
+	// audience has to be told which entry is its own before anything is
+	// delivered -- see deliveryAudience.
+	audience.beginSession(selfXUID)
 	// Runtime ID rather than XUID: the respawn exchange identifies the player
 	// by the id that is unique to this world session, not the account.
 	respawner := liveness.New(conn.GameData().EntityRuntimeID)
 	httpServer.SetReady(true)
 	httpapi.SetConnected(true)
 	defer httpapi.SetConnected(false)
-
-	// TODO(stage 2+): populate from a real sibling-bot roster (e.g. the
-	// AFK bots) once one exists, rather than an empty set.
-	siblingXUIDs := map[string]struct{}{}
 
 	for {
 		if ctx.Err() != nil {
@@ -546,9 +598,13 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 // RecordJoin without reporting anything, and no player arrival was ever
 // persisted. Nothing failed loudly, because the one branch that would have
 // logged is the error path of the call that was not being made.
-func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store) *plugin.Context {
+func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, voice plugin.Voice, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store, announceStore plugin.AnnounceStore, deliverer plugin.AnnounceDeliverer) *plugin.Context {
 	return &plugin.Context{
-		Voice: adapters.NewBridgeVoice(bridgeClient, playerRoster),
+		// The same Voice the Deliverer speaks through, passed in rather than
+		// built here: an announcement and a command reply are the same console
+		// bridge saying the same kind of thing, and a second instance would be
+		// a second place for that to stop being true.
+		Voice: voice,
 		Facts: adapters.NewBridgeFacts(bridgeClient),
 		// Shares the bridge's timeout: both are "one HTTP call to something
 		// in this namespace", and a second knob for the same property is a
@@ -565,17 +621,12 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 		// configured, the disabled implementation when not, never nil.
 		Knowledge: knowledgeStore,
 		Waypoints: waypointStore,
-		// announce.Nop{} until the wiring task builds a pool-backed store;
-		// same reasoning as Profiles again -- never nil, even though the
-		// field is documented as possibly nil for tests that construct a
-		// bare Context.
-		Announcements: announce.Nop{},
-		// A Deliverer backed by a disabled store returns zero and no error
-		// from every method before it ever touches its voice, roster or
-		// permissions dependency (see internal/announce's own doc comment),
-		// so nil is safe here rather than a placeholder that has to be
-		// remembered and replaced later.
-		Deliverer: announce.NewDeliverer(announce.Nop{}, nil, nil, nil, nil),
+		// Same reasoning as Profiles again -- pool-backed when a database is
+		// configured, the disabled implementation when not, never nil, even
+		// though the field is documented as possibly nil for tests that
+		// construct a bare Context.
+		Announcements: announceStore,
+		Deliverer:     deliverer,
 		// The same roster every other capability that needs live presence
 		// reads from -- this binary always constructs one, regardless of
 		// whether a database is configured, so !announce's @player
