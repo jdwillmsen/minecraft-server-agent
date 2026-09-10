@@ -195,7 +195,11 @@ contested: the welcome message lands in the same second. A wall of text is
 a worse experience than a trickle, and `!inbox` gives back control to the
 player who wants it all now.
 
-`!inbox` drains the remainder on demand, same rules, no cap.
+`!inbox` drains the remainder on demand, same rules. Implementation note:
+it delivers a few at a time and reports the remainder rather than draining
+without limit -- the command is answered inside a dispatch timeout, and an
+uncapped drain of a real backlog exceeds it mid-delivery, which costs the
+player their reply as well as the rest of their messages.
 
 ## Broadcast deduplication
 

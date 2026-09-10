@@ -5,10 +5,15 @@
 // with the pod, cannot be queried, and is not something an auditor would
 // accept. This one is a table.
 //
-// It deliberately does not store reply text. Replies to the waypoint
-// commands carry coordinates the agent goes out of its way to whisper, and a
-// trail that transcribes every private reply would be a larger exposure than
-// the gap it closes.
+// It stores the command and its arguments, and deliberately not the reply.
+// That protects less than it might sound like, and the difference is worth
+// stating: args holds the raw argument string, so "!wp set base 100 64 -200"
+// records those coordinates verbatim, as does the body of a private
+// "!announce @player". What the exclusion keeps out is everything a reply
+// says that nobody typed -- the answer to a bare "!wp" lists every waypoint
+// a player owns, including the ones this command never mentioned, and a
+// trail that transcribed those would expose far more than the dispatch it
+// is recording.
 package audit
 
 import (

@@ -104,11 +104,16 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   what keeps this an outbox instead of a growing pile nobody prunes
 - `internal/audit` - one row per command dispatch, whatever the outcome:
   the actor's XUID and gamertag, the permission they resolved at, the
-  command and its arguments. Never the reply - a reply can carry a
-  waypoint's whispered coordinates, and copying it into a durable trail
-  would be a bigger exposure than the compliance gap the trail closes. A
+  command and its arguments. Never the reply - a reply can name things
+  nobody typed, and copying those into a durable trail would expose more
+  than the dispatch it records. A
   write that fails is logged and swallowed rather than allowed to block the
   command it describes
+- `internal/pgerr` - recognises the two ways a configured database refuses a
+  statement for a reason a deploy is responsible for: the tables are not
+  migrated yet, or the role was never granted access to them. Both are
+  states a command can answer for and an operator can fix, so neither
+  reaches a player as silence
 - `internal/tools` - the read-only capability surface the `@server` answer
   path may call. Every tool answers a question; none of them change
   anything, so a prompt-injection attempt sitting in player chat has nothing
@@ -243,9 +248,27 @@ than resolved to either name: nothing distinguishes "the operator retargeted"
 from "the operator meant to send to two people," and guessing would silently
 drop one of the two names from both the target and the body.
 
+`@player` resolves against the live roster first and the profile store
+second, so a player who is offline - which is precisely who a queued
+announcement is for - is still a name the agent knows. Only a name neither
+has ever seen is refused, because an announcement aimed at an XUID nobody
+holds could never be delivered or drained. A gamertag freed by a rename can
+be taken by another account, so whoever answers to it now wins over whoever
+used to. The reply says what actually happened: `Told X.` only when the
+whisper went out, `Queued for X.` when it is waiting for them instead.
+
 `!inbox` is member level and only ever drains the caller's own queue - no
 argument names another player's, the same restriction `!wp` places on whose
-coordinates a command can touch.
+coordinates a command can touch. It delivers up to five messages per
+invocation and says how many are still waiting: the command is answered
+inside a dispatch timeout, and an uncapped drain of a real backlog spends
+that budget mid-delivery, leaving the player with a partial trickle and no
+reply at all. Saying `!inbox` again collects the next few. The console has
+no player identity and so has no queue; it is told that rather than drained.
+
+A command that fails or outlives its timeout answers with a plain line
+saying so. Silence is the one reply nobody can interpret - it is exactly
+what a command that worked and had nothing to say looks like.
 
 A queued message doesn't wait forever. Every announcement in this slice
 comes from `!announce`, and its expiry today depends on target, not source -
@@ -280,11 +303,22 @@ Every command dispatch, whatever happened to it, writes one row to the audit
 trail: the actor's XUID and gamertag, the permission they resolved at when
 the command ran (not their level now), the command name, its arguments, and
 the outcome (`ok`, `denied`, `unknown`, `error`, `rate_limited`, or
-`timeout`). It deliberately never records the reply. A reply can carry a
-waypoint's whispered coordinates, and a trail that copied every one of those
-would be a larger exposure than the compliance gap it closes - that's a
-privacy decision, not an oversight. A failed audit write is logged and never
-blocks the command it describes.
+`timeout`). The one exception to the permission is `rate_limited`: that
+dispatch is refused before the actor's level is ever resolved, so its row
+records an empty permission. Asking the bridge for a level on a request
+already being thrown away is exactly the work the limiter exists to avoid,
+so the order stays as it is and the row says what was known at refusal.
+
+It deliberately never records the reply. That is narrower than it sounds and
+worth being exact about: the arguments are stored verbatim, so `!wp set base
+100 64 -200` puts those coordinates in the trail, and so does the body of a
+private `!announce @player`. What the exclusion keeps out is everything a
+reply says that nobody typed - the answer to a bare `!wp` lists every
+waypoint a player owns, including ones this command never mentioned. That is
+a privacy decision, not an oversight. A failed audit write is logged and
+never blocks the command it describes; a table that has not been migrated
+yet, or one the agent's role was never granted, is reported once at INFO
+rather than once per command.
 
 ## Targeting a reply
 
