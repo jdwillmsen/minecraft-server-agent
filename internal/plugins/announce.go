@@ -259,6 +259,15 @@ func runInbox(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) 
 		return "", fmt.Errorf("announce: !inbox: %w", err)
 	}
 	if delivered == 0 {
+		// delivered counts only messages whose whisper and delivery row
+		// both succeeded, so zero is not the same fact as an empty queue:
+		// three whispers that landed and three rows that failed to write
+		// look identical to nothing having been owed. Saying "nothing new"
+		// there denies messages the player has just watched arrive, and
+		// they will arrive again, since nothing was recorded.
+		if remaining > 0 {
+			return "Something went wrong sending those - anything that did arrive may come again.", nil
+		}
 		return "You have nothing new.", nil
 	}
 	// Saying so is the whole reason the drain is capped: a player left

@@ -555,15 +555,24 @@ func TestAnnounceBeforeTheMigrationSaysSoRatherThanNothing(t *testing.T) {
 func TestInboxBeforeTheMigrationSaysSoRatherThanNothing(t *testing.T) {
 	cmd := announceCommand(t, "inbox")
 	deliverer := &fakeAnnounceDeliverer{drainErr: missingTableErr()}
+	// An enabled store, or the readiness guard answers first and this test
+	// passes without the drain ever being reached -- which is how it read
+	// while asserting a substring the guard happens to return too. The
+	// whole point here is the branch behind the guard, so the reply is
+	// pinned exactly.
+	pctx := &plugin.Context{Announcements: &fakeAnnounceStore{enabled: true}, Deliverer: deliverer}
 
-	reply, err := cmd.Run(context.Background(), &plugin.Context{Deliverer: deliverer}, plugin.Invocation{
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
 		ActorXUID: "someone", ActorPermission: plugin.PermissionMember,
 	})
 	if err != nil {
 		t.Fatalf("a missing table must not error the command: %v", err)
 	}
-	if !strings.Contains(strings.ToLower(reply), "store configured") {
-		t.Errorf("reply %q should explain the feature is unconfigured", reply)
+	if deliverer.drainXUID != "someone" {
+		t.Fatal("the drain was never reached; this test is not exercising the branch it names")
+	}
+	if reply != noStore {
+		t.Errorf("reply = %q, want %q", reply, noStore)
 	}
 }
 
@@ -668,6 +677,32 @@ func TestInboxSaysWhenSomethingIsStillWaiting(t *testing.T) {
 	}
 	if !strings.Contains(reply, "3") || !strings.Contains(reply, "!inbox") {
 		t.Errorf("reply %q should say how many are still waiting and how to get them", reply)
+	}
+	if strings.HasSuffix(reply, "?") {
+		t.Errorf("reply %q ends in a question mark", reply)
+	}
+}
+
+// delivered counts only messages whose whisper and delivery row both
+// succeeded. A player whose whispers land and whose rows fail to write is
+// owed exactly what they have just watched arrive -- and will be sent it
+// again, since nothing was recorded -- so "you have nothing new" is the one
+// answer that cannot be true.
+func TestInboxDoesNotClaimAnEmptyQueueWhenSomethingIsStillOwed(t *testing.T) {
+	cmd := announceCommand(t, "inbox")
+	pctx := &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: true},
+		Deliverer:     &fakeAnnounceDeliverer{drainCount: 0, drainRemaining: 3},
+	}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "player-a", ActorPermission: plugin.PermissionMember,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.Contains(strings.ToLower(reply), "nothing new") {
+		t.Errorf("reply %q denies messages the player is still owed", reply)
 	}
 	if strings.HasSuffix(reply, "?") {
 		t.Errorf("reply %q ends in a question mark", reply)

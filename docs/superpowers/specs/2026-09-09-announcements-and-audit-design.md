@@ -1,6 +1,6 @@
 # Announcements and Command Audit
 
-Status: approved design, not yet implemented.
+Status: approved and implemented, with the implementation notes inline.
 Date: 2026-09-09.
 Covers: slice 1 of 4 (the delivery engine and its first source), plus the
 command audit trail.
