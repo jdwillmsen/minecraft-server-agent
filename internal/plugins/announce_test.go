@@ -207,6 +207,9 @@ func TestAnnounceToAPlayerWhispersAndQueues(t *testing.T) {
 	if !strings.Contains(reply, "Dotablaze") {
 		t.Errorf("reply %q should name the whispered player", reply)
 	}
+	if !strings.Contains(strings.ToLower(reply), "queued") {
+		t.Errorf("reply %q should say the message is queued; nothing was delivered to an offline player", reply)
+	}
 	// Nothing was delivered -- they are offline -- so the row has to be the
 	// thing that survives, ready for their next join to drain.
 	if len(deliverer.sent) != 1 {
@@ -229,11 +232,12 @@ func TestAnnounceToAnOnlinePlayerResolvesFromTheLiveRoster(t *testing.T) {
 	}
 	pctx := &plugin.Context{Announcements: store, Deliverer: deliverer, Roster: roster}
 
-	if _, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
 		ActorXUID:       "op",
 		ActorPermission: plugin.PermissionOperator,
 		Args:            []string{"@Dotablaze", "the", "farm", "moved"},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if len(store.inserted) != 1 {
@@ -241,6 +245,32 @@ func TestAnnounceToAnOnlinePlayerResolvesFromTheLiveRoster(t *testing.T) {
 	}
 	if got := store.inserted[0].TargetValue; got != "xuid-live" {
 		t.Errorf("target = %q, want the connected player rather than the recorded one", got)
+	}
+	if reply != "Told Dotablaze." {
+		t.Errorf("reply = %q, want it to report the delivery that happened", reply)
+	}
+}
+
+// !now has no queue behind it, so nobody hearing it means nobody ever will
+// -- "Announced." would report something that did not happen and cannot
+// happen later.
+func TestAnnounceNowWithNobodyOnlineSaysNobodyHeardIt(t *testing.T) {
+	cmd := announceCommand(t, "announce")
+	pctx := &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: true},
+		Deliverer:     &fakeAnnounceDeliverer{sentNow: 0},
+	}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"!now", "restarting", "in", "five"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(reply), "nobody") {
+		t.Errorf("reply %q should say nobody heard it", reply)
 	}
 }
 

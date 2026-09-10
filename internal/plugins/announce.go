@@ -204,12 +204,27 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 	}
 	a.ID = id
 
-	if _, err := pctx.Deliverer.SendNow(ctx, a, id); err != nil {
+	sent, err := pctx.Deliverer.SendNow(ctx, a, id)
+	if err != nil {
 		return "", fmt.Errorf("announce: !announce: send: %w", err)
 	}
 
-	if target == announce.TargetPlayer {
+	// What the operator is told is what actually happened, not what was
+	// attempted. Nobody may have heard this: the target can be offline,
+	// their whisper can have failed, and a target that resolves to this
+	// agent or a sibling bot is filtered out of every audience. "Told X"
+	// in any of those cases is a report of a delivery that did not occur.
+	switch {
+	case target == announce.TargetPlayer && sent == 0:
+		// The row is stored and unexpired, so this is a promise the queue
+		// can keep: their next join or their own !inbox drains it.
+		return "Queued for " + displayName + ".", nil
+	case target == announce.TargetPlayer:
 		return "Told " + displayName + ".", nil
+	case target == announce.TargetOnlineOnly && sent == 0:
+		// online_only is the one target with no queue behind it, so nobody
+		// hearing it now means nobody ever will.
+		return "Nobody was online to hear that.", nil
 	}
 	return "Announced.", nil
 }
