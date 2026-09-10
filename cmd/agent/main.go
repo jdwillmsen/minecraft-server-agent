@@ -42,6 +42,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/toolset"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/liveness"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
@@ -428,10 +429,10 @@ type answering struct {
 	llm     *adapters.LLMClient
 	// toolsFor is rebuilt per answer rather than cached: it closes over the
 	// plugin context's capabilities, and which of those are usable can
-	// change while the process runs. The callerScoped it returns belongs to
+	// change while the process runs. The CallerScoped it returns belongs to
 	// that one answer and reports whether the model read the asker's own
-	// data -- see buildToolset.
-	toolsFor func(*plugin.Context) (*tools.Registry, *callerScoped)
+	// data -- see toolset.Build.
+	toolsFor func(*plugin.Context) (*tools.Registry, *toolset.CallerScoped)
 	// total bounds one whole answering attempt, tool rounds included.
 	total time.Duration
 	// inFlight is a counting semaphore over answers in progress, capped at
@@ -460,7 +461,7 @@ func newAnswering(llm *adapters.LLMClient, perMinute int, total, broadcast time.
 	return answering{
 		limiter:   ratelimit.NewPerActor(perMinute, time.Minute),
 		llm:       llm,
-		toolsFor:  buildToolset,
+		toolsFor:  toolset.Build,
 		total:     total,
 		inFlight:  make(chan struct{}, maxConcurrentAnswers),
 		broadcast: broadcast,
@@ -915,7 +916,7 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	sayCtx, sayCancel := context.WithTimeout(context.WithoutCancel(ctx), ans.broadcast)
 	defer sayCancel()
 
-	private := (whispered || personal.happened()) && actorXUID != chat.ServerOrigin
+	private := (whispered || personal.Happened()) && actorXUID != chat.ServerOrigin
 	var sendErr error
 	if private {
 		sendErr = pctx.Voice.Tell(sayCtx, actorXUID, reply)
