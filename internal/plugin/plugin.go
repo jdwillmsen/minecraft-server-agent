@@ -183,18 +183,33 @@ type Context struct {
 	// comment panicked the whole event dispatcher on a nil interface. A
 	// greeting is not worth taking the agent down for.
 	Profiles PlayerStore
-	// Knowledge and Waypoints are nil when no database is configured. Both
-	// are guarded at every use for the same reason Profiles is.
+	// Knowledge and Waypoints may be nil. cmd/agent always supplies both --
+	// the disabled implementation when no database is configured -- and
+	// both are guarded at every use for the same reason Profiles is.
 	Knowledge KnowledgeStore
 	Waypoints WaypointStore
-	// Announcements and Deliverer are nil when no database is configured,
-	// guarded at every use for the same reason Knowledge and Waypoints are.
+	// Announcements and Deliverer may be nil, on the same terms: cmd/agent
+	// always supplies both, and every use asks AnnouncementsReady rather
+	// than assuming it.
 	Announcements AnnounceStore
 	Deliverer     AnnounceDeliverer
 	// Roster resolves a "@player" reference in a command (!announce) to the
 	// XUID every other capability keys on. May be nil -- a command that
 	// needs it must refuse plainly rather than assume it can resolve one.
 	Roster Roster
+}
+
+// AnnouncementsReady reports whether an announcement can actually be stored
+// and sent: a store that persists, and a deliverer to send through.
+//
+// One predicate rather than a check per call site. The two were being asked
+// four different ways across this package and the plugins built on it --
+// nil-or-Enabled here, a bare nil there -- and the version that only tested
+// the deliverer let !inbox answer "you have nothing new" with no database
+// behind it at all: a claim about a player's queue made by something that
+// had never been able to read one.
+func (c *Context) AnnouncementsReady() bool {
+	return c != nil && c.Deliverer != nil && c.Announcements != nil && c.Announcements.Enabled()
 }
 
 // PlayerStore is the subset of internal/store a plugin may touch.
@@ -229,13 +244,12 @@ type WaypointStore interface {
 }
 
 // AnnounceStore is the outbox surface a plugin may touch: enough to create
-// an announcement and read what is pending for a player, but not to mark a
-// delivery -- that bookkeeping belongs to the deliverer, which is the only
-// thing that actually sends a message, so it is the only thing allowed to
-// record that one arrived.
+// an announcement, and nothing else. Reading what is pending and marking it
+// delivered both belong to the deliverer, which is the only thing that
+// actually sends a message, so it is the only thing allowed to decide what
+// is owed or record that one arrived.
 type AnnounceStore interface {
 	Insert(ctx context.Context, a announce.Announcement) (int64, error)
-	PendingFor(ctx context.Context, xuid, permission string, now time.Time) ([]announce.Announcement, error)
 	Enabled() bool
 }
 

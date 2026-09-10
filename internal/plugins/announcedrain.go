@@ -32,10 +32,11 @@ const drainTimeout = 30 * time.Second
 // maxConcurrentDrains caps join drains in flight across every player, the
 // same shape startAnswer uses to cap @server answers (cmd/agent/main.go).
 //
-// Kept smaller than that budget on purpose: an answer that misses its slot
-// is lost outright, so that cap is sized for throughput. A dropped drain
-// merely defers those messages to the player's next join or their own
-// !inbox -- nothing is lost -- so this only needs to be big enough that an
+// Kept larger than that budget on purpose, because dropping one costs less.
+// An answer that misses its slot is lost outright and the player who asked
+// gets nothing, so that cap is held down to what the model budget can bear.
+// A dropped drain merely defers those messages to the player's next join or
+// their own !inbox -- nothing is lost -- so this can be big enough that an
 // ordinary handful of simultaneous arrivals isn't shed, while still giving
 // a reconnect storm (a restart, a network blip) somewhere to stop opening
 // one bridge connection per returning player.
@@ -96,8 +97,10 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 		return fmt.Errorf("announcedrain: unexpected event type %T for kind %s", ev, ev.Kind())
 	}
 	if a.deliverer == nil {
-		// No store configured: there is nothing to drain and nothing to
-		// say, the same silence a disabled Deliverer would itself return.
+		// Nothing to drain through. Whether the store behind a real
+		// deliverer persists anything is that deliverer's question to
+		// answer -- it reports zero drained and nothing owed for a
+		// disabled one, which this handles as the quiet join it is.
 		return nil
 	}
 

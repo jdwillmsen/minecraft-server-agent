@@ -37,10 +37,6 @@ func (f *fakeAnnounceStore) Insert(_ context.Context, a announce.Announcement) (
 	return f.nextID, nil
 }
 
-func (f *fakeAnnounceStore) PendingFor(context.Context, string, string, time.Time) ([]announce.Announcement, error) {
-	return nil, nil
-}
-
 func (f *fakeAnnounceStore) Enabled() bool { return f.enabled }
 
 // fakeAnnounceDeliverer is a small stand-in for plugin.AnnounceDeliverer:
@@ -113,7 +109,7 @@ func announceCommand(t *testing.T, name string) plugin.Command {
 func TestAnnounceRequiresOperator(t *testing.T) {
 	cmd := announceCommand(t, "announce")
 	store := &fakeAnnounceStore{enabled: true}
-	pctx := &plugin.Context{Announcements: store}
+	pctx := &plugin.Context{Announcements: store, Deliverer: &fakeAnnounceDeliverer{}}
 
 	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
 		ActorXUID:       "member",
@@ -255,7 +251,7 @@ func TestAnnounceFailsRatherThanGuessWhenTheLookupBreaks(t *testing.T) {
 	cmd := announceCommand(t, "announce")
 	store := &fakeAnnounceStore{enabled: true}
 	roster := fakeAnnounceRoster{err: errors.New("connection refused")}
-	pctx := &plugin.Context{Announcements: store, Roster: roster}
+	pctx := &plugin.Context{Announcements: store, Deliverer: &fakeAnnounceDeliverer{}, Roster: roster}
 
 	if _, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
 		ActorXUID:       "op",
@@ -296,7 +292,7 @@ func TestAnnounceNowNeverQueues(t *testing.T) {
 func TestInboxDrainsOnlyTheCallersOwnQueue(t *testing.T) {
 	cmd := announceCommand(t, "inbox")
 	deliverer := &fakeAnnounceDeliverer{drainCount: 2}
-	pctx := &plugin.Context{Deliverer: deliverer}
+	pctx := &plugin.Context{Announcements: &fakeAnnounceStore{enabled: true}, Deliverer: deliverer}
 
 	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
 		ActorXUID:       "player-a",
@@ -315,7 +311,10 @@ func TestInboxDrainsOnlyTheCallersOwnQueue(t *testing.T) {
 
 func TestInboxWithNothingPendingSaysSo(t *testing.T) {
 	cmd := announceCommand(t, "inbox")
-	pctx := &plugin.Context{Deliverer: &fakeAnnounceDeliverer{drainCount: 0}}
+	pctx := &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: true},
+		Deliverer:     &fakeAnnounceDeliverer{drainCount: 0},
+	}
 
 	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
 		ActorXUID: "player-a", ActorPermission: plugin.PermissionMember,
@@ -345,7 +344,10 @@ func TestAnnounceWithoutAStoreSaysSo(t *testing.T) {
 	}
 
 	disabled := &fakeAnnounceStore{enabled: false}
-	reply, err = cmd.Run(context.Background(), &plugin.Context{Announcements: disabled}, plugin.Invocation{
+	reply, err = cmd.Run(context.Background(), &plugin.Context{
+		Announcements: disabled,
+		Deliverer:     &fakeAnnounceDeliverer{},
+	}, plugin.Invocation{
 		ActorXUID:       "op",
 		ActorPermission: plugin.PermissionOperator,
 		Args:            []string{"server", "restarting"},
@@ -363,22 +365,63 @@ func TestAnnounceWithoutAStoreSaysSo(t *testing.T) {
 
 func TestInboxWithoutAStoreSaysSo(t *testing.T) {
 	cmd := announceCommand(t, "inbox")
+	inv := plugin.Invocation{ActorXUID: "someone", ActorPermission: plugin.PermissionMember}
 
-	reply, err := cmd.Run(context.Background(), &plugin.Context{}, plugin.Invocation{
-		ActorXUID: "someone", ActorPermission: plugin.PermissionMember,
-	})
+	reply, err := cmd.Run(context.Background(), &plugin.Context{}, inv)
 	if err != nil {
 		t.Fatalf("a nil Deliverer must not error: %v", err)
 	}
 	if !strings.Contains(strings.ToLower(reply), "store configured") {
 		t.Errorf("reply %q should explain the feature is unconfigured", reply)
 	}
+
+	// The regression this predicate exists for: a deliverer over a store
+	// that persists nothing drains zero, which reads as an empty queue.
+	// Answering "you have nothing new" there asserts a fact about the
+	// player's messages that nothing here can know, while !announce in the
+	// identical state correctly says the store is unconfigured.
+	deliverer := &fakeAnnounceDeliverer{}
+	reply, err = cmd.Run(context.Background(), &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: false},
+		Deliverer:     deliverer,
+	}, inv)
+	if err != nil {
+		t.Fatalf("a disabled store must not error: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(reply), "store configured") {
+		t.Errorf("reply %q should explain the feature is unconfigured, not claim the queue is empty", reply)
+	}
+	if deliverer.drainXUID != "" {
+		t.Error("a disabled store was drained anyway")
+	}
+}
+
+// The console has no player identity, so nothing can ever be queued for it
+// and every whisper the drain attempted would fail to resolve a gamertag --
+// one logged failure per pending message, ending in "you have nothing new".
+func TestInboxFromTheConsoleIsRefusedPlainly(t *testing.T) {
+	cmd := announceCommand(t, "inbox")
+	deliverer := &fakeAnnounceDeliverer{drainCount: 3}
+
+	reply, err := cmd.Run(context.Background(), &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: true},
+		Deliverer:     deliverer,
+	}, plugin.Invocation{ActorXUID: chat.ServerOrigin, ActorPermission: plugin.PermissionOperator})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if deliverer.drainXUID != "" {
+		t.Errorf("the console drained %q; it has no queue to drain", deliverer.drainXUID)
+	}
+	if !strings.Contains(strings.ToLower(reply), "console") {
+		t.Errorf("reply %q should say the console has no inbox", reply)
+	}
 }
 
 func TestAnnounceRefusesAnUnknownPlayerRatherThanStoreIt(t *testing.T) {
 	cmd := announceCommand(t, "announce")
 	store := &fakeAnnounceStore{enabled: true}
-	pctx := &plugin.Context{Announcements: store, Roster: fakeAnnounceRoster{}}
+	pctx := &plugin.Context{Announcements: store, Deliverer: &fakeAnnounceDeliverer{}, Roster: fakeAnnounceRoster{}}
 
 	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
 		ActorXUID:       "op",
@@ -403,7 +446,7 @@ func TestAnnounceNowAndPlayerTargetIsRefused(t *testing.T) {
 	cmd := announceCommand(t, "announce")
 	store := &fakeAnnounceStore{enabled: true}
 	roster := fakeAnnounceRoster{online: map[string]string{"Dotablaze": "xuid-dota"}}
-	pctx := &plugin.Context{Announcements: store, Roster: roster}
+	pctx := &plugin.Context{Announcements: store, Deliverer: &fakeAnnounceDeliverer{}, Roster: roster}
 
 	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
 		ActorXUID:       "op",
@@ -425,7 +468,7 @@ func TestAnnounceRefusesASecondPlayerToken(t *testing.T) {
 	cmd := announceCommand(t, "announce")
 	store := &fakeAnnounceStore{enabled: true}
 	roster := fakeAnnounceRoster{online: map[string]string{"A": "xuid-a", "B": "xuid-b"}}
-	pctx := &plugin.Context{Announcements: store, Roster: roster}
+	pctx := &plugin.Context{Announcements: store, Deliverer: &fakeAnnounceDeliverer{}, Roster: roster}
 
 	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
 		ActorXUID:       "op",
@@ -500,7 +543,8 @@ func TestAnnounceStillFailsOnAnOrdinaryStoreError(t *testing.T) {
 	cmd := announceCommand(t, "announce")
 	store := &fakeAnnounceStore{enabled: true, insertErr: errors.New("connection refused")}
 
-	if _, err := cmd.Run(context.Background(), &plugin.Context{Announcements: store}, plugin.Invocation{
+	pctx := &plugin.Context{Announcements: store, Deliverer: &fakeAnnounceDeliverer{}}
+	if _, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
 		ActorXUID:       "op",
 		ActorPermission: plugin.PermissionOperator,
 		Args:            []string{"server", "restarting"},
@@ -553,6 +597,7 @@ func TestCommandsSayWhenTheStoreRefusesAccess(t *testing.T) {
 	announceCmd := announceCommand(t, "announce")
 	reply, err := announceCmd.Run(context.Background(), &plugin.Context{
 		Announcements: &fakeAnnounceStore{enabled: true, insertErr: grantErr},
+		Deliverer:     &fakeAnnounceDeliverer{},
 	}, plugin.Invocation{
 		ActorXUID:       "op",
 		ActorPermission: plugin.PermissionOperator,

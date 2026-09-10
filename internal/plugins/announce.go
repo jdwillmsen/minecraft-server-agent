@@ -100,7 +100,7 @@ loop:
 }
 
 func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (string, error) {
-	if pctx.Announcements == nil || !pctx.Announcements.Enabled() {
+	if !pctx.AnnouncementsReady() {
 		return noStore, nil
 	}
 	if inv.ActorPermission < plugin.PermissionOperator {
@@ -204,10 +204,8 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 	}
 	a.ID = id
 
-	if pctx.Deliverer != nil {
-		if _, err := pctx.Deliverer.SendNow(ctx, a, id); err != nil {
-			return "", fmt.Errorf("announce: !announce: send: %w", err)
-		}
+	if _, err := pctx.Deliverer.SendNow(ctx, a, id); err != nil {
+		return "", fmt.Errorf("announce: !announce: send: %w", err)
 	}
 
 	if target == announce.TargetPlayer {
@@ -217,7 +215,18 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 }
 
 func runInbox(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (string, error) {
-	if pctx.Deliverer == nil {
+	if inv.ActorXUID == chat.ServerOrigin {
+		// The console is not a player: nothing was ever queued for it, and
+		// every whisper the drain attempted would fail to resolve a
+		// gamertag it does not have -- one logged failure per pending
+		// message, ending in "you have nothing new".
+		return "The console has no inbox.", nil
+	}
+	// The store, not just the deliverer: a deliverer over a store that
+	// persists nothing reports zero drained, which is indistinguishable
+	// from an empty queue and would have this command assert a fact about
+	// the player's messages that it has no way to know.
+	if !pctx.AnnouncementsReady() {
 		return noStore, nil
 	}
 	// No argument names another player: a player can only ever drain their
