@@ -1090,7 +1090,13 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 		return
 	}
 
-	log.Info("command_replied", logging.Fields{"command": trigger.Command, "actor": actorXUID, "reply": reply})
+	replied := logging.Fields{"command": trigger.Command, "actor": actorXUID}
+	if cmd, ok := registry.Lookup(trigger.Command); ok && cmd.RedactReply {
+		replied["reply_chars"] = len(reply)
+	} else {
+		replied["reply"] = reply
+	}
+	log.Info("command_replied", replied)
 
 	speak(ctx, log, pctx, actorXUID, trigger.Command, reply)
 	// Written after the reply is sent, not before: the record must never be

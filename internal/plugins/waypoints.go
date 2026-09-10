@@ -52,6 +52,8 @@ func (*Waypoints) Commands() []plugin.Command {
 			Description: "Your saved coordinates: !wp, !wp <name>, !wp set <name> <x> <y> <z>, !wp help.",
 			Permission:  plugin.PermissionMember,
 			Run:         runWP,
+			// Every reply but a refusal names coordinates.
+			RedactReply: true,
 		},
 	}
 }

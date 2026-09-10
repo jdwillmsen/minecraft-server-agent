@@ -385,7 +385,12 @@ worth being exact about: the arguments are stored verbatim, so `!wp set base
 private `!announce @player`. What the exclusion keeps out is everything a
 reply says that nobody typed - the answer to a bare `!wp` lists every
 waypoint a player owns, including ones this command never mentioned. That is
-a privacy decision, not an oversight. A failed audit write is logged and
+a privacy decision, not an oversight. The stdout log line for each command
+does carry its reply, with one exception: commands whose replies are
+private (`!wp`, whose replies name coordinates, and `!modlog`, whose replies
+quote other players' flagged messages) log only the reply's length. The log
+is shipped on to storage whose retention this agent does not control, so a
+reply copied there would escape every limit placed on it here. A failed audit write is logged and
 never blocks the command it describes; a table that has not been migrated
 yet, or one the agent's role was never granted, is reported once at INFO
 rather than once per command.

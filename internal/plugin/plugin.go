@@ -161,6 +161,13 @@ type Command struct {
 	// Run executes the command. ctx carries the process lifetime; pctx
 	// carries the adapters this command is allowed to use.
 	Run func(ctx context.Context, pctx *Context, inv Invocation) (reply string, err error)
+	// RedactReply keeps the reply text out of the log, which then records
+	// only its length. Replies are logged to stdout and from there to log
+	// storage whose retention nothing in this repo controls. A reply that is
+	// whispered to keep it private -- a player's coordinates, other players'
+	// moderation records -- would otherwise sit there in full, outside every
+	// limit this agent promises about that data.
+	RedactReply bool
 }
 
 // Plugin is one self-contained unit of agent behaviour.

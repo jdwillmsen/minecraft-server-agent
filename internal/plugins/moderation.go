@@ -104,6 +104,9 @@ func (*Moderation) Commands() []plugin.Command {
 		// Checked again in runModlog, for the reason runAnnounce gives.
 		Permission: plugin.PermissionOperator,
 		Run:        runModlog,
+		// The reply quotes other players' flagged messages, which are kept
+		// for 90 days in the table and must not be kept longer in the log.
+		RedactReply: true,
 	}}
 }
 
