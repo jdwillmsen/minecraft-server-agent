@@ -61,6 +61,13 @@ A moderation audit checks public chat against three rules and records what
 they flag; operators read it with `!modlog`. It records and reports, and
 never kicks, mutes or bans. See "Moderation audit" below.
 
+Three more announcement sources share that same outbox: the server's own
+events (a first-ever join, a playtime milestone, a version change, a stale
+backup), operator-set schedules (`!schedule`), and an optional HTTP API
+(`POST /announcements`) for in-cluster systems. See "Event-driven
+announcements", "Scheduled announcements" and "The announcement HTTP API"
+below.
+
 ## Architecture
 
 ```
@@ -87,7 +94,12 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   (`!players`, `!online`, `!version`, `!backup`), `welcome` (event-driven, no
   commands), `knowledge` (`!kb`), `waypoints` (`!wp`), `announce`
   (`!announce`, `!inbox`), `moderation` (event-driven over chat, plus
-  `!modlog`)
+  `!modlog`), `schedule` (`!schedule`)
+- `internal/sources` - the announcement sources nobody types: the player
+  events read off the profile store's own writes, the watcher that polls
+  the exporters for a version change or a stale backup, and the loop that
+  fires due schedules. Each only describes an announcement and hands it to
+  the outbox; delivery stays the deliverer's job
 - `internal/store` - Postgres-backed player profiles and playtime, behind a
   `store.Nop` no-op so an unset `PG_HOST` is a supported state rather than a
   crash; a plugin only ever sees the narrow `PlayerStore` read-and-record
@@ -144,7 +156,8 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 - `internal/mcauth` - Xbox Live device-code login with on-disk token
   caching, so a restart doesn't require a fresh interactive login
 - `internal/httpapi` - `/healthz`, `/readyz` (reflects real Bedrock session
-  state), and `/metrics`
+  state), `/metrics`, and `POST /announcements` when `ANNOUNCE_API_TOKEN`
+  is set
 - `internal/metrics` - every series the agent exports beyond the session
   gauge and reconnect counter; callers record through small functions and
   never touch a Prometheus type - see "Metrics" below
@@ -182,6 +195,7 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 | `MC_MONITOR_URL` | *(empty)* | mc-monitor Prometheus endpoint behind `!online`; unset reports the command unconfigured rather than erroring |
 | `BACKUP_EXPORTER_URL` | *(empty)* | Backup exporter's `/metrics.txt` behind `!backup`; unset reports the command unconfigured rather than erroring |
 | `MODERATION_TERMS` | *(empty disables the term rule)* | Comma-separated terms whose use in public chat is flagged, matched case-insensitively as whole words; blanks between commas are ignored. The flood and caps rules need no configuration |
+| `ANNOUNCE_API_TOKEN` | *(empty disables the API)* | Bearer token for `POST /announcements`. Optional: unset leaves the route unmounted, so it answers 404 like any path that was never there - a disabled API is indistinguishable from an absent one and is never open. Created by a human, never by an agent |
 | `LOG_LEVEL` | `info` | `info` or `debug` |
 
 ## Metrics
@@ -346,11 +360,15 @@ A command that fails or outlives its timeout answers with a plain line
 saying so. Silence is the one reply nobody can interpret - it is exactly
 what a command that worked and had nothing to say looks like.
 
-A queued message doesn't wait forever. Every announcement in this slice
-comes from `!announce`, and its expiry today depends on target, not source -
-a `Source` is recorded on the row for when a scheduled or API-sourced
-announcement earns its own window later, but every source shares these same
-durations for now. A message aimed at one player keeps for a week, since
+An announcement body is capped at 512 characters, for every source. That is
+about what Bedrock chat already lets an operator type, so the cap only ever
+bites a schedule or an API caller; nothing downstream truncates, so an
+over-long body is refused where it is written rather than cut off mid-word.
+
+A queued message doesn't wait forever. Its expiry depends on target, not
+source, with one exception: a scheduled announcement expires at the
+schedule's next occurrence (see "Scheduled announcements"), and an API
+caller may choose its own. A message aimed at one player keeps for a week, since
 it's still true for that specific person a week from now; a message aimed at
 everyone or at a permission level keeps for a day, since a permission is a
 role rather than a person and whoever holds it next may not be who the
@@ -465,6 +483,107 @@ the first one, so a deploy that runs ahead of its migration whispers no
 warning it has no record of. A table that has not been migrated or granted
 yet is reported once at INFO, and `!modlog` answers that plainly.
 
+## Event-driven announcements
+
+The agent announces four things it notices on its own, each through the
+same outbox as `!announce`, recorded with `source = 'event'`, and each kept
+for 24 hours for anyone offline:
+
+| Event | Who hears it |
+|---|---|
+| A player's first-ever join | Operators, whispered - the welcome already greets the player in public, and a second public line is noise |
+| A player's total playtime reaches 10, 24, 100 or 500 hours | Everyone |
+| The server's Bedrock version changes | Everyone |
+| The world backup is older than the backup exporter's own max age | Operators, whispered |
+
+Playtime is measured when a player leaves, the only moment a session's
+length is known: the profile store closes the session and returns the
+totals before and after it from one statement. Reaching a milestone exactly
+counts; a session that crosses two at once announces only the higher. Like
+all playtime here it is a lower bound - sessions the agent never saw end
+contribute nothing. A player first recorded because they were already
+online when the agent logged in reads as a first-time arrival on their next
+observed join, the same way the welcome treats them.
+
+Version and backup are read from the exporters behind `!version` and
+`!backup` every five minutes, so they need `MC_MONITOR_URL` and
+`BACKUP_EXPORTER_URL` respectively. Each is announced once per change, not
+once per poll. The last value is kept in memory, and the first poll after
+the agent starts only records a baseline, so a restart never re-announces
+old news. A backup that stays stale is announced once, and again only after
+it has recovered and gone stale again; a scrape that fails, a backup that
+has never completed, or an exporter that publishes no max age is none of
+those things.
+
+With no database the events are not announced at all - a store that
+remembers nobody would report every arrival as a first.
+
+## Scheduled announcements
+
+`!schedule` is operator-only:
+
+- `!schedule add daily HH:MM [!now] [!urgent] <message>` - once a day
+- `!schedule add every <N>m|<N>h [!now] [!urgent] <message>` - on an
+  interval, first firing one interval from now
+- `!schedule list` - active schedules, their cadence, target and next
+  firing
+- `!schedule del <id>` - stops a schedule
+
+Times are UTC, and every reply says so: no configured zone means no
+daylight-saving rule to get wrong. Intervals are minutes or hours, at least
+15 minutes - below that a reminder is spam - and at most a week. `!now` and
+`!urgent` mean what they mean for `!announce` and are parsed by the same
+code, with the same rule that they only count before the message. A
+`@player` target is refused: a recurring whisper to one person is a nag, and
+`!announce @player` covers the one-off. `del` deactivates rather than
+deletes, so the announcements a schedule already sent keep pointing at it.
+
+The agent checks for due schedules once a minute. Each occurrence is
+claimed with a compare-and-set on its next firing time, in the same
+transaction as the announcement it creates, so it changes hands exactly
+once even if two agents ever run at once. The announcement it creates
+expires at the schedule's next occurrence, so a reminder nobody was online
+to hear is replaced by the next one rather than stacked on top of it. A
+schedule that fell behind while the agent was down fires once and moves to
+its next future occurrence - it never replays the slots it missed.
+
+## The announcement HTTP API
+
+When `ANNOUNCE_API_TOKEN` is set, `POST /announcements` on the agent's HTTP
+server (`HTTP_ADDR`) accepts an announcement from an in-cluster system such
+as a deploy hook:
+
+```sh
+curl -sS -X POST http://<agent>:8080/announcements \
+  -H "Authorization: Bearer $ANNOUNCE_API_TOKEN" \
+  -d '{"body": "Deploying v2 - back in five minutes.",
+       "target": {"kind": "everyone"},
+       "priority": "normal",
+       "expires_in_seconds": 3600}'
+# 201 {"id": 42, "reached": 3}
+```
+
+- `target.kind` is `everyone`, `player`, `permission` or `online_only`.
+  `player` takes a gamertag in `value`, resolved the same way
+  `!announce @player` resolves one; a name the server has never seen is a
+  `422`, not a message stored for nobody. `permission` takes `visitor`,
+  `member` or `operator`. The other two take no value.
+- `priority` is `normal` (the default) or `expedited`.
+- `expires_in_seconds` is optional, between 1 and 30 days; without it the
+  target's default lifetime applies. `online_only` never queues and so
+  takes none.
+- `201` carries the announcement id and how many players heard it
+  immediately; the rest are the queue's to deliver.
+- `400` for an invalid request, including unknown fields, `401` without the
+  right bearer token, `413` past the 16 KiB request cap, `422` for an
+  unknown player, `503` when announcements are not configured or the
+  database is not ready.
+
+The token is compared in constant time and checked before the body is
+read. With the variable unset the route is not mounted at all. The token is
+never minted by an agent: a human creates it, in a terminal outside any
+agent session, and until then the API stays off while everything else runs.
+
 ## Targeting a reply
 
 `Voice.Tell` only ever receives an XUID, but Bedrock's `tellraw` needs a
@@ -564,14 +683,16 @@ to a database whose schema came from the real migrations, which is what the
 setup above does.
 
 `internal/announce` and `internal/audit` follow the same pattern - a
-`livedb`-tagged test in each package that has never run against a real
-database either. Their three tables (`minecraft.announcements`,
-`minecraft.announcement_deliveries`, `minecraft.command_audit`) come from a
-fourth migration, `V4__minecraft_announcements.sql`, in that same
-`jdwlabs/platform` ConfigMap. Unlike V1 through V3 above, V4 has not merged
-or synced yet, so there is no schema today for `MC_TEST_DSN` to point at.
-Once it has, `go test -tags livedb ./internal/announce/ ./internal/audit/`
-follows the same setup as `internal/store` above.
+`livedb`-tagged test in each package. Their tables come from two further
+migrations in that same `jdwlabs/platform` ConfigMap:
+`V4__minecraft_announcements.sql` (`minecraft.announcements`,
+`minecraft.announcement_deliveries`, `minecraft.command_audit`) and
+`V5__minecraft_announcement_schedules.sql`
+(`minecraft.announcement_schedules`, plus `announcements.schedule_id`).
+Apply them after V1 and V2 and run
+`go test -tags livedb ./internal/store/ ./internal/announce/ ./internal/audit/`
+with the same setup as above. Point `MC_TEST_DSN` at a throwaway database,
+never production: these tests write rows.
 
 `internal/moderation` has one too, against `minecraft.moderation_events`
 from `V6__minecraft_moderation.sql`: `go test -tags livedb
