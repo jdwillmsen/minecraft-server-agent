@@ -499,6 +499,33 @@ go test -race ./...
 gofmt -l .
 ```
 
+### Evaluating the model
+
+`cmd/evalllm` puts the questions in `eval/cases.yaml` to the configured
+model through the real `@server` answer path: the same client, system
+prompt, tool-round cap and toolset production builds. Only the
+capabilities behind the tools are fixtures (a few knowledge facts,
+waypoints for two players, a canned server status), so two runs differ
+only in what the model did.
+
+```sh
+LLM_BASE_URL=http://<host>:8000/v1 LLM_MODEL=<model> scripts/eval.sh -label baseline -out /tmp/eval.md
+```
+
+Every setting defaults from the variable the agent reads (`LLM_MAX_TOKENS`,
+`LLM_TIMEOUT_MS`, `LLM_TOTAL_TIMEOUT_MS`, `LLM_API_KEY`), so a run with no
+flags measures production. `-only <regexp>` re-runs a subset by case id or
+category. Each case is scored on tool selection, content, privacy (whispered
+when it should be, never carrying another player's coordinates), length
+against the chat limit, not ending on a question, and latency. The report
+is markdown on stdout.
+
+Cases run one at a time, never in parallel: the endpoint also answers live
+players. Not wired into CI, because it needs a GPU endpoint and takes
+minutes. Run it by hand before changing the model, the prompt or the LLM
+settings, and commit the report under `docs/eval/`. The scorer's own tests
+need no endpoint and run with `go test ./...`.
+
 ### Testing the store against a real database
 
 `internal/store/postgres.go` talks to PostgreSQL, and the default suite does
