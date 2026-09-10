@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
@@ -65,38 +66,75 @@ func (*Announce) Commands() []plugin.Command {
 
 var _ plugin.Plugin = (*Announce)(nil)
 
-// parseAnnounceFlags reads !now, !urgent and an "@player" target from the
-// front of args, stopping at the first token that is not one of them.
-// Stopping there -- rather than scanning the whole line for flag-shaped
-// words -- is what keeps "!announce the !urgent flag goes first" a normal
-// announcement whose body happens to contain those words, rather than a
-// silent reinterpretation of it as urgent: the same ambiguity !wp set
+// announceLine is what the front of an announcement-shaped command says:
+// its flags, its "@player" target if it has one, and the body after them.
+type announceLine struct {
+	now, urgent bool
+	player      string
+	body        string
+}
+
+// parseAnnounceLine reads !now, !urgent and an "@player" target from the
+// front of args, stopping at the first token that is not one of them, and
+// applies the rules every command that describes an announcement shares.
+// refusal is non-empty when the line must not be sent, and is the reason to
+// give; usage is what an empty body is answered with, since only the
+// command knows its own syntax.
+//
+// Stopping at the first non-flag -- rather than scanning the whole line for
+// flag-shaped words -- is what keeps "!announce the !urgent flag goes first"
+// a normal announcement whose body happens to contain those words, rather
+// than a silent reinterpretation of it as urgent: the same ambiguity !wp set
 // refuses to guess at for its own trailing numeric token.
-// multiplePlayers is reported rather than resolved: a second leading
-// "@player" token is just as structurally shaped as the first one, so
-// nothing here distinguishes "the operator retargeted" from "the operator
-// meant to say @A, @B, ..." -- taking the last one silently drops the first
-// name from both the target and the body, with no trace it was ever there.
-func parseAnnounceFlags(args []string) (now, urgent bool, player string, multiplePlayers bool, body []string) {
+//
+// One helper for !announce and !schedule rather than a copy each: a flag
+// that parsed one way in a one-off and another way in a recurring reminder
+// would be a difference nobody could see until it fired.
+func parseAnnounceLine(args []string, usage string) (line announceLine, refusal string) {
 	i := 0
+	multiplePlayers := false
 loop:
 	for ; i < len(args); i++ {
 		switch tok := args[i]; {
 		case tok == "!now":
-			now = true
+			line.now = true
 		case tok == "!urgent":
-			urgent = true
+			line.urgent = true
 		case strings.HasPrefix(tok, "@") && len(tok) > 1:
-			if player != "" {
+			// Reported rather than resolved: a second leading "@player" is
+			// just as structurally shaped as the first, so nothing here
+			// distinguishes "the operator retargeted" from "the operator meant
+			// to say @A, @B, ..." -- taking the last one silently drops the
+			// first name from both the target and the body.
+			if line.player != "" {
 				multiplePlayers = true
 				continue
 			}
-			player = tok[1:]
+			line.player = tok[1:]
 		default:
 			break loop
 		}
 	}
-	return now, urgent, player, multiplePlayers, args[i:]
+	if i == len(args) {
+		return line, usage
+	}
+	line.body = strings.Join(args[i:], " ")
+
+	if multiplePlayers {
+		return line, "An announcement can only go to one player at a time."
+	}
+	if line.now && line.player != "" {
+		// online_only means "everyone connected right now"; a player target
+		// means one specific person, queued if they are not. Those are two
+		// different targets, and guessing which one was meant risks either
+		// broadcasting a message meant for one player or silently dropping
+		// a countdown nobody but that player was supposed to see.
+		return line, "!now and @player can't both be what this is aimed at: send it as one or the other."
+	}
+	if n := utf8.RuneCountInString(line.body); n > announce.MaxBodyChars {
+		return line, fmt.Sprintf("That message is %d characters; an announcement can be at most %d.", n, announce.MaxBodyChars)
+	}
+	return line, ""
 }
 
 func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (string, error) {
@@ -106,25 +144,12 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 	if inv.ActorPermission < plugin.PermissionOperator {
 		return "Only an operator can send an announcement.", nil
 	}
-	if len(inv.Args) == 0 {
-		return announceUsage, nil
-	}
 
-	isNow, isUrgent, playerName, multiplePlayers, body := parseAnnounceFlags(inv.Args)
-	if len(body) == 0 {
-		return announceUsage, nil
+	line, refusal := parseAnnounceLine(inv.Args, announceUsage)
+	if refusal != "" {
+		return refusal, nil
 	}
-	if multiplePlayers {
-		return "An announcement can only go to one player at a time.", nil
-	}
-	if isNow && playerName != "" {
-		// online_only means "everyone connected right now"; a player target
-		// means one specific person, queued if they are not. Those are two
-		// different targets, and guessing which one was meant risks either
-		// broadcasting a message meant for one player or silently dropping
-		// a countdown nobody but that player was supposed to see.
-		return "!now and @player can't both be what this is aimed at: send it as one or the other.", nil
-	}
+	isNow, isUrgent, playerName := line.now, line.urgent, line.player
 
 	target := announce.TargetEveryone
 	var targetValue, displayName string
@@ -176,7 +201,7 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 
 	now := time.Now()
 	a := announce.Announcement{
-		Body:         strings.Join(body, " "),
+		Body:         line.body,
 		Source:       announce.SourceCommand,
 		AuthorXUID:   authorXUID,
 		TargetKind:   target,
