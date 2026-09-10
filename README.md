@@ -121,7 +121,12 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 - `internal/adapters` - implementations of the plugin package's capability
   interfaces: `BridgeClient` (shared HTTP transport to mc-console-bridge),
   `BridgeVoice`, `BridgeFacts`, `PermissionResolver` (cached
-  `GET /permissions` lookups); `NoopVoice` remains for tests
+  `GET /permissions` lookups), `ServerPinger` (behind `!ping`: TPS read off
+  the server's own game clock with `time query gametime`, sampled once a
+  minute so every ping has a baseline, plus the round trip over the agent's
+  Bedrock connection); `NoopVoice` remains for tests. `!ping` never times
+  the bridge call itself - the bridge collects console output for a fixed
+  800ms window, so that number would be the same every time
 - `internal/mcauth` - Xbox Live device-code login with on-disk token
   caching, so a restart doesn't require a fresh interactive login
 - `internal/httpapi` - `/healthz`, `/readyz` (reflects real Bedrock session

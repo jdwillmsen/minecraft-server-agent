@@ -7,14 +7,42 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 )
 
-// Core provides command discovery (!help) and a liveness check (!ping).
+// Core provides command discovery (!help) and a server check (!ping).
 // Every other plugin should stay silent about its own existence and let
 // Core's !help be the single place players learn what's available.
 type Core struct{}
+
+// formatPing never fails. A ping that cannot reach part of the server is
+// reporting exactly what it was asked about, so each missing half is said
+// in place of its number rather than turned into an error.
+func formatPing(p plugin.ServerPing) string {
+	var tps string
+	switch {
+	case p.TPSErr != nil:
+		tps = "TPS unavailable (console didn't answer)"
+	case !p.TPSKnown:
+		tps = "TPS still measuring, try again in a minute"
+	default:
+		tps = fmt.Sprintf("TPS %.1f", p.TPS)
+	}
+	link := "link unavailable"
+	if p.LinkKnown {
+		link = "link " + formatRoundTrip(p.Link)
+	}
+	return "pong - " + tps + ", " + link
+}
+
+func formatRoundTrip(d time.Duration) string {
+	if d < time.Millisecond {
+		return "under 1ms"
+	}
+	return fmt.Sprintf("%dms", d.Milliseconds())
+}
 
 // NewCore builds the core plugin.
 func NewCore() Core { return Core{} }
@@ -25,10 +53,13 @@ func (Core) Commands() []plugin.Command {
 	return []plugin.Command{
 		{
 			Name:        "ping",
-			Description: "Check that the agent is alive.",
+			Description: "Check the server is keeping up: TPS and link latency.",
 			Permission:  plugin.PermissionVisitor,
 			Run: func(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (string, error) {
-				return "pong", nil
+				if pctx.Pinger == nil {
+					return "pong", nil
+				}
+				return formatPing(pctx.Pinger.Ping(ctx)), nil
 			},
 		},
 		{

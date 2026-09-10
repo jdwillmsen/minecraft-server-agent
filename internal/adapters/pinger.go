@@ -1,0 +1,154 @@
+package adapters
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
+)
+
+const (
+	gametimeCommand = "time query gametime"
+	// tpsMinWindow is the shortest span a TPS figure is measured over. The
+	// game clock is read in whole ticks and dated to the millisecond, so over
+	// a span of a few seconds that rounding alone moves the answer visibly.
+	tpsMinWindow = 10 * time.Second
+	// tpsMaxWindow is the longest. The game clock stops while the server is
+	// down, so a baseline from before a restart reports the downtime as lag;
+	// capping the span keeps that error to the minute or two after one.
+	tpsMaxWindow = 2 * time.Minute
+	// maxTickSamples bounds the history. The window only ever needs the
+	// newest few readings.
+	maxTickSamples = 32
+)
+
+// gametimeLine matches Bedrock's answer to `time query gametime`. The log
+// prefix, when present, carries the server's own clock to the millisecond.
+// That dates a reading exactly, where the agent's clock would also count
+// however long the request queued behind other commands at the bridge.
+var gametimeLine = regexp.MustCompile(`(?:\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}):(\d{3})[^\]]*\]\s*)?Gametime is (\d+)`)
+
+type tickSample struct {
+	ticks int64
+	at    time.Time
+	// serverClock marks at as the server's log stamp rather than the agent's
+	// clock. Readings from the two are never compared with each other.
+	serverClock bool
+}
+
+// ServerPinger measures TPS from the server's game clock through the console
+// bridge, and link latency from the agent's live Bedrock connection.
+//
+// Timing the bridge call itself would measure nothing: the bridge collects
+// console output for a fixed window before it answers, so every call takes
+// about as long as every other.
+type ServerPinger struct {
+	client *BridgeClient
+	link   func() (time.Duration, bool)
+	now    func() time.Time
+
+	mu      sync.Mutex
+	samples []tickSample
+}
+
+// NewServerPinger builds a ServerPinger. link reports the current Bedrock
+// round trip, or false when there is no session; it may be nil.
+func NewServerPinger(client *BridgeClient, link func() (time.Duration, bool)) *ServerPinger {
+	return &ServerPinger{client: client, link: link, now: time.Now}
+}
+
+var _ plugin.Pinger = (*ServerPinger)(nil)
+
+// Sample reads the game clock once and keeps the reading as a baseline. TPS
+// is a rate, so a !ping with no older reading to compare against can only
+// say it is still measuring; running this periodically is what saves every
+// ping from that.
+func (p *ServerPinger) Sample(ctx context.Context) error {
+	_, _, err := p.sample(ctx)
+	return err
+}
+
+// Ping takes a fresh reading and reports TPS against the most recent
+// baseline in the window, alongside the current link latency.
+func (p *ServerPinger) Ping(ctx context.Context) plugin.ServerPing {
+	var out plugin.ServerPing
+	if p.link != nil {
+		out.Link, out.LinkKnown = p.link()
+	}
+	out.TPS, out.TPSKnown, out.TPSErr = p.sample(ctx)
+	return out
+}
+
+func (p *ServerPinger) sample(ctx context.Context) (tps float64, known bool, err error) {
+	sent := p.now()
+	resp, err := p.client.runCommand(ctx, gametimeCommand)
+	if err != nil {
+		return 0, false, fmt.Errorf("pinger: %w", err)
+	}
+	cur, err := parseGametime(resp.Output, sent)
+	if err != nil {
+		return 0, false, err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	tps, known = tpsAgainst(p.samples, cur)
+	p.samples = append(p.samples, cur)
+	if len(p.samples) > maxTickSamples {
+		p.samples = p.samples[len(p.samples)-maxTickSamples:]
+	}
+	return tps, known, nil
+}
+
+// parseGametime reads the last Gametime line in output. The bridge runs one
+// command at a time, but its collect window can still catch console lines
+// from elsewhere, and the newest match is the one this command produced.
+func parseGametime(output string, sent time.Time) (tickSample, error) {
+	all := gametimeLine.FindAllStringSubmatch(output, -1)
+	if len(all) == 0 {
+		return tickSample{}, fmt.Errorf("pinger: the bridge captured no Gametime line for %q", gametimeCommand)
+	}
+	m := all[len(all)-1]
+	ticks, err := strconv.ParseInt(m[3], 10, 64)
+	if err != nil {
+		return tickSample{}, fmt.Errorf("pinger: gametime %q: %w", m[3], err)
+	}
+	if m[1] != "" {
+		// Parsed as UTC whatever zone the server logs in: only differences
+		// between two stamps are ever used. A DST change lands a difference
+		// outside the window, which drops that pair rather than misreading it.
+		if at, err := time.Parse(time.DateTime, m[1]); err == nil {
+			ms, _ := strconv.Atoi(m[2])
+			return tickSample{ticks: ticks, at: at.Add(time.Duration(ms) * time.Millisecond), serverClock: true}, nil
+		}
+	}
+	return tickSample{ticks: ticks, at: sent}, nil
+}
+
+// tpsAgainst measures cur against the newest usable baseline in history.
+// Newest rather than oldest because a TPS figure is a question about now:
+// a longer span averages a lag spike away.
+//
+// A baseline with more ticks than cur means the world's clock went
+// backwards -- a restored or replaced world -- and is never usable.
+func tpsAgainst(history []tickSample, cur tickSample) (float64, bool) {
+	var base tickSample
+	found := false
+	for _, s := range history {
+		span := cur.at.Sub(s.at)
+		if s.serverClock != cur.serverClock || span < tpsMinWindow || span > tpsMaxWindow || s.ticks > cur.ticks {
+			continue
+		}
+		if !found || s.at.After(base.at) {
+			base, found = s, true
+		}
+	}
+	if !found {
+		return 0, false
+	}
+	return float64(cur.ticks-base.ticks) / cur.at.Sub(base.at).Seconds(), true
+}
