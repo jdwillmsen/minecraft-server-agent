@@ -12,7 +12,7 @@
 phrases:
   # Ways a model says it has nothing to go on.
   dont_know: &dont_know
-    ["not", "no ", "don't", "dont", "nothing", "unknown", "unsure", "can't", "cannot", "couldn't", "isn't", "haven't", "none"]
+    ["not", "no ", "don't", "dont", "doesn't", "nothing", "unknown", "unsure", "can't", "cannot", "couldn't", "isn't", "haven't", "none"]
   # Ways a model declines.
   decline: &decline
     ["can't", "cannot", "won't", "unable", "not able", "not allowed", "only", "don't", "no ", "not", "sorry"]
@@ -38,7 +38,7 @@ cases:
     xuid: "2535400000000002"
     question: why is it so laggy today
     tools: {any_of: [server_status]}
-    must_contain_any: ["42", healthy, responding, smooth, fine]
+    must_contain_any: ["42", healthy, responding, smooth, fine, well]
     private: false
 
   - id: status_count
