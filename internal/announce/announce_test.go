@@ -32,6 +32,60 @@ func TestOnlineOnlyNeverQueues(t *testing.T) {
 	}
 }
 
+// TestConstantsMatchTheSchema looks tautological — every comparison is a
+// constant against a literal that was copied from its own declaration — but
+// it exists to catch a rename the rest of this file cannot: every other
+// test compares a constant to itself under a different name, so a typo'd
+// constant value would still pass every one of them. These strings are also
+// written verbatim into Postgres columns guarded by CHECK constraints in
+// another repository's migration, so a drift here is invisible until the
+// first write of that kind, in production.
+func TestConstantsMatchTheSchema(t *testing.T) {
+	targets := map[Target]string{
+		TargetEveryone:   "everyone",
+		TargetPlayer:     "player",
+		TargetPermission: "permission",
+		TargetOnlineOnly: "online_only",
+	}
+	for constant, want := range targets {
+		if got := string(constant); got != want {
+			t.Errorf("Target = %q, want %q", got, want)
+		}
+	}
+
+	sources := map[Source]string{
+		SourceCommand:  "command",
+		SourceSchedule: "schedule",
+		SourceEvent:    "event",
+		SourceAPI:      "api",
+	}
+	for constant, want := range sources {
+		if got := string(constant); got != want {
+			t.Errorf("Source = %q, want %q", got, want)
+		}
+	}
+
+	priorities := map[Priority]string{
+		PriorityNormal:    "normal",
+		PriorityExpedited: "expedited",
+	}
+	for constant, want := range priorities {
+		if got := string(constant); got != want {
+			t.Errorf("Priority = %q, want %q", got, want)
+		}
+	}
+
+	deliveries := map[Delivery]string{
+		DeliveryBroadcast: "broadcast",
+		DeliveryWhisper:   "whisper",
+	}
+	for constant, want := range deliveries {
+		if got := string(constant); got != want {
+			t.Errorf("Delivery = %q, want %q", got, want)
+		}
+	}
+}
+
 func TestDefaultExpiryVariesByWhatTheMessageIsFor(t *testing.T) {
 	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 

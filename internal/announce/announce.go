@@ -71,12 +71,19 @@ type Announcement struct {
 // DeliveryFor derives how an announcement is said from who it is for.
 // Derived rather than chosen: a player- or permission-targeted announcement
 // that broadcast would expose exactly what whispering a waypoint protects.
+//
+// The two branches are asymmetric on purpose: only everyone and online-only
+// genuinely broadcast, and anything else — including a zero-value or
+// future Target this switch doesn't recognize yet — whispers. Whispering
+// something that could have been broadcast just reaches fewer people;
+// broadcasting something that should have been whispered puts a player's
+// coordinates in public chat. The default has to fail toward silence.
 func DeliveryFor(t Target) Delivery {
 	switch t {
-	case TargetPlayer, TargetPermission:
-		return DeliveryWhisper
-	default:
+	case TargetEveryone, TargetOnlineOnly:
 		return DeliveryBroadcast
+	default:
+		return DeliveryWhisper
 	}
 }
 
@@ -90,10 +97,13 @@ func Queues(t Target) bool {
 // DefaultExpiry is how long an announcement of this kind stays worth saying.
 // This is the line between a queue and a nag: without it, a message
 // eventually reaches whoever logs in next no matter how stale it has gone.
-// Online-only needs none, since it never queues to begin with. A message
-// whispered to one player gets a week, because it's personal and still true
-// next week; everything else gets a day, because it's addressed to whoever
-// happens to be around when it's said.
+// Online-only needs none, since it never queues to begin with. The rest
+// split on how personal the message is, not on whether it's whispered: a
+// message addressed to one player gets a week, because it's still true for
+// that specific person next week. A message addressed to a permission — a
+// role rather than a person — gets a day like a broadcast does, because
+// roles change hands and whoever holds one next may not be who it was
+// written for.
 //
 // s doesn't change the window today, but the parameter stays so a schedule
 // or an API-sourced announcement can earn its own window later without
