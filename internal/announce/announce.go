@@ -52,6 +52,18 @@ const (
 // player who wants it right away.
 const MaxNormalPerJoin = 3
 
+// MaxPerInbox caps how many announcements one !inbox delivers.
+//
+// !inbox runs inside a command dispatch's timeout, and every message on it
+// costs a whisper through the console bridge plus a delivery row. An
+// uncapped drain of a real backlog spends that budget before it finishes,
+// the dispatch is abandoned as a timeout, and the player gets a partial
+// trickle of messages and no reply at all -- the one outcome worse than
+// being told to ask again. Larger than the per-join cap because the player
+// asked for this and nothing else is competing for the moment; small enough
+// that an ordinary backlog is answered rather than abandoned.
+const MaxPerInbox = 5
+
 // Announcement is one thing the server wants said.
 type Announcement struct {
 	ID           int64

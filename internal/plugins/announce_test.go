@@ -51,11 +51,12 @@ type fakeAnnounceDeliverer struct {
 	// sentNow is what SendNow reports as actually delivered. Zero by
 	// default, which is what a real deliverer reports for a target who is
 	// offline -- the case the queue exists for.
-	sentNow    int
-	sendErr    error
-	drainXUID  string
-	drainCount int
-	drainErr   error
+	sentNow        int
+	sendErr        error
+	drainXUID      string
+	drainCount     int
+	drainRemaining int
+	drainErr       error
 }
 
 var _ plugin.AnnounceDeliverer = (*fakeAnnounceDeliverer)(nil)
@@ -68,9 +69,9 @@ func (f *fakeAnnounceDeliverer) SendNow(_ context.Context, a announce.Announceme
 	return f.sentNow, nil
 }
 
-func (f *fakeAnnounceDeliverer) DrainAll(_ context.Context, xuid string, _ time.Time) (int, error) {
+func (f *fakeAnnounceDeliverer) DrainAll(_ context.Context, xuid string, _ time.Time) (int, int, error) {
 	f.drainXUID = xuid
-	return f.drainCount, f.drainErr
+	return f.drainCount, f.drainRemaining, f.drainErr
 }
 
 // fakeAnnounceRoster stands in for the two-tier lookup a command is handed:
@@ -574,5 +575,26 @@ func TestCommandsSayWhenTheStoreRefusesAccess(t *testing.T) {
 	}
 	if reply != noAccess {
 		t.Errorf("!inbox replied %q, want %q", reply, noAccess)
+	}
+}
+
+// A capped drain that said only how many arrived would leave the player
+// holding a partial delivery with no way to know there is more.
+func TestInboxSaysWhenSomethingIsStillWaiting(t *testing.T) {
+	cmd := announceCommand(t, "inbox")
+	deliverer := &fakeAnnounceDeliverer{drainCount: announce.MaxPerInbox, drainRemaining: 3}
+	pctx := &plugin.Context{Announcements: &fakeAnnounceStore{enabled: true}, Deliverer: deliverer}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "player-a", ActorPermission: plugin.PermissionMember,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(reply, "3") || !strings.Contains(reply, "!inbox") {
+		t.Errorf("reply %q should say how many are still waiting and how to get them", reply)
+	}
+	if strings.HasSuffix(reply, "?") {
+		t.Errorf("reply %q ends in a question mark", reply)
 	}
 }

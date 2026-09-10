@@ -245,7 +245,7 @@ type AnnounceStore interface {
 // draining is the announce-drain event handler's job, not a chat command's.
 type AnnounceDeliverer interface {
 	SendNow(ctx context.Context, a announce.Announcement, id int64) (int, error)
-	DrainAll(ctx context.Context, xuid string, now time.Time) (int, error)
+	DrainAll(ctx context.Context, xuid string, now time.Time) (delivered, remaining int, err error)
 }
 
 // Roster resolves a player's XUID from a gamertag typed into a command,

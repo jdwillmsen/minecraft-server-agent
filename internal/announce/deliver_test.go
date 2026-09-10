@@ -360,8 +360,8 @@ func TestDisabledStoreReturnsZeroAndNoError(t *testing.T) {
 	if delivered, remaining, err := d.DrainForJoin(context.Background(), "xuid-1", time.Now()); delivered != 0 || remaining != 0 || err != nil {
 		t.Errorf("DrainForJoin on disabled store = (%d, %d, %v), want (0, 0, nil)", delivered, remaining, err)
 	}
-	if n, err := d.DrainAll(context.Background(), "xuid-1", time.Now()); n != 0 || err != nil {
-		t.Errorf("DrainAll on disabled store = (%d, %v), want (0, nil)", n, err)
+	if n, remaining, err := d.DrainAll(context.Background(), "xuid-1", time.Now()); n != 0 || remaining != 0 || err != nil {
+		t.Errorf("DrainAll on disabled store = (%d, %d, %v), want (0, 0, nil)", n, remaining, err)
 	}
 	if len(voice.says) != 0 || len(voice.tells) != 0 {
 		t.Errorf("a disabled store must short-circuit before touching Voice at all")
@@ -495,7 +495,7 @@ func TestConcurrentDrainForJoinAndDrainAllForSameXUIDEachSendOnlyOnce(t *testing
 	}()
 	go func() {
 		defer wg.Done()
-		if _, err := d.DrainAll(context.Background(), "xuid-1", time.Now()); err != nil {
+		if _, _, err := d.DrainAll(context.Background(), "xuid-1", time.Now()); err != nil {
 			t.Errorf("DrainAll: %v", err)
 		}
 	}()
@@ -506,5 +506,53 @@ func TestConcurrentDrainForJoinAndDrainAllForSameXUIDEachSendOnlyOnce(t *testing
 		if n := counts[a.Body]; n != 1 {
 			t.Errorf("xuid-1 was told %q %d times, want exactly 1 -- a concurrent join and !inbox must not repeat a message", a.Body, n)
 		}
+	}
+}
+
+// !inbox is answered inside a command dispatch's timeout, and every message
+// on it is a bridge round trip. An uncapped drain of a real backlog spends
+// that budget mid-delivery and the player gets a partial trickle with no
+// reply at all, so the drain stops at MaxPerInbox and says what is left.
+func TestDrainAllCapsOneInboxAndReportsTheRest(t *testing.T) {
+	var pending []Announcement
+	for i := 1; i <= MaxPerInbox+2; i++ {
+		pending = append(pending, Announcement{
+			ID: int64(i), Body: "message", Priority: PriorityNormal,
+			TargetKind: TargetPlayer, Delivery: DeliveryWhisper,
+		})
+	}
+	store := &fakeStore{enabled: true, pending: pending}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+
+	delivered, remaining, err := d.DrainAll(context.Background(), "xuid-1", time.Now())
+	if err != nil {
+		t.Fatalf("DrainAll: %v", err)
+	}
+	if delivered != MaxPerInbox {
+		t.Errorf("delivered = %d, want %d", delivered, MaxPerInbox)
+	}
+	if remaining != 2 {
+		t.Errorf("remaining = %d, want 2 -- the player has to be told to ask again", remaining)
+	}
+	if len(voice.tellMsg) != MaxPerInbox {
+		t.Errorf("Tell called %d times, want %d", len(voice.tellMsg), MaxPerInbox)
+	}
+}
+
+// A backlog that fits is delivered whole, with nothing owed afterwards.
+func TestDrainAllUnderTheCapLeavesNothingOwed(t *testing.T) {
+	store := &fakeStore{enabled: true, pending: []Announcement{
+		{ID: 1, Body: "one", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
+		{ID: 2, Body: "two", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
+	}}
+	d := NewDeliverer(store, &fakeVoice{}, fakeRoster{}, fakePermissions{}, testLogger())
+
+	delivered, remaining, err := d.DrainAll(context.Background(), "xuid-1", time.Now())
+	if err != nil {
+		t.Fatalf("DrainAll: %v", err)
+	}
+	if delivered != 2 || remaining != 0 {
+		t.Errorf("DrainAll = (%d, %d), want (2, 0)", delivered, remaining)
 	}
 }

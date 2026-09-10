@@ -223,7 +223,7 @@ func runInbox(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) 
 	// No argument names another player: a player can only ever drain their
 	// own queue, the same restriction !wp places on whose coordinates a
 	// command can touch.
-	delivered, err := pctx.Deliverer.DrainAll(ctx, inv.ActorXUID, time.Now())
+	delivered, remaining, err := pctx.Deliverer.DrainAll(ctx, inv.ActorXUID, time.Now())
 	// Same two states !announce answers for, same reasoning.
 	if pgerr.NotMigrated(err) {
 		return noStore, nil
@@ -236,6 +236,12 @@ func runInbox(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) 
 	}
 	if delivered == 0 {
 		return "You have nothing new.", nil
+	}
+	// Saying so is the whole reason the drain is capped: a player left
+	// holding an unexplained partial delivery has no way to know there is
+	// more, and !inbox is the same gesture they already made.
+	if remaining > 0 {
+		return fmt.Sprintf("Delivered %d, with %d still waiting - say !inbox again for the rest.", delivered, remaining), nil
 	}
 	if delivered == 1 {
 		return "Delivered 1 message.", nil

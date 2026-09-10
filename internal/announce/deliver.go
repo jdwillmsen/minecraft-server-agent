@@ -267,10 +267,15 @@ func (d *Deliverer) DrainForJoin(ctx context.Context, xuid string, now time.Time
 	return delivered, remaining, nil
 }
 
-// DrainAll sends xuid every pending message with no cap — the !inbox
-// command's job, for a player who has explicitly asked for the rest rather
-// than having it trickle in a few at a time across future joins.
-func (d *Deliverer) DrainAll(ctx context.Context, xuid string, now time.Time) (int, error) {
+// DrainAll sends xuid up to MaxPerInbox pending messages, oldest-priority
+// order — the !inbox command's job, for a player who has explicitly asked
+// for the rest rather than having it trickle in across future joins.
+// remaining reports what is still owed afterwards, counted the same way
+// DrainForJoin counts it: total pending minus what actually went out, so a
+// send that failed still shows as owed rather than vanishing because this
+// call had a turn at it. A caller with remaining > 0 tells the player to
+// ask again.
+func (d *Deliverer) DrainAll(ctx context.Context, xuid string, now time.Time) (delivered, remaining int, err error) {
 	// Same guard as DrainForJoin, over the same per-xuid lock: this is the
 	// other half of the race xuidLocks exists for -- a player's !inbox
 	// landing while their own join drain is still in flight.
@@ -279,12 +284,17 @@ func (d *Deliverer) DrainAll(ctx context.Context, xuid string, now time.Time) (i
 	defer mu.Unlock()
 
 	if !d.store.Enabled() {
-		return 0, nil
+		return 0, 0, nil
 	}
 	permission := d.perms.Resolve(ctx, xuid)
 	pending, err := d.store.PendingFor(ctx, xuid, permission, now)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return d.sendPending(ctx, xuid, now, pending), nil
+	limit := len(pending)
+	if limit > MaxPerInbox {
+		limit = MaxPerInbox
+	}
+	delivered = d.sendPending(ctx, xuid, now, pending[:limit])
+	return delivered, len(pending) - delivered, nil
 }
