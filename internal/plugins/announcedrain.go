@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/pgerr"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
@@ -155,7 +156,9 @@ func (a *AnnounceDrain) drain(voice plugin.Voice, xuid string) {
 	// backlog may have already spent down to nothing.
 	tellCtx, tellCancel := context.WithTimeout(a.rootCtx, plugin.DefaultDispatchTimeout)
 	defer tellCancel()
-	if err := voice.Tell(tellCtx, xuid, drainSummary(remaining)); err != nil {
+	err = voice.Tell(tellCtx, xuid, drainSummary(remaining))
+	metrics.AnnounceDelivery(metrics.DeliverySummary, err)
+	if err != nil {
 		a.log.Error("announce_drain_summary_failed", logging.Fields{"xuid": xuid, "error": err.Error()})
 	}
 }

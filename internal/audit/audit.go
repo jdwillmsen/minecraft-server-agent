@@ -34,6 +34,12 @@ const (
 	OutcomeTimeout     Outcome = "timeout"
 )
 
+// Outcomes is every Outcome, so a caller that must enumerate them -- the
+// command counter starts each one at zero -- cannot drift from this list.
+func Outcomes() []Outcome {
+	return []Outcome{OutcomeOK, OutcomeDenied, OutcomeUnknown, OutcomeError, OutcomeRateLimited, OutcomeTimeout}
+}
+
 // Record is one command dispatch.
 type Record struct {
 	XUID     string

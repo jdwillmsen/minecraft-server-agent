@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/audit"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/pgerr"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
@@ -49,6 +50,14 @@ func (a *auditTrail) Enabled() bool { return a.store.Enabled() }
 func (a *auditTrail) Write(ctx context.Context, r audit.Record) error {
 	err := a.store.Write(ctx, r)
 	if pgerr.Unready(err) {
+		// Counted every time even though it is logged once. The log line is
+		// said once because repeating it tells a reader nothing new; the
+		// counter answers a different question -- is the trail whole -- and
+		// every one of these is a dispatch it does not hold. Left uncounted, a
+		// release that outran its migration would lose every record while the
+		// failure alert read zero. Counted here because the caller, which
+		// counts every other failure, never sees this one.
+		metrics.AuditWriteFailure()
 		a.unready.Do(func() {
 			a.log.Info("audit_store_unready", logging.Fields{"error": err.Error()})
 		})

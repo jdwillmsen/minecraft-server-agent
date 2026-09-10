@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/text"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
@@ -135,6 +136,14 @@ func (p *ServerPinger) sample(ctx context.Context) (tps float64, known bool, err
 	p.samples = append(p.samples, cur)
 	if len(p.samples) > maxTickSamples {
 		p.samples = p.samples[len(p.samples)-maxTickSamples:]
+	}
+	// Recorded here rather than by either caller so a player's !ping and the
+	// background sampler both refresh the gauge: whichever measured last is
+	// the freshest value there is. Stamped with the agent's clock at the
+	// request, not the server's log stamp: an alert compares it with the
+	// scraper's time(), which the server's zone-less stamp cannot be.
+	if known {
+		metrics.ServerTPS(tps, sent)
 	}
 	return tps, known, nil
 }
