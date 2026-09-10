@@ -112,6 +112,31 @@ type ServerInfo interface {
 	BackupEnabled() bool
 }
 
+// Pinger measures the server itself, for !ping. A reply that only proves the
+// agent's own process is running answers the wrong question: whoever asks
+// wants to know whether the server is keeping up.
+type Pinger interface {
+	Ping(ctx context.Context) ServerPing
+}
+
+// ServerPing is one !ping measurement. Each half can be missing on its own:
+// the console and the Bedrock connection are separate paths to the server,
+// and whichever one still answers is the useful half of the reply.
+type ServerPing struct {
+	// TPS is ticks per second read off the server's own game clock over the
+	// last minute or so; 20 is full speed. Meaningful only when TPSKnown.
+	TPS      float64
+	TPSKnown bool
+	// TPSErr is set when the console could not be asked at all, as distinct
+	// from there being no older reading to measure against yet.
+	TPSErr error
+	// Link is the round trip over the agent's own Bedrock connection.
+	// Meaningful only when LinkKnown: between sessions there is no
+	// connection to measure.
+	Link      time.Duration
+	LinkKnown bool
+}
+
 // Invocation is one player's attempt to run a command.
 type Invocation struct {
 	// ActorXUID identifies who issued the command (never a gamertag - see
@@ -197,6 +222,8 @@ type Context struct {
 	// XUID every other capability keys on. May be nil -- a command that
 	// needs it must refuse plainly rather than assume it can resolve one.
 	Roster Roster
+	// Pinger may be nil; !ping then answers from the agent alone.
+	Pinger Pinger
 }
 
 // AnnouncementsReady reports whether an announcement can actually be stored

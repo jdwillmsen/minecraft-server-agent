@@ -103,6 +103,11 @@ func main() {
 	bridgeClient := adapters.NewBridgeClient(cfg.ConsoleBridgeURL, cfg.ConsoleBridgeToken, bridgeTimeout)
 	permResolver := adapters.NewPermissionResolver(bridgeClient, adapters.DefaultPermissionsCacheTTL, log)
 	siblings := siblingBotXUIDs()
+	// The pinger lives for the process and the Bedrock connection for one
+	// session; the link meter is how the one reaches whichever of the other
+	// is live.
+	link := &linkMeter{}
+	pinger := adapters.NewServerPinger(bridgeClient, link.roundTrip, log)
 
 	// Opened before the game connection so a misconfigured database is a
 	// startup log line rather than a surprise at the first player join, and
@@ -155,7 +160,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, voice, playerRoster, registry, playerStore, knowledgeStore, waypointStore, announceStore, deliverer)
+	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, voice, playerRoster, registry, playerStore, knowledgeStore, waypointStore, announceStore, deliverer, pinger)
 	// Every answerable chat message and every roster join is published
 	// here; event-driven plugins (welcome) subscribe via startEventDispatch
 	// rather than touching the connection directly.
@@ -168,6 +173,7 @@ func main() {
 		bridgeTimeout,
 	)
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
+	go sampleGameClock(ctx, pinger, bridgeTimeout, log)
 
 	httpServer, err := httpapi.New(cfg.HTTPAddr)
 	if err != nil {
@@ -200,7 +206,7 @@ func main() {
 	}
 
 	log.Info("starting", logging.Fields{"mc_host": cfg.MCHost, "mc_port": cfg.MCPort})
-	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblings, permResolver, ans, playerStore, auditor)
+	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblings, permResolver, ans, playerStore, auditor, link)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
@@ -260,9 +266,39 @@ func siblingBotXUIDs() map[string]struct{} {
 	return map[string]struct{}{}
 }
 
+// tpsSampleInterval spaces the background game-clock readings that !ping
+// measures TPS against. Each one is a console command and a line in the
+// server log, so it is as long as it can be while still leaving every ping
+// a baseline inside the pinger's window.
+const tpsSampleInterval = time.Minute
+
+// sampleGameClock keeps the pinger's TPS baseline fresh until ctx ends. It
+// runs for the process, not the session: the console bridge is a separate
+// path to the server from the Bedrock connection and outlives a reconnect.
+func sampleGameClock(ctx context.Context, pinger *adapters.ServerPinger, timeout time.Duration, log *logging.Logger) {
+	ticker := time.NewTicker(tpsSampleInterval)
+	defer ticker.Stop()
+	for {
+		sampleCtx, cancel := context.WithTimeout(ctx, timeout)
+		err := pinger.Sample(sampleCtx)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			// Debug rather than Error: !ping already tells whoever asks that
+			// the console did not answer, and an outage would otherwise add a
+			// line a minute to the bridge's own failures.
+			log.Debug("tps_sample_failed", logging.Fields{"error": err.Error()})
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 // runConnectLoop owns the reconnect/backoff policy. Each iteration runs one
 // session to completion (or failure), then waits before trying again.
-func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store) {
+func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store, link *linkMeter) {
 	minDelay := time.Duration(cfg.ReconnectMinMs) * time.Millisecond
 	maxDelay := time.Duration(cfg.ReconnectMaxMs) * time.Millisecond
 	// authDelay does not enter the doubling ladder: nextDelay never sees it,
@@ -284,7 +320,7 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		firstAttempt = false
 
 		started := time.Now()
-		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblingXUIDs, permResolver, ans, playerStore, auditor)
+		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblingXUIDs, permResolver, ans, playerStore, auditor, link)
 		lasted := time.Since(started)
 		httpServer.SetReady(false)
 
@@ -453,7 +489,7 @@ func isAuthRejection(err error) bool {
 // clean disconnect and a non-nil error on anything else (including ctx
 // cancellation surfaced as a read error, which the caller ignores because
 // it checks ctx.Err() itself).
-func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store) error {
+func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store, link *linkMeter) error {
 	// Without this the agent joins as a solid black silhouette under a
 	// SkinID regenerated every connect: Bedrock skins are uploaded by the
 	// client from its own installation, and a headless client has none, so
@@ -527,6 +563,10 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 	// audience has to be told which entry is its own before anything is
 	// delivered -- see deliveryAudience.
 	audience.beginSession(selfXUID)
+	// Ended by defer so that no way out of this session leaves !ping reading
+	// a closed connection.
+	link.beginSession(conn)
+	defer link.endSession()
 	// Runtime ID rather than XUID: the respawn exchange identifies the player
 	// by the id that is unique to this world session, not the account.
 	respawner := liveness.New(conn.GameData().EntityRuntimeID)
@@ -603,7 +643,7 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 // RecordJoin without reporting anything, and no player arrival was ever
 // persisted. Nothing failed loudly, because the one branch that would have
 // logged is the error path of the call that was not being made.
-func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, voice plugin.Voice, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store, announceStore plugin.AnnounceStore, deliverer plugin.AnnounceDeliverer) *plugin.Context {
+func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, voice plugin.Voice, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store, announceStore plugin.AnnounceStore, deliverer plugin.AnnounceDeliverer, pinger plugin.Pinger) *plugin.Context {
 	return &plugin.Context{
 		// The same Voice the Deliverer speaks through, passed in rather than
 		// built here: an announcement and a command reply are the same console
@@ -638,6 +678,7 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 		// answers "never seen", and !announce refuses exactly as it did
 		// before there was one.
 		Roster: playerLookup{live: playerRoster, archive: playerStore},
+		Pinger: pinger,
 	}
 }
 

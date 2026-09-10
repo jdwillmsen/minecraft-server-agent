@@ -46,6 +46,7 @@ func testPluginContext() *plugin.Context {
 		waypoints.Nop{},
 		announce.Nop{},
 		deliverer,
+		adapters.NewServerPinger(bridgeClient, (&linkMeter{}).roundTrip, logging.New("error")),
 	)
 }
 
