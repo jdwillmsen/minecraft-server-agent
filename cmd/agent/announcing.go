@@ -140,10 +140,12 @@ var _ announce.Store = (*outbox)(nil)
 // recorded as the author of their own announcement either.
 func (o *outbox) Insert(ctx context.Context, a announce.Announcement) (int64, error) {
 	if a.AuthorXUID == chat.ServerOrigin {
-		// The console is not a player. ServerOrigin is a sentinel that will
-		// never appear in minecraft.players, and the column is documented
-		// as null for an announcement with no human behind it — which is
-		// exactly what a `send-command say !announce ...` is.
+		// Belt and braces. The command that builds a console-issued
+		// announcement already blanks this, because the console has no
+		// player identity and the whole process should agree about that --
+		// but this is the last point before a foreign key sees it, and a
+		// future source that forgets would fail the write rather than be
+		// caught here.
 		a.AuthorXUID = ""
 	}
 	o.ensure(ctx, a.AuthorXUID)
@@ -174,8 +176,14 @@ func (o *outbox) Enabled() bool { return o.store.Enabled() }
 //
 // A failure is logged and not returned for the same reason: the caller's
 // own write is worth attempting regardless, and it reports its own error.
+//
+// Nothing here guards against its own dependencies being nil. An outbox
+// assembled without a store, a roster or a logger is a wiring mistake, and
+// this file's whole subject is that a wiring mistake must be loud: a guard
+// would turn it into an announcement trail that quietly stops recording who
+// heard what.
 func (o *outbox) ensure(ctx context.Context, xuid string) {
-	if xuid == "" || o.players == nil || o.names == nil {
+	if xuid == "" {
 		return
 	}
 	gamertag, ok := o.names.NameFor(xuid)

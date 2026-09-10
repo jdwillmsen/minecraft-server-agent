@@ -7,12 +7,19 @@ import (
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 )
 
 // announceUsage is shown for empty or flag-only input, so a mistyped
 // command teaches the syntax rather than silently doing nothing.
 const announceUsage = "Usage: !announce [@player] [!now] [!urgent] <message>."
+
+// noStore is what both commands say when the outbox cannot be reached --
+// whether because none is configured or because the tables are not there
+// yet. One string for both: to the player they are the same fact, and the
+// difference between them is an operator's problem, not theirs.
+const noStore = "I have no announcement store configured."
 
 // Announce lets an operator say something to the server, right now or
 // queued for whoever is offline, and lets any member collect what has been
@@ -85,7 +92,7 @@ loop:
 
 func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (string, error) {
 	if pctx.Announcements == nil || !pctx.Announcements.Enabled() {
-		return "I have no announcement store configured.", nil
+		return noStore, nil
 	}
 	if inv.ActorPermission < plugin.PermissionOperator {
 		return "Only an operator can send an announcement.", nil
@@ -136,11 +143,24 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 		priority = announce.PriorityExpedited
 	}
 
+	// The console has no player identity. chat.ServerOrigin is a sentinel
+	// standing in for one, and author_xuid is a foreign key into
+	// minecraft.players, so carrying it any further would fail the write --
+	// and an announcement with nobody behind it is exactly what the column
+	// is documented to be null for. Blanked here, where the announcement is
+	// described, rather than on the way to the database: everything
+	// downstream, the delivery included, should see the same author the row
+	// does.
+	authorXUID := inv.ActorXUID
+	if authorXUID == chat.ServerOrigin {
+		authorXUID = ""
+	}
+
 	now := time.Now()
 	a := announce.Announcement{
 		Body:         strings.Join(body, " "),
 		Source:       announce.SourceCommand,
-		AuthorXUID:   inv.ActorXUID,
+		AuthorXUID:   authorXUID,
 		TargetKind:   target,
 		TargetValue:  targetValue,
 		Priority:     priority,
@@ -151,6 +171,14 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 	}
 
 	id, err := pctx.Announcements.Insert(ctx, a)
+	if announce.NotMigrated(err) {
+		// A store that exists but has no tables behind it yet. Answered like
+		// an unconfigured one rather than returned as an error, because an
+		// errored command sends no reply at all: the operator would type
+		// !announce, see nothing, and have no way to tell that from the
+		// message having gone out.
+		return noStore, nil
+	}
 	if err != nil {
 		return "", fmt.Errorf("announce: !announce: %w", err)
 	}
@@ -170,12 +198,17 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 
 func runInbox(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (string, error) {
 	if pctx.Deliverer == nil {
-		return "I have no announcement store configured.", nil
+		return noStore, nil
 	}
 	// No argument names another player: a player can only ever drain their
 	// own queue, the same restriction !wp places on whose coordinates a
 	// command can touch.
 	delivered, err := pctx.Deliverer.DrainAll(ctx, inv.ActorXUID, time.Now())
+	if announce.NotMigrated(err) {
+		// Same reasoning as !announce: silence is the one answer a player
+		// cannot interpret.
+		return noStore, nil
+	}
 	if err != nil {
 		return "", fmt.Errorf("announce: !inbox: %w", err)
 	}

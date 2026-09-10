@@ -10,6 +10,7 @@ import (
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
@@ -320,5 +321,61 @@ func TestBroadcastRecordsEveryPlayerAndOnlyPlayers(t *testing.T) {
 	}
 	if len(players.all()) != 2 {
 		t.Errorf("ensured %v, want a row for each real recipient", players.all())
+	}
+}
+
+// Nothing but registerPlugins knows which plugins this binary serves, so a
+// Register call deleted from it takes !announce, !inbox or join delivery
+// with it, compiles, and leaves every other test green. plugin.Context
+// already carries a comment about a capability declared and never wired that
+// only production noticed; this is the same defect one layer out.
+func TestEveryPluginThisBinaryServesIsRegistered(t *testing.T) {
+	registry := plugin.NewRegistry()
+	deliverer := announce.NewDeliverer(
+		&recordingAnnounceStore{},
+		&recordingVoice{},
+		newDeliveryAudience(roster.New(), siblingBotXUIDs()),
+		announcePermissions{resolver: fakePermResolver(t, nil)},
+		logging.New("error"),
+	)
+	if err := registerPlugins(t.Context(), registry, deliverer, logging.New("error")); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	registered := map[string]plugin.Plugin{}
+	for _, p := range registry.Plugins() {
+		registered[p.Name()] = p
+	}
+	for _, name := range []string{"core", "stats", "knowledge", "waypoints", "welcome", "announce", "announce-drain"} {
+		if _, ok := registered[name]; !ok {
+			t.Errorf("the %s plugin is not registered", name)
+		}
+	}
+
+	commands := map[string]bool{}
+	for _, c := range registry.Commands() {
+		commands[c.Name] = true
+	}
+	for _, name := range []string{"announce", "inbox"} {
+		if !commands[name] {
+			t.Errorf("!%s is not dispatchable; the command exists in no registry", name)
+		}
+	}
+
+	// The drain exposes no command, so its registration is only observable
+	// as a join subscription -- which is exactly what startEventDispatch
+	// reads to wire it up.
+	drain, ok := registered["announce-drain"].(plugin.EventHandler)
+	if !ok {
+		t.Fatal("the announce-drain plugin does not handle events; nothing would deliver on a join")
+	}
+	joins := false
+	for _, kind := range drain.Kinds() {
+		if kind == roster.JoinKind {
+			joins = true
+		}
+	}
+	if !joins {
+		t.Error("the announce-drain plugin does not subscribe to joins")
 	}
 }

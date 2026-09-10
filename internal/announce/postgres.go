@@ -2,11 +2,34 @@ package announce
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// undefinedTable is Postgres's SQLSTATE for "relation does not exist".
+const undefinedTable = "42P01"
+
+// NotMigrated reports whether err is this store talking to a database whose
+// announcement tables have not been created yet.
+//
+// Enabled() answers "is there a pool", which is not the same question: an
+// agent pointed at a database that predates the announcements migration
+// passes every configuration check and then fails on the first statement.
+// Without this the operator who typed !announce is told nothing at all --
+// the command errors, and an errored command has no reply -- which is the
+// same silent shape as the permissions incident this project keeps
+// designing against.
+//
+// This becomes dead code the moment the migration is applied everywhere, and
+// is meant to: it costs one comparison on a path that is already failing.
+func NotMigrated(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == undefinedTable
+}
 
 // Store is what a source writes to and a deliverer reads from: the outbox
 // and the record of who has already heard what.

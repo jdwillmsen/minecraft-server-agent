@@ -150,33 +150,8 @@ func main() {
 	)
 
 	registry := plugin.NewRegistry()
-	if err := registry.Register(plugins.NewCore()); err != nil {
-		log.Error("plugin_register_failed", logging.Fields{"plugin": "core", "error": err.Error()})
-		os.Exit(1)
-	}
-	if err := registry.Register(plugins.NewStats()); err != nil {
-		log.Error("plugin_register_failed", logging.Fields{"plugin": "stats", "error": err.Error()})
-		os.Exit(1)
-	}
-	if err := registry.Register(plugins.NewKnowledge()); err != nil {
-		log.Error("plugin_register_failed", logging.Fields{"plugin": "knowledge", "error": err.Error()})
-		os.Exit(1)
-	}
-	if err := registry.Register(plugins.NewWaypoints()); err != nil {
-		log.Error("plugin_register_failed", logging.Fields{"plugin": "waypoints", "error": err.Error()})
-		os.Exit(1)
-	}
-	welcomePlugin := plugins.NewWelcome(ctx, welcomeDelay, log)
-	if err := registry.Register(welcomePlugin); err != nil {
-		log.Error("plugin_register_failed", logging.Fields{"plugin": "welcome", "error": err.Error()})
-		os.Exit(1)
-	}
-	if err := registry.Register(plugins.NewAnnounce()); err != nil {
-		log.Error("plugin_register_failed", logging.Fields{"plugin": "announce", "error": err.Error()})
-		os.Exit(1)
-	}
-	if err := registry.Register(plugins.NewAnnounceDrain(ctx, deliverer, log)); err != nil {
-		log.Error("plugin_register_failed", logging.Fields{"plugin": "announce-drain", "error": err.Error()})
+	if err := registerPlugins(ctx, registry, deliverer, log); err != nil {
+		log.Error("plugin_register_failed", logging.Fields{"error": err.Error()})
 		os.Exit(1)
 	}
 
@@ -235,14 +210,44 @@ func main() {
 	log.Info("stopped", nil)
 }
 
+// registerPlugins registers every plugin this binary serves.
+//
+// A function rather than a run of Register calls inside main so a test can
+// hold the finished registry and say what it must contain. Nothing else in
+// the process knows this set: a plugin dropped from here takes its commands
+// with it, compiles, and leaves every test green -- the same shape as the
+// Profiles field that was declared, never assigned, and only noticed in
+// production.
+//
+// The error carries the plugin's own name, because "registration failed" on
+// its own does not say which one.
+func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer plugins.AnnounceDeliverer, log *logging.Logger) error {
+	for _, p := range []plugin.Plugin{
+		plugins.NewCore(),
+		plugins.NewStats(),
+		plugins.NewKnowledge(),
+		plugins.NewWaypoints(),
+		plugins.NewWelcome(ctx, welcomeDelay, log),
+		plugins.NewAnnounce(),
+		plugins.NewAnnounceDrain(ctx, deliverer, log),
+	} {
+		if err := registry.Register(p); err != nil {
+			return fmt.Errorf("%s: %w", p.Name(), err)
+		}
+	}
+	return nil
+}
+
 // siblingBotXUIDs is the set of bot identities this agent treats as its own
 // kind: never answered in chat, never welcomed, never announced to.
 //
 // It is empty, and nothing populates it. Read that plainly: every filter
 // built on it — handleText, handlePlayerList, the delivery audience —
 // currently excludes this agent and nobody else, so a sibling AFK bot is
-// welcomed, drained and whispered to exactly like a player, and its
-// deliveries are recorded against an XUID minecraft.players has no row for.
+// welcomed, drained and whispered to exactly like a player. It leaves no
+// error behind either: the roster can name a bot, so the outbox creates a
+// minecraft.players row for one and records its deliveries as if a person
+// had heard them. The gap is silent in the database as well as in chat.
 //
 // Populating it is not a line of code here. The AFK bots are identified by
 // gamertag in their own deployment, not by XUID, and this binary is given
