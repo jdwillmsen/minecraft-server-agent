@@ -10,6 +10,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/config"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/moderation"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
@@ -47,6 +48,7 @@ func testPluginContext() *plugin.Context {
 		announce.Nop{},
 		deliverer,
 		adapters.NewServerPinger(bridgeClient, (&linkMeter{}).roundTrip, logging.New("error")),
+		moderation.Nop{},
 	)
 }
 

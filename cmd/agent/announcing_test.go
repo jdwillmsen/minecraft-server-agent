@@ -338,7 +338,7 @@ func TestEveryPluginThisBinaryServesIsRegistered(t *testing.T) {
 		announcePermissions{resolver: fakePermResolver(t, nil)},
 		logging.New("error"),
 	)
-	if err := registerPlugins(t.Context(), registry, deliverer, logging.New("error")); err != nil {
+	if err := registerPlugins(t.Context(), registry, deliverer, []string{"griefer"}, logging.New("error")); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -346,7 +346,7 @@ func TestEveryPluginThisBinaryServesIsRegistered(t *testing.T) {
 	for _, p := range registry.Plugins() {
 		registered[p.Name()] = p
 	}
-	for _, name := range []string{"core", "stats", "knowledge", "waypoints", "welcome", "announce", "announce-drain"} {
+	for _, name := range []string{"core", "stats", "knowledge", "waypoints", "welcome", "announce", "announce-drain", "moderation"} {
 		if _, ok := registered[name]; !ok {
 			t.Errorf("the %s plugin is not registered", name)
 		}
@@ -356,7 +356,7 @@ func TestEveryPluginThisBinaryServesIsRegistered(t *testing.T) {
 	for _, c := range registry.Commands() {
 		commands[c.Name] = true
 	}
-	for _, name := range []string{"announce", "inbox"} {
+	for _, name := range []string{"announce", "inbox", "modlog"} {
 		if !commands[name] {
 			t.Errorf("!%s is not dispatchable; the command exists in no registry", name)
 		}
@@ -377,6 +377,16 @@ func TestEveryPluginThisBinaryServesIsRegistered(t *testing.T) {
 	}
 	if !joins {
 		t.Error("the announce-drain plugin does not subscribe to joins")
+	}
+
+	// Moderation reads chat only through its subscription; registered
+	// without one it would serve !modlog over a log nothing ever writes.
+	mod, ok := registered["moderation"].(plugin.EventHandler)
+	if !ok {
+		t.Fatal("the moderation plugin does not handle events; no chat would ever be checked")
+	}
+	if kinds := mod.Kinds(); len(kinds) != 1 || kinds[0] != chat.MessageKind {
+		t.Errorf("the moderation plugin subscribes to %v, want chat messages", kinds)
 	}
 }
 

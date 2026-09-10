@@ -102,6 +102,11 @@ type Config struct {
 	// ConsoleBridgeTimeoutMs bounds every individual bridge HTTP call.
 	ConsoleBridgeTimeoutMs int
 
+	// ModerationTerms are the words whose use in public chat is recorded,
+	// from a comma-separated MODERATION_TERMS. Empty turns the term rule off.
+	// The other rules need no configuration.
+	ModerationTerms []string
+
 	// Logging.
 	LogLevel string
 }
@@ -205,9 +210,23 @@ func Load() (Config, error) {
 		ConsoleBridgeURL:          bridgeURL,
 		ConsoleBridgeToken:        bridgeToken,
 		ConsoleBridgeTimeoutMs:    bridgeTimeout,
+		ModerationTerms:           commaList("MODERATION_TERMS"),
 		LogLevel:                  strings.ToLower(stringDefault("LOG_LEVEL", "info")),
 	}
 	return cfg, nil
+}
+
+// commaList splits a comma-separated variable, trimming each entry and
+// dropping blanks. A trailing comma or a doubled comma is then just
+// punctuation, not an empty entry for every consumer to guard against.
+func commaList(name string) []string {
+	var out []string
+	for _, part := range strings.Split(os.Getenv(name), ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func required(name string) (string, error) {

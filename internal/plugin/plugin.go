@@ -21,6 +21,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/moderation"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
 )
@@ -224,6 +225,19 @@ type Context struct {
 	Roster Roster
 	// Pinger may be nil; !ping then answers from the agent alone.
 	Pinger Pinger
+	// Moderation may be nil, on the same terms as Knowledge: cmd/agent
+	// always supplies one, and every use checks Enabled first.
+	Moderation ModerationStore
+}
+
+// ModerationStore is the flagged-chat record a plugin may touch: write a flag
+// and read the newest back. Pruning is left out on purpose. It is
+// housekeeping the process runs on a timer, and no command or event handler
+// has a reason to delete a record.
+type ModerationStore interface {
+	Record(ctx context.Context, e moderation.Event) error
+	Recent(ctx context.Context, xuid string, limit int) ([]moderation.Event, error)
+	Enabled() bool
 }
 
 // AnnouncementsReady reports whether an announcement can actually be stored

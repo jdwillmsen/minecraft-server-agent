@@ -35,6 +35,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/httpapi"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/moderation"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
@@ -125,8 +126,10 @@ func main() {
 	var waypointStore waypoints.Store = waypoints.Nop{}
 	var announceStore announce.Store = announce.Nop{}
 	var auditor audit.Store = audit.Nop{}
+	var moderationStore moderation.Store = moderation.Nop{}
 	if pg, ok := playerStore.(*store.Postgres); ok && pg.Pool() != nil {
 		knowledgeStore = knowledge.NewPostgres(pg.Pool())
+		moderationStore = newModerationLog(moderation.NewPostgres(pg.Pool()), log)
 		waypointStore = waypoints.NewPostgres(pg.Pool())
 		auditor = newAuditTrail(audit.NewPostgres(pg.Pool()), log)
 		// Wrapped rather than used directly: every announcement row names a
@@ -156,12 +159,12 @@ func main() {
 	)
 
 	registry := plugin.NewRegistry()
-	if err := registerPlugins(ctx, registry, deliverer, log); err != nil {
+	if err := registerPlugins(ctx, registry, deliverer, cfg.ModerationTerms, log); err != nil {
 		log.Error("plugin_register_failed", logging.Fields{"error": err.Error()})
 		os.Exit(1)
 	}
 
-	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, voice, playerRoster, registry, playerStore, knowledgeStore, waypointStore, announceStore, deliverer, pinger)
+	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, voice, playerRoster, registry, playerStore, knowledgeStore, waypointStore, announceStore, deliverer, pinger, moderationStore)
 	// Every answerable chat message and every roster join is published
 	// here; event-driven plugins (welcome) subscribe via startEventDispatch
 	// rather than touching the connection directly.
@@ -175,6 +178,7 @@ func main() {
 	)
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
 	go sampleGameClock(ctx, pinger, link.roundTrip, bridgeTimeout, log)
+	go pruneModerationLog(ctx, moderationStore, moderationPruneInterval, log)
 
 	httpServer, err := httpapi.New(cfg.HTTPAddr)
 	if err != nil {
@@ -228,7 +232,11 @@ func main() {
 //
 // The error carries the plugin's own name, because "registration failed" on
 // its own does not say which one.
-func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer plugins.AnnounceDeliverer, log *logging.Logger) error {
+func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer plugins.AnnounceDeliverer, moderationTerms []string, log *logging.Logger) error {
+	mod, err := plugins.NewModeration(ctx, moderationTerms, log)
+	if err != nil {
+		return fmt.Errorf("moderation: %w", err)
+	}
 	for _, p := range []plugin.Plugin{
 		plugins.NewCore(),
 		plugins.NewStats(),
@@ -237,6 +245,7 @@ func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer p
 		plugins.NewWelcome(ctx, welcomeDelay, log),
 		plugins.NewAnnounce(),
 		plugins.NewAnnounceDrain(ctx, deliverer, log),
+		mod,
 	} {
 		if err := registry.Register(p); err != nil {
 			return fmt.Errorf("%s: %w", p.Name(), err)
@@ -664,7 +673,13 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 	}
 
 	trigger := chat.ParseTrigger(text.Message)
-	eventBus.Publish(chat.MessageEvent{ActorXUID: id, Message: text.Message, Trigger: trigger})
+	eventBus.Publish(chat.MessageEvent{
+		ActorXUID: id,
+		Gamertag:  rosterName(playerRoster, id),
+		Message:   text.Message,
+		Trigger:   trigger,
+		Public:    chat.IsPublicType(text.TextType),
+	})
 
 	switch trigger.Kind {
 	case chat.TriggerCommand:
@@ -682,7 +697,7 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 // RecordJoin without reporting anything, and no player arrival was ever
 // persisted. Nothing failed loudly, because the one branch that would have
 // logged is the error path of the call that was not being made.
-func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, voice plugin.Voice, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store, announceStore plugin.AnnounceStore, deliverer plugin.AnnounceDeliverer, pinger plugin.Pinger) *plugin.Context {
+func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, voice plugin.Voice, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store, announceStore plugin.AnnounceStore, deliverer plugin.AnnounceDeliverer, pinger plugin.Pinger, moderationStore plugin.ModerationStore) *plugin.Context {
 	return &plugin.Context{
 		// The same Voice the Deliverer speaks through, passed in rather than
 		// built here: an announcement and a command reply are the same console
@@ -718,6 +733,9 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 		// before there was one.
 		Roster: playerLookup{live: playerRoster, archive: playerStore},
 		Pinger: pinger,
+		// Same reasoning as Profiles: moderation.Nop when no database is
+		// configured, never nil.
+		Moderation: moderationStore,
 	}
 }
 
