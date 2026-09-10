@@ -433,6 +433,15 @@ func (r *Registry) Dispatch(ctx context.Context, pctx *Context, name string, inv
 	}
 }
 
+// Lookup returns the command name resolves to, matched the same
+// case-insensitive way Dispatch matches it.
+func (r *Registry) Lookup(name string) (Command, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cmd, ok := r.commands[commandKey(name)]
+	return cmd, ok
+}
+
 // Commands returns every registered command, sorted by name. Satisfies
 // Directory.
 func (r *Registry) Commands() []Command {

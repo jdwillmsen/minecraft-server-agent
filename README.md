@@ -131,6 +131,9 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   caching, so a restart doesn't require a fresh interactive login
 - `internal/httpapi` - `/healthz`, `/readyz` (reflects real Bedrock session
   state), and `/metrics`
+- `internal/metrics` - every series the agent exports beyond the session
+  gauge and reconnect counter; callers record through small functions and
+  never touch a Prometheus type - see "Metrics" below
 - `internal/ratelimit` - per-actor sliding-window command rate limiting
 
 ## Environment variables
@@ -165,6 +168,57 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 | `MC_MONITOR_URL` | *(empty)* | mc-monitor Prometheus endpoint behind `!online`; unset reports the command unconfigured rather than erroring |
 | `BACKUP_EXPORTER_URL` | *(empty)* | Backup exporter's `/metrics.txt` behind `!backup`; unset reports the command unconfigured rather than erroring |
 | `LOG_LEVEL` | `info` | `info` or `debug` |
+
+## Metrics
+
+`/metrics` serves the default Prometheus registry. Dashboards and alerts are
+written against these exact names and label values, so renaming one is a
+breaking change.
+
+| Name | Type | Labels | Recorded |
+|---|---|---|---|
+| `mc_agent_connected` | gauge | none | 1 while a Bedrock session is up |
+| `mc_agent_reconnects_total` | counter | none | per reconnect attempt |
+| `mc_agent_commands_total` | counter | `command`, `outcome` | once per dispatch, beside the audit write |
+| `mc_agent_mentions_total` | counter | `outcome` | once per `@server` mention |
+| `mc_agent_answer_duration_seconds` | histogram | `outcome` | per answer attempt that reached the model |
+| `mc_agent_tool_calls_total` | counter | `tool`, `outcome` | per tool invocation |
+| `mc_agent_announce_deliveries_total` | counter | `delivery`, `outcome` | per send attempt |
+| `mc_agent_audit_write_failures_total` | counter | none | per dispatch the audit trail did not record |
+| `mc_agent_auth_rejections_total` | counter | none | per Xbox Live account rejection |
+| `mc_agent_deaths_total` | counter | none | per death the respawner handles |
+| `mc_agent_server_tps` | gauge | none | per successful TPS measurement, background or `!ping` |
+| `mc_agent_tps_last_success_timestamp_seconds` | gauge | none | same moment |
+| `mc_agent_link_rtt_seconds` | gauge | none | per background sample while a session exists |
+
+Every label is bounded by construction; nothing a player types or a model
+invents reaches one unfiltered:
+
+- `command` is the registered command name, or `unregistered` for anything
+  else - including a rate-limited dispatch of a word that is not a command.
+  `outcome` is the audit outcome: `ok`, `denied`, `unknown`, `error`,
+  `rate_limited`, `timeout`
+- mention `outcome`: `answered`, `failed`, `empty`, `rate_limited`, `busy`,
+  `undeliverable`, `send_failed`, `disabled`
+- answer `outcome`: `answered` or `failed`. An empty completion is timed as
+  answered - the model came back - and counted as `empty` in the mentions
+  counter. Buckets 0.5-30s, matching the 30s answer budget
+- `tool` is a name from the tool registry, or `unregistered` for one the
+  model made up; `outcome` is `ok` or `error`
+- `delivery` is `broadcast`, `whisper`, or `summary` (the drain's "more are
+  waiting" line); `outcome` is `sent` or `failed`
+
+Every known mention, announce-delivery and command/outcome combination, and
+the audit, auth and death counters, start at zero: `increase()` over a
+series that first appears at 1 reads as 0, and an alert on the first failure
+after a restart would never fire. A missing or ungranted audit table counts
+as a write failure on every command, though it is logged only once.
+
+`mc_agent_server_tps` and `mc_agent_link_rtt_seconds` do not exist until
+first measured, and a failed measurement never resets them: a zero would
+read as a crashed server or a perfect link. How old the TPS figure is comes
+from the success timestamp, which starts at 0 so a measurement that never
+succeeds reads as stale rather than as missing.
 
 ## Identity model
 

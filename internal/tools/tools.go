@@ -111,6 +111,16 @@ func (r *Registry) Definitions() []Definition {
 	return out
 }
 
+// Has reports whether name is a registered tool, matched the way Invoke
+// matches it.
+func (r *Registry) Has(name string) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.byName[strings.TrimSpace(name)]
+	return ok
+}
+
 // Invoke runs one tool call and returns its result, truncated.
 func (r *Registry) Invoke(ctx context.Context, name string, args json.RawMessage, caller string) (string, error) {
 	if r == nil {

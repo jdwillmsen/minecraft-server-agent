@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/text"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
@@ -276,6 +277,7 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 		messages = append(messages, chatMessage{Role: "assistant", ToolCalls: calls})
 		for _, call := range calls {
 			result, err := registry.Invoke(ctx, call.Function.Name, json.RawMessage(call.Function.Arguments), callerXUID)
+			metrics.ToolCall(toolLabel(registry, call.Function.Name), err)
 			if err != nil {
 				if c.log != nil {
 					c.log.Error("tool_invocation_failed", logging.Fields{"tool": call.Function.Name, "error": err.Error()})
@@ -294,4 +296,15 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 			})
 		}
 	}
+}
+
+// toolLabel is the metric label for a tool the model asked for. The name
+// comes from the model, which invents plausible ones, so anything the
+// registry does not hold collapses into one series rather than becoming a
+// label a single answer can mint.
+func toolLabel(registry *tools.Registry, name string) string {
+	if registry.Has(name) {
+		return strings.TrimSpace(name)
+	}
+	return metrics.Unregistered
 }

@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
@@ -121,7 +122,9 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 	// TargetPlayer row that happened to carry DeliveryBroadcast must still
 	// whisper, not broadcast a private message to the whole server.
 	if DeliveryFor(a.TargetKind) == DeliveryBroadcast {
-		if err := d.voice.Say(ctx, a.Body); err != nil {
+		err := d.voice.Say(ctx, a.Body)
+		metrics.AnnounceDelivery(metrics.DeliveryBroadcast, err)
+		if err != nil {
 			// Say never went out, so nothing was heard — recording a
 			// delivery here would make an online player's next join
 			// silently skip a message they never actually received.
@@ -161,7 +164,9 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 			// (and an error line) for every recipient still left to try.
 			break
 		}
-		if err := d.voice.Tell(ctx, xuid, a.Body); err != nil {
+		err := d.voice.Tell(ctx, xuid, a.Body)
+		metrics.AnnounceDelivery(metrics.DeliveryWhisper, err)
+		if err != nil {
 			d.log.Error("announce_tell_failed", logging.Fields{"announcement_id": id, "xuid": xuid, "error": err.Error()})
 			continue
 		}
@@ -186,7 +191,9 @@ func (d *Deliverer) sendPending(ctx context.Context, xuid string, now time.Time,
 			// into that many more failed bridge attempts and error lines.
 			break
 		}
-		if err := d.voice.Tell(ctx, xuid, a.Body); err != nil {
+		err := d.voice.Tell(ctx, xuid, a.Body)
+		metrics.AnnounceDelivery(metrics.DeliveryWhisper, err)
+		if err != nil {
 			d.log.Error("announce_tell_failed", logging.Fields{"announcement_id": a.ID, "xuid": xuid, "error": err.Error()})
 			continue
 		}

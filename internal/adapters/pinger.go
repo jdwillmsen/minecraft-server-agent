@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/text"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
@@ -41,6 +43,14 @@ const (
 // apart from a transport failure because it points at a different cause --
 // the server's output changed shape -- and says so at a louder log level.
 var errNoGametime = errors.New("pinger: the console answered without a Gametime line")
+
+// errNoAnswer is the console saying nothing inside the bridge's collect
+// window, which is not the same fault as errNoGametime. A server lagging by
+// more than that window prints its Gametime line a moment after the bridge
+// has stopped listening -- seen in production at 18 TPS -- so this is
+// transient, and it is the laggy moments that go unmeasured. Treating it as a
+// parser regression would raise the loudest alarm for the most ordinary cause.
+var errNoAnswer = errors.New("pinger: the console printed nothing within the bridge's collect window")
 
 // gametimeLine matches Bedrock's answer to `time query gametime`. The log
 // prefix, when present, carries the server's own clock to the millisecond.
@@ -119,6 +129,12 @@ func (p *ServerPinger) sample(ctx context.Context) (tps float64, known bool, err
 	if err != nil {
 		return 0, false, fmt.Errorf("pinger: %w", err)
 	}
+	if strings.TrimSpace(resp.Output) == "" {
+		// Not logged here: a player's !ping reports it at Warn, and the
+		// background sampler at Debug, which is the right weight for a
+		// server that answered a second late.
+		return 0, false, errNoAnswer
+	}
 	cur, err := parseGametime(resp.Output, sent)
 	if err != nil {
 		// Error rather than Warn: the console is up and answering, so this is
@@ -135,6 +151,14 @@ func (p *ServerPinger) sample(ctx context.Context) (tps float64, known bool, err
 	p.samples = append(p.samples, cur)
 	if len(p.samples) > maxTickSamples {
 		p.samples = p.samples[len(p.samples)-maxTickSamples:]
+	}
+	// Recorded here rather than by either caller so a player's !ping and the
+	// background sampler both refresh the gauge: whichever measured last is
+	// the freshest value there is. Stamped with the agent's clock at the
+	// request, not the server's log stamp: an alert compares it with the
+	// scraper's time(), which the server's zone-less stamp cannot be.
+	if known {
+		metrics.ServerTPS(tps, sent)
 	}
 	return tps, known, nil
 }

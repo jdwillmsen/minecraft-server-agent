@@ -34,6 +34,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/config"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/httpapi"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
@@ -173,7 +174,7 @@ func main() {
 		bridgeTimeout,
 	)
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
-	go sampleGameClock(ctx, pinger, bridgeTimeout, log)
+	go sampleGameClock(ctx, pinger, link.roundTrip, bridgeTimeout, log)
 
 	httpServer, err := httpapi.New(cfg.HTTPAddr)
 	if err != nil {
@@ -241,6 +242,11 @@ func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer p
 			return fmt.Errorf("%s: %w", p.Name(), err)
 		}
 	}
+	// Here rather than as a separate line in main: the only moment the
+	// command set is known to be complete is the end of this function, and
+	// a call main could drop leaves every test green while each command's
+	// first use after a restart reads as zero to increase().
+	initCommandMetrics(registry)
 	return nil
 }
 
@@ -275,24 +281,38 @@ const tpsSampleInterval = time.Minute
 // sampleGameClock keeps the pinger's TPS baseline fresh until ctx ends. It
 // runs for the process, not the session: the console bridge is a separate
 // path to the server from the Bedrock connection and outlives a reconnect.
-func sampleGameClock(ctx context.Context, pinger *adapters.ServerPinger, timeout time.Duration, log *logging.Logger) {
+func sampleGameClock(ctx context.Context, pinger *adapters.ServerPinger, link func() (time.Duration, bool), timeout time.Duration, log *logging.Logger) {
 	ticker := time.NewTicker(tpsSampleInterval)
 	defer ticker.Stop()
 	for {
-		sampleCtx, cancel := context.WithTimeout(ctx, timeout)
-		err := pinger.Sample(sampleCtx)
-		cancel()
-		if err != nil && ctx.Err() == nil {
-			// Debug rather than Error: !ping already tells whoever asks that
-			// the console did not answer, and an outage would otherwise add a
-			// line a minute to the bridge's own failures.
-			log.Debug("tps_sample_failed", logging.Fields{"error": err.Error()})
-		}
+		sampleOnce(ctx, pinger, link, timeout, log)
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
+	}
+}
+
+// sampleOnce is one tick of sampleGameClock. The pinger records a TPS it
+// measures itself; the link round trip is read here because this is the one
+// place that runs on a schedule whether or not anyone types !ping.
+//
+// The link is read independently of the console answering: they are two
+// paths to the server, and a bridge outage says nothing about the Bedrock
+// connection.
+func sampleOnce(ctx context.Context, pinger *adapters.ServerPinger, link func() (time.Duration, bool), timeout time.Duration, log *logging.Logger) {
+	if rtt, ok := link(); ok {
+		metrics.LinkRTT(rtt)
+	}
+	sampleCtx, cancel := context.WithTimeout(ctx, timeout)
+	err := pinger.Sample(sampleCtx)
+	cancel()
+	if err != nil && ctx.Err() == nil {
+		// Debug rather than Error: !ping already tells whoever asks that
+		// the console did not answer, and an outage would otherwise add a
+		// line a minute to the bridge's own failures.
+		log.Debug("tps_sample_failed", logging.Fields{"error": err.Error()})
 	}
 }
 
@@ -333,19 +353,26 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		rawWait, delay, rejected = reconnectDelay(err, lasted, delay, minDelay, maxDelay, authDelay)
 		wait := jitter(rawWait)
 
-		switch {
-		case rejected:
-			log.Error("auth_rejected", logging.Fields{"username": cfg.MCUsername, "error": err.Error(), "session_lasted_ms": lasted.Milliseconds(), "delay_ms": wait.Milliseconds()})
-		case err != nil:
-			log.Error("session_error", logging.Fields{"error": err.Error(), "session_lasted_ms": lasted.Milliseconds()})
-		default:
-			log.Info("disconnected", logging.Fields{"session_lasted_ms": lasted.Milliseconds()})
-		}
+		reportSessionEnd(log, cfg.MCUsername, err, rejected, lasted, wait)
 		log.Info("reconnecting", logging.Fields{"delay_ms": wait.Milliseconds()})
 
 		if !waitOrShutdown(ctx, wait) {
 			return
 		}
+	}
+}
+
+// reportSessionEnd says how one session ended. Its own function so the
+// rejection count can be tested without dialling a server that rejects us.
+func reportSessionEnd(log *logging.Logger, username string, err error, rejected bool, lasted, wait time.Duration) {
+	switch {
+	case rejected:
+		metrics.AuthRejection()
+		log.Error("auth_rejected", logging.Fields{"username": username, "error": err.Error(), "session_lasted_ms": lasted.Milliseconds(), "delay_ms": wait.Milliseconds()})
+	case err != nil:
+		log.Error("session_error", logging.Fields{"error": err.Error(), "session_lasted_ms": lasted.Milliseconds()})
+	default:
+		log.Info("disconnected", logging.Fields{"session_lasted_ms": lasted.Milliseconds()})
 	}
 }
 
@@ -584,22 +611,34 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		}
 		// Before anything else: a dead agent answers no commands and holds no
 		// chunks, and nothing outside this loop can tell that it is dead.
-		if handled, err := respawner.Handle(pk, conn); err != nil {
-			log.Error("respawn_failed", logging.Fields{"error": err.Error()})
-		} else if handled {
-			if respawner.Dead() {
-				log.Info("died", logging.Fields{"requesting_respawn": true})
-			} else {
-				log.Info("respawned", nil)
-			}
-			// Readiness follows aliveness, not just the session. An agent on
-			// a death screen is connected and useless; reporting ready would
-			// be the lie that made this invisible in the first place.
-			httpServer.SetReady(!respawner.Dead())
-		}
+		handleLiveness(pk, respawner, conn, log, httpServer.SetReady)
 
 		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, ans, playerStore, auditor)
 	}
+}
+
+// handleLiveness drives the respawn exchange for one packet. Split out of
+// session so a death can be counted in a test, which has no way to die on a
+// live server.
+func handleLiveness(pk packet.Packet, respawner *liveness.Respawner, w liveness.Writer, log *logging.Logger, setReady func(bool)) {
+	handled, err := respawner.Handle(pk, w)
+	if err != nil {
+		log.Error("respawn_failed", logging.Fields{"error": err.Error()})
+		return
+	}
+	if !handled {
+		return
+	}
+	if respawner.Dead() {
+		metrics.Death()
+		log.Info("died", logging.Fields{"requesting_respawn": true})
+	} else {
+		log.Info("respawned", nil)
+	}
+	// Readiness follows aliveness, not just the session. An agent on a death
+	// screen is connected and useless; reporting ready would be the lie that
+	// made this invisible in the first place.
+	setReady(!respawner.Dead())
 }
 
 func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store) {
@@ -737,6 +776,7 @@ func startAnswer(ctx context.Context, actorXUID string, trigger chat.Trigger, lo
 	if ans.llm == nil || !ans.llm.Enabled() {
 		// Stage 1-3 behaviour, kept as the unconfigured path: detection is
 		// proven, nothing is answered.
+		metrics.Mention(metrics.MentionDisabled)
 		log.Info("mention_received", logging.Fields{"actor": actorXUID, "message": trigger.Message})
 		return
 	}
@@ -744,6 +784,7 @@ func startAnswer(ctx context.Context, actorXUID string, trigger chat.Trigger, lo
 	if !ans.limiter.Allow(actorXUID, time.Now()) {
 		// Silent on purpose. Telling a player they are rate limited is itself
 		// a chat line, so a spammer would still get one message per attempt.
+		metrics.Mention(metrics.MentionRateLimited)
 		log.Info("mention_rate_limited", logging.Fields{"actor": actorXUID})
 		return
 	}
@@ -754,6 +795,7 @@ func startAnswer(ctx context.Context, actorXUID string, trigger chat.Trigger, lo
 		// Dropped, not queued: an answer that waits for a slot arrives after
 		// the conversation it belongs to has moved on, and the asker has by
 		// then read the silence as the answer.
+		metrics.Mention(metrics.MentionBusy)
 		log.Info("mention_answer_dropped_busy", logging.Fields{"actor": actorXUID, "max_concurrent": cap(ans.inFlight)})
 		return
 	}
@@ -792,21 +834,30 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	defer cancel()
 
 	registry, personal := ans.toolsFor(pctx)
+	started := time.Now()
 	reply, err := ans.llm.AnswerWithTools(answerCtx, name, actorXUID, trigger.Message, registry)
+	// Timed as answered even when the reply turns out empty: the histogram
+	// is how long the model takes to come back, and an empty completion took
+	// exactly as long as a usable one. Whether the reply could be used is
+	// what the mentions counter below records.
+	metrics.Answer(time.Since(started), err)
 	if err != nil {
 		// Logged, never spoken. A backend timeout is an operator's problem,
 		// and narrating it in chat turns one failure into an audience.
+		metrics.Mention(metrics.MentionFailed)
 		log.Error("mention_answer_failed", logging.Fields{"actor": actorXUID, "error": err.Error()})
 		return
 	}
 	if reply == "" {
 		// An empty completion broadcast as a blank line reads to players as
 		// the server glitching -- a bug minecraft-afk-bot shipped and fixed.
+		metrics.Mention(metrics.MentionEmpty)
 		log.Info("mention_answer_empty", logging.Fields{"actor": actorXUID})
 		return
 	}
 
 	if pctx.Voice == nil {
+		metrics.Mention(metrics.MentionUndeliverable)
 		log.Error("mention_answer_undeliverable", logging.Fields{"actor": actorXUID})
 		return
 	}
@@ -843,9 +894,11 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 		sendErr = pctx.Voice.Say(sayCtx, reply)
 	}
 	if sendErr != nil {
+		metrics.Mention(metrics.MentionSendFailed)
 		log.Error("mention_answer_send_failed", logging.Fields{"actor": actorXUID, "error": sendErr.Error()})
 		return
 	}
+	metrics.Mention(metrics.MentionAnswered)
 	log.Info("mention_answered", logging.Fields{"actor": actorXUID, "reply_chars": len(reply), "private": private})
 }
 
@@ -912,6 +965,10 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	// than a gap in the record, so a write failure is logged and swallowed
 	// rather than surfaced to the caller.
 	writeAudit := func(outcome audit.Outcome) {
+		// Counted here because this is already the one call every exit path
+		// makes, and before the enabled check because a dispatch happened
+		// whether or not a database is configured to record it.
+		metrics.Command(commandLabel(registry, trigger.Command), string(outcome))
 		if auditor == nil || !auditor.Enabled() {
 			return
 		}
@@ -931,6 +988,7 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 			Outcome:    outcome,
 			At:         time.Now(),
 		}); err != nil {
+			metrics.AuditWriteFailure()
 			log.Error("audit_write_failed", logging.Fields{
 				"command": trigger.Command, "actor": actorXUID, "outcome": string(outcome), "error": err.Error(),
 			})
@@ -984,6 +1042,34 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	// Written after the reply is sent, not before: the record must never be
 	// in front of what the player is waiting on.
 	writeAudit(audit.OutcomeOK)
+}
+
+// commandLabel is the metric label for a typed command: the name it is
+// registered under, or metrics.Unregistered for anything else.
+//
+// Decided by asking the registry rather than by the outcome. An unknown
+// command is the obvious case, but a rate-limited dispatch is refused before
+// anything resolves what was typed, so "!" followed by any word a spammer
+// likes would otherwise reach the label through that path instead.
+func commandLabel(registry *plugin.Registry, typed string) string {
+	if cmd, ok := registry.Lookup(typed); ok {
+		return cmd.Name
+	}
+	return metrics.Unregistered
+}
+
+// initCommandMetrics starts every command the registry holds, and the
+// unregistered bucket, at zero for every audit outcome.
+func initCommandMetrics(registry *plugin.Registry) {
+	names := []string{metrics.Unregistered}
+	for _, cmd := range registry.Commands() {
+		names = append(names, cmd.Name)
+	}
+	var outcomes []string
+	for _, o := range audit.Outcomes() {
+		outcomes = append(outcomes, string(o))
+	}
+	metrics.InitCommands(names, outcomes)
 }
 
 // commandFailedReply and commandTimedOutReply are what a dispatch that
