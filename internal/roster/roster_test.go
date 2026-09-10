@@ -163,3 +163,67 @@ func TestApply_UsernameUpdatesOnReAdd(t *testing.T) {
 		t.Errorf("NameFor(111) = (%q, %v), want (NewName, true)", name, ok)
 	}
 }
+
+func containsXUID(xuids []string, want string) bool {
+	for _, x := range xuids {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestOnline_ReportsEveryPresentXUID(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
+	r.Apply([]PlayerListEntry{{XUID: "222", Username: "Alex"}})
+
+	online := r.Online()
+	if len(online) != 3 {
+		t.Fatalf("Online() = %v, want 3 entries", online)
+	}
+	for _, want := range []string{agentEntry.XUID, "111", "222"} {
+		if !containsXUID(online, want) {
+			t.Errorf("Online() = %v, missing %q", online, want)
+		}
+	}
+}
+
+func TestOnline_OmitsPlayersWhoLeft(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
+	r.Apply([]PlayerListEntry{{XUID: "111", Remove: true}})
+
+	if online := r.Online(); containsXUID(online, "111") {
+		t.Errorf("Online() = %v, want 111 absent after leaving", online)
+	}
+}
+
+func TestXUIDFor_ResolvesTheReverseOfNameFor(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
+
+	xuid, ok := r.XUIDFor("Steve")
+	if !ok || xuid != "111" {
+		t.Errorf("XUIDFor(Steve) = (%q, %v), want (111, true)", xuid, ok)
+	}
+}
+
+func TestXUIDFor_UnknownNameNotOK(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry)
+
+	if _, ok := r.XUIDFor("NoSuchPlayer"); ok {
+		t.Error("XUIDFor on an unknown name = ok, want not-ok")
+	}
+}
+
+func TestXUIDFor_StaleAfterRemove(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
+	r.Apply([]PlayerListEntry{{XUID: "111", Remove: true}})
+
+	if _, ok := r.XUIDFor("Steve"); ok {
+		t.Error("XUIDFor after removal = ok, want not-ok")
+	}
+}

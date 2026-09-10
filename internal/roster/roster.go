@@ -123,6 +123,43 @@ func (r *Roster) NameFor(xuid string) (name string, ok bool) {
 	return name, ok
 }
 
+// Online returns the XUIDs currently on the roster, so a caller deciding
+// who actually hears a broadcast doesn't have to re-derive "connected" from
+// join/leave events itself — this is the same map Apply maintains, read
+// under the same lock. The order is unspecified; callers that need a
+// deterministic order sort it themselves.
+func (r *Roster) Online() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.players))
+	for xuid := range r.players {
+		out = append(out, xuid)
+	}
+	return out
+}
+
+// XUIDFor is NameFor's reverse: it resolves a gamertag back to the XUID
+// currently on record for it, so a caller that only has a display name
+// (e.g. a "@PlayerName" reference typed into a command) can turn it into
+// the identity Voice.Tell and the announcement store actually key on. ok is
+// false if name isn't the current username of anyone on the roster.
+//
+// This is a linear scan rather than a second index: the roster is sized to
+// a Bedrock server's concurrent player count, not a lookup table, and the
+// map already gives O(1) resolution the other direction (NameFor), which is
+// the hot path (every Tell). A reverse index would double the bookkeeping
+// Apply has to keep consistent for a lookup that isn't on that hot path.
+func (r *Roster) XUIDFor(name string) (xuid string, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for x, n := range r.players {
+		if n == name {
+			return x, true
+		}
+	}
+	return "", false
+}
+
 // PlayerListEntry is the subset of protocol.PlayerListEntry this package
 // needs. Defined here rather than importing the protocol package directly,
 // so Roster's own tests don't need to construct a full gophertunnel
