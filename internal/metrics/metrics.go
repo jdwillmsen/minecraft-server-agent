@@ -79,9 +79,11 @@ var (
 	answerDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name: "mc_agent_answer_duration_seconds",
 		Help: "Time the model took over one @server answer, tool rounds included.",
-		// Topped at 30s because that is the whole answer budget: an attempt
-		// cannot take longer, so finer buckets beyond it would stay empty.
-		Buckets: []float64{0.5, 1, 2, 4, 8, 15, 30},
+		// 30s is the default whole-answer budget, but LLM_TOTAL_TIMEOUT_MS
+		// has no ceiling and must grow with the per-call timeout. The buckets
+		// past 30 exist so a raised budget still shows up in p95, instead of
+		// slow answers vanishing into +Inf with the quantile pinned at 30.
+		Buckets: []float64{0.5, 1, 2, 4, 8, 15, 30, 45, 60, 90},
 	}, []string{"outcome"})
 
 	toolCallsTotal = promauto.NewCounterVec(prometheus.CounterOpts{

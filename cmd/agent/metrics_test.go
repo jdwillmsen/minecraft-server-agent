@@ -104,7 +104,6 @@ func TestEveryRegisteredCommandStartsAtZero(t *testing.T) {
 	if err := registerPlugins(context.Background(), registry, nil, quietLog); err != nil {
 		t.Fatalf("registerPlugins: %v", err)
 	}
-	initCommandMetrics(registry)
 
 	names := []string{metrics.Unregistered}
 	for _, cmd := range registry.Commands() {

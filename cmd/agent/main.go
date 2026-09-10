@@ -160,7 +160,6 @@ func main() {
 		log.Error("plugin_register_failed", logging.Fields{"error": err.Error()})
 		os.Exit(1)
 	}
-	initCommandMetrics(registry)
 
 	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, voice, playerRoster, registry, playerStore, knowledgeStore, waypointStore, announceStore, deliverer, pinger)
 	// Every answerable chat message and every roster join is published
@@ -243,6 +242,11 @@ func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer p
 			return fmt.Errorf("%s: %w", p.Name(), err)
 		}
 	}
+	// Here rather than as a separate line in main: the only moment the
+	// command set is known to be complete is the end of this function, and
+	// a call main could drop leaves every test green while each command's
+	// first use after a restart reads as zero to increase().
+	initCommandMetrics(registry)
 	return nil
 }
 
