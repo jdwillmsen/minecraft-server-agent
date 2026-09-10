@@ -149,6 +149,27 @@ func (p *Postgres) RecordJoin(ctx context.Context, xuid, gamertag string, at tim
 	return prior, nil
 }
 
+// EnsurePlayer inserts the minimum row a foreign key needs and leaves an
+// existing one untouched.
+//
+// join_count keeps its schema default of zero: this is not an arrival, and
+// RecordJoin increments from whatever is already there, so a player recorded
+// here and greeted later still reads as the first-time arrival they are.
+// first_seen_at is when this agent first had to write them down, which is
+// all it has ever meant -- the server saw them earlier, and nothing here can
+// know when.
+func (p *Postgres) EnsurePlayer(ctx context.Context, xuid, gamertag string, at time.Time) error {
+	if _, err := p.pool.Exec(ctx, `
+		INSERT INTO minecraft.players (xuid, current_gamertag, first_seen_at, last_seen_at)
+		VALUES ($1, $2, $3, $3)
+		ON CONFLICT (xuid) DO NOTHING`,
+		xuid, gamertag, at,
+	); err != nil {
+		return fmt.Errorf("store: ensure player: %w", err)
+	}
+	return nil
+}
+
 func (p *Postgres) RecordLeave(ctx context.Context, xuid string, at time.Time) error {
 	_, err := p.pool.Exec(ctx, `
 		UPDATE minecraft.sessions

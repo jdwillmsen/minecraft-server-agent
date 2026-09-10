@@ -155,3 +155,59 @@ func TestCloseOrphansClosesOnlyOpenSessions(t *testing.T) {
 		t.Errorf("closed %d sessions on a second pass, want 0 -- closing is not idempotent", again)
 	}
 }
+
+// EnsurePlayer exists so an announcement can be recorded as delivered to
+// someone the agent never watched arrive. What it must not do is look like
+// an arrival: the greeting a player gets on their next real join is read
+// from a row this may have created first.
+func TestEnsurePlayerCreatesARowWithoutCountingAJoin(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := "2535400000000005"
+	at := time.Now().UTC()
+
+	if err := pg.EnsurePlayer(ctx, xuid, "AlreadyOnline", at); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	var joins int
+	if err := pg.pool.QueryRow(ctx, `SELECT join_count FROM minecraft.players WHERE xuid = $1`, xuid).Scan(&joins); err != nil {
+		t.Fatalf("read join_count: %v", err)
+	}
+	if joins != 0 {
+		t.Errorf("join_count = %d after an ensure, want 0; a delivery is not an arrival", joins)
+	}
+
+	profile, err := pg.RecordJoin(ctx, xuid, "AlreadyOnline", at.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if !profile.New() {
+		t.Error("the first observed join of an ensured player reported as a return; they would be greeted as a regular")
+	}
+}
+
+// Ensuring is idempotent and never rewrites a real profile: a returning
+// player's history must survive an announcement being delivered to them.
+func TestEnsurePlayerLeavesAnExistingProfileAlone(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := "2535400000000006"
+
+	if _, err := pg.RecordJoin(ctx, xuid, "Regular", time.Now().UTC().Add(-time.Hour)); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if err := pg.EnsurePlayer(ctx, xuid, "SomethingElse", time.Now().UTC()); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+
+	var gamertag string
+	var joins int
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT current_gamertag, join_count FROM minecraft.players WHERE xuid = $1`, xuid,
+	).Scan(&gamertag, &joins); err != nil {
+		t.Fatalf("read player: %v", err)
+	}
+	if gamertag != "Regular" || joins != 1 {
+		t.Errorf("player is (%q, %d) after an ensure, want (\"Regular\", 1)", gamertag, joins)
+	}
+}

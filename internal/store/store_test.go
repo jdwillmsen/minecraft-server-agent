@@ -60,6 +60,9 @@ func TestNopStoreIsSafeAndInert(t *testing.T) {
 	if err := s.RecordLeave(context.Background(), "xuid", at); err != nil {
 		t.Errorf("RecordLeave: %v", err)
 	}
+	if err := s.EnsurePlayer(context.Background(), "xuid", "Steve", at); err != nil {
+		t.Errorf("EnsurePlayer: %v", err)
+	}
 	if n, err := s.CloseOrphans(context.Background(), at); err != nil || n != 0 {
 		t.Errorf("CloseOrphans = (%d, %v), want (0, nil)", n, err)
 	}
