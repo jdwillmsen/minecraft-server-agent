@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/audit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
@@ -62,6 +64,32 @@ func (v *recordingVoice) output() []string {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return append([]string(nil), v.said...)
+}
+
+// recordingAudit is a test double for audit.Store: it collects every record
+// written to it and, when err is set, fails every Write -- proving a broken
+// audit store cannot take a command down with it.
+type recordingAudit struct {
+	mu      sync.Mutex
+	records []audit.Record
+	err     error
+}
+
+var _ audit.Store = (*recordingAudit)(nil)
+
+func (r *recordingAudit) Write(_ context.Context, rec audit.Record) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.records = append(r.records, rec)
+	return r.err
+}
+
+func (r *recordingAudit) Enabled() bool { return true }
+
+func (r *recordingAudit) all() []audit.Record {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]audit.Record(nil), r.records...)
 }
 
 // opOnlyPlugin exists so the permission gate has something above the
@@ -226,7 +254,7 @@ func TestChatCommandFlow(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
-			handlePacket(context.Background(), tc.pk, selfXUID, siblings, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering(), store.Nop{})
+			handlePacket(context.Background(), tc.pk, selfXUID, siblings, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
 
 			got := voice.output()
 			if len(got) != len(tc.want) {
@@ -252,9 +280,9 @@ func TestHandleCommand_RateLimitBlocksASpammingActorButNotOthers(t *testing.T) {
 
 	const otherPlayer = "2535499999999998"
 	for i := 0; i < 5; i++ {
-		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{})
+		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
 	}
-	handlePacket(context.Background(), chatPacket(otherPlayer, "Alex", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{})
+	handlePacket(context.Background(), chatPacket(otherPlayer, "Alex", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
 
 	got := voice.output()
 	want := []string{
@@ -280,9 +308,9 @@ func TestChatMessagePublishedOnBus(t *testing.T) {
 	log := logging.New("info")
 	limiter := unlimitedRateLimit()
 
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping now"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{})
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server hello"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{})
-	handlePacket(context.Background(), chatPacket(selfXUID, "Agent", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{})
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping now"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server hello"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
+	handlePacket(context.Background(), chatPacket(selfXUID, "Agent", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
 
 	first, ok := (<-events).(chat.MessageEvent)
 	if !ok {
@@ -461,13 +489,13 @@ func TestMentionIsAnsweredWithoutBlockingTheReadLoop(t *testing.T) {
 			if i%2 == 1 {
 				pk = &packet.PlayerList{Entries: []protocol.PlayerListEntry{removeEntry(bystanderXUID)}}
 			}
-			handlePacket(context.Background(), pk, selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+			handlePacket(context.Background(), pk, selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
 			churns.Add(1)
 		}
 	}()
 
 	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server where is my base"),
-		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
 
 	<-backend.arrived
 	if got := voice.output(); len(got) != 0 {
@@ -519,13 +547,13 @@ func TestMentionIsDroppedWhenTheAgentIsAlreadyBusy(t *testing.T) {
 		ans.inFlight = make(chan struct{}, 1)
 
 		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server first"),
-			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
 		<-backend.arrived
 
 		// A different player, so the per-player limiter has nothing to say
 		// about this one: only the global cap can refuse it.
 		handlePacket(context.Background(), chatPacket(otherPlayerXUID, "Alex", "@server second"),
-			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
 
 		backend.serve()
 		waitForOutput(t, voice)
@@ -558,11 +586,11 @@ func TestRateLimitedMentionIsRefusedBeforeAGoroutineExists(t *testing.T) {
 		ans.inFlight = make(chan struct{}, 1)
 
 		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server first"),
-			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
 		<-backend.arrived
 
 		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server second"),
-			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
 
 		backend.serve()
 		waitForOutput(t, voice)
@@ -623,7 +651,7 @@ func answerOnce(t *testing.T, ctx context.Context, voice *broadcastVoice, adjust
 	adjust(&ans)
 
 	handlePacket(ctx, chatPacket(playerXUID, "Steve", "@server hello"),
-		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
 	waitForOutput(t, &voice.recordingVoice)
 }
 
@@ -698,7 +726,7 @@ func answerMention(t *testing.T, configure func(*plugin.Context), replies ...str
 	ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
 
 	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server where is my base"),
-		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{})
+		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
 	return waitForOutput(t, voice)
 }
 
@@ -725,5 +753,79 @@ func TestAnswerFromSharedKnowledgeIsStillBroadcast(t *testing.T) {
 
 	if said[0] != "say: Be nice to each other." {
 		t.Errorf("answer = %q, want it broadcast to everyone who saw the question", said[0])
+	}
+}
+
+// TestEveryCommandOutcomeIsAudited proves handleCommand writes exactly one
+// audit record for every dispatch outcome, and that the record never carries
+// the reply text the command produced -- the one privacy property
+// internal/audit's package doc promises the table.
+func TestEveryCommandOutcomeIsAudited(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		perm    plugin.Permission
+		want    audit.Outcome
+	}{
+		{"successful command", "ping", plugin.PermissionVisitor, audit.OutcomeOK},
+		{"unknown command", "nosuchcommand", plugin.PermissionVisitor, audit.OutcomeUnknown},
+		{"denied command", "shutdown", plugin.PermissionVisitor, audit.OutcomeDenied},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			registry, pctx, voice, _, _, playerRoster, _ := newHarness(t)
+			permResolver := fakePermResolver(t, map[string]string{playerXUID: tc.perm.String()})
+			log := logging.New("info")
+			rec := &recordingAudit{}
+
+			handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!"+tc.command), log,
+				registry, pctx, unlimitedRateLimit(), permResolver, rec, playerRoster)
+
+			records := rec.all()
+			if len(records) != 1 {
+				t.Fatalf("got %d audit records, want exactly 1", len(records))
+			}
+			got := records[0]
+			if got.Outcome != tc.want {
+				t.Errorf("outcome = %q, want %q", got.Outcome, tc.want)
+			}
+
+			// audit.Record has no field named Reply, and none should be added:
+			// what matters is that no *existing* field ever holds reply text.
+			// Only the successful case produced one; checking every field
+			// against it either way is what makes this a guarantee rather
+			// than a case-by-case hope.
+			if said := voice.output(); len(said) == 1 {
+				if idx := strings.LastIndex(said[0], ": "); idx != -1 {
+					reply := said[0][idx+2:]
+					for _, field := range []string{got.XUID, got.Gamertag, got.Permission, got.Command, got.Args, string(got.Outcome)} {
+						if reply != "" && strings.Contains(field, reply) {
+							t.Errorf("audit record %+v has a field containing reply text %q", got, reply)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestAFailingAuditWriteDoesNotFailTheCommand proves a broken audit store
+// cannot take a command down with it: a compliance record that can fail a
+// command is a worse liability than a gap in the record.
+func TestAFailingAuditWriteDoesNotFailTheCommand(t *testing.T) {
+	registry, pctx, voice, _, _, playerRoster, permResolver := newHarness(t)
+	log := logging.New("info")
+	rec := &recordingAudit{err: errors.New("database on fire")}
+
+	handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!ping"), log,
+		registry, pctx, unlimitedRateLimit(), permResolver, rec, playerRoster)
+
+	got := voice.output()
+	want := "tell " + playerXUID + ": pong"
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("voice output = %v, want [%q] -- a failing audit write must never cost the player their reply", got, want)
+	}
+	if n := len(rec.all()); n != 1 {
+		t.Errorf("got %d audit records, want exactly 1 (the write is attempted and its failure logged, not skipped)", n)
 	}
 }
