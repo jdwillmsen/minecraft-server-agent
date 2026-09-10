@@ -2,6 +2,7 @@ package adapters
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/text"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
 const (
@@ -24,7 +27,20 @@ const (
 	// maxTickSamples bounds the history. The window only ever needs the
 	// newest few readings.
 	maxTickSamples = 32
+	// pingHeadroom is held back from the caller's deadline for the reply.
+	// A bridge call allowed to run to the same deadline as the command loses
+	// that race, and the player hears a timeout instead of the half of the
+	// answer that was already measured.
+	pingHeadroom = time.Second
+	// maxLoggedOutput bounds the console text copied into a parse-failure
+	// log line; enough to see what the server said instead.
+	maxLoggedOutput = 200
 )
+
+// errNoGametime is the console answering, but not with a game time. Kept
+// apart from a transport failure because it points at a different cause --
+// the server's output changed shape -- and says so at a louder log level.
+var errNoGametime = errors.New("pinger: the console answered without a Gametime line")
 
 // gametimeLine matches Bedrock's answer to `time query gametime`. The log
 // prefix, when present, carries the server's own clock to the millisecond.
@@ -49,6 +65,7 @@ type tickSample struct {
 type ServerPinger struct {
 	client *BridgeClient
 	link   func() (time.Duration, bool)
+	log    *logging.Logger
 	now    func() time.Time
 
 	mu      sync.Mutex
@@ -57,8 +74,8 @@ type ServerPinger struct {
 
 // NewServerPinger builds a ServerPinger. link reports the current Bedrock
 // round trip, or false when there is no session; it may be nil.
-func NewServerPinger(client *BridgeClient, link func() (time.Duration, bool)) *ServerPinger {
-	return &ServerPinger{client: client, link: link, now: time.Now}
+func NewServerPinger(client *BridgeClient, link func() (time.Duration, bool), log *logging.Logger) *ServerPinger {
+	return &ServerPinger{client: client, link: link, log: log, now: time.Now}
 }
 
 var _ plugin.Pinger = (*ServerPinger)(nil)
@@ -79,7 +96,20 @@ func (p *ServerPinger) Ping(ctx context.Context) plugin.ServerPing {
 	if p.link != nil {
 		out.Link, out.LinkKnown = p.link()
 	}
-	out.TPS, out.TPSKnown, out.TPSErr = p.sample(ctx)
+
+	bridgeCtx := ctx
+	if deadline, ok := ctx.Deadline(); ok {
+		var cancel context.CancelFunc
+		bridgeCtx, cancel = context.WithDeadline(ctx, deadline.Add(-pingHeadroom))
+		defer cancel()
+	}
+	out.TPS, out.TPSKnown, out.TPSErr = p.sample(bridgeCtx)
+	if out.TPSErr != nil && !errors.Is(out.TPSErr, errNoGametime) {
+		// A player asked and was told TPS is unavailable; the reason belongs
+		// in the log. A missing Gametime line has already been logged, louder,
+		// by sample.
+		p.log.Warn("ping_console_failed", logging.Fields{"error": out.TPSErr.Error()})
+	}
 	return out
 }
 
@@ -91,6 +121,11 @@ func (p *ServerPinger) sample(ctx context.Context) (tps float64, known bool, err
 	}
 	cur, err := parseGametime(resp.Output, sent)
 	if err != nil {
+		// Error rather than Warn: the console is up and answering, so this is
+		// the server's output no longer matching what the pinger expects, and
+		// every !ping and background reading fails the same way until someone
+		// changes the parser.
+		p.log.Error("tps_gametime_unparsed", logging.Fields{"error": err.Error(), "output": text.Truncate(resp.Output, maxLoggedOutput)})
 		return 0, false, err
 	}
 
@@ -110,12 +145,12 @@ func (p *ServerPinger) sample(ctx context.Context) (tps float64, known bool, err
 func parseGametime(output string, sent time.Time) (tickSample, error) {
 	all := gametimeLine.FindAllStringSubmatch(output, -1)
 	if len(all) == 0 {
-		return tickSample{}, fmt.Errorf("pinger: the bridge captured no Gametime line for %q", gametimeCommand)
+		return tickSample{}, errNoGametime
 	}
 	m := all[len(all)-1]
 	ticks, err := strconv.ParseInt(m[3], 10, 64)
 	if err != nil {
-		return tickSample{}, fmt.Errorf("pinger: gametime %q: %w", m[3], err)
+		return tickSample{}, fmt.Errorf("%w: gametime %q: %v", errNoGametime, m[3], err)
 	}
 	if m[1] != "" {
 		// Parsed as UTC whatever zone the server logs in: only differences

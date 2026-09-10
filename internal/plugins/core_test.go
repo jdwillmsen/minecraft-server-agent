@@ -51,7 +51,7 @@ func TestCorePing_ReportsTheServer(t *testing.T) {
 		{
 			name: "console down, between sessions",
 			got:  plugin.ServerPing{TPSErr: errors.New("console not connected")},
-			want: "pong - TPS unavailable (console didn't answer), link unavailable",
+			want: "pong - TPS unavailable right now, link unavailable",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

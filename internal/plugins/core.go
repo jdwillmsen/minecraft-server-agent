@@ -24,7 +24,9 @@ func formatPing(p plugin.ServerPing) string {
 	var tps string
 	switch {
 	case p.TPSErr != nil:
-		tps = "TPS unavailable (console didn't answer)"
+		// Not "the console didn't answer": it may have answered with
+		// something unreadable. The log has which.
+		tps = "TPS unavailable right now"
 	case !p.TPSKnown:
 		tps = "TPS still measuring, try again in a minute"
 	default:

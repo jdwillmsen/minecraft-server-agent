@@ -107,7 +107,7 @@ func main() {
 	// session; the link meter is how the one reaches whichever of the other
 	// is live.
 	link := &linkMeter{}
-	pinger := adapters.NewServerPinger(bridgeClient, link.roundTrip)
+	pinger := adapters.NewServerPinger(bridgeClient, link.roundTrip, log)
 
 	// Opened before the game connection so a misconfigured database is a
 	// startup log line rather than a surprise at the first player join, and
