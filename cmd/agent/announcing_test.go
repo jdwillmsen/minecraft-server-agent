@@ -346,7 +346,7 @@ func TestEveryPluginThisBinaryServesIsRegistered(t *testing.T) {
 	for _, p := range registry.Plugins() {
 		registered[p.Name()] = p
 	}
-	for _, name := range []string{"core", "stats", "knowledge", "waypoints", "welcome", "announce", "announce-drain", "moderation"} {
+	for _, name := range []string{"core", "stats", "knowledge", "waypoints", "welcome", "announce", "announce-drain", "moderation", "schedule"} {
 		if _, ok := registered[name]; !ok {
 			t.Errorf("the %s plugin is not registered", name)
 		}
@@ -356,7 +356,7 @@ func TestEveryPluginThisBinaryServesIsRegistered(t *testing.T) {
 	for _, c := range registry.Commands() {
 		commands[c.Name] = true
 	}
-	for _, name := range []string{"announce", "inbox", "modlog"} {
+	for _, name := range []string{"announce", "inbox", "modlog", "schedule"} {
 		if !commands[name] {
 			t.Errorf("!%s is not dispatchable; the command exists in no registry", name)
 		}

@@ -127,6 +127,7 @@ func main() {
 	var knowledgeStore knowledge.Store = knowledge.Nop{}
 	var waypointStore waypoints.Store = waypoints.Nop{}
 	var announceStore announce.Store = announce.Nop{}
+	var scheduleStore announce.ScheduleStore = announce.Nop{}
 	var auditor audit.Store = audit.Nop{}
 	var moderationStore moderation.Store = moderation.Nop{}
 	if pg, ok := playerStore.(*store.Postgres); ok && pg.Pool() != nil {
@@ -136,7 +137,10 @@ func main() {
 		auditor = newAuditTrail(audit.NewPostgres(pg.Pool()), log)
 		// Wrapped rather than used directly: every announcement row names a
 		// player that minecraft.players must already hold -- see outbox.
-		announceStore = newOutbox(announce.NewPostgres(pg.Pool()), pg, playerRoster, log)
+		announcePG := announce.NewPostgres(pg.Pool())
+		ob := newOutbox(announcePG, pg, playerRoster, log)
+		announceStore = ob
+		scheduleStore = scheduleBook{ScheduleStore: announcePG, outbox: ob}
 		log.Info("knowledge_ready", nil)
 	}
 
@@ -169,7 +173,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, voice, playerRoster, registry, playerStore, knowledgeStore, waypointStore, announceStore, deliverer, pinger, moderationStore)
+	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, voice, playerRoster, registry, playerStore, knowledgeStore, waypointStore, announceStore, deliverer, pinger, moderationStore, scheduleStore)
 	// Every answerable chat message and every roster join is published
 	// here; event-driven plugins (welcome) subscribe via startEventDispatch
 	// rather than touching the connection directly.
@@ -185,6 +189,7 @@ func main() {
 	go sampleGameClock(ctx, pinger, link.roundTrip, bridgeTimeout, log)
 	go pruneModerationLog(ctx, moderationStore, moderationPruneInterval, log)
 	go runServerWatcher(ctx, cfg, bridgeTimeout, announceStore, deliverer, log)
+	go runScheduler(ctx, scheduleStore, deliverer, log)
 
 	httpServer, err := httpapi.New(cfg.HTTPAddr)
 	if err != nil {
@@ -252,6 +257,7 @@ func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer p
 		plugins.NewAnnounce(),
 		plugins.NewAnnounceDrain(ctx, deliverer, log),
 		mod,
+		plugins.NewSchedule(),
 	} {
 		if err := registry.Register(p); err != nil {
 			return fmt.Errorf("%s: %w", p.Name(), err)
@@ -703,7 +709,7 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 // RecordJoin without reporting anything, and no player arrival was ever
 // persisted. Nothing failed loudly, because the one branch that would have
 // logged is the error path of the call that was not being made.
-func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, voice plugin.Voice, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store, announceStore plugin.AnnounceStore, deliverer plugin.AnnounceDeliverer, pinger plugin.Pinger, moderationStore plugin.ModerationStore) *plugin.Context {
+func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, voice plugin.Voice, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store, announceStore plugin.AnnounceStore, deliverer plugin.AnnounceDeliverer, pinger plugin.Pinger, moderationStore plugin.ModerationStore, scheduleStore plugin.ScheduleStore) *plugin.Context {
 	return &plugin.Context{
 		// The same Voice the Deliverer speaks through, passed in rather than
 		// built here: an announcement and a command reply are the same console
@@ -732,6 +738,8 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 		// construct a bare Context.
 		Announcements: announceStore,
 		Deliverer:     deliverer,
+		// Same again: the disabled implementation with no database.
+		Schedules: scheduleStore,
 		// The live roster backed by the profile store, so "@player" resolves
 		// for someone who is offline -- which is precisely who a queued
 		// announcement is for. With no database configured the second tier

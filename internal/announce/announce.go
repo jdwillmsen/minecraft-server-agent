@@ -89,6 +89,11 @@ type Announcement struct {
 	DeliverAfter time.Time
 	// ExpiresAt nil means the announcement never goes stale.
 	ExpiresAt *time.Time
+	// ScheduleID is the schedule that fired this, zero for every other
+	// source. Written only by a schedule firing -- see FireSchedule -- so
+	// the one-off write path never names a column a database without
+	// schedules does not have.
+	ScheduleID int64
 }
 
 // DeliveryFor derives how an announcement is said from who it is for.
