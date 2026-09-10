@@ -47,6 +47,21 @@ func (p Profile) AwayFor(now time.Time) time.Duration {
 	return now.Sub(p.LastSeen)
 }
 
+// Playtime is a player's completed session time immediately before and
+// after one departure was recorded.
+//
+// Both totals count the same sessions TotalSeconds does, so a lower bound
+// for the same reason. Equal totals mean the departure closed nothing: no
+// open session was found, which is what a leave the agent already recorded,
+// or never saw the start of, looks like.
+type Playtime struct {
+	// Gamertag is who the closed session says they were, for a caller that
+	// names the player after the roster has already forgotten them.
+	Gamertag string
+	Before   time.Duration
+	After    time.Duration
+}
+
 // Store records presence. Every method must tolerate being called on a
 // disabled implementation.
 type Store interface {
@@ -55,8 +70,14 @@ type Store interface {
 	// a greeting cannot describe a player as new after their own arrival has
 	// already been counted.
 	RecordJoin(ctx context.Context, xuid, gamertag string, at time.Time) (Profile, error)
-	// RecordLeave closes the player's open session.
-	RecordLeave(ctx context.Context, xuid string, at time.Time) error
+	// RecordLeave closes the player's open session and reports their total
+	// playtime on either side of it.
+	//
+	// Returned rather than read afterwards because "this session carried
+	// them past a milestone" is a comparison of the two, and two separate
+	// reads can straddle a concurrent write and disagree about what the
+	// session added.
+	RecordLeave(ctx context.Context, xuid string, at time.Time) (Playtime, error)
 	// EnsurePlayer makes sure a row exists for xuid without treating it as
 	// an arrival: no join counted, no session opened, an existing row left
 	// exactly as it is.
@@ -100,7 +121,9 @@ var _ Store = Nop{}
 func (Nop) RecordJoin(context.Context, string, string, time.Time) (Profile, error) {
 	return Profile{}, nil
 }
-func (Nop) RecordLeave(context.Context, string, time.Time) error          { return nil }
+func (Nop) RecordLeave(context.Context, string, time.Time) (Playtime, error) {
+	return Playtime{}, nil
+}
 func (Nop) EnsurePlayer(context.Context, string, string, time.Time) error { return nil }
 func (Nop) XUIDForName(context.Context, string) (string, bool, error)     { return "", false, nil }
 func (Nop) CloseOrphans(context.Context, time.Time) (int, error)          { return 0, nil }

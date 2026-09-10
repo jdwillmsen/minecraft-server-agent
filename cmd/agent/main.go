@@ -40,6 +40,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/sources"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/toolset"
@@ -158,6 +159,9 @@ func main() {
 		announcePermissions{resolver: permResolver},
 		log,
 	)
+	// Wrapped only now: the stores above type-assert the concrete Postgres
+	// to borrow its pool, which the wrapper would hide from them.
+	playerStore = withPlayerEvents(playerStore, sources.NewEvents(ctx, deliverer, log))
 
 	registry := plugin.NewRegistry()
 	if err := registerPlugins(ctx, registry, deliverer, cfg.ModerationTerms, log); err != nil {
@@ -180,6 +184,7 @@ func main() {
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
 	go sampleGameClock(ctx, pinger, link.roundTrip, bridgeTimeout, log)
 	go pruneModerationLog(ctx, moderationStore, moderationPruneInterval, log)
+	go runServerWatcher(ctx, cfg, bridgeTimeout, announceStore, deliverer, log)
 
 	httpServer, err := httpapi.New(cfg.HTTPAddr)
 	if err != nil {
@@ -965,7 +970,7 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 			continue
 		}
 		log.Info("player_left", logging.Fields{"xuid": leave.XUID, "username": leave.Username})
-		if err := playerStore.RecordLeave(ctx, leave.XUID, time.Now()); err != nil {
+		if _, err := playerStore.RecordLeave(ctx, leave.XUID, time.Now()); err != nil {
 			// Logged, never fatal: an unclosed session is recoverable at the
 			// next startup, and a database problem must not disturb the game.
 			log.Error("store_record_leave_failed", logging.Fields{"xuid": leave.XUID, "error": err.Error()})

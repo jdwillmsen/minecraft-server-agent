@@ -209,17 +209,46 @@ func (p *Postgres) XUIDForName(ctx context.Context, gamertag string) (string, bo
 	return xuid, true, nil
 }
 
-func (p *Postgres) RecordLeave(ctx context.Context, xuid string, at time.Time) error {
-	_, err := p.pool.Exec(ctx, `
-		UPDATE minecraft.sessions
-		SET left_at = $2, ended_reason = 'left'
-		WHERE xuid = $1 AND ended_reason = 'open'`,
+// RecordLeave closes the open session and reports the totals around it in
+// one statement.
+//
+// One statement is what makes the two totals comparable. Every part of a
+// statement reads the same snapshot, taken before its own UPDATE applies, so
+// prior sums every session as it stood -- the open one contributing nothing,
+// since its generated duration is NULL until left_at is set -- and closed
+// returns the duration the UPDATE just gave it. After is their sum, not a
+// second read that a concurrent join could have moved.
+//
+// No open session is not an error: after equals before and the gamertag is
+// blank, which reads to the caller as a departure that changed nothing.
+func (p *Postgres) RecordLeave(ctx context.Context, xuid string, at time.Time) (Playtime, error) {
+	var gamertag string
+	var before, after int64
+	err := p.pool.QueryRow(ctx, `
+		WITH closed AS (
+		    UPDATE minecraft.sessions
+		    SET left_at = $2, ended_reason = 'left'
+		    WHERE xuid = $1 AND ended_reason = 'open'
+		    RETURNING gamertag, duration_seconds
+		), prior AS (
+		    SELECT COALESCE(SUM(duration_seconds), 0)::BIGINT AS total
+		    FROM minecraft.sessions
+		    WHERE xuid = $1
+		)
+		SELECT COALESCE((SELECT MAX(gamertag) FROM closed), ''),
+		       prior.total,
+		       prior.total + COALESCE((SELECT SUM(duration_seconds) FROM closed), 0)::BIGINT
+		FROM prior`,
 		xuid, at,
-	)
+	).Scan(&gamertag, &before, &after)
 	if err != nil {
-		return fmt.Errorf("store: close session: %w", err)
+		return Playtime{}, fmt.Errorf("store: close session: %w", err)
 	}
-	return nil
+	return Playtime{
+		Gamertag: gamertag,
+		Before:   time.Duration(before) * time.Second,
+		After:    time.Duration(after) * time.Second,
+	}, nil
 }
 
 // CloseOrphans ends sessions left open by a previous run.

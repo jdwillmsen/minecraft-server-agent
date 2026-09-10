@@ -2,6 +2,7 @@ package announce
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -177,6 +178,34 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 		delivered++
 	}
 	return delivered, nil
+}
+
+// ErrDisabled is what Publish returns when there is no store to write an
+// announcement to. A sentinel rather than a silent zero because the callers
+// differ in what it means to them: an event source shrugs, while the HTTP
+// API must tell its caller that nothing was stored.
+var ErrDisabled = errors.New("announce: no announcement store configured")
+
+// Publish stores a and then sends it to whoever is online and matches it,
+// reporting the stored id and how many heard it immediately.
+//
+// The one path for every source that has no command reply to shape: a
+// schedule, a server event, the HTTP API. Delivery is re-derived here from
+// the target whatever the caller set, for the same reason SendNow never
+// trusts it off a row. A send that reaches nobody is not an error -- the
+// row is stored and the queue owns it from here.
+func (d *Deliverer) Publish(ctx context.Context, a Announcement) (id int64, sent int, err error) {
+	if !d.store.Enabled() {
+		return 0, 0, ErrDisabled
+	}
+	a.Delivery = DeliveryFor(a.TargetKind)
+	id, err = d.store.Insert(ctx, a)
+	if err != nil {
+		return 0, 0, err
+	}
+	a.ID = id
+	sent, err = d.SendNow(ctx, a, id)
+	return id, sent, err
 }
 
 // sendPending whispers each of msgs to xuid in order, marking every

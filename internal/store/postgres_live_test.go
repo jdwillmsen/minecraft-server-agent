@@ -51,7 +51,7 @@ func TestJoinLeaveRejoinAgainstRealPostgres(t *testing.T) {
 		t.Errorf("a player's first join reported as returning: %+v", first)
 	}
 
-	if err := pg.RecordLeave(ctx, xuid, start.Add(30*time.Minute)); err != nil {
+	if _, err := pg.RecordLeave(ctx, xuid, start.Add(30*time.Minute)); err != nil {
 		t.Fatalf("leave: %v", err)
 	}
 
@@ -74,6 +74,54 @@ func TestJoinLeaveRejoinAgainstRealPostgres(t *testing.T) {
 	}
 }
 
+// Milestones are read off the two totals RecordLeave returns, so they have
+// to be the real before-and-after of the session it closed. Asserted
+// relative to each other rather than as absolutes: the fixed XUID keeps its
+// history across runs, and only the difference is this run's to know.
+func TestRecordLeaveReportsTheTotalsAroundTheSession(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := "2535400000000010"
+	start := time.Now().UTC().Add(-12 * time.Hour)
+
+	if _, err := pg.RecordJoin(ctx, xuid, "Milestoner", start); err != nil {
+		t.Fatalf("first join: %v", err)
+	}
+	first, err := pg.RecordLeave(ctx, xuid, start.Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("first leave: %v", err)
+	}
+	if first.After-first.Before != 2*time.Hour {
+		t.Errorf("first leave added %v, want the 2h session it closed", first.After-first.Before)
+	}
+	if first.Gamertag != "Milestoner" {
+		t.Errorf("gamertag = %q, want the session's own", first.Gamertag)
+	}
+
+	if _, err := pg.RecordJoin(ctx, xuid, "Milestoner", start.Add(3*time.Hour)); err != nil {
+		t.Fatalf("second join: %v", err)
+	}
+	second, err := pg.RecordLeave(ctx, xuid, start.Add(11*time.Hour))
+	if err != nil {
+		t.Fatalf("second leave: %v", err)
+	}
+	if second.Before != first.After {
+		t.Errorf("second leave's before = %v, want the first's after %v", second.Before, first.After)
+	}
+	if second.After-second.Before != 8*time.Hour {
+		t.Errorf("second leave added %v, want 8h", second.After-second.Before)
+	}
+
+	// Nothing open any more: a departure that changed nothing.
+	again, err := pg.RecordLeave(ctx, xuid, start.Add(12*time.Hour))
+	if err != nil {
+		t.Fatalf("repeated leave: %v", err)
+	}
+	if again.Before != again.After || again.Gamertag != "" {
+		t.Errorf("repeated leave = %+v, want equal totals and no gamertag", again)
+	}
+}
+
 // A gamertag change must not create a second player: identity is the XUID.
 func TestGamertagChangeKeepsOneIdentity(t *testing.T) {
 	pg := liveStore(t)
@@ -83,7 +131,7 @@ func TestGamertagChangeKeepsOneIdentity(t *testing.T) {
 	if _, err := pg.RecordJoin(ctx, xuid, "OldName", time.Now().UTC().Add(-time.Hour)); err != nil {
 		t.Fatalf("join as OldName: %v", err)
 	}
-	if err := pg.RecordLeave(ctx, xuid, time.Now().UTC().Add(-50*time.Minute)); err != nil {
+	if _, err := pg.RecordLeave(ctx, xuid, time.Now().UTC().Add(-50*time.Minute)); err != nil {
 		t.Fatalf("leave: %v", err)
 	}
 	profile, err := pg.RecordJoin(ctx, xuid, "NewName", time.Now().UTC())
@@ -143,7 +191,7 @@ func TestXUIDForNameResolvesOfflineAndRenamedPlayers(t *testing.T) {
 	if _, err := pg.RecordJoin(ctx, xuid, "CalledThisNow", time.Now().UTC()); err != nil {
 		t.Fatalf("join under the new name: %v", err)
 	}
-	if err := pg.RecordLeave(ctx, xuid, time.Now().UTC()); err != nil {
+	if _, err := pg.RecordLeave(ctx, xuid, time.Now().UTC()); err != nil {
 		t.Fatalf("leave: %v", err)
 	}
 

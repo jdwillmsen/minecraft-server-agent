@@ -47,9 +47,9 @@ type leaveRecorder struct {
 	leaves []string
 }
 
-func (s *leaveRecorder) RecordLeave(_ context.Context, xuid string, _ time.Time) error {
+func (s *leaveRecorder) RecordLeave(_ context.Context, xuid string, _ time.Time) (store.Playtime, error) {
 	s.leaves = append(s.leaves, xuid)
-	return nil
+	return store.Playtime{}, nil
 }
 
 // drainJoins collects every join already delivered to events. Publish is
