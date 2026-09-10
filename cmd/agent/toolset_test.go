@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,4 +144,44 @@ func (enabledKnowledge) Enabled() bool { return true }
 
 func (enabledKnowledge) Lookup(context.Context, string, int) ([]knowledge.Entry, error) {
 	return []knowledge.Entry{{Topic: "rules", Body: "be nice"}}, nil
+}
+
+// fallbackOnlyKnowledge returns a single entry that matched only through
+// Lookup's substring fallback, with no full-text overlap with the query at
+// all -- exactly the case knowledge_lookup's output has to flag rather than
+// hand the model a guess dressed as a confirmed fact.
+type fallbackOnlyKnowledge struct{ knowledge.Nop }
+
+func (fallbackOnlyKnowledge) Enabled() bool { return true }
+
+func (fallbackOnlyKnowledge) Lookup(context.Context, string, int) ([]knowledge.Entry, error) {
+	return []knowledge.Entry{
+		{Topic: "weather", Body: "ask an operator", Matched: knowledge.MatchFallback},
+	}, nil
+}
+
+func TestKnowledgeLookupToolFlagsAFallbackOnlyMatch(t *testing.T) {
+	pctx := &plugin.Context{Knowledge: fallbackOnlyKnowledge{}}
+	registry, _ := buildToolset(pctx)
+
+	out, err := registry.Invoke(t.Context(), "knowledge_lookup", json.RawMessage(`{"query":"nether"}`), "2535411111111111")
+	if err != nil {
+		t.Fatalf("knowledge_lookup: %v", err)
+	}
+	if !strings.Contains(out, "possible match") {
+		t.Errorf("output = %q, want it to flag the fallback-only match", out)
+	}
+}
+
+func TestKnowledgeLookupToolDoesNotFlagAConfirmedMatch(t *testing.T) {
+	pctx := &plugin.Context{Knowledge: enabledKnowledge{}}
+	registry, _ := buildToolset(pctx)
+
+	out, err := registry.Invoke(t.Context(), "knowledge_lookup", json.RawMessage(`{"query":"rules"}`), "2535411111111111")
+	if err != nil {
+		t.Fatalf("knowledge_lookup: %v", err)
+	}
+	if strings.Contains(out, "possible match") {
+		t.Errorf("output = %q, a confirmed match should not be flagged", out)
+	}
 }

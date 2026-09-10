@@ -20,7 +20,32 @@ type Entry struct {
 	// deleted -- the fact outlives the account that wrote it.
 	AuthorXUID string
 	UpdatedAt  time.Time
+	// Matched records how this entry answered the query it came from. Its
+	// zero value, MatchExact, is correct for Get and List, which never
+	// guess; only Lookup's substring fallback ever sets MatchFallback.
+	Matched MatchKind
 }
+
+// MatchKind says how confidently an Entry answers the query that returned
+// it, so a caller can hedge a weak match rather than state it as settled
+// fact.
+type MatchKind int
+
+const (
+	// MatchExact covers every result except a Lookup row found only
+	// through the substring fallback: Get by its exact topic, every row
+	// from List, and any Lookup row Postgres full-text search itself
+	// matched. It is the zero value on purpose, so Get and List need not
+	// set it.
+	MatchExact MatchKind = iota
+	// MatchFallback is a Lookup row that satisfied only the substring
+	// fallback -- some query token happened to appear inside the topic, or
+	// the topic inside some token -- with no full-text overlap at all. A
+	// row like this is a plausible guess, not a confirmed answer: ts_rank
+	// is 0 for it and a caller with limit=1 has no other way to tell it
+	// apart from a real hit.
+	MatchFallback
+)
 
 // Store reads and writes curated facts. Every method must tolerate being
 // called on a disabled implementation.

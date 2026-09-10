@@ -24,9 +24,28 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres { return &Postgres{pool: pool} }
 
 func (p *Postgres) Enabled() bool { return p != nil && p.pool != nil }
 
-// Lookup ranks by Postgres full-text relevance and falls back to a prefix
-// match on the topic, so a player asking "gold" still finds "gold farm" when
-// the body shares no stemmed words with the question.
+// Lookup ranks by Postgres full-text relevance against ANY of the query's
+// terms (see searchQuery), and falls back to a plain substring test against
+// the topic for compound words full-text search cannot split on its own --
+// English stemming has no reason to know "goldfarm" is "gold" plus "farm".
+// Both sides are driven from the same tokens, so "goldfarm", "gold farm",
+// and "gold farm location" all find a fact stored under the topic
+// "goldfarm".
+//
+// The fallback's substring test is one-directional in practice even though
+// it reads as symmetric: a query token can be a substring of a multi-word
+// topic ("farm" inside "gold farm"), but a multi-word topic can never be a
+// substring of a single query token, because queryTokens never emits a
+// token containing a space. That's harmless today only because !kb set
+// takes a single argument as the topic, so no stored topic actually
+// contains a space; NormalizeTopic's own type would allow one, and a future
+// caller that joined multiple arguments into a topic the way !kb set joins
+// them into a body would silently lose this half of the fallback for it.
+//
+// Each returned Entry also carries whether it matched full-text or only the
+// substring fallback (see MatchKind) -- ts_rank is 0 for a fallback-only
+// row, so with limit=1 a caller has no other way to tell a confirmed answer
+// from a guess.
 func (p *Postgres) Lookup(ctx context.Context, query string, limit int) ([]Entry, error) {
 	if limit <= 0 {
 		limit = 3
@@ -35,14 +54,25 @@ func (p *Postgres) Lookup(ctx context.Context, query string, limit int) ([]Entry
 	if normalized == "" {
 		return nil, nil
 	}
+	tokens := queryTokens(normalized)
+	if len(tokens) == 0 {
+		return nil, nil
+	}
+	tsq := searchQuery(tokens)
+	fallback := fallbackTokens(tokens)
+
 	rows, err := p.pool.Query(ctx, `
-		SELECT topic, body, COALESCE(author_xuid, ''), updated_at
+		SELECT topic, body, COALESCE(author_xuid, ''), updated_at,
+		       search @@ websearch_to_tsquery('english', $1) AS full_text_match
 		FROM minecraft.knowledge
-		WHERE search @@ plainto_tsquery('english', $1)
-		   OR topic LIKE $2
-		ORDER BY ts_rank(search, plainto_tsquery('english', $1)) DESC, updated_at DESC
+		WHERE search @@ websearch_to_tsquery('english', $1)
+		   OR EXISTS (
+		        SELECT 1 FROM unnest($2::text[]) AS tok
+		        WHERE position(tok IN topic) > 0 OR position(topic IN tok) > 0
+		      )
+		ORDER BY ts_rank(search, websearch_to_tsquery('english', $1)) DESC, updated_at DESC
 		LIMIT $3`,
-		normalized, normalized+"%", limit,
+		tsq, fallback, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("knowledge: lookup: %w", err)
@@ -52,8 +82,12 @@ func (p *Postgres) Lookup(ctx context.Context, query string, limit int) ([]Entry
 	var out []Entry
 	for rows.Next() {
 		var e Entry
-		if err := rows.Scan(&e.Topic, &e.Body, &e.AuthorXUID, &e.UpdatedAt); err != nil {
+		var fullTextMatch bool
+		if err := rows.Scan(&e.Topic, &e.Body, &e.AuthorXUID, &e.UpdatedAt, &fullTextMatch); err != nil {
 			return nil, fmt.Errorf("knowledge: scan: %w", err)
+		}
+		if !fullTextMatch {
+			e.Matched = MatchFallback
 		}
 		out = append(out, e)
 	}
