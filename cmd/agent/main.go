@@ -199,6 +199,10 @@ func main() {
 		log.Error("http_bind_failed", logging.Fields{"error": err.Error()})
 		os.Exit(1)
 	}
+	// Same two-tier lookup !announce @player uses, so a name the API and the
+	// command resolve can never mean two different players.
+	apiOn := httpServer.MountAnnouncements(cfg.AnnounceAPIToken, deliverer, playerLookup{live: playerRoster, archive: playerStore}, log)
+	log.Info("announce_api", logging.Fields{"enabled": apiOn})
 
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil {

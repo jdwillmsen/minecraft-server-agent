@@ -107,6 +107,12 @@ type Config struct {
 	// The other rules need no configuration.
 	ModerationTerms []string
 
+	// AnnounceAPIToken is the bearer token POST /announcements requires.
+	// Unset leaves the route unmounted, answering 404 like any path that
+	// was never there: a disabled API must be indistinguishable from an
+	// absent one, and never open.
+	AnnounceAPIToken string
+
 	// Logging.
 	LogLevel string
 }
@@ -211,6 +217,7 @@ func Load() (Config, error) {
 		ConsoleBridgeToken:        bridgeToken,
 		ConsoleBridgeTimeoutMs:    bridgeTimeout,
 		ModerationTerms:           commaList("MODERATION_TERMS"),
+		AnnounceAPIToken:          stringDefault("ANNOUNCE_API_TOKEN", ""),
 		LogLevel:                  strings.ToLower(stringDefault("LOG_LEVEL", "info")),
 	}
 	return cfg, nil

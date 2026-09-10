@@ -17,6 +17,9 @@ type Server struct {
 	httpServer *http.Server
 	ln         net.Listener
 	ready      atomic.Bool
+	// mux is kept so a route that depends on configuration -- the
+	// announcement API -- can be mounted after New, or not at all.
+	mux *http.ServeMux
 }
 
 // New binds addr and builds a Server with /healthz, /readyz, and /metrics
@@ -30,9 +33,9 @@ func New(addr string) (*Server, error) {
 		return nil, fmt.Errorf("httpapi: listen on %s: %w", addr, err)
 	}
 
-	s := &Server{ln: ln}
-
 	mux := http.NewServeMux()
+	s := &Server{ln: ln, mux: mux}
+
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
