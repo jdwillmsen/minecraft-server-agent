@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
@@ -186,6 +187,14 @@ type Context struct {
 	// are guarded at every use for the same reason Profiles is.
 	Knowledge KnowledgeStore
 	Waypoints WaypointStore
+	// Announcements and Deliverer are nil when no database is configured,
+	// guarded at every use for the same reason Knowledge and Waypoints are.
+	Announcements AnnounceStore
+	Deliverer     AnnounceDeliverer
+	// Roster resolves a "@player" reference in a command (!announce) to the
+	// XUID every other capability keys on. May be nil -- a command that
+	// needs it must refuse plainly rather than assume it can resolve one.
+	Roster Roster
 }
 
 // PlayerStore is the subset of internal/store a plugin may touch.
@@ -217,6 +226,34 @@ type WaypointStore interface {
 	Delete(ctx context.Context, xuid, name string) (removed bool, err error)
 	List(ctx context.Context, xuid string) ([]waypoints.Waypoint, error)
 	Enabled() bool
+}
+
+// AnnounceStore is the outbox surface a plugin may touch: enough to create
+// an announcement and read what is pending for a player, but not to mark a
+// delivery -- that bookkeeping belongs to the deliverer, which is the only
+// thing that actually sends a message, so it is the only thing allowed to
+// record that one arrived.
+type AnnounceStore interface {
+	Insert(ctx context.Context, a announce.Announcement) (int64, error)
+	PendingFor(ctx context.Context, xuid, permission string, now time.Time) ([]announce.Announcement, error)
+	Enabled() bool
+}
+
+// AnnounceDeliverer is how a command sends an announcement immediately and
+// drains a player's own queue on request. Narrowed to what !announce and
+// !inbox need -- not announce.Deliverer's full method set, since join-time
+// draining is the announce-drain event handler's job, not a chat command's.
+type AnnounceDeliverer interface {
+	SendNow(ctx context.Context, a announce.Announcement, id int64) (int, error)
+	DrainAll(ctx context.Context, xuid string, now time.Time) (int, error)
+}
+
+// Roster resolves a player's XUID from the gamertag currently on record for
+// them. Narrowed from internal/roster.Roster's full method set to the one
+// lookup a command needs: turning an "@player" reference into the identity
+// every other capability keys on.
+type Roster interface {
+	XUIDFor(name string) (xuid string, ok bool)
 }
 
 // Registry holds every registered plugin and routes commands to them.
