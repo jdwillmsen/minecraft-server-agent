@@ -458,3 +458,41 @@ func TestAnnounceFromTheConsoleHasNoAuthor(t *testing.T) {
 		t.Errorf("delivered author = %q; the delivery must see the same author the row does", got)
 	}
 }
+
+// The tables exist but the role the agent connects as cannot touch them --
+// the failure this project has actually had. Answered, and answered
+// differently from an unconfigured store, because the two need different
+// things done to them.
+func TestCommandsSayWhenTheStoreRefusesAccess(t *testing.T) {
+	grantErr := fmt.Errorf("announce: insert: %w", &pgconn.PgError{
+		Code:    "42501",
+		Message: "permission denied for table announcements",
+	})
+
+	announceCmd := announceCommand(t, "announce")
+	reply, err := announceCmd.Run(context.Background(), &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: true, insertErr: grantErr},
+	}, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"server", "restarting"},
+	})
+	if err != nil {
+		t.Fatalf("a refused grant must not error the command: %v", err)
+	}
+	if reply != noAccess {
+		t.Errorf("!announce replied %q, want %q -- a missing grant is not a missing store", reply, noAccess)
+	}
+
+	inboxCmd := announceCommand(t, "inbox")
+	reply, err = inboxCmd.Run(context.Background(), &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: true},
+		Deliverer:     &fakeAnnounceDeliverer{drainErr: grantErr},
+	}, plugin.Invocation{ActorXUID: "player-a", ActorPermission: plugin.PermissionMember})
+	if err != nil {
+		t.Fatalf("a refused grant must not error the command: %v", err)
+	}
+	if reply != noAccess {
+		t.Errorf("!inbox replied %q, want %q", reply, noAccess)
+	}
+}

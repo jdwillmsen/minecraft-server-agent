@@ -894,7 +894,8 @@ func TestErroredCommandIsAudited(t *testing.T) {
 	if err := registry.Register(flakyPlugin{}); err != nil {
 		t.Fatalf("register flaky: %v", err)
 	}
-	pctx := &plugin.Context{Voice: &recordingVoice{}, Directory: registry}
+	voice := &recordingVoice{}
+	pctx := &plugin.Context{Voice: voice, Directory: registry}
 	log := logging.New("info")
 	rec := &recordingAudit{}
 
@@ -907,6 +908,11 @@ func TestErroredCommandIsAudited(t *testing.T) {
 	}
 	if records[0].Outcome != audit.OutcomeError {
 		t.Errorf("outcome = %q, want %q", records[0].Outcome, audit.OutcomeError)
+	}
+	// A failure the player is never told about is indistinguishable from a
+	// command that worked and had nothing to say.
+	if out := voice.output(); len(out) != 1 || !strings.Contains(out[0], commandFailedReply) {
+		t.Errorf("output = %v, want one line carrying %q", out, commandFailedReply)
 	}
 }
 
@@ -921,7 +927,8 @@ func TestTimedOutCommandIsAudited(t *testing.T) {
 	if err := registry.Register(flakyPlugin{}); err != nil {
 		t.Fatalf("register flaky: %v", err)
 	}
-	pctx := &plugin.Context{Voice: &recordingVoice{}, Directory: registry}
+	voice := &recordingVoice{}
+	pctx := &plugin.Context{Voice: voice, Directory: registry}
 	log := logging.New("info")
 	rec := &recordingAudit{}
 
@@ -938,5 +945,28 @@ func TestTimedOutCommandIsAudited(t *testing.T) {
 	}
 	if records[0].Outcome != audit.OutcomeTimeout {
 		t.Errorf("outcome = %q, want %q", records[0].Outcome, audit.OutcomeTimeout)
+	}
+	if out := voice.output(); len(out) != 1 || !strings.Contains(out[0], commandTimedOutReply) {
+		t.Errorf("output = %v, want one line carrying %q", out, commandTimedOutReply)
+	}
+}
+
+// The console gets the same failure line, broadcast rather than whispered:
+// it has no player identity to whisper to, and an operator typing into the
+// console is the reader most likely to act on it.
+func TestAFailedConsoleCommandIsAnsweredOnTheConsolePath(t *testing.T) {
+	registry := plugin.NewRegistry()
+	if err := registry.Register(flakyPlugin{}); err != nil {
+		t.Fatalf("register flaky: %v", err)
+	}
+	voice := &recordingVoice{}
+	pctx := &plugin.Context{Voice: voice, Directory: registry}
+
+	handleCommand(context.Background(), chat.ServerOrigin, chat.ParseTrigger("!boom"), logging.New("info"),
+		registry, pctx, unlimitedRateLimit(), fakePermResolver(t, nil), &recordingAudit{}, roster.New())
+
+	out := voice.output()
+	if len(out) != 1 || !strings.HasPrefix(out[0], "say: ") || !strings.Contains(out[0], commandFailedReply) {
+		t.Errorf("output = %v, want one broadcast carrying %q", out, commandFailedReply)
 	}
 }

@@ -122,7 +122,7 @@ func main() {
 	if pg, ok := playerStore.(*store.Postgres); ok && pg.Pool() != nil {
 		knowledgeStore = knowledge.NewPostgres(pg.Pool())
 		waypointStore = waypoints.NewPostgres(pg.Pool())
-		auditor = audit.NewPostgres(pg.Pool())
+		auditor = newAuditTrail(audit.NewPostgres(pg.Pool()), log)
 		// Wrapped rather than used directly: every announcement row names a
 		// player that minecraft.players must already hold -- see outbox.
 		announceStore = newOutbox(announce.NewPostgres(pg.Pool()), pg, playerRoster, log)
@@ -926,35 +926,58 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 		// wraps into that branch too, and a timeout recorded as a plain error
 		// loses exactly the distinction the schema draws between them.
 		log.Error("command_timed_out", logging.Fields{"command": trigger.Command, "actor": actorXUID})
+		speak(ctx, log, pctx, actorXUID, trigger.Command, commandTimedOutReply)
 		writeAudit(audit.OutcomeTimeout)
 		return
 	case err != nil:
 		log.Error("command_failed", logging.Fields{"command": trigger.Command, "actor": actorXUID, "error": err.Error()})
+		speak(ctx, log, pctx, actorXUID, trigger.Command, commandFailedReply)
 		writeAudit(audit.OutcomeError)
 		return
 	}
 
 	log.Info("command_replied", logging.Fields{"command": trigger.Command, "actor": actorXUID, "reply": reply})
 
-	// The reply runs on the packet-read goroutine just like Dispatch does,
-	// so it needs the same bound: a hung Voice implementation must not be
-	// able to stall the read loop indefinitely.
+	speak(ctx, log, pctx, actorXUID, trigger.Command, reply)
+	// Written after the reply is sent, not before: the record must never be
+	// in front of what the player is waiting on.
+	writeAudit(audit.OutcomeOK)
+}
+
+// commandFailedReply and commandTimedOutReply are what a dispatch that
+// produced no reply of its own says instead of nothing.
+//
+// A command that errors is a command whose author never got to write an
+// answer for what went wrong, and every one of those used to end in
+// silence: the player or operator sees their own typed line and then
+// nothing, which reads exactly like a command that worked and had nothing
+// to say. The two are separated because they call for different next steps
+// -- one is a failure already in the log, the other is something still
+// running that outlasted its budget.
+const (
+	commandFailedReply   = "That didn't work - the failure is in my log."
+	commandTimedOutReply = "That took too long, so I stopped waiting on it."
+)
+
+// speak sends one reply back the way the command came in: broadcast for the
+// console, which has no player to whisper to, and a whisper for anyone else.
+//
+// Bounded like Dispatch is, and for the same reason: this runs on the
+// packet-read goroutine, so a hung Voice implementation must not be able to
+// stall the read loop indefinitely.
+func speak(ctx context.Context, log *logging.Logger, pctx *plugin.Context, actorXUID, command, reply string) {
 	replyCtx, cancel := context.WithTimeout(ctx, plugin.DefaultDispatchTimeout)
 	defer cancel()
 
-	// Written after the reply is sent, not before: the record must never be
-	// in front of what the player is waiting on.
 	if actorXUID == chat.ServerOrigin {
 		if err := pctx.Voice.Say(replyCtx, reply); err != nil {
-			log.Error("voice_say_failed", logging.Fields{"command": trigger.Command, "error": err.Error()})
+			log.Error("voice_say_failed", logging.Fields{"command": command, "error": err.Error()})
 		}
-		writeAudit(audit.OutcomeOK)
 		return
 	}
 	if err := pctx.Voice.Tell(replyCtx, actorXUID, reply); err != nil {
-		log.Error("voice_tell_failed", logging.Fields{"command": trigger.Command, "actor": actorXUID, "error": err.Error()})
+		log.Error("voice_tell_failed", logging.Fields{"command": command, "actor": actorXUID, "error": err.Error()})
 	}
-	writeAudit(audit.OutcomeOK)
 }
 
 // startEventDispatch subscribes every registered plugin.EventHandler to

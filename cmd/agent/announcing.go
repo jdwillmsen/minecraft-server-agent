@@ -8,6 +8,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/pgerr"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
@@ -125,6 +126,14 @@ type outbox struct {
 	players playerRecorder
 	names   adapters.NameResolver
 	log     *logging.Logger
+	// unready fires for the first statement the database refuses for a
+	// deploy reason. !announce and !inbox both answer that state to
+	// whoever typed them, which leaves it visible to exactly one person
+	// and indistinguishable from an agent that was never given a database
+	// at all. This is the other half of that: one line, in the log an
+	// operator reads when a release looks wrong. Once, because the state
+	// cannot change without this process being replaced.
+	unready sync.Once
 }
 
 func newOutbox(store announce.Store, players playerRecorder, names adapters.NameResolver, log *logging.Logger) *outbox {
@@ -138,6 +147,18 @@ var _ announce.Store = (*outbox)(nil)
 // announcements.author_xuid is a foreign key into the same table, so an
 // operator who was already connected when the agent logged in cannot be
 // recorded as the author of their own announcement either.
+// noteUnready reports, once, that the announcement tables are missing or
+// unreadable to this role. op names the statement that hit it, since which
+// one it was is the difference between a partial migration and a total one.
+func (o *outbox) noteUnready(op string, err error) {
+	if !pgerr.Unready(err) {
+		return
+	}
+	o.unready.Do(func() {
+		o.log.Info("announce_store_unready", logging.Fields{"op": op, "error": err.Error()})
+	})
+}
+
 func (o *outbox) Insert(ctx context.Context, a announce.Announcement) (int64, error) {
 	if a.AuthorXUID == chat.ServerOrigin {
 		// Belt and braces. The command that builds a console-issued
@@ -149,16 +170,22 @@ func (o *outbox) Insert(ctx context.Context, a announce.Announcement) (int64, er
 		a.AuthorXUID = ""
 	}
 	o.ensure(ctx, a.AuthorXUID)
-	return o.store.Insert(ctx, a)
+	id, err := o.store.Insert(ctx, a)
+	o.noteUnready("insert", err)
+	return id, err
 }
 
 func (o *outbox) PendingFor(ctx context.Context, xuid, permission string, now time.Time) ([]announce.Announcement, error) {
-	return o.store.PendingFor(ctx, xuid, permission, now)
+	pending, err := o.store.PendingFor(ctx, xuid, permission, now)
+	o.noteUnready("pending", err)
+	return pending, err
 }
 
 func (o *outbox) MarkDelivered(ctx context.Context, id int64, xuid string, at time.Time) error {
 	o.ensure(ctx, xuid)
-	return o.store.MarkDelivered(ctx, id, xuid, at)
+	err := o.store.MarkDelivered(ctx, id, xuid, at)
+	o.noteUnready("mark_delivered", err)
+	return err
 }
 
 func (o *outbox) Enabled() bool { return o.store.Enabled() }

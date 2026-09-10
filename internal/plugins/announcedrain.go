@@ -3,9 +3,11 @@ package plugins
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/pgerr"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
@@ -52,6 +54,13 @@ type AnnounceDrain struct {
 	rootCtx   context.Context
 	deliverer AnnounceDeliverer
 	log       *logging.Logger
+	// unready fires for the first drain the database refuses because its
+	// tables are missing or ungranted. Every join hits the same wall until
+	// the deploy that fixes it, so this is said once and at INFO: an
+	// error line per arrival would bury the rest of the log for as long as
+	// the release and its migration are out of step, and nothing after the
+	// first one carries information.
+	unready sync.Once
 	// inFlight is a counting semaphore over drains in progress, capped at
 	// maxConcurrentDrains. Acquired non-blockingly in HandleEvent, before
 	// the goroutine is even spawned: a caller that blocked here would stall
@@ -120,6 +129,12 @@ func (a *AnnounceDrain) drain(voice plugin.Voice, xuid string) {
 	defer cancel()
 
 	_, remaining, err := a.deliverer.DrainForJoin(drainCtx, xuid, time.Now())
+	if pgerr.Unready(err) {
+		a.unready.Do(func() {
+			a.log.Info("announce_drain_unready", logging.Fields{"error": err.Error()})
+		})
+		return
+	}
 	if err != nil {
 		a.log.Error("announce_drain_failed", logging.Fields{"xuid": xuid, "error": err.Error()})
 		return

@@ -8,6 +8,7 @@ import (
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/pgerr"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 )
 
@@ -20,6 +21,14 @@ const announceUsage = "Usage: !announce [@player] [!now] [!urgent] <message>."
 // yet. One string for both: to the player they are the same fact, and the
 // difference between them is an operator's problem, not theirs.
 const noStore = "I have no announcement store configured."
+
+// noAccess is what both commands say when the tables exist but the role the
+// agent connects as cannot touch them. Kept distinct from noStore because
+// the two need different things done to them: one is a migration that has
+// not run, the other is a grant that was never made -- and the grant is the
+// failure this project has actually had in production, where it read as the
+// agent having gone quiet for no stated reason.
+const noAccess = "My announcement store is refusing me access."
 
 // Announce lets an operator say something to the server, right now or
 // queued for whoever is offline, and lets any member collect what has been
@@ -171,13 +180,15 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 	}
 
 	id, err := pctx.Announcements.Insert(ctx, a)
-	if announce.NotMigrated(err) {
-		// A store that exists but has no tables behind it yet. Answered like
-		// an unconfigured one rather than returned as an error, because an
-		// errored command sends no reply at all: the operator would type
-		// !announce, see nothing, and have no way to tell that from the
-		// message having gone out.
+	// A store that exists but cannot serve this statement yet: no tables
+	// behind it, or no grant on them. Answered rather than returned as an
+	// error so the operator is told which one to go and fix, instead of
+	// reading the generic failure line every other broken command gets.
+	if pgerr.NotMigrated(err) {
 		return noStore, nil
+	}
+	if pgerr.NotGranted(err) {
+		return noAccess, nil
 	}
 	if err != nil {
 		return "", fmt.Errorf("announce: !announce: %w", err)
@@ -204,10 +215,12 @@ func runInbox(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) 
 	// own queue, the same restriction !wp places on whose coordinates a
 	// command can touch.
 	delivered, err := pctx.Deliverer.DrainAll(ctx, inv.ActorXUID, time.Now())
-	if announce.NotMigrated(err) {
-		// Same reasoning as !announce: silence is the one answer a player
-		// cannot interpret.
+	// Same two states !announce answers for, same reasoning.
+	if pgerr.NotMigrated(err) {
 		return noStore, nil
+	}
+	if pgerr.NotGranted(err) {
+		return noAccess, nil
 	}
 	if err != nil {
 		return "", fmt.Errorf("announce: !inbox: %w", err)

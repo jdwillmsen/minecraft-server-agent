@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
@@ -286,5 +289,62 @@ func TestAnnounceDrain_DroppedWhenAlreadyAtTheConcurrencyCap(t *testing.T) {
 	}
 	if deliverer.xuid != "" {
 		t.Errorf("DrainForJoin was called with xuid %q, want the dropped join never to reach the deliverer", deliverer.xuid)
+	}
+}
+
+// missingGrantErr is what pgx returns when the tables exist but the role the
+// agent connects as was never granted access to them.
+func missingGrantErr() error {
+	return fmt.Errorf("announce: pending: %w", &pgconn.PgError{
+		Code:    "42501",
+		Message: "permission denied for table announcements",
+	})
+}
+
+// Every join hits the same missing tables, and an error line per arrival
+// buries the log for as long as the release and its migration are out of
+// step. Said once, at INFO, it is a deploy-ordering notice.
+func TestAnnounceDrain_MissingTablesAreOneNoticeNotAnErrorPerJoin(t *testing.T) {
+	for name, drainErr := range map[string]error{
+		"tables not migrated": missingTableErr(),
+		"tables not granted":  missingGrantErr(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			deliverer := &fakeJoinDeliverer{err: drainErr, calls: make(chan struct{}, 1)}
+			pctx := &plugin.Context{Voice: newRecordingTellVoice()}
+
+			out := captureStdout(t, func() {
+				d := NewAnnounceDrain(context.Background(), deliverer, logging.New("info"))
+				// One join at a time: two drains sharing this fake would
+				// race on what it records, which is a property of the fake
+				// and not of the plugin under test.
+				for _, xuid := range []string{"xuid-1", "xuid-2"} {
+					if err := d.HandleEvent(context.Background(), pctx, joinEvent(xuid)); err != nil {
+						t.Fatalf("HandleEvent: %v", err)
+					}
+					select {
+					case <-deliverer.calls:
+					case <-time.After(time.Second):
+						t.Fatal("timed out waiting for the drain to run")
+					}
+				}
+				// The drain logs after it has answered the deliverer, so
+				// waiting on the call alone would race the capture against
+				// the line it is capturing. A slot in the semaphore is only
+				// released once the whole drain has returned, so taking
+				// every one of them is the plugin's own proof that both
+				// goroutines are done.
+				for i := 0; i < cap(d.inFlight); i++ {
+					d.inFlight <- struct{}{}
+				}
+			})
+
+			if strings.Contains(out, `"event":"announce_drain_failed"`) {
+				t.Errorf("stdout = %q, want no error line for a state a deploy fixes", out)
+			}
+			if got := strings.Count(out, `"event":"announce_drain_unready"`); got != 1 {
+				t.Errorf("stdout carried %d announce_drain_unready events, want exactly 1:\n%s", got, out)
+			}
+		})
 	}
 }
