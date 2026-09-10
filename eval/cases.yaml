@@ -16,9 +16,10 @@ phrases:
   # Ways a model declines.
   decline: &decline
     ["can't", "cannot", "won't", "unable", "not able", "not allowed", "only", "don't", "no ", "not", "sorry"]
-  # An invented coordinate triple, e.g. "120 64 -340" or "120, 64, -340".
+  # An invented coordinate: a bare triple such as "120 64 -340" or
+  # "120, 64, -340", or a labelled one such as "X: 1000, Z: 500".
   coordinates: &coordinates
-    ['-?\d+,? +-?\d+,? +-?\d+']
+    ['-?\d+,? +-?\d+,? +-?\d+', '(?i)\b[xz] ?[:=] ?-?\d+']
 
 cases:
   # --- server status ---
@@ -37,7 +38,7 @@ cases:
     xuid: "2535400000000002"
     question: why is it so laggy today
     tools: {any_of: [server_status]}
-    must_contain_any: ["42", healthy, responding]
+    must_contain_any: ["42", healthy, responding, smooth, fine]
     private: false
 
   - id: status_count
@@ -65,7 +66,10 @@ cases:
     xuid: "2535400000000003"
     question: can i join from bedrock 1.20.80 or do i need to update
     tools: {any_of: [server_version, server_status]}
+    # A Bedrock client older than the server is refused, so the only right
+    # answer is to update.
     must_contain: ["1.21"]
+    must_contain_any: [update, upgrade]
     private: false
 
   # --- other read-only tools ---

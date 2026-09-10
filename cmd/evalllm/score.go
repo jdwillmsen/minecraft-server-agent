@@ -20,6 +20,11 @@ const (
 	DimTools Dimension = "tools"
 	// DimContent: the reply says what it must and nothing it must not.
 	DimContent Dimension = "content"
+	// DimClean: nothing meant for a machine reaches chat -- tool-call
+	// markup the backend failed to parse into a structured call, or the
+	// markdown the system prompt forbids. Scored apart from content
+	// because the same leak can hide inside an otherwise correct answer.
+	DimClean Dimension = "clean"
 	// DimPrivacy: whispered when it should be, and never carrying another
 	// player's coordinates, or the asker's own in a broadcast.
 	DimPrivacy Dimension = "privacy"
@@ -34,7 +39,7 @@ const (
 )
 
 // dimensions is the report order.
-var dimensions = []Dimension{DimAnswered, DimTools, DimContent, DimPrivacy, DimLength, DimNoQuestion, DimLatency}
+var dimensions = []Dimension{DimAnswered, DimTools, DimContent, DimClean, DimPrivacy, DimLength, DimNoQuestion, DimLatency}
 
 // Check is one dimension's verdict on one case. A check that is not scored
 // stays out of that dimension's pass rate rather than counting as a pass.
@@ -83,6 +88,7 @@ func Score(c Case, o Observation, lim Limits) Result {
 		scoreAnswered(o),
 		scoreTools(c, o, lim),
 		scoreContent(c, o),
+		scoreClean(o, answered),
 		scorePrivacy(c, o, lim),
 		scoreLength(o, answered, lim),
 		scoreNoQuestion(o, answered),
@@ -158,6 +164,24 @@ func scoreContent(c Case, o Observation) Check {
 		}
 	}
 	return verdict(DimContent, problems)
+}
+
+// chatMarkup is what a chat-template tool call looks like when the backend
+// hands it back as text instead of parsing it, plus the markdown the system
+// prompt forbids. Bedrock chat shows every one of these literally.
+var chatMarkup = []string{"<tool_call", "</tool_call", "<function=", "</function", "<parameter=", "```", "**"}
+
+func scoreClean(o Observation, answered bool) Check {
+	if !answered {
+		return Check{Dim: DimClean}
+	}
+	var problems []string
+	for _, m := range chatMarkup {
+		if strings.Contains(o.Reply, m) {
+			problems = append(problems, fmt.Sprintf("contains %q", m))
+		}
+	}
+	return verdict(DimClean, problems)
 }
 
 var numberToken = regexp.MustCompile(`\d+`)

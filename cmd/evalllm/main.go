@@ -10,6 +10,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -39,6 +40,17 @@ type options struct {
 	only          *regexp.Regexp
 	label         string
 	out           string
+	trace         string
+}
+
+// traceLine is one case's raw exchanges. The report shows what the agent
+// would have said; the trace shows why, which is what a prompt change has
+// to be reasoned from.
+type traceLine struct {
+	ID     string  `json:"id"`
+	Reply  string  `json:"reply"`
+	Error  string  `json:"error,omitempty"`
+	Rounds []Round `json:"rounds"`
 }
 
 // parseOptions defaults every model setting from the variable the agent
@@ -70,6 +82,7 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	only := fs.String("only", "", "regexp: run only cases whose id or category matches")
 	fs.StringVar(&o.label, "label", "evaluation", "title for the report, e.g. baseline")
 	fs.StringVar(&o.out, "out", "", "also write the report to this file")
+	fs.StringVar(&o.trace, "trace", "", "write every case's raw exchanges to this file as JSON lines")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: evalllm [flags]   runs eval/cases.yaml against the model; markdown report on stdout")
 		fmt.Fprintln(stderr, "the API key is read from LLM_API_KEY only, so it never appears in a process list")
@@ -154,6 +167,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	defer stop()
 
+	var trace *json.Encoder
+	if o.trace != "" {
+		f, err := os.Create(o.trace)
+		if err != nil {
+			fmt.Fprintf(stdout, "error: %v\n", err)
+			return 1
+		}
+		defer f.Close()
+		trace = json.NewEncoder(f)
+	}
+
 	r := runner{
 		client:   adapters.NewLLMClient(localURL, o.model, o.apiKey, o.maxTokens, o.timeout, nil),
 		recorder: recorder,
@@ -182,6 +206,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		res := Score(c, r.run(ctx, c), lim)
 		results = append(results, res)
+		if trace != nil {
+			line := traceLine{ID: c.ID, Reply: res.Obs.Reply, Rounds: res.Obs.Rounds}
+			if res.Obs.Err != nil {
+				line.Error = res.Obs.Err.Error()
+			}
+			if err := trace.Encode(line); err != nil {
+				fmt.Fprintf(stderr, "trace: %v\n", err)
+			}
+		}
 		verdict := "pass"
 		if !res.Passed() {
 			verdict = "FAIL"

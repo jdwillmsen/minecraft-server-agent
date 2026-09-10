@@ -216,3 +216,22 @@ func TestLatencyBudget(t *testing.T) {
 		t.Error("an answer exactly at budget failed")
 	}
 }
+
+// Seen against the production model: a tool call the backend failed to
+// parse came back as text, and the agent would have said it in chat.
+func TestCleanCatchesLeakedToolMarkup(t *testing.T) {
+	cases := map[string]bool{
+		"Your stash is saved. <tool_call>":                                      false,
+		"<tool_call> <function=shutdown_announcement> </function> </tool_call>": false,
+		"Use **bold** sparingly.":                                               false,
+		"The gold farm is at 120 64 -340.":                                      true,
+	}
+	for reply, pass := range cases {
+		if got := check(t, Score(testCase(t, nil), answered(reply), testLimits()), DimClean); got.Pass != pass {
+			t.Errorf("%q: pass = %v, want %v", reply, got.Pass, pass)
+		}
+	}
+	if check(t, Score(testCase(t, nil), Observation{}, testLimits()), DimClean).Scored {
+		t.Error("clean was scored on an answer that never came")
+	}
+}
