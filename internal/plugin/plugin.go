@@ -248,12 +248,18 @@ type AnnounceDeliverer interface {
 	DrainAll(ctx context.Context, xuid string, now time.Time) (int, error)
 }
 
-// Roster resolves a player's XUID from the gamertag currently on record for
-// them. Narrowed from internal/roster.Roster's full method set to the one
-// lookup a command needs: turning an "@player" reference into the identity
-// every other capability keys on.
+// Roster resolves a player's XUID from a gamertag typed into a command,
+// turning an "@player" reference into the identity every other capability
+// keys on.
+//
+// It carries a context and an error because the answer is not always in
+// memory: a player who is offline is exactly who a queued announcement is
+// for, and only a durable record can name them. ok false means nobody by
+// that name has ever been seen -- the only case in which a command should
+// refuse. An error means the lookup itself could not be made, which is not
+// the same as an answer of no.
 type Roster interface {
-	XUIDFor(name string) (xuid string, ok bool)
+	XUIDFor(ctx context.Context, name string) (xuid string, ok bool, err error)
 }
 
 // Registry holds every registered plugin and routes commands to them.

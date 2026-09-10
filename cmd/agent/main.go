@@ -632,11 +632,12 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 		// construct a bare Context.
 		Announcements: announceStore,
 		Deliverer:     deliverer,
-		// The same roster every other capability that needs live presence
-		// reads from -- this binary always constructs one, regardless of
-		// whether a database is configured, so !announce's @player
-		// resolution never has to treat "no roster" as a real case.
-		Roster: playerRoster,
+		// The live roster backed by the profile store, so "@player" resolves
+		// for someone who is offline -- which is precisely who a queued
+		// announcement is for. With no database configured the second tier
+		// answers "never seen", and !announce refuses exactly as it did
+		// before there was one.
+		Roster: playerLookup{live: playerRoster, archive: playerStore},
 	}
 }
 

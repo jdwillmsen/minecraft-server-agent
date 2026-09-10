@@ -379,3 +379,82 @@ func TestEveryPluginThisBinaryServesIsRegistered(t *testing.T) {
 		t.Error("the announce-drain plugin does not subscribe to joins")
 	}
 }
+
+// recordedNames is the profile store's durable half of a gamertag lookup,
+// as a fixed map.
+type recordedNames struct {
+	byName map[string]string
+	err    error
+}
+
+var _ nameArchive = recordedNames{}
+
+func (r recordedNames) XUIDForName(_ context.Context, gamertag string) (string, bool, error) {
+	if r.err != nil {
+		return "", false, r.err
+	}
+	xuid, ok := r.byName[gamertag]
+	return xuid, ok, nil
+}
+
+// The whole reason the lookup has two tiers: the roster is emptied at the
+// start of every session and holds only who is connected, so an offline
+// player -- the one target a queued announcement exists for -- is
+// resolvable only from what the server has written down.
+func TestPlayerLookupResolvesAnOfflinePlayerFromTheProfileStore(t *testing.T) {
+	lookup := playerLookup{
+		live:    onlineRoster(present("2535400000000001", "Online")),
+		archive: recordedNames{byName: map[string]string{"Offline": "2535400000000002"}},
+	}
+
+	xuid, ok, err := lookup.XUIDFor(context.Background(), "Offline")
+	if err != nil {
+		t.Fatalf("XUIDFor: %v", err)
+	}
+	if !ok || xuid != "2535400000000002" {
+		t.Errorf("XUIDFor(Offline) = (%q, %v), want the recorded xuid -- an offline player is not an unknown one", xuid, ok)
+	}
+}
+
+// A connected player answers from memory, and the recorded name is not
+// consulted: the two only disagree while a rename propagates, and the
+// player who is actually here is the better answer.
+func TestPlayerLookupPrefersTheLiveRoster(t *testing.T) {
+	lookup := playerLookup{
+		live:    onlineRoster(present("2535400000000001", "Dotablaze")),
+		archive: recordedNames{byName: map[string]string{"Dotablaze": "2535400000000009"}},
+	}
+
+	xuid, ok, err := lookup.XUIDFor(context.Background(), "Dotablaze")
+	if err != nil {
+		t.Fatalf("XUIDFor: %v", err)
+	}
+	if !ok || xuid != "2535400000000001" {
+		t.Errorf("XUIDFor = (%q, %v), want the connected player", xuid, ok)
+	}
+}
+
+// Never seen by either tier is a real answer, and it is the one !announce
+// refuses on -- so it must not arrive as an error.
+func TestPlayerLookupReportsANameNobodyHasEverHeld(t *testing.T) {
+	lookup := playerLookup{live: roster.New(), archive: recordedNames{}}
+
+	xuid, ok, err := lookup.XUIDFor(context.Background(), "NoSuchPlayer")
+	if err != nil {
+		t.Fatalf("XUIDFor: %v", err)
+	}
+	if ok || xuid != "" {
+		t.Errorf("XUIDFor = (%q, %v), want not found", xuid, ok)
+	}
+}
+
+// A lookup that could not be made is not "no such player": the caller has
+// to be able to tell them apart, or a database blip silently becomes a
+// refusal aimed at a player who does exist.
+func TestPlayerLookupSurfacesAFailedLookup(t *testing.T) {
+	lookup := playerLookup{live: roster.New(), archive: recordedNames{err: errors.New("connection refused")}}
+
+	if _, ok, err := lookup.XUIDFor(context.Background(), "Dotablaze"); err == nil || ok {
+		t.Errorf("XUIDFor = (ok %v, err %v), want the failure surfaced", ok, err)
+	}
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"reflect"
 	"testing"
 	"time"
@@ -89,5 +90,19 @@ func TestProfilesIsUsableWithoutADatabase(t *testing.T) {
 	}
 	if _, err := profiles.RecordJoin(t.Context(), "2535400000000000", "SomePlayer", time.Now()); err != nil {
 		t.Errorf("recording a join against the no-op store failed: %v", err)
+	}
+}
+
+// With no database configured the durable tier answers "never seen", so
+// "@player" refuses exactly as it did before there was one -- rather than
+// panicking on a nil archive, which is what a context wired with a bare
+// roster would have done the moment the lookup grew a second tier.
+func TestRosterLookupIsUsableWithoutADatabase(t *testing.T) {
+	xuid, ok, err := testPluginContext().Roster.XUIDFor(context.Background(), "SomePlayer")
+	if err != nil {
+		t.Fatalf("resolving a name with no database configured failed: %v", err)
+	}
+	if ok || xuid != "" {
+		t.Errorf("XUIDFor = (%q, %v), want not found", xuid, ok)
 	}
 }

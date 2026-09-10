@@ -170,6 +170,45 @@ func (p *Postgres) EnsurePlayer(ctx context.Context, xuid, gamertag string, at t
 	return nil
 }
 
+// XUIDForName resolves a gamertag through the two places one is recorded:
+// the name a player answers to now, and every name they have answered to
+// before.
+//
+// The current holder wins outright over anyone who merely used to hold the
+// name. A gamertag freed by a rename can be taken by a different Xbox
+// account, so a historical match is a guess about which person was meant
+// while a current match is not: aiming a private message at the previous
+// holder of a name someone else answers to today is the one outcome worth
+// designing against. Among historical holders only -- which needs two
+// renames in opposite directions to even arise -- the most recent to answer
+// to the name wins, because there is nothing better to go on and refusing
+// outright would make a queued message impossible for a player who has
+// merely changed their name once.
+func (p *Postgres) XUIDForName(ctx context.Context, gamertag string) (string, bool, error) {
+	var xuid string
+	err := p.pool.QueryRow(ctx, `
+		SELECT xuid FROM (
+		    SELECT p.xuid, 0 AS tier, p.last_seen_at
+		    FROM minecraft.players p
+		    WHERE p.current_gamertag = $1
+		    UNION ALL
+		    SELECT n.xuid, 1 AS tier, n.last_seen_at
+		    FROM minecraft.player_names n
+		    WHERE n.gamertag = $1
+		) held
+		ORDER BY tier, last_seen_at DESC
+		LIMIT 1`,
+		gamertag,
+	).Scan(&xuid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: resolve gamertag: %w", err)
+	}
+	return xuid, true, nil
+}
+
 func (p *Postgres) RecordLeave(ctx context.Context, xuid string, at time.Time) error {
 	_, err := p.pool.Exec(ctx, `
 		UPDATE minecraft.sessions

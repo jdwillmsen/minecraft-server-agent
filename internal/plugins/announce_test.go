@@ -47,7 +47,11 @@ func (f *fakeAnnounceStore) Enabled() bool { return f.enabled }
 // SendNow records what it was asked to send, DrainAll reports a
 // test-configured count and remembers which xuid it was asked to drain.
 type fakeAnnounceDeliverer struct {
-	sent       []announce.Announcement
+	sent []announce.Announcement
+	// sentNow is what SendNow reports as actually delivered. Zero by
+	// default, which is what a real deliverer reports for a target who is
+	// offline -- the case the queue exists for.
+	sentNow    int
 	sendErr    error
 	drainXUID  string
 	drainCount int
@@ -61,7 +65,7 @@ func (f *fakeAnnounceDeliverer) SendNow(_ context.Context, a announce.Announceme
 		return 0, f.sendErr
 	}
 	f.sent = append(f.sent, a)
-	return 1, nil
+	return f.sentNow, nil
 }
 
 func (f *fakeAnnounceDeliverer) DrainAll(_ context.Context, xuid string, _ time.Time) (int, error) {
@@ -69,17 +73,29 @@ func (f *fakeAnnounceDeliverer) DrainAll(_ context.Context, xuid string, _ time.
 	return f.drainCount, f.drainErr
 }
 
-// fakeAnnounceRoster resolves a fixed set of gamertags to XUIDs, standing in
-// for the live roster's XUIDFor.
+// fakeAnnounceRoster stands in for the two-tier lookup a command is handed:
+// online names resolve from the live roster, and names the server has
+// merely recorded before resolve from the profile store. The split is the
+// point -- a fake with only one map cannot tell an offline player from one
+// who has never existed, which is exactly the distinction this command has
+// to make.
 type fakeAnnounceRoster struct {
-	byName map[string]string
+	online  map[string]string
+	offline map[string]string
+	err     error
 }
 
 var _ plugin.Roster = fakeAnnounceRoster{}
 
-func (f fakeAnnounceRoster) XUIDFor(name string) (string, bool) {
-	xuid, ok := f.byName[name]
-	return xuid, ok
+func (f fakeAnnounceRoster) XUIDFor(_ context.Context, name string) (string, bool, error) {
+	if f.err != nil {
+		return "", false, f.err
+	}
+	if xuid, ok := f.online[name]; ok {
+		return xuid, true, nil
+	}
+	xuid, ok := f.offline[name]
+	return xuid, ok, nil
 }
 
 func announceCommand(t *testing.T, name string) plugin.Command {
@@ -151,11 +167,16 @@ func TestAnnounceFlagsParseOnlyBeforeTheBody(t *testing.T) {
 	}
 }
 
+// The headline case: the player is not here. An announcement aimed at
+// someone offline has to be stored and left pending, because a message that
+// waits for them is the entire promise of the feature -- a lookup that only
+// knew who was connected would answer "I don't know a player named X" to
+// the one target this command exists for.
 func TestAnnounceToAPlayerWhispersAndQueues(t *testing.T) {
 	cmd := announceCommand(t, "announce")
 	store := &fakeAnnounceStore{enabled: true}
 	deliverer := &fakeAnnounceDeliverer{}
-	roster := fakeAnnounceRoster{byName: map[string]string{"Dotablaze": "xuid-dota"}}
+	roster := fakeAnnounceRoster{offline: map[string]string{"Dotablaze": "xuid-dota"}}
 	pctx := &plugin.Context{Announcements: store, Deliverer: deliverer, Roster: roster}
 
 	before := time.Now()
@@ -188,6 +209,62 @@ func TestAnnounceToAPlayerWhispersAndQueues(t *testing.T) {
 	}
 	if !strings.Contains(reply, "Dotablaze") {
 		t.Errorf("reply %q should name the whispered player", reply)
+	}
+	// Nothing was delivered -- they are offline -- so the row has to be the
+	// thing that survives, ready for their next join to drain.
+	if len(deliverer.sent) != 1 {
+		t.Fatalf("the deliverer was asked to send %d times, want 1", len(deliverer.sent))
+	}
+	if deliverer.sent[0].TargetValue != "xuid-dota" {
+		t.Errorf("delivered target = %q, want the resolved xuid", deliverer.sent[0].TargetValue)
+	}
+}
+
+// An online target resolves through the live roster without the durable
+// half being consulted at all.
+func TestAnnounceToAnOnlinePlayerResolvesFromTheLiveRoster(t *testing.T) {
+	cmd := announceCommand(t, "announce")
+	store := &fakeAnnounceStore{enabled: true}
+	deliverer := &fakeAnnounceDeliverer{sentNow: 1}
+	roster := fakeAnnounceRoster{
+		online:  map[string]string{"Dotablaze": "xuid-live"},
+		offline: map[string]string{"Dotablaze": "xuid-stale"},
+	}
+	pctx := &plugin.Context{Announcements: store, Deliverer: deliverer, Roster: roster}
+
+	if _, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"@Dotablaze", "the", "farm", "moved"},
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(store.inserted) != 1 {
+		t.Fatalf("got %d announcements, want 1", len(store.inserted))
+	}
+	if got := store.inserted[0].TargetValue; got != "xuid-live" {
+		t.Errorf("target = %q, want the connected player rather than the recorded one", got)
+	}
+}
+
+// A lookup that could not be made is not an answer of "no". Refusing on one
+// would deny a player who does exist, and storing on one would aim a
+// private message at nobody.
+func TestAnnounceFailsRatherThanGuessWhenTheLookupBreaks(t *testing.T) {
+	cmd := announceCommand(t, "announce")
+	store := &fakeAnnounceStore{enabled: true}
+	roster := fakeAnnounceRoster{err: errors.New("connection refused")}
+	pctx := &plugin.Context{Announcements: store, Roster: roster}
+
+	if _, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"@Dotablaze", "hello"},
+	}); err == nil {
+		t.Error("a broken lookup was treated as a player who does not exist")
+	}
+	if len(store.inserted) != 0 {
+		t.Error("an announcement was stored for a name that was never resolved")
 	}
 }
 
@@ -300,7 +377,7 @@ func TestInboxWithoutAStoreSaysSo(t *testing.T) {
 func TestAnnounceRefusesAnUnknownPlayerRatherThanStoreIt(t *testing.T) {
 	cmd := announceCommand(t, "announce")
 	store := &fakeAnnounceStore{enabled: true}
-	pctx := &plugin.Context{Announcements: store, Roster: fakeAnnounceRoster{byName: map[string]string{}}}
+	pctx := &plugin.Context{Announcements: store, Roster: fakeAnnounceRoster{}}
 
 	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
 		ActorXUID:       "op",
@@ -313,6 +390,9 @@ func TestAnnounceRefusesAnUnknownPlayerRatherThanStoreIt(t *testing.T) {
 	if len(store.inserted) != 0 {
 		t.Error("an announcement was stored for a player nobody can ever resolve")
 	}
+	if !strings.Contains(reply, "NoSuchPlayer") {
+		t.Errorf("reply %q should name the player it does not know", reply)
+	}
 	if reply == "" {
 		t.Error("reply should say the player is unknown")
 	}
@@ -321,7 +401,7 @@ func TestAnnounceRefusesAnUnknownPlayerRatherThanStoreIt(t *testing.T) {
 func TestAnnounceNowAndPlayerTargetIsRefused(t *testing.T) {
 	cmd := announceCommand(t, "announce")
 	store := &fakeAnnounceStore{enabled: true}
-	roster := fakeAnnounceRoster{byName: map[string]string{"Dotablaze": "xuid-dota"}}
+	roster := fakeAnnounceRoster{online: map[string]string{"Dotablaze": "xuid-dota"}}
 	pctx := &plugin.Context{Announcements: store, Roster: roster}
 
 	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
@@ -343,7 +423,7 @@ func TestAnnounceNowAndPlayerTargetIsRefused(t *testing.T) {
 func TestAnnounceRefusesASecondPlayerToken(t *testing.T) {
 	cmd := announceCommand(t, "announce")
 	store := &fakeAnnounceStore{enabled: true}
-	roster := fakeAnnounceRoster{byName: map[string]string{"A": "xuid-a", "B": "xuid-b"}}
+	roster := fakeAnnounceRoster{online: map[string]string{"A": "xuid-a", "B": "xuid-b"}}
 	pctx := &plugin.Context{Announcements: store, Roster: roster}
 
 	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{

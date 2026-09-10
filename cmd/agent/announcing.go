@@ -9,6 +9,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/pgerr"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
@@ -94,6 +95,51 @@ func (a *deliveryAudience) Online() []string {
 		out = append(out, xuid)
 	}
 	return out
+}
+
+// nameArchive is the durable half of resolving a gamertag: the names this
+// server has recorded, as opposed to the names currently connected.
+// Narrowed from store.Store to the single read that needs it.
+type nameArchive interface {
+	XUIDForName(ctx context.Context, gamertag string) (xuid string, ok bool, err error)
+}
+
+// playerLookup resolves the "@player" an operator typed, live roster first
+// and the profile store second.
+//
+// One tier is not enough, and which one is missing decides whether the
+// feature works at all. The roster holds only who is connected and is
+// emptied at the start of every session, so a lookup that stopped there
+// could never name the player an offline announcement is for -- and being
+// able to leave a message for someone who is not here is the entire reason
+// the queue exists. The store alone would be worse in the other direction:
+// it cannot answer for a player this agent has watched arrive but never
+// written down.
+//
+// Ordered roster-first for cost, not correctness. The roster is an in-memory
+// map and is by definition current, and the two only ever disagree while a
+// rename is still propagating, in which case the connected player is the
+// better answer anyway.
+type playerLookup struct {
+	live    *roster.Roster
+	archive nameArchive
+}
+
+var _ plugin.Roster = playerLookup{}
+
+// XUIDFor satisfies plugin.Roster. A name neither tier knows is reported as
+// not found, never as an error: that is a real answer, and it is the one
+// the command refuses on.
+func (l playerLookup) XUIDFor(ctx context.Context, name string) (string, bool, error) {
+	if l.live != nil {
+		if xuid, ok := l.live.XUIDFor(name); ok {
+			return xuid, true, nil
+		}
+	}
+	if l.archive == nil {
+		return "", false, nil
+	}
+	return l.archive.XUIDForName(ctx, name)
 }
 
 // playerRecorder is the one thing an outbox needs from the profile store: a

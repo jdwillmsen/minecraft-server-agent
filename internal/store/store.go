@@ -68,6 +68,17 @@ type Store interface {
 	// from RecordJoin because "has a row" and "just joined" are different
 	// facts and only one of them is worth greeting.
 	EnsurePlayer(ctx context.Context, xuid, gamertag string, at time.Time) error
+	// XUIDForName resolves a gamertag to the XUID it belongs to, from what
+	// this server has recorded rather than from who is connected.
+	//
+	// The live roster answers the same question for players who are online
+	// right now, and answers it faster; this is the half that survives a
+	// logout, which is the whole point of being able to leave a message for
+	// someone who is not here. ok is false when the server has never
+	// recorded anyone by that name -- which is a different fact from
+	// "offline", and the only one that justifies refusing to store a
+	// message.
+	XUIDForName(ctx context.Context, gamertag string) (xuid string, ok bool, err error)
 	// CloseOrphans marks sessions still open from a previous run as ended
 	// without observation. Called once at startup: the agent learns of a
 	// departure by being connected, so anything still open when it starts is
@@ -91,6 +102,7 @@ func (Nop) RecordJoin(context.Context, string, string, time.Time) (Profile, erro
 }
 func (Nop) RecordLeave(context.Context, string, time.Time) error          { return nil }
 func (Nop) EnsurePlayer(context.Context, string, string, time.Time) error { return nil }
+func (Nop) XUIDForName(context.Context, string) (string, bool, error)     { return "", false, nil }
 func (Nop) CloseOrphans(context.Context, time.Time) (int, error)          { return 0, nil }
 func (Nop) Close()                                                        {}
 func (Nop) Enabled() bool                                                 { return false }

@@ -135,11 +135,20 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 		if pctx.Roster == nil {
 			return "I don't know a player named " + playerName + ".", nil
 		}
-		xuid, ok := pctx.Roster.XUIDFor(playerName)
+		xuid, ok, err := pctx.Roster.XUIDFor(ctx, playerName)
+		if err != nil {
+			// Not an answer of "no": the lookup itself could not be made,
+			// and storing on a guess would aim a private message at nobody
+			// while refusing would deny a player who does exist.
+			return "", fmt.Errorf("announce: !announce: resolve @%s: %w", playerName, err)
+		}
 		if !ok {
-			// Refuse rather than store: an announcement targeted at an XUID
-			// nobody holds can never be delivered or drained, so it would
-			// sit in the outbox forever looking like a message in flight.
+			// Nobody by that name has ever been seen -- neither connected
+			// now nor recorded before. Refuse rather than store: an
+			// announcement targeted at an XUID nobody holds can never be
+			// delivered or drained, so it would sit in the outbox forever
+			// looking like a message in flight. Being offline is not this
+			// case, which is why the lookup outlives the session.
 			return "I don't know a player named " + playerName + ".", nil
 		}
 		target = announce.TargetPlayer
