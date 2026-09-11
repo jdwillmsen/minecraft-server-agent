@@ -683,6 +683,75 @@ func TestInboxSaysWhenSomethingIsStillWaiting(t *testing.T) {
 	}
 }
 
+// The shared parser is what !schedule reuses, so its rules are pinned here
+// directly rather than only through !announce's replies: a rule that moved
+// would change both commands at once, and only a test of the helper says
+// which one it was.
+func TestParseAnnounceLine(t *testing.T) {
+	const usage = "usage"
+	atCap := strings.Repeat("é", announce.MaxBodyChars)
+	cases := []struct {
+		name        string
+		args        []string
+		want        announceLine
+		wantRefusal string // substring; "" means accepted
+	}{
+		{"plain body", []string{"hello", "all"}, announceLine{body: "hello all"}, ""},
+		{"flags before the body", []string{"!urgent", "!now", "restart"}, announceLine{now: true, urgent: true, body: "restart"}, ""},
+		{"a flag inside the body is text", []string{"the", "!urgent", "flag"}, announceLine{body: "the !urgent flag"}, ""},
+		{"player target", []string{"@Steve", "hi"}, announceLine{player: "Steve", body: "hi"}, ""},
+		{"a bare @ is text", []string{"@", "hi"}, announceLine{body: "@ hi"}, ""},
+		{"no args", nil, announceLine{}, usage},
+		{"flags only", []string{"!now", "!urgent"}, announceLine{}, usage},
+		{"two players", []string{"@A", "@B", "hi"}, announceLine{}, "one player"},
+		{"now and a player", []string{"@A", "!now", "hi"}, announceLine{}, "!now and @player"},
+		// Counted in characters: a body of multi-byte runes at the cap is
+		// twice the cap in bytes and must still be accepted.
+		{"exactly at the cap", []string{atCap}, announceLine{body: atCap}, ""},
+		{"one past the cap", []string{atCap + "x"}, announceLine{}, "at most 512"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, refusal := parseAnnounceLine(tc.args, usage)
+			if tc.wantRefusal == "" {
+				if refusal != "" {
+					t.Fatalf("refused with %q, want accepted", refusal)
+				}
+				if got != tc.want {
+					t.Errorf("parsed %+v, want %+v", got, tc.want)
+				}
+				return
+			}
+			if !strings.Contains(refusal, tc.wantRefusal) {
+				t.Errorf("refusal = %q, want it to contain %q", refusal, tc.wantRefusal)
+			}
+		})
+	}
+}
+
+// An over-long body is refused before anything is stored: the cap is only a
+// cap if nothing gets past it.
+func TestAnnounceRefusesAnOverlongBodyBeforeStoringIt(t *testing.T) {
+	cmd := announceCommand(t, "announce")
+	store := &fakeAnnounceStore{enabled: true}
+	pctx := &plugin.Context{Announcements: store, Deliverer: &fakeAnnounceDeliverer{}}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{strings.Repeat("a", announce.MaxBodyChars+1)},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(store.inserted) != 0 {
+		t.Error("an over-long announcement was stored")
+	}
+	if !strings.Contains(reply, "at most") {
+		t.Errorf("reply %q should say what the limit is", reply)
+	}
+}
+
 // delivered counts only messages whose whisper and delivery row both
 // succeeded. A player whose whispers land and whose rows fail to write is
 // owed exactly what they have just watched arrive -- and will be sent it

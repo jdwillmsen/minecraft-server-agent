@@ -2,6 +2,7 @@ package adapters
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -83,6 +84,28 @@ func (f *MetricsFacts) Version(ctx context.Context) (string, error) {
 	if f.client.mcMonitorURL == "" {
 		return notConfigured, nil
 	}
+	v, err := f.CurrentVersion(ctx)
+	if err != nil {
+		return "", err
+	}
+	return "Bedrock " + v + ".", nil
+}
+
+// errStatusUnconfigured and errBackupUnconfigured are what the raw readings
+// return without their exporter. An error rather than the player-facing
+// notConfigured line: the caller of a raw reading is a watcher comparing
+// values, and a sentence is not a version it should ever compare against.
+var (
+	errStatusUnconfigured = errors.New("metrics facts: mc-monitor is not configured")
+	errBackupUnconfigured = errors.New("metrics facts: backup exporter is not configured")
+)
+
+// CurrentVersion is the bare server_version label, for a caller that
+// compares versions rather than reading one out to a player.
+func (f *MetricsFacts) CurrentVersion(ctx context.Context) (string, error) {
+	if !f.StatusEnabled() {
+		return "", errStatusUnconfigured
+	}
 	m, err := f.client.fetch(ctx, f.client.mcMonitorURL)
 	if err != nil {
 		return "", fmt.Errorf("metrics facts: version: %w", err)
@@ -91,7 +114,54 @@ func (f *MetricsFacts) Version(ctx context.Context) (string, error) {
 	if v == "" {
 		return "", fmt.Errorf("metrics facts: version: no server_version label on any minecraft_status series")
 	}
-	return "Bedrock " + v + ".", nil
+	return v, nil
+}
+
+// BackupState is the backup exporter's reading, reduced to the facts a
+// staleness check needs.
+type BackupState struct {
+	// Completed is false while the exporter still publishes its placeholder
+	// zero: there is no backup yet, so there is no age to be stale by.
+	Completed bool
+	Age       time.Duration
+	// MaxAge is zero when the exporter publishes no policy, in which case
+	// nothing is stale because nothing says what stale means.
+	MaxAge time.Duration
+}
+
+// Stale reports whether the last backup is older than the exporter's own
+// policy allows. The same rule !backup's warning uses, defined once so a
+// warning in chat and a notice to operators can never disagree.
+func (b BackupState) Stale() bool {
+	return b.Completed && b.MaxAge > 0 && b.Age > b.MaxAge
+}
+
+// BackupState reads the backup exporter for a caller that decides what to
+// do about its age, rather than one reading it out to a player.
+func (f *MetricsFacts) BackupState(ctx context.Context) (BackupState, error) {
+	if !f.BackupEnabled() {
+		return BackupState{}, errBackupUnconfigured
+	}
+	m, err := f.client.fetch(ctx, f.client.backupURL)
+	if err != nil {
+		return BackupState{}, fmt.Errorf("metrics facts: backup state: %w", err)
+	}
+	return f.backupState(m)
+}
+
+func (f *MetricsFacts) backupState(m map[string][]sample) (BackupState, error) {
+	ts, ok := first(m, "backup_last_success_timestamp_seconds")
+	if !ok {
+		return BackupState{}, fmt.Errorf("metrics facts: backup status: exporter published no backup_last_success_timestamp_seconds")
+	}
+	if ts.value <= 0 {
+		return BackupState{}, nil
+	}
+	st := BackupState{Completed: true, Age: f.now().Sub(time.Unix(int64(ts.value), 0))}
+	if maxAge, ok := first(m, "backup_max_age_seconds"); ok && maxAge.value > 0 {
+		st.MaxAge = time.Duration(maxAge.value) * time.Second
+	}
+	return st, nil
 }
 
 // BackupStatus answers !backup: when the world was last saved, how big the
@@ -109,19 +179,18 @@ func (f *MetricsFacts) BackupStatus(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("metrics facts: backup status: %w", err)
 	}
 
-	ts, ok := first(m, "backup_last_success_timestamp_seconds")
-	if !ok {
-		return "", fmt.Errorf("metrics facts: backup status: exporter published no backup_last_success_timestamp_seconds")
+	st, err := f.backupState(m)
+	if err != nil {
+		return "", err
 	}
-	if ts.value <= 0 {
+	if !st.Completed {
 		// The exporter publishes zeros as placeholders before the first real
 		// run. Reporting "56 years ago" would be technically derived from the
 		// data and useless.
 		return "No backup has completed yet.", nil
 	}
 
-	age := f.now().Sub(time.Unix(int64(ts.value), 0))
-	parts := []string{"Last world backup " + formatAge(age) + " ago"}
+	parts := []string{"Last world backup " + formatAge(st.Age) + " ago"}
 
 	if size, ok := first(m, "backup_last_artifact_bytes"); ok && size.value > 0 {
 		parts = append(parts, formatBytes(size.value))
@@ -138,10 +207,8 @@ func (f *MetricsFacts) BackupStatus(ctx context.Context) (string, error) {
 	}
 
 	msg := strings.Join(parts, ", ") + "."
-	if maxAge, ok := first(m, "backup_max_age_seconds"); ok && maxAge.value > 0 {
-		if age > time.Duration(maxAge.value)*time.Second {
-			msg += " WARNING: that is older than this server's backup policy allows."
-		}
+	if st.Stale() {
+		msg += " WARNING: that is older than this server's backup policy allows."
 	}
 	return msg, nil
 }

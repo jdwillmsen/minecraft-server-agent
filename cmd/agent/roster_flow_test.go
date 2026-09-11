@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -47,9 +49,9 @@ type leaveRecorder struct {
 	leaves []string
 }
 
-func (s *leaveRecorder) RecordLeave(_ context.Context, xuid string, _ time.Time) error {
+func (s *leaveRecorder) RecordLeave(_ context.Context, xuid string, _, _ time.Time) (store.Playtime, error) {
 	s.leaves = append(s.leaves, xuid)
-	return nil
+	return store.Playtime{}, nil
 }
 
 // drainJoins collects every join already delivered to events. Publish is
@@ -181,7 +183,7 @@ func TestPlayerListFlow(t *testing.T) {
 			addEntry(playerXUID, "Steve"),
 		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
 
-		playerRoster.BeginSession()
+		playerRoster.BeginSession(time.Now())
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry("2535411111111111", "Alex"),
@@ -194,4 +196,125 @@ func TestPlayerListFlow(t *testing.T) {
 			t.Error("NameFor for a player absent from the reconnect snapshot = ok, want not-ok — a tellraw aimed at them would reach nobody")
 		}
 	})
+}
+
+// sessionCalls records the session writes handlePlayerList and beginWatching
+// make, in order, as "method:xuid". A join opens its session in the welcome
+// plugin, off the bus, so it shows up here only as a published join.
+type sessionCalls struct {
+	store.Nop
+	calls []string
+	// failOpening fails CloseOrphans and ResumeSession, the two writes a
+	// connection starts with.
+	failOpening bool
+	closedAt    []time.Time
+	leaveSince  []time.Time
+}
+
+func (s *sessionCalls) RecordLeave(_ context.Context, xuid string, since, _ time.Time) (store.Playtime, error) {
+	s.calls = append(s.calls, "leave:"+xuid)
+	s.leaveSince = append(s.leaveSince, since)
+	return store.Playtime{}, nil
+}
+
+func (s *sessionCalls) ResumeSession(_ context.Context, xuid, _ string, _ time.Time) (bool, error) {
+	s.calls = append(s.calls, "resume:"+xuid)
+	if s.failOpening {
+		return false, errors.New("database unreachable")
+	}
+	return false, nil
+}
+
+func (s *sessionCalls) CloseOrphans(_ context.Context, at time.Time) (int, error) {
+	s.calls = append(s.calls, "close-orphans")
+	s.closedAt = append(s.closedAt, at)
+	if s.failOpening {
+		return 0, errors.New("database unreachable")
+	}
+	return 0, nil
+}
+
+// A player seen joining before a disconnect may have left and returned
+// while the agent was away, so their open session cannot be trusted to
+// measure anything. The reconnect closes it before the snapshot is read,
+// the snapshot opens a fresh one, and the eventual leave closes that --
+// never the session from before the gap. Nobody is greeted for being in
+// the snapshot.
+func TestReconnectRestartsTheSessionsOfPlayersStillOnline(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	events, _ := eventBus.Subscribe(roster.JoinKind, 8)
+	playerRoster := roster.New()
+	profiles := &sessionCalls{}
+
+	beginWatching(context.Background(), playerRoster, profiles, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	if joins := drainJoins(t, events); len(joins) != 1 {
+		t.Fatalf("got %d joins before the disconnect, want Steve's", len(joins))
+	}
+
+	beginWatching(context.Background(), playerRoster, profiles, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(siblingBot, "AfkBot"),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	handlePlayerList(context.Background(), wire(t,
+		removeEntry(playerXUID),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+
+	want := []string{
+		"close-orphans",
+		"close-orphans",
+		"resume:" + playerXUID,
+		"leave:" + playerXUID,
+	}
+	if !slices.Equal(profiles.calls, want) {
+		t.Errorf("session writes = %v, want %v", profiles.calls, want)
+	}
+	if joins := drainJoins(t, events); len(joins) != 0 {
+		t.Errorf("got %d joins from the reconnect snapshot, want 0: %+v", len(joins), joins)
+	}
+}
+
+// When the close a connection starts with and the snapshot's fresh session
+// both fail, the session from before the gap is still open when the player
+// leaves. The leave must carry when this connection began, so the store can
+// tell that session was never watched through and credit none of it.
+func TestALeaveAfterFailedReconnectWritesCarriesTheConnectionStart(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	playerRoster := roster.New()
+	profiles := &sessionCalls{}
+
+	beginWatching(context.Background(), playerRoster, profiles, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+
+	profiles.failOpening = true
+	beginWatching(context.Background(), playerRoster, profiles, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	profiles.failOpening = false
+	handlePlayerList(context.Background(), wire(t,
+		removeEntry(playerXUID),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+
+	if len(profiles.closedAt) != 2 || len(profiles.leaveSince) != 1 {
+		t.Fatalf("session writes = %v, want two connection starts and one leave", profiles.calls)
+	}
+	if got, want := profiles.leaveSince[0], profiles.closedAt[1]; !got.Equal(want) {
+		t.Errorf("leave since = %v, want the reconnect's start %v", got, want)
+	}
 }

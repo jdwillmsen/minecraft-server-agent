@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -81,17 +82,21 @@ func (p *Postgres) RecordJoin(ctx context.Context, xuid, gamertag string, at tim
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if err := lockPlayer(ctx, tx, xuid); err != nil {
+		return Profile{}, err
+	}
 	prior := Profile{XUID: xuid, Gamertag: gamertag}
 	err = tx.QueryRow(ctx, `
 		SELECT p.first_seen_at, p.last_seen_at, p.join_count,
-		       COALESCE(SUM(s.duration_seconds), 0)::BIGINT,
-		       COUNT(s.session_id) FILTER (WHERE s.ended_reason = 'unknown')
+		       COALESCE(SUM(s.duration_seconds) FILTER (WHERE s.ended_reason = 'left'), 0)::BIGINT,
+		       COUNT(s.session_id) FILTER (WHERE s.ended_reason = 'unknown'),
+		       COUNT(s.session_id)
 		FROM minecraft.players p
 		LEFT JOIN minecraft.sessions s ON s.xuid = p.xuid
 		WHERE p.xuid = $1
 		GROUP BY p.first_seen_at, p.last_seen_at, p.join_count`,
 		xuid,
-	).Scan(&prior.FirstSeen, &prior.LastSeen, &prior.JoinCount, &prior.TotalSeconds, &prior.UncleanSessions)
+	).Scan(&prior.FirstSeen, &prior.LastSeen, &prior.JoinCount, &prior.TotalSeconds, &prior.UncleanSessions, &prior.Sessions)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return Profile{}, fmt.Errorf("store: read profile: %w", err)
 	}
@@ -119,24 +124,8 @@ func (p *Postgres) RecordJoin(ctx context.Context, xuid, gamertag string, at tim
 		return Profile{}, fmt.Errorf("store: record name: %w", err)
 	}
 
-	// Any session still open for this player belongs to a visit whose end was
-	// never observed -- the agent was away for it. Closing it here rather
-	// than leaving two open sessions keeps playtime arithmetic honest.
-	if _, err := tx.Exec(ctx, `
-		UPDATE minecraft.sessions
-		SET left_at = $2, ended_reason = 'unknown'
-		WHERE xuid = $1 AND ended_reason = 'open'`,
-		xuid, at,
-	); err != nil {
-		return Profile{}, fmt.Errorf("store: close stale sessions: %w", err)
-	}
-
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO minecraft.sessions (xuid, gamertag, joined_at)
-		VALUES ($1, $2, $3)`,
-		xuid, gamertag, at,
-	); err != nil {
-		return Profile{}, fmt.Errorf("store: open session: %w", err)
+	if err := openSession(ctx, tx, xuid, gamertag, at); err != nil {
+		return Profile{}, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -149,6 +138,77 @@ func (p *Postgres) RecordJoin(ctx context.Context, xuid, gamertag string, at tim
 	return prior, nil
 }
 
+// lockPlayer serializes the transactions that decide whether a player has
+// been seen before. RecordJoin runs on a dispatch goroutine and ResumeSession
+// on the read loop, so both can reach a brand-new player at once; under READ
+// COMMITTED neither would see the other's session, and operators would be
+// told twice. Held until the transaction ends.
+func lockPlayer(ctx context.Context, tx pgx.Tx, xuid string) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('minecraft.player:' || $1))`, xuid); err != nil {
+		return fmt.Errorf("store: lock player: %w", err)
+	}
+	return nil
+}
+
+// openSession starts the player's one open session, closing any other first.
+//
+// A session still open here belongs to a visit whose end was never observed.
+// Every connection closes those as it begins, so one surviving to this point
+// means that close failed. Closed at its own joined_at, the way CloseOrphans
+// closes one, and never at this new start: that would credit the player with
+// their whole absence, days of it after a long break, and a milestone read
+// off that total would be announced to the server as fact.
+func openSession(ctx context.Context, tx pgx.Tx, xuid, gamertag string, at time.Time) error {
+	if _, err := tx.Exec(ctx, `
+		UPDATE minecraft.sessions
+		SET left_at = joined_at, ended_reason = 'unknown'
+		WHERE xuid = $1 AND ended_reason = 'open'`,
+		xuid,
+	); err != nil {
+		return fmt.Errorf("store: close stale sessions: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO minecraft.sessions (xuid, gamertag, joined_at)
+		VALUES ($1, $2, $3)`,
+		xuid, gamertag, at,
+	); err != nil {
+		return fmt.Errorf("store: open session: %w", err)
+	}
+	return nil
+}
+
+// ResumeSession opens a session for a player already connected, leaving
+// their profile as it was: no join counted, last_seen_at not advanced, the
+// player row created bare if this is the first the agent has heard of them,
+// exactly as EnsurePlayer would.
+func (p *Postgres) ResumeSession(ctx context.Context, xuid, gamertag string, at time.Time) (bool, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("store: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := lockPlayer(ctx, tx, xuid); err != nil {
+		return false, err
+	}
+	if err := ensurePlayer(ctx, tx, xuid, gamertag, at); err != nil {
+		return false, err
+	}
+	var firstSeen bool
+	if err := tx.QueryRow(ctx,
+		`SELECT NOT EXISTS (SELECT 1 FROM minecraft.sessions WHERE xuid = $1)`, xuid,
+	).Scan(&firstSeen); err != nil {
+		return false, fmt.Errorf("store: read sessions: %w", err)
+	}
+	if err := openSession(ctx, tx, xuid, gamertag, at); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("store: commit: %w", err)
+	}
+	return firstSeen, nil
+}
+
 // EnsurePlayer inserts the minimum row a foreign key needs and leaves an
 // existing one untouched.
 //
@@ -159,7 +219,13 @@ func (p *Postgres) RecordJoin(ctx context.Context, xuid, gamertag string, at tim
 // all it has ever meant -- the server saw them earlier, and nothing here can
 // know when.
 func (p *Postgres) EnsurePlayer(ctx context.Context, xuid, gamertag string, at time.Time) error {
-	if _, err := p.pool.Exec(ctx, `
+	return ensurePlayer(ctx, p.pool, xuid, gamertag, at)
+}
+
+func ensurePlayer(ctx context.Context, db interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}, xuid, gamertag string, at time.Time) error {
+	if _, err := db.Exec(ctx, `
 		INSERT INTO minecraft.players (xuid, current_gamertag, first_seen_at, last_seen_at)
 		VALUES ($1, $2, $3, $3)
 		ON CONFLICT (xuid) DO NOTHING`,
@@ -209,20 +275,68 @@ func (p *Postgres) XUIDForName(ctx context.Context, gamertag string) (string, bo
 	return xuid, true, nil
 }
 
-func (p *Postgres) RecordLeave(ctx context.Context, xuid string, at time.Time) error {
-	_, err := p.pool.Exec(ctx, `
-		UPDATE minecraft.sessions
-		SET left_at = $2, ended_reason = 'left'
-		WHERE xuid = $1 AND ended_reason = 'open'`,
-		xuid, at,
-	)
+// RecordLeave closes the open session and reports the totals around it in
+// one statement.
+//
+// One statement is what makes the two totals comparable. Every part of a
+// statement reads the same snapshot, taken before its own UPDATE applies, so
+// prior sums the sessions as they stood -- the open one contributing nothing,
+// since its generated duration is NULL until left_at is set -- and closed
+// returns the duration the UPDATE just gave it. After is their sum, not a
+// second read that a concurrent join could have moved.
+//
+// prior counts only 'left' sessions, the ones whose end was watched, the
+// same rule RecordJoin's TotalSeconds uses so a greeting and a milestone
+// never disagree. An 'unknown' session's duration is a guess: this agent
+// now closes one at zero length, but rows written before that carry the
+// player's entire absence, and a milestone read off them would announce
+// hours nobody played. closed needs no filter; everything it returns has
+// just been set to 'left'.
+//
+// Only a session that began at or after since is closed as 'left'. One
+// older than that was open when the current connection began, which means
+// the close every connection starts with failed and nothing replaced it:
+// the player may have left and returned unseen, so stale closes it at its
+// own joined_at like CloseOrphans would, and it adds nothing.
+//
+// No open session is not an error: after equals before and the gamertag is
+// blank, which reads to the caller as a departure that changed nothing.
+func (p *Postgres) RecordLeave(ctx context.Context, xuid string, since, at time.Time) (Playtime, error) {
+	var gamertag string
+	var before, after int64
+	err := p.pool.QueryRow(ctx, `
+		WITH stale AS (
+		    UPDATE minecraft.sessions
+		    SET left_at = joined_at, ended_reason = 'unknown'
+		    WHERE xuid = $1 AND ended_reason = 'open' AND joined_at < $3
+		), closed AS (
+		    UPDATE minecraft.sessions
+		    SET left_at = $2, ended_reason = 'left'
+		    WHERE xuid = $1 AND ended_reason = 'open' AND joined_at >= $3
+		    RETURNING gamertag, duration_seconds
+		), prior AS (
+		    SELECT COALESCE(SUM(duration_seconds) FILTER (WHERE ended_reason = 'left'), 0)::BIGINT AS total
+		    FROM minecraft.sessions
+		    WHERE xuid = $1
+		)
+		SELECT COALESCE((SELECT MAX(gamertag) FROM closed), ''),
+		       prior.total,
+		       prior.total + COALESCE((SELECT SUM(duration_seconds) FROM closed), 0)::BIGINT
+		FROM prior`,
+		xuid, at, since,
+	).Scan(&gamertag, &before, &after)
 	if err != nil {
-		return fmt.Errorf("store: close session: %w", err)
+		return Playtime{}, fmt.Errorf("store: close session: %w", err)
 	}
-	return nil
+	return Playtime{
+		Gamertag: gamertag,
+		Before:   time.Duration(before) * time.Second,
+		After:    time.Duration(after) * time.Second,
+	}, nil
 }
 
-// CloseOrphans ends sessions left open by a previous run.
+// CloseOrphans ends sessions left open by a previous run or a previous
+// connection.
 //
 // left_at is the session's own joined_at, not now: the agent has no idea when
 // those players actually left, and crediting them with the entire downtime

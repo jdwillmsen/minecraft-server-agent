@@ -64,6 +64,17 @@ const MaxNormalPerJoin = 3
 // that an ordinary backlog is answered rather than abandoned.
 const MaxPerInbox = 5
 
+// MaxBodyChars caps an announcement's body, in characters rather than
+// bytes, for every source that lets a person or a system choose the words.
+//
+// Set at what an operator can already type into Bedrock chat, so the cap
+// changes nothing for !announce and exists for the sources that are not
+// bound by a chat box: a schedule repeats its body indefinitely, and the
+// HTTP API accepts whatever a script hands it. Nothing downstream truncates
+// -- the console bridge sends what it is given -- so a body this long is
+// refused where it is written rather than cut off mid-word in chat.
+const MaxBodyChars = 512
+
 // Announcement is one thing the server wants said.
 type Announcement struct {
 	ID           int64
@@ -78,6 +89,11 @@ type Announcement struct {
 	DeliverAfter time.Time
 	// ExpiresAt nil means the announcement never goes stale.
 	ExpiresAt *time.Time
+	// ScheduleID is the schedule that fired this, zero for every other
+	// source. Written only by a schedule firing -- see FireSchedule -- so
+	// the one-off write path never names a column a database without
+	// schedules does not have.
+	ScheduleID int64
 }
 
 // DeliveryFor derives how an announcement is said from who it is for.

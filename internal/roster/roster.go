@@ -9,7 +9,10 @@
 // (for an announcement deciding who actually hears it).
 package roster
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Entry is one player's identity as reported by the server's own roster,
 // not the spoofable chat SourceName field.
@@ -60,6 +63,9 @@ type Roster struct {
 	// add record immediately after login, so without this the whole
 	// existing population would look like a burst of arrivals.
 	snapshotSeen bool
+	// since is when the current session began watching; zero before the
+	// first one.
+	since time.Time
 }
 
 // New builds an empty Roster awaiting its first session snapshot.
@@ -72,13 +78,25 @@ func New() *Roster {
 // across a disconnect gap the retained map is not merely incomplete but
 // wrong: it would claim players who have since left are still online (and
 // suppress a genuine rejoin as already-known). Call this at the start of
-// every session, before any packet from it is applied.
-func (r *Roster) BeginSession() {
+// every session, before any packet from it is applied, with the moment it
+// began watching.
+func (r *Roster) BeginSession(at time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.since = at
 	r.players = make(map[string]string)
 	r.xuidByUUID = make(map[string]string)
 	r.snapshotSeen = false
+}
+
+// Since reports when the current session began watching, as given to
+// BeginSession. A presence that started before it was not watched through:
+// whatever happened across the gap -- a departure, a return -- was never
+// seen. Zero before any session, which makes everything count as watched.
+func (r *Roster) Since() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.since
 }
 
 // Apply updates the roster from one PlayerList packet's entries and
@@ -94,10 +112,10 @@ func (r *Roster) BeginSession() {
 //
 // The first packet of a session carrying at least one usable add is the
 // server's roster snapshot: those players were already connected before
-// this process was watching, so they are recorded but never reported as
-// joins. Neither an empty packet nor a removal consumes it, so neither can
-// cause the real snapshot behind it to be mistaken for arrivals.
-func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves []Entry) {
+// this process was watching, so they are recorded and reported as present
+// rather than as joins. Neither an empty packet nor a removal consumes it, so
+// neither can cause the real snapshot behind it to be mistaken for arrivals.
+func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -132,12 +150,17 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves []Entry) {
 		if e.UUID != "" {
 			r.xuidByUUID[e.UUID] = e.XUID
 		}
-		if _, known := r.players[e.XUID]; !known && !snapshot {
-			joins = append(joins, Entry{XUID: e.XUID, Username: e.Username})
+		if _, known := r.players[e.XUID]; !known {
+			entry := Entry{XUID: e.XUID, Username: e.Username}
+			if snapshot {
+				present = append(present, entry)
+			} else {
+				joins = append(joins, entry)
+			}
 		}
 		r.players[e.XUID] = e.Username
 	}
-	return joins, leaves
+	return joins, leaves, present
 }
 
 // NameFor returns the username currently on record for xuid, so a caller

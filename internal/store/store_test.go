@@ -57,11 +57,16 @@ func TestNopStoreIsSafeAndInert(t *testing.T) {
 	if !profile.New() {
 		t.Error("Nop returned a profile that is not new; greetings would claim knowledge it does not have")
 	}
-	if err := s.RecordLeave(context.Background(), "xuid", at); err != nil {
-		t.Errorf("RecordLeave: %v", err)
+	// Equal totals, both zero: a departure that changed nothing, so no
+	// milestone can ever be read off a store that remembers nothing.
+	if pt, err := s.RecordLeave(context.Background(), "xuid", at, at); err != nil || pt != (Playtime{}) {
+		t.Errorf("RecordLeave = (%+v, %v), want a zero Playtime and no error", pt, err)
 	}
 	if err := s.EnsurePlayer(context.Background(), "xuid", "Steve", at); err != nil {
 		t.Errorf("EnsurePlayer: %v", err)
+	}
+	if firstSeen, err := s.ResumeSession(context.Background(), "xuid", "Steve", at); err != nil || firstSeen {
+		t.Errorf("ResumeSession = (%v, %v), want (false, nil): a store that records nothing has seen nobody", firstSeen, err)
 	}
 	if n, err := s.CloseOrphans(context.Background(), at); err != nil || n != 0 {
 		t.Errorf("CloseOrphans = (%d, %v), want (0, nil)", n, err)

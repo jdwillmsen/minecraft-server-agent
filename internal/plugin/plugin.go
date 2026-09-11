@@ -226,6 +226,9 @@ type Context struct {
 	// than assuming it.
 	Announcements AnnounceStore
 	Deliverer     AnnounceDeliverer
+	// Schedules may be nil on the same terms: cmd/agent always supplies
+	// one, and !schedule asks Enabled before every use.
+	Schedules ScheduleStore
 	// Roster resolves a "@player" reference in a command (!announce) to the
 	// XUID every other capability keys on. May be nil -- a command that
 	// needs it must refuse plainly rather than assume it can resolve one.
@@ -308,6 +311,17 @@ type AnnounceStore interface {
 type AnnounceDeliverer interface {
 	SendNow(ctx context.Context, a announce.Announcement, id int64) (int, error)
 	DrainAll(ctx context.Context, xuid string, now time.Time) (delivered, remaining int, err error)
+}
+
+// ScheduleStore is what a command may do with recurring announcements:
+// create, list and stop them. Firing one belongs to the schedule loop, the
+// only thing that claims an occurrence, so no command can make a reminder
+// fire twice.
+type ScheduleStore interface {
+	AddSchedule(ctx context.Context, s announce.Schedule) (int64, error)
+	ListSchedules(ctx context.Context) ([]announce.Schedule, error)
+	DeactivateSchedule(ctx context.Context, id int64) (ok bool, err error)
+	Enabled() bool
 }
 
 // Roster resolves a player's XUID from a gamertag typed into a command,

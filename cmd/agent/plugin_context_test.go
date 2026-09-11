@@ -49,6 +49,7 @@ func testPluginContext() *plugin.Context {
 		deliverer,
 		adapters.NewServerPinger(bridgeClient, (&linkMeter{}).roundTrip, logging.New("error")),
 		moderation.Nop{},
+		announce.Nop{},
 	)
 }
 

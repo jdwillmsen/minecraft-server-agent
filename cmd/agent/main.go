@@ -40,6 +40,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/sources"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/toolset"
@@ -126,6 +127,7 @@ func main() {
 	var knowledgeStore knowledge.Store = knowledge.Nop{}
 	var waypointStore waypoints.Store = waypoints.Nop{}
 	var announceStore announce.Store = announce.Nop{}
+	var scheduleStore announce.ScheduleStore = announce.Nop{}
 	var auditor audit.Store = audit.Nop{}
 	var moderationStore moderation.Store = moderation.Nop{}
 	if pg, ok := playerStore.(*store.Postgres); ok && pg.Pool() != nil {
@@ -135,7 +137,10 @@ func main() {
 		auditor = newAuditTrail(audit.NewPostgres(pg.Pool()), log)
 		// Wrapped rather than used directly: every announcement row names a
 		// player that minecraft.players must already hold -- see outbox.
-		announceStore = newOutbox(announce.NewPostgres(pg.Pool()), pg, playerRoster, log)
+		announcePG := announce.NewPostgres(pg.Pool())
+		ob := newOutbox(announcePG, pg, playerRoster, log)
+		announceStore = ob
+		scheduleStore = scheduleBook{ScheduleStore: announcePG, outbox: ob}
 		log.Info("knowledge_ready", nil)
 	}
 
@@ -158,6 +163,9 @@ func main() {
 		announcePermissions{resolver: permResolver},
 		log,
 	)
+	// Wrapped only now: the stores above type-assert the concrete Postgres
+	// to borrow its pool, which the wrapper would hide from them.
+	playerStore = withPlayerEvents(playerStore, sources.NewEvents(ctx, deliverer, log))
 
 	registry := plugin.NewRegistry()
 	if err := registerPlugins(ctx, registry, deliverer, cfg.ModerationTerms, log); err != nil {
@@ -165,7 +173,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, voice, playerRoster, registry, playerStore, knowledgeStore, waypointStore, announceStore, deliverer, pinger, moderationStore)
+	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, voice, playerRoster, registry, playerStore, knowledgeStore, waypointStore, announceStore, deliverer, pinger, moderationStore, scheduleStore)
 	// Every answerable chat message and every roster join is published
 	// here; event-driven plugins (welcome) subscribe via startEventDispatch
 	// rather than touching the connection directly.
@@ -180,6 +188,8 @@ func main() {
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
 	go sampleGameClock(ctx, pinger, link.roundTrip, bridgeTimeout, log)
 	go pruneModerationLog(ctx, moderationStore, moderationPruneInterval, log)
+	go runServerWatcher(ctx, cfg, bridgeTimeout, announceStore, deliverer, log)
+	go runScheduler(ctx, scheduleStore, deliverer, log)
 
 	httpServer, err := httpapi.New(cfg.HTTPAddr)
 	if err != nil {
@@ -189,6 +199,10 @@ func main() {
 		log.Error("http_bind_failed", logging.Fields{"error": err.Error()})
 		os.Exit(1)
 	}
+	// Same two-tier lookup !announce @player uses, so a name the API and the
+	// command resolve can never mean two different players.
+	apiOn := httpServer.MountAnnouncements(cfg.AnnounceAPIToken, deliverer, playerLookup{live: playerRoster, archive: playerStore}, log)
+	log.Info("announce_api", logging.Fields{"enabled": apiOn})
 
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil {
@@ -247,6 +261,7 @@ func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer p
 		plugins.NewAnnounce(),
 		plugins.NewAnnounceDrain(ctx, deliverer, log),
 		mod,
+		plugins.NewSchedule(),
 	} {
 		if err := registry.Register(p); err != nil {
 			return fmt.Errorf("%s: %w", p.Name(), err)
@@ -589,10 +604,7 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		return fmt.Errorf("spawn: %w", err)
 	}
 
-	// Anything the roster still holds predates this connection and cannot
-	// be trusted: leaves that happened while disconnected were never seen.
-	// The server's own opening PlayerList repopulates it from scratch.
-	playerRoster.BeginSession()
+	beginWatching(ctx, playerRoster, playerStore, log)
 
 	selfXUID := conn.IdentityData().XUID
 	log.Info("spawned", logging.Fields{"self_xuid": selfXUID})
@@ -624,6 +636,31 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		handleLiveness(pk, respawner, conn, log, httpServer.SetReady)
 
 		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, ans, playerStore, auditor)
+	}
+}
+
+// beginWatching resets everything the agent believes about who is online, at
+// the start of a connection and before any of its packets are applied.
+//
+// Anything the roster still holds predates this connection and cannot be
+// trusted: leaves that happened while disconnected were never seen. The
+// server's own opening PlayerList repopulates it from scratch. The same goes
+// for open sessions, which are closed at zero length rather than left for a
+// later departure to close: a player who left and came back unseen would
+// otherwise be credited with their whole absence. handlePlayerList reopens a
+// session for each player the snapshot shows is still here.
+//
+// The roster keeps when this began, and every departure passes it to
+// RecordLeave. If both this close and the snapshot's ResumeSession fail, a
+// session from before the gap is still open when the player leaves, and
+// that is what stops it being credited.
+func beginWatching(ctx context.Context, playerRoster *roster.Roster, playerStore store.Store, log *logging.Logger) {
+	now := time.Now()
+	playerRoster.BeginSession(now)
+	if n, err := playerStore.CloseOrphans(ctx, now); err != nil {
+		log.Error("store_close_orphans_failed", logging.Fields{"error": err.Error()})
+	} else if n > 0 {
+		log.Info("store_closed_orphans", logging.Fields{"sessions": n})
 	}
 }
 
@@ -698,7 +735,7 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 // RecordJoin without reporting anything, and no player arrival was ever
 // persisted. Nothing failed loudly, because the one branch that would have
 // logged is the error path of the call that was not being made.
-func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, voice plugin.Voice, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store, announceStore plugin.AnnounceStore, deliverer plugin.AnnounceDeliverer, pinger plugin.Pinger, moderationStore plugin.ModerationStore) *plugin.Context {
+func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, voice plugin.Voice, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store, announceStore plugin.AnnounceStore, deliverer plugin.AnnounceDeliverer, pinger plugin.Pinger, moderationStore plugin.ModerationStore, scheduleStore plugin.ScheduleStore) *plugin.Context {
 	return &plugin.Context{
 		// The same Voice the Deliverer speaks through, passed in rather than
 		// built here: an announcement and a command reply are the same console
@@ -727,6 +764,8 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 		// construct a bare Context.
 		Announcements: announceStore,
 		Deliverer:     deliverer,
+		// Same again: the disabled implementation with no database.
+		Schedules: scheduleStore,
 		// The live roster backed by the profile store, so "@player" resolves
 		// for someone who is offline -- which is precisely who a queued
 		// announcement is for. With no database configured the second tier
@@ -771,14 +810,8 @@ func openStore(ctx context.Context, cfg config.Config, log *logging.Logger) stor
 		log.Error("store_open_failed", logging.Fields{"error": err.Error()})
 		return store.Nop{}
 	}
-	// Sessions still open belong to a previous run: the agent learns of a
-	// departure by being connected, so anything open at startup ended while
-	// it was away.
-	if n, err := pg.CloseOrphans(ctx, time.Now()); err != nil {
-		log.Error("store_close_orphans_failed", logging.Fields{"error": err.Error()})
-	} else if n > 0 {
-		log.Info("store_closed_orphans", logging.Fields{"sessions": n})
-	}
+	// Sessions a previous run left open are closed by beginWatching, at the
+	// start of every connection including the first.
 	log.Info("store_ready", logging.Fields{"database": cfg.PGDatabase})
 	return pg
 }
@@ -949,7 +982,19 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 		}
 	}
 
-	joins, leaves := playerRoster.Apply(entries)
+	joins, leaves, alreadyOnline := playerRoster.Apply(entries)
+	// Already here when this connection began, so their session restarts now
+	// -- playtime counts only what the agent watched -- and nothing greets
+	// them: they did not just arrive. The one exception is a player the agent
+	// has never seen before, whom operators are told of once.
+	for _, p := range alreadyOnline {
+		if chat.IsSelfOrSibling(p.XUID, selfXUID, siblingXUIDs) {
+			continue
+		}
+		if _, err := playerStore.ResumeSession(ctx, p.XUID, p.Username, time.Now()); err != nil {
+			log.Error("store_resume_session_failed", logging.Fields{"xuid": p.XUID, "error": err.Error()})
+		}
+	}
 	for _, join := range joins {
 		if chat.IsSelfOrSibling(join.XUID, selfXUID, siblingXUIDs) {
 			continue
@@ -965,9 +1010,10 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 			continue
 		}
 		log.Info("player_left", logging.Fields{"xuid": leave.XUID, "username": leave.Username})
-		if err := playerStore.RecordLeave(ctx, leave.XUID, time.Now()); err != nil {
-			// Logged, never fatal: an unclosed session is recoverable at the
-			// next startup, and a database problem must not disturb the game.
+		if _, err := playerStore.RecordLeave(ctx, leave.XUID, playerRoster.Since(), time.Now()); err != nil {
+			// Logged, never fatal: the session stays open until the next
+			// connection closes it at zero length, so this visit's time is
+			// lost, and a database problem must not disturb the game.
 			log.Error("store_record_leave_failed", logging.Fields{"xuid": leave.XUID, "error": err.Error()})
 		}
 	}
