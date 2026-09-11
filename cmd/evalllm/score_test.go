@@ -235,3 +235,25 @@ func TestCleanCatchesLeakedToolMarkup(t *testing.T) {
 		t.Error("clean was scored on an answer that never came")
 	}
 }
+
+// Production cleanup strips markup and closing questions from the reply, so
+// clean and no_question must judge what the model wrote or they would pass
+// by construction.
+func TestCleanAndNoQuestionJudgeTheModelsOwnText(t *testing.T) {
+	o := answered("Your stash is saved.")
+	o.Rounds[0].Content = "Your stash is saved. <tool_call>"
+	if check(t, Score(testCase(t, nil), o, testLimits()), DimClean).Pass {
+		t.Error("markup the model wrote passed because the reply had it cut")
+	}
+
+	o = answered("Your stash is saved.")
+	o.Rounds[0].Content = "Your stash is saved. Anything else?"
+	if check(t, Score(testCase(t, nil), o, testLimits()), DimNoQuestion).Pass {
+		t.Error("a closing question the model wrote passed because the reply had it trimmed")
+	}
+
+	o = Observation{Latency: time.Second, Rounds: []Round{{Status: 200, Content: "How can I help?"}}}
+	if got := check(t, Score(testCase(t, nil), o, testLimits()), DimNoQuestion); !got.Scored || got.Pass {
+		t.Errorf("a question the cleanup emptied: scored = %v, pass = %v, want a scored failure", got.Scored, got.Pass)
+	}
+}

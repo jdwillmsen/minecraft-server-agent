@@ -20,7 +20,7 @@ const (
 	DimTools Dimension = "tools"
 	// DimContent: the reply says what it must and nothing it must not.
 	DimContent Dimension = "content"
-	// DimClean: nothing meant for a machine reaches chat -- tool-call
+	// DimClean: the model wrote nothing meant for a machine -- tool-call
 	// markup the backend failed to parse into a structured call, or the
 	// markdown the system prompt forbids. Scored apart from content
 	// because the same leak can hide inside an otherwise correct answer.
@@ -31,7 +31,7 @@ const (
 	// DimLength: the model's own text fit the chat limit, so the agent did
 	// not have to cut it mid-sentence.
 	DimLength Dimension = "length"
-	// DimNoQuestion: the reply does not end on a question, the system
+	// DimNoQuestion: the model did not end on a question, the system
 	// prompt's guard against two bots talking forever.
 	DimNoQuestion Dimension = "no_question"
 	// DimLatency: the whole answer arrived within the budget.
@@ -88,10 +88,10 @@ func Score(c Case, o Observation, lim Limits) Result {
 		scoreAnswered(o),
 		scoreTools(c, o, lim),
 		scoreContent(c, o),
-		scoreClean(o, answered),
+		scoreClean(o),
 		scorePrivacy(c, o, lim),
 		scoreLength(o, answered, lim),
-		scoreNoQuestion(o, answered),
+		scoreNoQuestion(o),
 		scoreLatency(o, lim),
 	}}
 }
@@ -171,13 +171,25 @@ func scoreContent(c Case, o Observation) Check {
 // prompt forbids. Bedrock chat shows every one of these literally.
 var chatMarkup = []string{"<tool_call", "</tool_call", "<function=", "</function", "<parameter=", "```", "**"}
 
-func scoreClean(o Observation, answered bool) Check {
-	if !answered {
+// modelText is what the model itself wrote in the round that became the
+// reply, before production's cleanup. clean and no_question judge it rather
+// than the reply: the client cuts markup and closing questions, so the reply
+// would pass by construction and hide a model that still writes them. A
+// reply the cleanup emptied is still scored here.
+func modelText(o Observation) (string, bool) {
+	final, ok := o.finalRound()
+	written := strings.Join(strings.Fields(final.Content), " ")
+	return written, ok && written != ""
+}
+
+func scoreClean(o Observation) Check {
+	written, ok := modelText(o)
+	if !ok {
 		return Check{Dim: DimClean}
 	}
 	var problems []string
 	for _, m := range chatMarkup {
-		if strings.Contains(o.Reply, m) {
+		if strings.Contains(written, m) {
 			problems = append(problems, fmt.Sprintf("contains %q", m))
 		}
 	}
@@ -231,11 +243,12 @@ func scoreLength(o Observation, answered bool, lim Limits) Check {
 	return verdict(DimLength, problems)
 }
 
-func scoreNoQuestion(o Observation, answered bool) Check {
-	if !answered {
+func scoreNoQuestion(o Observation) Check {
+	written, ok := modelText(o)
+	if !ok {
 		return Check{Dim: DimNoQuestion}
 	}
-	if endsWithQuestion(o.Reply) {
+	if endsWithQuestion(written) {
 		return verdict(DimNoQuestion, []string{"ends with a question"})
 	}
 	return verdict(DimNoQuestion, nil)

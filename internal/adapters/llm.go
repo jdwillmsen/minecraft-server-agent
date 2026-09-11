@@ -231,9 +231,13 @@ func cutToolMarkup(s string) string {
 	return s[:cut]
 }
 
-// questionClosers may follow a question mark without making the sentence
-// any less a question.
-const questionClosers = "\"')]}”’"
+// sentenceClosers may follow a terminator without starting a new sentence:
+// `"is it up?"` is still a question and `(see spawn.)` still a statement.
+const sentenceClosers = "\"')]}”’"
+
+// clauseBreaks join a statement to a tag question in one sentence. A bare
+// hyphen is not one: "-2291" is a coordinate.
+var clauseBreaks = []string{",", "，", " - ", "–", "—"}
 
 // trimTrailingQuestions drops closing sentences that end in a question mark.
 //
@@ -242,30 +246,49 @@ const questionClosers = "\"')]}”’"
 // is a conversation nothing ends. The prompt alone does not hold: greeted,
 // the production model answered "How can I assist you today?" every time.
 // Only the closing sentences are touched, since a question earlier in a
-// reply that ends on a statement invites nothing. A reply that is nothing
-// but questions comes back empty.
+// reply that ends on a statement invites nothing. A closing question joined
+// to a statement by a comma or dash loses only the part after the last
+// break, so "Your base is at 1843 64 -2291, want directions?" keeps its
+// answer. A reply that is nothing but questions comes back empty.
 func trimTrailingQuestions(s string) string {
 	for {
 		s = strings.TrimSpace(s)
-		body := strings.TrimRight(s, questionClosers)
+		body := strings.TrimRight(s, sentenceClosers)
 		if !strings.HasSuffix(body, "?") && !strings.HasSuffix(body, "？") {
 			return s
 		}
-		s = s[:lastSentenceEnd(strings.TrimRight(body, "?？"))]
+		body = strings.TrimRight(body, "?？")
+		start := lastSentenceEnd(body)
+		s = body[:start+lastClauseBreak(body[start:])]
 	}
 }
 
-// lastSentenceEnd is the index just past the last sentence terminator that
-// is followed by a space, or 0 when s is a single sentence. Requiring the
-// space keeps a version like "1.21.100.7" from reading as four sentences.
+// lastSentenceEnd is the index just past the last sentence terminator, and
+// any closers after it, that is followed by a space, or 0 when s is a single
+// sentence. Requiring the space keeps a version like "1.21.100.7" from
+// reading as four sentences.
 func lastSentenceEnd(s string) int {
 	end := 0
-	for i := 0; i+1 < len(s); i++ {
-		if (s[i] == '.' || s[i] == '!' || s[i] == '?') && s[i+1] == ' ' {
-			end = i + 1
+	for i := 0; i < len(s); i++ {
+		if s[i] != '.' && s[i] != '!' && s[i] != '?' {
+			continue
+		}
+		rest := strings.TrimLeft(s[i+1:], sentenceClosers)
+		if strings.HasPrefix(rest, " ") {
+			end = len(s) - len(rest)
 		}
 	}
 	return end
+}
+
+// lastClauseBreak is the index of the last clause break in sentence, or 0
+// when it has none.
+func lastClauseBreak(sentence string) int {
+	at := 0
+	for _, b := range clauseBreaks {
+		at = max(at, strings.LastIndex(sentence, b))
+	}
+	return at
 }
 
 // ExtractToolCalls returns the tool calls in a completion, or nil when the
