@@ -170,8 +170,9 @@ CREATE INDEX IF NOT EXISTS moderation_events_time_idx ON minecraft.moderation_ev
 - `!modlog [player] [n]` (operator only): the newest flags, default 5, at
   most 10, whispered, each with its rule, detail, time and a truncated
   message.
-- The moderation check never blocks the command or answer path. It runs
-  after dispatch on the same message.
+- The moderation check runs alongside dispatch of the same message, on its
+  own bus subscriber, and never blocks or delays the command or answer
+  path.
 
 ## Stage 7: local-model evaluation
 

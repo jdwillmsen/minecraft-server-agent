@@ -447,8 +447,9 @@ resolves through the same live-then-recorded lookup `!announce @player`
 uses. The console is refused, because a console reply is broadcast and
 would read every flag out to the server.
 
-Moderation runs off the packet read loop and never delays a command or an
-answer. Rules are evaluated in memory, and the database write, the warning
+Moderation runs off the packet read loop, alongside dispatch of the same
+message on its own bus subscriber, and never blocks or delays a command or
+an answer. Rules are evaluated in memory, and the database write, the warning
 and the notice run on a worker of their own, each bounded by the command
 timeout. With no database the rules do not run at all: a warning with no
 record behind it is enforcement nobody can review. For the same reason a
