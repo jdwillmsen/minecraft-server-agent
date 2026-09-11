@@ -18,9 +18,15 @@ import (
 )
 
 // MaxToolResultChars bounds what one tool feeds back into the model's
-// context. The reply itself is capped at 200 characters, so a tool result
-// larger than this buys nothing and costs prompt tokens on a small local
-// model with a finite window.
+// context: prompt tokens are the scarce thing on a small local model with a
+// finite window, and a result the model only has to summarise into one chat
+// line does not need to arrive whole.
+//
+// It is deliberately not tied to adapters.MaxReplyChars. Sharing a number
+// would read as one constraint when they are two: this one is the model's
+// context budget, that one is how much chat a player should read at once.
+// knowledge_lookup joins up to three entries under this cap, so an entry
+// likely to lead a result should be short enough to leave room for the rest.
 const MaxToolResultChars = 400
 
 // Tool is one capability the model may call.

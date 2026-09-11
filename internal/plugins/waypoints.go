@@ -27,11 +27,12 @@ func NewWaypoints() *Waypoints { return &Waypoints{} }
 // still sits in the table.
 var reservedNames = map[string]bool{"set": true, "del": true}
 
-// wpListReplyCap mirrors adapters.MaxReplyChars: this reply crosses the
-// same Bedrock chat line, but !wp is dispatched by the plugin registry
-// rather than the LLM answer path, so nothing else enforces the cap for it.
-// Defined locally rather than imported so this package does not have to
-// depend on adapters for one number.
+// wpListReplyCap bounds this one reply: !wp is dispatched by the plugin
+// registry rather than the LLM answer path, so nothing else enforces a cap
+// for it. Its own number rather than adapters.MaxReplyChars, which it used
+// to mirror: Bedrock carries either length fine, and what a list of saved
+// names is worth on screen has nothing to do with what an answered question
+// is worth in output tokens.
 const wpListReplyCap = 200
 
 func (*Waypoints) Name() string { return "waypoints" }
