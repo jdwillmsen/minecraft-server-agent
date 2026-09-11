@@ -25,7 +25,15 @@ func NewWaypoints() *Waypoints { return &Waypoints{} }
 // the same reason knowledge.go refuses a reserved topic: a waypoint saved
 // under one of these would be unreachable through !wp <name> even though it
 // still sits in the table.
-var reservedNames = map[string]bool{"set": true, "del": true}
+var reservedNames = map[string]bool{"set": true, "del": true, "help": true}
+
+// wpHelpReply is what !wp help answers. Held under wpListReplyCap like the
+// list reply, and naming the coordinate forms because they are the part
+// players cannot discover by guessing: a plain triple works, and so does
+// Minecraft's own x= y= z= display form in any order.
+const wpHelpReply = "!wp = list yours. !wp <name> = show one. " +
+	"!wp set <name> <x> <y> <z> [dimension] = save. !wp del <name> = remove. " +
+	"Coords may be plain or x= y= z= in any order."
 
 // wpListReplyCap bounds this one reply: !wp is dispatched by the plugin
 // registry rather than the LLM answer path, so nothing else enforces a cap
@@ -41,7 +49,7 @@ func (*Waypoints) Commands() []plugin.Command {
 	return []plugin.Command{
 		{
 			Name:        "wp",
-			Description: "Your saved coordinates: !wp, !wp <name>, !wp set <name> <x> <y> <z>.",
+			Description: "Your saved coordinates: !wp, !wp <name>, !wp set <name> <x> <y> <z>, !wp help.",
 			Permission:  plugin.PermissionMember,
 			Run:         runWP,
 		},
@@ -67,6 +75,13 @@ func runWP(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (st
 	const setUsage = "Usage: !wp set <name> <x> <y> <z> [overworld|nether|end]."
 
 	switch strings.ToLower(inv.Args[0]) {
+	case "help":
+		// Before this case existed, "!wp help" fell through to the lookup
+		// below and answered "You have no waypoint called help", which
+		// reads as a broken command rather than an unknown name -- the one
+		// thing a player reaches for when the syntax is not obvious.
+		return wpHelpReply, nil
+
 	case "set":
 		// The trailing arguments are positional (three coordinates, or
 		// three coordinates plus a dimension) and everything before them is

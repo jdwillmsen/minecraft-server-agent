@@ -14,7 +14,13 @@ import (
 // would treat it as list/set/del) while the LLM's lookup path reads the
 // store directly and would still find it -- refusing the write keeps both
 // surfaces agreeing on what the agent knows.
-var reservedTopics = map[string]bool{"list": true, "set": true, "del": true}
+var reservedTopics = map[string]bool{"list": true, "set": true, "del": true, "help": true}
+
+// kbHelpReply is what !kb help answers. Reads are open to everyone, so it
+// names the write subcommands as operator-only rather than hiding them: a
+// member who tries !kb set should learn why it refused, not that it exists.
+const kbHelpReply = "!kb <topic> = look up. !kb list = topics I know. " +
+	"!kb set <topic> <text> = teach me (operator). !kb del <topic> = make me forget (operator)."
 
 // Knowledge exposes the curated fact store in chat.
 //
@@ -32,7 +38,7 @@ func (*Knowledge) Commands() []plugin.Command {
 	return []plugin.Command{
 		{
 			Name:        "kb",
-			Description: "Look up what the server knows: !kb <topic>, !kb list.",
+			Description: "Look up what the server knows: !kb <topic>, !kb list, !kb help.",
 			// Visitor, because reads are open. The write subcommands check
 			// the actor's level themselves -- see runKB.
 			Permission: plugin.PermissionVisitor,
@@ -50,6 +56,12 @@ func runKB(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (st
 	}
 
 	switch strings.ToLower(inv.Args[0]) {
+	case "help":
+		// Without this, "!kb help" is a lookup for a topic called help and
+		// answers "I don't know anything about help", which a player cannot
+		// tell apart from the command being broken.
+		return kbHelpReply, nil
+
 	case "list":
 		entries, err := pctx.Knowledge.List(ctx)
 		if err != nil {
