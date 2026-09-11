@@ -914,6 +914,7 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 		entries[i] = roster.PlayerListEntry{
 			XUID:     e.XUID,
 			Username: e.Username,
+			UUID:     e.UUID.String(),
 			Remove:   e.ActionType == protocol.PlayerListActionRemove,
 		}
 	}

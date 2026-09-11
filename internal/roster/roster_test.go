@@ -51,6 +51,60 @@ func TestApply_RemoveThenReAddReportsJoinAgain(t *testing.T) {
 	}
 }
 
+// The shape the server actually sends: the add carries XUID and UUID, the
+// removal carries only the UUID. Every departure used to be dropped here.
+func TestApply_RemovalCarryingOnlyAUUIDIsALeave(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve", UUID: "u-111"})
+
+	_, leaves := r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}})
+	if len(leaves) != 1 || leaves[0].XUID != "111" || leaves[0].Username != "Steve" {
+		t.Fatalf("leaves = %+v, want Steve (111)", leaves)
+	}
+	if _, ok := r.NameFor("111"); ok {
+		t.Error("Steve still on the roster after a UUID-only removal")
+	}
+
+	joins, _ := r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve", UUID: "u-111"}})
+	if len(joins) != 1 {
+		t.Errorf("got %d joins for a rejoin after a UUID-only removal, want 1: a rejoin is what triggers the welcome and the announcement drain", len(joins))
+	}
+}
+
+func TestApply_RemovalOfAnUnknownUUIDIsIgnored(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve", UUID: "u-111"})
+
+	if _, leaves := r.Apply([]PlayerListEntry{{UUID: "u-unknown", Remove: true}}); len(leaves) != 0 {
+		t.Errorf("leaves = %+v for a UUID nobody was recorded under, want none", leaves)
+	}
+	if _, ok := r.NameFor("111"); !ok {
+		t.Error("an unrelated removal took Steve off the roster")
+	}
+}
+
+// A removal before the snapshot is not the snapshot. If it consumed it, the
+// real snapshot behind it would be read as a burst of arrivals.
+func TestApply_RemovalDoesNotConsumeTheSnapshot(t *testing.T) {
+	r := New()
+	r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}})
+
+	if joins, _ := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve", UUID: "u-111"}}); len(joins) != 0 {
+		t.Errorf("got %d joins from the snapshot after a stray removal, want 0", len(joins))
+	}
+}
+
+func TestBeginSession_ForgetsUUIDs(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve", UUID: "u-111"})
+	r.BeginSession()
+	absorbSnapshot(t, r, agentEntry)
+
+	if _, leaves := r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}}); len(leaves) != 0 {
+		t.Errorf("leaves = %+v resolved through a previous session's UUID, want none", leaves)
+	}
+}
+
 func TestApply_BlankXUIDIgnored(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry)
