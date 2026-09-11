@@ -66,6 +66,23 @@ func TestAnswerTruncatesLongReplies(t *testing.T) {
 	if len(got) != MaxReplyChars {
 		t.Errorf("len(AnswerWithTools) = %d, want %d", len(got), MaxReplyChars)
 	}
+	// A player reads this line. Cut silently, it reads as a finished
+	// sentence and the answer looks confident rather than clipped.
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("AnswerWithTools = %q, want a shortened reply to end in an ellipsis", got)
+	}
+}
+
+func TestAnswerLeavesRepliesWithinTheCapUnmarked(t *testing.T) {
+	reply := strings.Repeat("x", MaxReplyChars)
+	got, err := newTestClient(okResponse(t, reply).URL).
+		AnswerWithTools(context.Background(), "Steve", "", "q", nil)
+	if err != nil {
+		t.Fatalf("AnswerWithTools: %v", err)
+	}
+	if got != reply {
+		t.Errorf("AnswerWithTools = %q, want the reply unchanged at exactly the cap", got)
+	}
 }
 
 // The question is player-typed and goes to a model; it is bounded before it

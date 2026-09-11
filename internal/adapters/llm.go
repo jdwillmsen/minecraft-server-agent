@@ -16,11 +16,19 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
-// Bedrock renders long chat lines badly and the server-side line limit is
-// tight, so a reply is one short sentence. The question is bounded too: it
-// comes straight from player-typed chat and is forwarded to a model.
+// MaxReplyChars is a readability and cost budget, not a protocol limit.
+// Bedrock itself carries far more: measured against a live server, tellraw
+// payloads of 200 through 2000 characters all arrived intact, so the ceiling
+// here is only how much chat a player should have to read at once, and how
+// many output tokens each question is worth. It stays well inside the
+// deployment's LLM_MAX_TOKENS so the cap that shortens a reply is this one,
+// which cuts on a rune boundary and marks the cut, rather than the model's
+// token budget, which stops wherever it runs out.
+//
+// The question is bounded too: it comes straight from player-typed chat and
+// is forwarded to a model.
 const (
-	MaxReplyChars    = 200
+	MaxReplyChars    = 400
 	MaxQuestionChars = 256
 )
 
@@ -39,7 +47,7 @@ const MaxToolRounds = 2
 // removes the invitation at the source, which is cheaper and more reliable
 // than trying to detect the loop once it has started.
 const systemPrompt = "You are the voice of a Minecraft Bedrock server, replying directly in its own chat. " +
-	"Answer in one short, plain sentence under 200 characters. " +
+	"Answer in one or two short, plain sentences under 400 characters. " +
 	"No markdown, no roleplay asterisks, and never end your reply with a question mark."
 
 // LLMClient calls an OpenAI-compatible chat-completions endpoint.
@@ -164,7 +172,9 @@ func ExtractText(payload []byte) string {
 		return ""
 	}
 	// Bedrock chat is single-line; collapse anything the model wrapped.
-	return text.Truncate(strings.Join(strings.Fields(parsed.Choices[0].Message.Content), " "), MaxReplyChars)
+	// Ellipsis rather than a bare cut: this string is read by a player, and
+	// a reply that stops mid-word looks like a complete, confident answer.
+	return text.TruncateEllipsis(strings.Join(strings.Fields(parsed.Choices[0].Message.Content), " "), MaxReplyChars)
 }
 
 // ExtractToolCalls returns the tool calls in a completion, or nil when the
