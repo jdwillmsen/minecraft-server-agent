@@ -668,7 +668,7 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 
 	switch trigger.Kind {
 	case chat.TriggerCommand:
-		handleCommand(ctx, id, trigger, log, registry, pctx, limiter, permResolver, auditor, playerRoster)
+		handleCommand(ctx, id, trigger, chat.IsPrivateType(text.TextType), log, registry, pctx, limiter, permResolver, auditor, playerRoster)
 	case chat.TriggerMention:
 		startAnswer(ctx, id, trigger, chat.IsPrivateType(text.TextType), log, pctx, ans, playerRoster)
 	}
@@ -953,7 +953,10 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 	}
 }
 
-func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, limiter *ratelimit.PerActor, permResolver *adapters.PermissionResolver, auditor audit.Store, playerRoster *roster.Roster) {
+// whispered says the command arrived through /tell rather than open chat. It
+// decides only whether an unknown command is answered -- see the
+// ErrUnknownCommand case below for why that one distinction exists.
+func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, whispered bool, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, limiter *ratelimit.PerActor, permResolver *adapters.PermissionResolver, auditor audit.Store, playerRoster *roster.Roster) {
 	// Mirrors handleMention's resolution exactly: the roster is the one place
 	// an XUID becomes a name, and a second lookup path here would be a second
 	// place for that mapping to drift from the first.
@@ -1025,11 +1028,32 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	reply, err := registry.Dispatch(ctx, pctx, trigger.Command, inv)
 	switch {
 	case errors.Is(err, plugin.ErrUnknownCommand):
-		log.Debug("command_unknown", logging.Fields{"command": trigger.Command, "actor": actorXUID})
+		// Answered only when whispered. ParseTrigger treats any message
+		// opening with "!" as a command, so "!!!" and "!nice that was
+		// close" reach this branch too -- replying to every one of them
+		// would have the agent talking over ordinary conversation. A
+		// whisper is the opposite situation: the player addressed the agent
+		// directly, nobody else can see it, and silence there is
+		// indistinguishable from the agent being down.
+		log.Debug("command_unknown", logging.Fields{"command": trigger.Command, "actor": actorXUID, "whispered": whispered})
+		if whispered {
+			speak(ctx, log, pctx, actorXUID, trigger.Command, unknownCommandReply(trigger.Command))
+		}
 		writeAudit(audit.OutcomeUnknown)
 		return
 	case errors.Is(err, plugin.ErrPermissionDenied):
+		// Always answered, whispered or not, and the stray-"!" argument
+		// above does not apply: a denial means the command matched a real
+		// registered one, so nothing conversational can land here.
+		//
+		// This does tell the asker the command exists, which !help does not
+		// -- it lists only what the actor may run. Naming it is the
+		// deliberate trade: a player who guessed right and got silence
+		// cannot tell a refusal from a broken agent, and that costs more
+		// than the existence of !shutdown being guessable on a server whose
+		// members are known to each other.
 		log.Info("command_denied", logging.Fields{"command": trigger.Command, "actor": actorXUID})
+		speak(ctx, log, pctx, actorXUID, trigger.Command, deniedCommandReply(trigger.Command))
 		writeAudit(audit.OutcomeDenied)
 		return
 	case errors.Is(err, plugin.ErrCommandTimedOut):
@@ -1097,6 +1121,18 @@ const (
 	commandFailedReply   = "That didn't work - the failure is in my log."
 	commandTimedOutReply = "That took too long, so I stopped waiting on it."
 )
+
+// unknownCommandReply and deniedCommandReply both point at !help rather than
+// listing anything themselves, because !help already filters to what the
+// asker may actually run and duplicating that here would be a second place
+// for the two to disagree.
+func unknownCommandReply(command string) string {
+	return "I don't know !" + command + ". Try !help to see what I can do."
+}
+
+func deniedCommandReply(command string) string {
+	return "!" + command + " isn't available to you - !help lists what is."
+}
 
 // speak sends one reply back the way the command came in: broadcast for the
 // console, which has no player to whisper to, and a whisper for anyone else.
