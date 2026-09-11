@@ -29,6 +29,7 @@ func TestEverySeriesIsExportedUnderItsAgreedName(t *testing.T) {
 		"mc_agent_audit_write_failures_total",
 		"mc_agent_auth_rejections_total",
 		"mc_agent_deaths_total",
+		"mc_agent_moderation_flags_total",
 		"mc_agent_server_tps",
 		"mc_agent_tps_last_success_timestamp_seconds",
 		"mc_agent_link_rtt_seconds",
@@ -136,5 +137,20 @@ func TestLinkRTTIsInSeconds(t *testing.T) {
 	LinkRTT(6 * time.Millisecond)
 	if got := testutil.ToFloat64(linkRTT.WithLabelValues()); math.Abs(got-0.006) > 1e-9 {
 		t.Errorf("link rtt = %v, want 0.006", got)
+	}
+}
+
+// The rule and action sets are fixed by the schema, so every pair can start
+// at zero and an alert on the first flag after a restart still fires.
+func TestEveryModerationFlagPairStartsAtZero(t *testing.T) {
+	for _, r := range moderationRules {
+		for _, a := range moderationActions {
+			if !metricstest.Exists(t, "mc_agent_moderation_flags_total", "rule", string(r), "action", string(a)) {
+				t.Errorf("moderation flag %s/%s is not pre-initialised", r, a)
+			}
+		}
+	}
+	if n := metricstest.Series(t, "mc_agent_moderation_flags_total"); n != len(moderationRules)*len(moderationActions) {
+		t.Errorf("mc_agent_moderation_flags_total exports %d series, want exactly %d", n, len(moderationRules)*len(moderationActions))
 	}
 }

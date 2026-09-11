@@ -19,6 +19,15 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/jdwillmsen/minecraft-server-agent/internal/moderation"
+)
+
+// moderationRules and moderationActions are the schema's own sets, so the
+// counter's labels can never hold more than their product.
+var (
+	moderationRules   = []moderation.Rule{moderation.RuleTerm, moderation.RuleFlood, moderation.RuleCaps}
+	moderationActions = []moderation.Action{moderation.ActionLogged, moderation.ActionWarned}
 )
 
 // Unregistered stands in for any command or tool name the registry does not
@@ -106,6 +115,13 @@ var (
 		Help: "Times Xbox Live rejected the account itself rather than the connection failing.",
 	})
 
+	// Counted when a flag is written, not when a rule fires, so this agrees
+	// with the rows in minecraft.moderation_events.
+	moderationFlagsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mc_agent_moderation_flags_total",
+		Help: "Moderation flags written to the record, by rule and the action taken.",
+	}, []string{"rule", "action"})
+
 	deathsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "mc_agent_deaths_total",
 		Help: "Deaths the respawner handled.",
@@ -149,6 +165,14 @@ func init() {
 	}
 	answerDuration.WithLabelValues(outcomeAnswered)
 	answerDuration.WithLabelValues(outcomeFailed)
+	// Every pair, including ones only term can reach today: which rule may
+	// warn is the plugin's decision, and restating it here would be a second
+	// place for it to drift.
+	for _, r := range moderationRules {
+		for _, a := range moderationActions {
+			moderationFlagsTotal.WithLabelValues(string(r), string(a))
+		}
+	}
 }
 
 // InitCommands starts every command x outcome pair at zero, for the same
@@ -211,6 +235,11 @@ func AuthRejection() { authRejectionsTotal.Inc() }
 
 // Death counts one death the respawner handled.
 func Death() { deathsTotal.Inc() }
+
+// ModerationFlag counts one flag written to the moderation record.
+func ModerationFlag(rule moderation.Rule, action moderation.Action) {
+	moderationFlagsTotal.WithLabelValues(string(rule), string(action)).Inc()
+}
 
 // ServerTPS records a successful TPS measurement taken at at. There is
 // deliberately no way to record a failed one: the last real value beside its

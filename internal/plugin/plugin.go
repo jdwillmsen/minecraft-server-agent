@@ -21,6 +21,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/moderation"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
 )
@@ -160,6 +161,13 @@ type Command struct {
 	// Run executes the command. ctx carries the process lifetime; pctx
 	// carries the adapters this command is allowed to use.
 	Run func(ctx context.Context, pctx *Context, inv Invocation) (reply string, err error)
+	// RedactReply keeps the reply text out of the log, which then records
+	// only its length. Replies are logged to stdout and from there to log
+	// storage whose retention nothing in this repo controls. A reply that is
+	// whispered to keep it private -- a player's coordinates, other players'
+	// moderation records -- would otherwise sit there in full, outside every
+	// limit this agent promises about that data.
+	RedactReply bool
 }
 
 // Plugin is one self-contained unit of agent behaviour.
@@ -224,6 +232,19 @@ type Context struct {
 	Roster Roster
 	// Pinger may be nil; !ping then answers from the agent alone.
 	Pinger Pinger
+	// Moderation may be nil, on the same terms as Knowledge: cmd/agent
+	// always supplies one, and every use checks Enabled first.
+	Moderation ModerationStore
+}
+
+// ModerationStore is the flagged-chat record a plugin may touch: write a flag
+// and read the newest back. Pruning is left out on purpose. It is
+// housekeeping the process runs on a timer, and no command or event handler
+// has a reason to delete a record.
+type ModerationStore interface {
+	Record(ctx context.Context, e moderation.Event) error
+	Recent(ctx context.Context, xuid string, limit int) ([]moderation.Event, error)
+	Enabled() bool
 }
 
 // AnnouncementsReady reports whether an announcement can actually be stored

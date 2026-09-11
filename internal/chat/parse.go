@@ -60,6 +60,13 @@ func IsPrivateType(textType byte) bool {
 	return ok
 }
 
+// IsPublicType reports whether textType is something every connected player
+// saw. A whisper is answerable but not public: only the agent received it,
+// so it is nobody else's business what it said.
+func IsPublicType(textType byte) bool {
+	return textType == packet.TextTypeChat || textType == packet.TextTypeAnnouncement
+}
+
 // Identity resolves the XUID-based identity of a Text packet's sender.
 //
 // A real player always carries a non-empty XUID on chat/whisper/announcement
@@ -160,10 +167,16 @@ const MessageKind = "chat.message"
 type MessageEvent struct {
 	// ActorXUID is the resolved sender identity (see Identity).
 	ActorXUID string
+	// Gamertag is ActorXUID's name from the live roster, or the XUID itself
+	// when the roster cannot name them. Never the packet's SourceName, which
+	// the sender controls.
+	Gamertag string
 	// Message is the original chat line, unmodified.
 	Message string
 	// Trigger is the classification ParseTrigger produced for Message.
 	Trigger Trigger
+	// Public reports whether everyone connected saw Message (IsPublicType).
+	Public bool
 }
 
 // Kind satisfies the bus's Event interface.

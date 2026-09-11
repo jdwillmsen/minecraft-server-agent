@@ -265,3 +265,38 @@ func TestLoad_LLMAnswerBudgetDefaults(t *testing.T) {
 		t.Errorf("LLMMaxTokens = %d, want 192 -- 96 cannot hold tool arguments plus an answer", cfg.LLMMaxTokens)
 	}
 }
+
+func TestLoad_ModerationTermsAreTrimmedAndBlanksDropped(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("MODERATION_TERMS", " griefer, ,Free Diamonds,,")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"griefer", "Free Diamonds"}
+	if len(cfg.ModerationTerms) != len(want) {
+		t.Fatalf("ModerationTerms = %q, want %q", cfg.ModerationTerms, want)
+	}
+	for i := range want {
+		if cfg.ModerationTerms[i] != want[i] {
+			t.Errorf("ModerationTerms[%d] = %q, want %q", i, cfg.ModerationTerms[i], want[i])
+		}
+	}
+}
+
+func TestLoad_NoModerationTermsTurnsTheRuleOff(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("MODERATION_TERMS", "")
+	os.Unsetenv("MODERATION_TERMS")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.ModerationTerms) != 0 {
+		t.Errorf("ModerationTerms = %q, want none", cfg.ModerationTerms)
+	}
+}

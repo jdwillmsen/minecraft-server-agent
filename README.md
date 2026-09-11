@@ -57,6 +57,10 @@ recorded durably rather than only to stdout. See "Announcements and the
 command audit trail" below for the delivery rules, the expiry rules, and
 what the audit trail does and doesn't record.
 
+A moderation audit checks public chat against three rules and records what
+they flag; operators read it with `!modlog`. It records and reports, and
+never kicks, mutes or bans. See "Moderation audit" below.
+
 ## Architecture
 
 ```
@@ -82,7 +86,8 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 - `internal/plugins` - concrete plugins: `core` (`!help`/`!ping`), `stats`
   (`!players`, `!online`, `!version`, `!backup`), `welcome` (event-driven, no
   commands), `knowledge` (`!kb`), `waypoints` (`!wp`), `announce`
-  (`!announce`, `!inbox`)
+  (`!announce`, `!inbox`), `moderation` (event-driven over chat, plus
+  `!modlog`)
 - `internal/store` - Postgres-backed player profiles and playtime, behind a
   `store.Nop` no-op so an unset `PG_HOST` is a supported state rather than a
   crash; a plugin only ever sees the narrow `PlayerStore` read-and-record
@@ -109,6 +114,10 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   than the dispatch it records. A
   write that fails is logged and swallowed rather than allowed to block the
   command it describes
+- `internal/moderation` - the moderation rules, the bounded per-player
+  memory the flood rule and the notice and warning throttles need, and the
+  store behind `minecraft.moderation_events`. Only flagged messages are
+  stored, for 90 days
 - `internal/pgerr` - recognises the two ways a configured database refuses a
   statement for a reason a deploy is responsible for: the tables are not
   migrated yet, or the role was never granted access to them. Both are
@@ -167,6 +176,7 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 | `ANSWER_MAX_PER_MINUTE` | `4` | Max `@server` answers a single actor may trigger per rolling minute, tracked separately from `COMMAND_RATE_LIMIT_PER_MINUTE` since one LLM call costs far more than one console command |
 | `MC_MONITOR_URL` | *(empty)* | mc-monitor Prometheus endpoint behind `!online`; unset reports the command unconfigured rather than erroring |
 | `BACKUP_EXPORTER_URL` | *(empty)* | Backup exporter's `/metrics.txt` behind `!backup`; unset reports the command unconfigured rather than erroring |
+| `MODERATION_TERMS` | *(empty disables the term rule)* | Comma-separated terms whose use in public chat is flagged, matched case-insensitively as whole words; blanks between commas are ignored. The flood and caps rules need no configuration |
 | `LOG_LEVEL` | `info` | `info` or `debug` |
 
 ## Metrics
@@ -187,6 +197,7 @@ breaking change.
 | `mc_agent_audit_write_failures_total` | counter | none | per dispatch the audit trail did not record |
 | `mc_agent_auth_rejections_total` | counter | none | per Xbox Live account rejection |
 | `mc_agent_deaths_total` | counter | none | per death the respawner handles |
+| `mc_agent_moderation_flags_total` | counter | `rule`, `action` | per flag written to the moderation record; every pair starts at zero |
 | `mc_agent_server_tps` | gauge | none | per successful TPS measurement, background or `!ping` |
 | `mc_agent_tps_last_success_timestamp_seconds` | gauge | none | same moment |
 | `mc_agent_link_rtt_seconds` | gauge | none | per background sample while a session exists |
@@ -374,10 +385,79 @@ worth being exact about: the arguments are stored verbatim, so `!wp set base
 private `!announce @player`. What the exclusion keeps out is everything a
 reply says that nobody typed - the answer to a bare `!wp` lists every
 waypoint a player owns, including ones this command never mentioned. That is
-a privacy decision, not an oversight. A failed audit write is logged and
+a privacy decision, not an oversight. The stdout log line for each command
+does carry its reply, with one exception: commands whose replies are
+private (`!wp`, whose replies name coordinates, and `!modlog`, whose replies
+quote other players' flagged messages) log only the reply's length. The log
+is shipped on to storage whose retention this agent does not control, so a
+reply copied there would escape every limit placed on it here. A failed audit write is logged and
 never blocks the command it describes; a table that has not been migrated
 yet, or one the agent's role was never granted, is reported once at INFO
 rather than once per command.
+
+## Moderation audit
+
+Every public chat line is checked against three rules. Whispers to the
+agent are not, because nobody else saw them, and neither is the console,
+whose public lines are this agent's own voice. Operators are checked like
+everyone else: a record that exempts the people who read it is not one
+anybody can rely on.
+
+- `term` - the line contains a term from `MODERATION_TERMS`, matched
+  case-insensitively on whole words, so a short term never fires inside a
+  longer, innocent word. Terms are matched literally: punctuation in a term
+  is text to find, not pattern syntax. With no terms configured the rule is
+  off.
+- `flood` - more than 5 lines from one player inside 10 seconds. A
+  sustained burst is one flag, not one per line.
+- `caps` - at least 20 letters, 80% or more of them capitals. Only letters
+  that have a case count.
+
+A `!` command or an `@server` question is checked like any other line. It
+was typed into public chat and everyone read it; the prefix changes who
+answers, not who saw it.
+
+Every flag is written to `minecraft.moderation_events` as `logged`. A
+`term` flag also whispers the player a short warning, at most once a
+minute, and that row is written as `warned` only if the whisper actually
+went out. The first recorded flag for a player in any 10-minute window also
+queues an announcement for the operator permission, so operators online
+now are whispered and one who is offline hears it at their next join. The
+notice names the player and the rules and never the message: announcements
+are kept indefinitely, and a copy of what was said there would outlive the
+limit below.
+
+**Privacy.** Only flagged lines are stored, never chat as a whole. A
+complete chat log would be a far larger exposure than the problem this
+solves. Flags are kept for 90 days, and the agent deletes older ones once a
+day.
+
+No kicks, mutes or bans. The console bridge's allowlist does not permit
+them, and widening it is a security decision for a human, not a side effect
+of this feature.
+
+`!modlog [player] [n]` (operator only) whispers the newest flags: 5 by
+default, at most 10, each with its time in UTC, rule, detail and the start
+of the message. A trailing number is the count and everything before it is
+the name, so a gamertag with a space in it needs no quoting; a whole line
+that is itself a known gamertag, such as `Sniper 360`, is read as the name
+first. The operator notice suggests the command with an explicit count, and
+leaves the name out when the roster only knew the player's XUID. The name
+resolves through the same live-then-recorded lookup `!announce @player`
+uses. The console is refused, because a console reply is broadcast and
+would read every flag out to the server.
+
+Moderation runs off the packet read loop, alongside dispatch of the same
+message on its own bus subscriber, and never blocks or delays a command or
+an answer. Rules are evaluated in memory, and the database write, the warning
+and the notice run on a worker of their own, each bounded by the command
+timeout. With no database the rules do not run at all: a warning with no
+record behind it is enforcement nobody can review. For the same reason a
+configured database is not enough: the warning is only whispered while the
+record is writable, judged by the last write, or by a zero-row read before
+the first one, so a deploy that runs ahead of its migration whispers no
+warning it has no record of. A table that has not been migrated or granted
+yet is reported once at INFO, and `!modlog` answers that plainly.
 
 ## Targeting a reply
 
@@ -456,6 +536,11 @@ fourth migration, `V4__minecraft_announcements.sql`, in that same
 or synced yet, so there is no schema today for `MC_TEST_DSN` to point at.
 Once it has, `go test -tags livedb ./internal/announce/ ./internal/audit/`
 follows the same setup as `internal/store` above.
+
+`internal/moderation` has one too, against `minecraft.moderation_events`
+from `V6__minecraft_moderation.sql`: `go test -tags livedb
+./internal/moderation/`. It inserts and deletes rows, so point it at a
+disposable database built from the migrations, never at production.
 
 ## Releases
 

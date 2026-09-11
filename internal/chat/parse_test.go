@@ -209,3 +209,17 @@ func TestMessageEvent_KindIsTheChatMessageKind(t *testing.T) {
 		t.Errorf("Kind() = %q, want %q", ev.Kind(), MessageKind)
 	}
 }
+
+// Moderation applies to what everyone saw. A whisper reached only the agent.
+func TestIsPublicType(t *testing.T) {
+	for textType, want := range map[byte]bool{
+		packet.TextTypeChat:         true,
+		packet.TextTypeAnnouncement: true,
+		packet.TextTypeWhisper:      false,
+		packet.TextTypePopup:        false,
+	} {
+		if got := IsPublicType(textType); got != want {
+			t.Errorf("IsPublicType(%d) = %v, want %v", textType, got, want)
+		}
+	}
+}
