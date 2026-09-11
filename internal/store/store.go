@@ -25,9 +25,10 @@ type Profile struct {
 	// JoinCount includes the join being recorded, so a first-ever arrival
 	// reads as 1 rather than 0.
 	JoinCount int
-	// TotalSeconds is completed session time only. Sessions that ended
-	// without being observed contribute nothing, so this is a lower bound --
-	// see UncleanSessions.
+	// TotalSeconds sums only sessions whose departure the agent observed
+	// (ended_reason 'left'). A session it never saw end contributes nothing,
+	// whatever duration its row carries, so this is a lower bound -- see
+	// UncleanSessions.
 	TotalSeconds int64
 	// UncleanSessions counts visits the agent never saw end, because a server
 	// restart, an agent restart or a crash ended them instead. A profile with
@@ -50,10 +51,13 @@ func (p Profile) AwayFor(now time.Time) time.Duration {
 // Playtime is a player's completed session time immediately before and
 // after one departure was recorded.
 //
-// Both totals count the same sessions TotalSeconds does, so a lower bound
-// for the same reason. Equal totals mean the departure closed nothing: no
-// open session was found, which is what a leave the agent already recorded,
-// or never saw the start of, looks like.
+// Both totals count exactly the sessions TotalSeconds does: those ended by
+// an observed departure. Time in a session the agent never saw end is not
+// in either, even where the row records a duration, so both are lower
+// bounds and a milestone is never announced off time nobody watched. Equal
+// totals mean the departure closed nothing: no open session was found,
+// which is what a leave the agent already recorded, or never saw the start
+// of, looks like.
 type Playtime struct {
 	// Gamertag is who the closed session says they were, for a caller that
 	// names the player after the roster has already forgotten them.

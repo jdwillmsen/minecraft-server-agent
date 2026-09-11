@@ -500,8 +500,12 @@ Playtime is measured when a player leaves, the only moment a session's
 length is known: the profile store closes the session and returns the
 totals before and after it from one statement. Reaching a milestone exactly
 counts; a session that crosses two at once announces only the higher. Like
-all playtime here it is a lower bound - sessions the agent never saw end
-contribute nothing. A player first recorded because they were already
+all playtime here it counts only sessions whose departure the agent
+watched, so it is a lower bound: a session it never saw end - the agent
+restarted or reconnected while the player was on - contributes nothing,
+even where an older row records a duration for it. Such a session is now
+closed at zero length, never at the moment the player next arrives, so an
+absence is never credited as playtime. A player first recorded because they were already
 online when the agent logged in reads as a first-time arrival on their next
 observed join, the same way the welcome treats them.
 

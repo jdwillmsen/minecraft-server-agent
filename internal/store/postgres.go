@@ -84,7 +84,7 @@ func (p *Postgres) RecordJoin(ctx context.Context, xuid, gamertag string, at tim
 	prior := Profile{XUID: xuid, Gamertag: gamertag}
 	err = tx.QueryRow(ctx, `
 		SELECT p.first_seen_at, p.last_seen_at, p.join_count,
-		       COALESCE(SUM(s.duration_seconds), 0)::BIGINT,
+		       COALESCE(SUM(s.duration_seconds) FILTER (WHERE s.ended_reason = 'left'), 0)::BIGINT,
 		       COUNT(s.session_id) FILTER (WHERE s.ended_reason = 'unknown')
 		FROM minecraft.players p
 		LEFT JOIN minecraft.sessions s ON s.xuid = p.xuid
@@ -120,13 +120,17 @@ func (p *Postgres) RecordJoin(ctx context.Context, xuid, gamertag string, at tim
 	}
 
 	// Any session still open for this player belongs to a visit whose end was
-	// never observed -- the agent was away for it. Closing it here rather
-	// than leaving two open sessions keeps playtime arithmetic honest.
+	// never observed -- the agent was away for it, typically across a
+	// reconnect inside this process, which clears the roster without seeing
+	// anyone leave. Closed at its own joined_at, the way CloseOrphans closes
+	// one, and never at this arrival: that would credit the player with their
+	// whole absence, days of it after a long break, and a milestone read off
+	// that total would be announced to the server as fact.
 	if _, err := tx.Exec(ctx, `
 		UPDATE minecraft.sessions
-		SET left_at = $2, ended_reason = 'unknown'
+		SET left_at = joined_at, ended_reason = 'unknown'
 		WHERE xuid = $1 AND ended_reason = 'open'`,
-		xuid, at,
+		xuid,
 	); err != nil {
 		return Profile{}, fmt.Errorf("store: close stale sessions: %w", err)
 	}
@@ -214,10 +218,18 @@ func (p *Postgres) XUIDForName(ctx context.Context, gamertag string) (string, bo
 //
 // One statement is what makes the two totals comparable. Every part of a
 // statement reads the same snapshot, taken before its own UPDATE applies, so
-// prior sums every session as it stood -- the open one contributing nothing,
+// prior sums the sessions as they stood -- the open one contributing nothing,
 // since its generated duration is NULL until left_at is set -- and closed
 // returns the duration the UPDATE just gave it. After is their sum, not a
 // second read that a concurrent join could have moved.
+//
+// prior counts only 'left' sessions, the ones whose end was watched, the
+// same rule RecordJoin's TotalSeconds uses so a greeting and a milestone
+// never disagree. An 'unknown' session's duration is a guess: this agent
+// now closes one at zero length, but rows written before that carry the
+// player's entire absence, and a milestone read off them would announce
+// hours nobody played. closed needs no filter; everything it returns has
+// just been set to 'left'.
 //
 // No open session is not an error: after equals before and the gamertag is
 // blank, which reads to the caller as a departure that changed nothing.
@@ -231,7 +243,7 @@ func (p *Postgres) RecordLeave(ctx context.Context, xuid string, at time.Time) (
 		    WHERE xuid = $1 AND ended_reason = 'open'
 		    RETURNING gamertag, duration_seconds
 		), prior AS (
-		    SELECT COALESCE(SUM(duration_seconds), 0)::BIGINT AS total
+		    SELECT COALESCE(SUM(duration_seconds) FILTER (WHERE ended_reason = 'left'), 0)::BIGINT AS total
 		    FROM minecraft.sessions
 		    WHERE xuid = $1
 		)

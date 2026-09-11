@@ -122,6 +122,97 @@ func TestRecordLeaveReportsTheTotalsAroundTheSession(t *testing.T) {
 	}
 }
 
+// A session the agent never saw end is left open across a reconnect inside
+// the process. The next arrival must close it at zero length -- the player
+// was not playing through their absence -- and neither playtime total may
+// grow from it. If it did, a player back after three days would be broadcast
+// as having played 72 hours more than they had.
+func TestAStaleSessionIsClosedAtZeroLengthAndCountsForNothing(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := "2535400000000011"
+	t0 := time.Now().UTC().Add(-100 * time.Hour).Truncate(time.Second)
+
+	// Closes nothing, so it reports the history this fixed XUID already has.
+	base, err := pg.RecordLeave(ctx, xuid, t0.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("baseline leave: %v", err)
+	}
+
+	if _, err := pg.RecordJoin(ctx, xuid, "Wanderer", t0); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	// No leave: the agent reconnected and never saw one. Three days later:
+	back := t0.Add(72 * time.Hour)
+	profile, err := pg.RecordJoin(ctx, xuid, "Wanderer", back)
+	if err != nil {
+		t.Fatalf("return after the gap: %v", err)
+	}
+
+	var duration int64
+	var reason string
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT duration_seconds, ended_reason FROM minecraft.sessions WHERE xuid = $1 AND joined_at = $2`,
+		xuid, t0,
+	).Scan(&duration, &reason); err != nil {
+		t.Fatalf("read the stale session: %v", err)
+	}
+	if duration != 0 || reason != "unknown" {
+		t.Errorf("stale session closed as (%ds, %s), want (0s, unknown): the absence was credited as playtime", duration, reason)
+	}
+	if want := int64(base.Before / time.Second); profile.TotalSeconds != want {
+		t.Errorf("welcome total = %ds, want %ds: the unobserved session counted", profile.TotalSeconds, want)
+	}
+
+	pt, err := pg.RecordLeave(ctx, xuid, back.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	if pt.Before != base.Before || pt.After != base.Before+time.Hour {
+		t.Errorf("totals = (%v, %v), want (%v, %v): only the observed hour counts", pt.Before, pt.After, base.Before, base.Before+time.Hour)
+	}
+}
+
+// Rows written before stale sessions were closed at zero length carry the
+// player's whole absence as an 'unknown' duration, and production still has
+// them. Neither the welcome's total nor the milestone totals may read them.
+func TestUnknownSessionsWithADurationCountForNothing(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := "2535400000000012"
+	t0 := time.Now().UTC().Add(-200 * time.Hour).Truncate(time.Second)
+
+	if err := pg.EnsurePlayer(ctx, xuid, "LegacyRow", t0); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	base, err := pg.RecordLeave(ctx, xuid, t0)
+	if err != nil {
+		t.Fatalf("baseline leave: %v", err)
+	}
+	if _, err := pg.pool.Exec(ctx, `
+		INSERT INTO minecraft.sessions (xuid, gamertag, joined_at, left_at, ended_reason)
+		VALUES ($1, 'LegacyRow', $2, $3, 'unknown')`,
+		xuid, t0, t0.Add(72*time.Hour),
+	); err != nil {
+		t.Fatalf("insert a legacy inflated session: %v", err)
+	}
+
+	pt, err := pg.RecordLeave(ctx, xuid, t0.Add(80*time.Hour))
+	if err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	if pt.Before != base.Before || pt.After != base.Before {
+		t.Errorf("totals = (%v, %v), want both %v: a 72h 'unknown' row was counted", pt.Before, pt.After, base.Before)
+	}
+	profile, err := pg.RecordJoin(ctx, xuid, "LegacyRow", t0.Add(90*time.Hour))
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if want := int64(base.Before / time.Second); profile.TotalSeconds != want {
+		t.Errorf("welcome total = %ds, want %ds, the same total the milestones read", profile.TotalSeconds, want)
+	}
+}
+
 // A gamertag change must not create a second player: identity is the XUID.
 func TestGamertagChangeKeepsOneIdentity(t *testing.T) {
 	pg := liveStore(t)
