@@ -177,6 +177,12 @@ func (c *LLMClient) BuildRequest(asker, question string) (url string, headers ma
 // not a normal OpenAI-shaped completion, so a new or misbehaving backend makes
 // the agent fall silent rather than error into chat.
 func ExtractText(payload []byte) string {
+	return cleanReply(messageContent(payload))
+}
+
+// messageContent is the completion's text exactly as the model wrote it, or
+// "" for anything that is not an OpenAI-shaped completion.
+func messageContent(payload []byte) string {
 	var parsed struct {
 		Choices []struct {
 			Message struct {
@@ -184,16 +190,82 @@ func ExtractText(payload []byte) string {
 			} `json:"message"`
 		} `json:"choices"`
 	}
-	if err := json.Unmarshal(payload, &parsed); err != nil {
+	if err := json.Unmarshal(payload, &parsed); err != nil || len(parsed.Choices) == 0 {
 		return ""
 	}
-	if len(parsed.Choices) == 0 {
-		return ""
-	}
+	return parsed.Choices[0].Message.Content
+}
+
+// cleanReply turns what the model wrote into what the agent may say. It can
+// return "", which callers already treat as nothing to say.
+func cleanReply(s string) string {
 	// Bedrock chat is single-line; collapse anything the model wrapped.
+	s = strings.Join(strings.Fields(cutToolMarkup(s)), " ")
+	s = trimTrailingQuestions(s)
 	// Ellipsis rather than a bare cut: this string is read by a player, and
 	// a reply that stops mid-word looks like a complete, confident answer.
-	return text.TruncateEllipsis(strings.Join(strings.Fields(parsed.Choices[0].Message.Content), " "), MaxReplyChars)
+	// The ellipsis also means a cut reply never ends on a question mark, so
+	// the cap cannot expose one the trim above removed.
+	return text.TruncateEllipsis(s, MaxReplyChars)
+}
+
+// toolCallMarkers are the ways chat templates spell a tool call in text.
+//
+// A backend that fails to parse a call returns its markup as content. The
+// production model does this regularly: it finishes its answer, opens a
+// second call, and stops before writing it. Without the cut the agent says
+// "<tool_call>" in chat, and once said an entire call to a tool that does
+// not exist.
+var toolCallMarkers = []string{"<tool_call", "</tool_call", "<function=", "[TOOL_CALLS]", "<|python_tag|>"}
+
+// cutToolMarkup keeps only what the model wrote before any tool-call
+// syntax. Everything after the first marker goes, not just the tags: what
+// follows a marker is a call's name and arguments, never prose for players.
+func cutToolMarkup(s string) string {
+	cut := len(s)
+	for _, m := range toolCallMarkers {
+		if i := strings.Index(s, m); i >= 0 && i < cut {
+			cut = i
+		}
+	}
+	return s[:cut]
+}
+
+// questionClosers may follow a question mark without making the sentence
+// any less a question.
+const questionClosers = "\"')]}”’"
+
+// trimTrailingQuestions drops closing sentences that end in a question mark.
+//
+// The system prompt forbids ending on a question because a reply that asks
+// something invites an answer, and two bots in one chat answering each other
+// is a conversation nothing ends. The prompt alone does not hold: greeted,
+// the production model answered "How can I assist you today?" every time.
+// Only the closing sentences are touched, since a question earlier in a
+// reply that ends on a statement invites nothing. A reply that is nothing
+// but questions comes back empty.
+func trimTrailingQuestions(s string) string {
+	for {
+		s = strings.TrimSpace(s)
+		body := strings.TrimRight(s, questionClosers)
+		if !strings.HasSuffix(body, "?") && !strings.HasSuffix(body, "？") {
+			return s
+		}
+		s = s[:lastSentenceEnd(strings.TrimRight(body, "?？"))]
+	}
+}
+
+// lastSentenceEnd is the index just past the last sentence terminator that
+// is followed by a space, or 0 when s is a single sentence. Requiring the
+// space keeps a version like "1.21.100.7" from reading as four sentences.
+func lastSentenceEnd(s string) int {
+	end := 0
+	for i := 0; i+1 < len(s); i++ {
+		if (s[i] == '.' || s[i] == '!' || s[i] == '?') && s[i+1] == ' ' {
+			end = i + 1
+		}
+	}
+	return end
 }
 
 // ExtractToolCalls returns the tool calls in a completion, or nil when the
