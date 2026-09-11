@@ -604,10 +604,7 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		return fmt.Errorf("spawn: %w", err)
 	}
 
-	// Anything the roster still holds predates this connection and cannot
-	// be trusted: leaves that happened while disconnected were never seen.
-	// The server's own opening PlayerList repopulates it from scratch.
-	playerRoster.BeginSession()
+	beginWatching(ctx, playerRoster, playerStore, log)
 
 	selfXUID := conn.IdentityData().XUID
 	log.Info("spawned", logging.Fields{"self_xuid": selfXUID})
@@ -639,6 +636,25 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		handleLiveness(pk, respawner, conn, log, httpServer.SetReady)
 
 		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, ans, playerStore, auditor)
+	}
+}
+
+// beginWatching resets everything the agent believes about who is online, at
+// the start of a connection and before any of its packets are applied.
+//
+// Anything the roster still holds predates this connection and cannot be
+// trusted: leaves that happened while disconnected were never seen. The
+// server's own opening PlayerList repopulates it from scratch. The same goes
+// for open sessions, which are closed at zero length rather than left for a
+// later departure to close: a player who left and came back unseen would
+// otherwise be credited with their whole absence. handlePlayerList reopens a
+// session for each player the snapshot shows is still here.
+func beginWatching(ctx context.Context, playerRoster *roster.Roster, playerStore store.Store, log *logging.Logger) {
+	playerRoster.BeginSession()
+	if n, err := playerStore.CloseOrphans(ctx, time.Now()); err != nil {
+		log.Error("store_close_orphans_failed", logging.Fields{"error": err.Error()})
+	} else if n > 0 {
+		log.Info("store_closed_orphans", logging.Fields{"sessions": n})
 	}
 }
 
@@ -966,7 +982,18 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 		}
 	}
 
-	joins, leaves := playerRoster.Apply(entries)
+	joins, leaves, alreadyOnline := playerRoster.Apply(entries)
+	// Already here when this connection began, so their session restarts now
+	// -- playtime counts only what the agent watched -- and nothing greets or
+	// announces them: they did not just arrive.
+	for _, p := range alreadyOnline {
+		if chat.IsSelfOrSibling(p.XUID, selfXUID, siblingXUIDs) {
+			continue
+		}
+		if err := playerStore.ResumeSession(ctx, p.XUID, p.Username, time.Now()); err != nil {
+			log.Error("store_resume_session_failed", logging.Fields{"xuid": p.XUID, "error": err.Error()})
+		}
+	}
 	for _, join := range joins {
 		if chat.IsSelfOrSibling(join.XUID, selfXUID, siblingXUIDs) {
 			continue

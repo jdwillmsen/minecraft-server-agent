@@ -94,10 +94,10 @@ func (r *Roster) BeginSession() {
 //
 // The first packet of a session carrying at least one usable add is the
 // server's roster snapshot: those players were already connected before
-// this process was watching, so they are recorded but never reported as
-// joins. Neither an empty packet nor a removal consumes it, so neither can
-// cause the real snapshot behind it to be mistaken for arrivals.
-func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves []Entry) {
+// this process was watching, so they are recorded and reported as present
+// rather than as joins. Neither an empty packet nor a removal consumes it, so
+// neither can cause the real snapshot behind it to be mistaken for arrivals.
+func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -132,12 +132,17 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves []Entry) {
 		if e.UUID != "" {
 			r.xuidByUUID[e.UUID] = e.XUID
 		}
-		if _, known := r.players[e.XUID]; !known && !snapshot {
-			joins = append(joins, Entry{XUID: e.XUID, Username: e.Username})
+		if _, known := r.players[e.XUID]; !known {
+			entry := Entry{XUID: e.XUID, Username: e.Username}
+			if snapshot {
+				present = append(present, entry)
+			} else {
+				joins = append(joins, entry)
+			}
 		}
 		r.players[e.XUID] = e.Username
 	}
-	return joins, leaves
+	return joins, leaves, present
 }
 
 // NameFor returns the username currently on record for xuid, so a caller

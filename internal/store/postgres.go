@@ -119,28 +119,8 @@ func (p *Postgres) RecordJoin(ctx context.Context, xuid, gamertag string, at tim
 		return Profile{}, fmt.Errorf("store: record name: %w", err)
 	}
 
-	// Any session still open for this player belongs to a visit whose end was
-	// never observed -- the agent was away for it, typically across a
-	// reconnect inside this process, which clears the roster without seeing
-	// anyone leave. Closed at its own joined_at, the way CloseOrphans closes
-	// one, and never at this arrival: that would credit the player with their
-	// whole absence, days of it after a long break, and a milestone read off
-	// that total would be announced to the server as fact.
-	if _, err := tx.Exec(ctx, `
-		UPDATE minecraft.sessions
-		SET left_at = joined_at, ended_reason = 'unknown'
-		WHERE xuid = $1 AND ended_reason = 'open'`,
-		xuid,
-	); err != nil {
-		return Profile{}, fmt.Errorf("store: close stale sessions: %w", err)
-	}
-
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO minecraft.sessions (xuid, gamertag, joined_at)
-		VALUES ($1, $2, $3)`,
-		xuid, gamertag, at,
-	); err != nil {
-		return Profile{}, fmt.Errorf("store: open session: %w", err)
+	if err := openSession(ctx, tx, xuid, gamertag, at); err != nil {
+		return Profile{}, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -151,6 +131,61 @@ func (p *Postgres) RecordJoin(ctx context.Context, xuid, gamertag string, at tim
 	// reads as 1 rather than 0 -- see Profile.JoinCount.
 	prior.JoinCount++
 	return prior, nil
+}
+
+// openSession starts the player's one open session, closing any other first.
+//
+// A session still open here belongs to a visit whose end was never observed.
+// Every connection closes those as it begins, so one surviving to this point
+// means that close failed. Closed at its own joined_at, the way CloseOrphans
+// closes one, and never at this new start: that would credit the player with
+// their whole absence, days of it after a long break, and a milestone read
+// off that total would be announced to the server as fact.
+func openSession(ctx context.Context, tx pgx.Tx, xuid, gamertag string, at time.Time) error {
+	if _, err := tx.Exec(ctx, `
+		UPDATE minecraft.sessions
+		SET left_at = joined_at, ended_reason = 'unknown'
+		WHERE xuid = $1 AND ended_reason = 'open'`,
+		xuid,
+	); err != nil {
+		return fmt.Errorf("store: close stale sessions: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO minecraft.sessions (xuid, gamertag, joined_at)
+		VALUES ($1, $2, $3)`,
+		xuid, gamertag, at,
+	); err != nil {
+		return fmt.Errorf("store: open session: %w", err)
+	}
+	return nil
+}
+
+// ResumeSession opens a session for a player already connected, leaving
+// their profile as it was: no join counted, last_seen_at not advanced, the
+// player row created bare if this is the first the agent has heard of them,
+// exactly as EnsurePlayer would.
+func (p *Postgres) ResumeSession(ctx context.Context, xuid, gamertag string, at time.Time) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("store: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO minecraft.players (xuid, current_gamertag, first_seen_at, last_seen_at)
+		VALUES ($1, $2, $3, $3)
+		ON CONFLICT (xuid) DO NOTHING`,
+		xuid, gamertag, at,
+	); err != nil {
+		return fmt.Errorf("store: ensure player: %w", err)
+	}
+	if err := openSession(ctx, tx, xuid, gamertag, at); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("store: commit: %w", err)
+	}
+	return nil
 }
 
 // EnsurePlayer inserts the minimum row a foreign key needs and leaves an
@@ -263,7 +298,8 @@ func (p *Postgres) RecordLeave(ctx context.Context, xuid string, at time.Time) (
 	}, nil
 }
 
-// CloseOrphans ends sessions left open by a previous run.
+// CloseOrphans ends sessions left open by a previous run or a previous
+// connection.
 //
 // left_at is the session's own joined_at, not now: the agent has no idea when
 // those players actually left, and crediting them with the entire downtime

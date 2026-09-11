@@ -93,6 +93,15 @@ type Store interface {
 	// from RecordJoin because "has a row" and "just joined" are different
 	// facts and only one of them is worth greeting.
 	EnsurePlayer(ctx context.Context, xuid, gamertag string, at time.Time) error
+	// ResumeSession opens a session at `at` for a player who was already
+	// connected when the agent began watching -- one in a connection's
+	// opening roster snapshot -- without counting it as an arrival.
+	//
+	// Playtime counts only time the agent watched. The part of the visit
+	// before this connection was closed at zero length when it began, so
+	// without a fresh session here the player's eventual departure would
+	// close nothing and the time watched from now on would be lost too.
+	ResumeSession(ctx context.Context, xuid, gamertag string, at time.Time) error
 	// XUIDForName resolves a gamertag to the XUID it belongs to, from what
 	// this server has recorded rather than from who is connected.
 	//
@@ -104,10 +113,10 @@ type Store interface {
 	// "offline", and the only one that justifies refusing to store a
 	// message.
 	XUIDForName(ctx context.Context, gamertag string) (xuid string, ok bool, err error)
-	// CloseOrphans marks sessions still open from a previous run as ended
-	// without observation. Called once at startup: the agent learns of a
-	// departure by being connected, so anything still open when it starts is
-	// a visit whose end nobody saw.
+	// CloseOrphans marks every open session as ended without observation.
+	// Called at startup and again at the start of every connection: the
+	// agent learns of a departure by being connected, so anything still open
+	// when it (re)connects is a visit whose end nobody saw.
 	CloseOrphans(ctx context.Context, at time.Time) (int, error)
 	// Close releases resources.
 	Close()
@@ -128,8 +137,9 @@ func (Nop) RecordJoin(context.Context, string, string, time.Time) (Profile, erro
 func (Nop) RecordLeave(context.Context, string, time.Time) (Playtime, error) {
 	return Playtime{}, nil
 }
-func (Nop) EnsurePlayer(context.Context, string, string, time.Time) error { return nil }
-func (Nop) XUIDForName(context.Context, string) (string, bool, error)     { return "", false, nil }
-func (Nop) CloseOrphans(context.Context, time.Time) (int, error)          { return 0, nil }
-func (Nop) Close()                                                        {}
-func (Nop) Enabled() bool                                                 { return false }
+func (Nop) EnsurePlayer(context.Context, string, string, time.Time) error  { return nil }
+func (Nop) ResumeSession(context.Context, string, string, time.Time) error { return nil }
+func (Nop) XUIDForName(context.Context, string) (string, bool, error)      { return "", false, nil }
+func (Nop) CloseOrphans(context.Context, time.Time) (int, error)           { return 0, nil }
+func (Nop) Close()                                                         {}
+func (Nop) Enabled() bool                                                  { return false }

@@ -15,6 +15,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -170,6 +171,84 @@ func TestAStaleSessionIsClosedAtZeroLengthAndCountsForNothing(t *testing.T) {
 	}
 	if pt.Before != base.Before || pt.After != base.Before+time.Hour {
 		t.Errorf("totals = (%v, %v), want (%v, %v): only the observed hour counts", pt.Before, pt.After, base.Before, base.Before+time.Hour)
+	}
+}
+
+// The reconnect sequence as the agent drives it: a player joins at T0, the
+// agent loses its connection, the player leaves and comes back unseen, and
+// the agent reconnects at T4 to find them in the opening snapshot. Only
+// T4..T5 was watched, so only that hour may count -- 72 hours of absence
+// credited here would be announced as a playtime milestone.
+func TestAReconnectCreditsOnlyTheTimeWatchedSinceIt(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := "2535400000000013"
+	t0 := time.Now().UTC().Add(-300 * time.Hour).Truncate(time.Second)
+
+	base, err := pg.RecordLeave(ctx, xuid, t0.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("baseline leave: %v", err)
+	}
+	if _, err := pg.RecordJoin(ctx, xuid, "Reconnected", t0); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	var joinsBefore int
+	if err := pg.pool.QueryRow(ctx, `SELECT join_count FROM minecraft.players WHERE xuid = $1`, xuid).Scan(&joinsBefore); err != nil {
+		t.Fatalf("read join count: %v", err)
+	}
+
+	t4 := t0.Add(72 * time.Hour)
+	if _, err := pg.CloseOrphans(ctx, t4); err != nil {
+		t.Fatalf("close orphans at reconnect: %v", err)
+	}
+	if err := pg.ResumeSession(ctx, xuid, "Reconnected", t4); err != nil {
+		t.Fatalf("resume from the snapshot: %v", err)
+	}
+
+	pt, err := pg.RecordLeave(ctx, xuid, t4.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	if pt.Before != base.Before || pt.After != base.Before+time.Hour {
+		t.Errorf("totals = (%v, %v), want (%v, %v): only the hour since the reconnect was watched", pt.Before, pt.After, base.Before, base.Before+time.Hour)
+	}
+	if pt.Gamertag != "Reconnected" {
+		t.Errorf("gamertag = %q, want the resumed session's", pt.Gamertag)
+	}
+
+	var joinsAfter int
+	if err := pg.pool.QueryRow(ctx, `SELECT join_count FROM minecraft.players WHERE xuid = $1`, xuid).Scan(&joinsAfter); err != nil {
+		t.Fatalf("read join count: %v", err)
+	}
+	if joinsAfter != joinsBefore {
+		t.Errorf("join_count went %d -> %d: resuming a session is not an arrival", joinsBefore, joinsAfter)
+	}
+}
+
+// A player the agent has never recorded can be in a snapshot; resuming
+// their session must create the row the session's foreign key needs.
+func TestResumeSessionForAnUnrecordedPlayer(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := fmt.Sprintf("25354%011d", time.Now().UnixNano()%1e11)
+	at := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+
+	if err := pg.ResumeSession(ctx, xuid, "Stranger", at); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	pt, err := pg.RecordLeave(ctx, xuid, at.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	if pt.Before != 0 || pt.After != time.Hour {
+		t.Errorf("totals = (%v, %v), want (0s, 1h0m0s)", pt.Before, pt.After)
+	}
+	profile, err := pg.RecordJoin(ctx, xuid, "Stranger", at.Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if profile.JoinCount != 1 {
+		t.Errorf("JoinCount = %d on the first observed arrival, want 1", profile.JoinCount)
 	}
 }
 

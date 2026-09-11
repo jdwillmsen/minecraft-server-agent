@@ -11,7 +11,7 @@ var agentEntry = PlayerListEntry{XUID: "999", Username: "Agent"}
 // the test can go on to exercise genuine joins.
 func absorbSnapshot(t *testing.T, r *Roster, entries ...PlayerListEntry) {
 	t.Helper()
-	if joins, _ := r.Apply(entries); len(joins) != 0 {
+	if joins, _, _ := r.Apply(entries); len(joins) != 0 {
 		t.Fatalf("session snapshot reported %d joins, want 0", len(joins))
 	}
 }
@@ -20,7 +20,7 @@ func TestApply_NewPlayerReportedAsJoin(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry)
 
-	joins, _ := r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve"}})
+	joins, _, _ := r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve"}})
 	if len(joins) != 1 {
 		t.Fatalf("got %d joins, want 1", len(joins))
 	}
@@ -34,7 +34,7 @@ func TestApply_KnownPlayerNotReportedAgain(t *testing.T) {
 	absorbSnapshot(t, r, agentEntry)
 	r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve"}})
 
-	joins, _ := r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve"}})
+	joins, _, _ := r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve"}})
 	if len(joins) != 0 {
 		t.Errorf("got %d joins on a repeated add, want 0", len(joins))
 	}
@@ -45,7 +45,7 @@ func TestApply_RemoveThenReAddReportsJoinAgain(t *testing.T) {
 	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
 	r.Apply([]PlayerListEntry{{XUID: "111", Remove: true}})
 
-	joins, _ := r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve"}})
+	joins, _, _ := r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve"}})
 	if len(joins) != 1 {
 		t.Errorf("got %d joins after leave+rejoin, want 1", len(joins))
 	}
@@ -57,7 +57,7 @@ func TestApply_RemovalCarryingOnlyAUUIDIsALeave(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve", UUID: "u-111"})
 
-	_, leaves := r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}})
+	_, leaves, _ := r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}})
 	if len(leaves) != 1 || leaves[0].XUID != "111" || leaves[0].Username != "Steve" {
 		t.Fatalf("leaves = %+v, want Steve (111)", leaves)
 	}
@@ -65,7 +65,7 @@ func TestApply_RemovalCarryingOnlyAUUIDIsALeave(t *testing.T) {
 		t.Error("Steve still on the roster after a UUID-only removal")
 	}
 
-	joins, _ := r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve", UUID: "u-111"}})
+	joins, _, _ := r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve", UUID: "u-111"}})
 	if len(joins) != 1 {
 		t.Errorf("got %d joins for a rejoin after a UUID-only removal, want 1: a rejoin is what triggers the welcome and the announcement drain", len(joins))
 	}
@@ -75,7 +75,7 @@ func TestApply_RemovalOfAnUnknownUUIDIsIgnored(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve", UUID: "u-111"})
 
-	if _, leaves := r.Apply([]PlayerListEntry{{UUID: "u-unknown", Remove: true}}); len(leaves) != 0 {
+	if _, leaves, _ := r.Apply([]PlayerListEntry{{UUID: "u-unknown", Remove: true}}); len(leaves) != 0 {
 		t.Errorf("leaves = %+v for a UUID nobody was recorded under, want none", leaves)
 	}
 	if _, ok := r.NameFor("111"); !ok {
@@ -89,7 +89,7 @@ func TestApply_RemovalDoesNotConsumeTheSnapshot(t *testing.T) {
 	r := New()
 	r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}})
 
-	if joins, _ := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve", UUID: "u-111"}}); len(joins) != 0 {
+	if joins, _, _ := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve", UUID: "u-111"}}); len(joins) != 0 {
 		t.Errorf("got %d joins from the snapshot after a stray removal, want 0", len(joins))
 	}
 }
@@ -100,7 +100,7 @@ func TestBeginSession_ForgetsUUIDs(t *testing.T) {
 	r.BeginSession()
 	absorbSnapshot(t, r, agentEntry)
 
-	if _, leaves := r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}}); len(leaves) != 0 {
+	if _, leaves, _ := r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}}); len(leaves) != 0 {
 		t.Errorf("leaves = %+v resolved through a previous session's UUID, want none", leaves)
 	}
 }
@@ -109,7 +109,7 @@ func TestApply_BlankXUIDIgnored(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry)
 
-	joins, _ := r.Apply([]PlayerListEntry{{XUID: "", Username: "Nobody"}})
+	joins, _, _ := r.Apply([]PlayerListEntry{{XUID: "", Username: "Nobody"}})
 	if len(joins) != 0 {
 		t.Errorf("got %d joins for a blank XUID, want 0", len(joins))
 	}
@@ -122,7 +122,7 @@ func TestApply_MultipleNewPlayersInOneUpdate(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry)
 
-	joins, _ := r.Apply([]PlayerListEntry{
+	joins, _, _ := r.Apply([]PlayerListEntry{
 		{XUID: "111", Username: "Steve"},
 		{XUID: "222", Username: "Alex"},
 	})
@@ -134,7 +134,7 @@ func TestApply_MultipleNewPlayersInOneUpdate(t *testing.T) {
 func TestApply_SessionSnapshotRecordsPlayersWithoutReportingJoins(t *testing.T) {
 	r := New()
 
-	joins, _ := r.Apply([]PlayerListEntry{
+	joins, _, _ := r.Apply([]PlayerListEntry{
 		agentEntry,
 		{XUID: "111", Username: "Steve"},
 		{XUID: "222", Username: "Alex"},
@@ -153,11 +153,11 @@ func TestApply_SessionSnapshotRecordsPlayersWithoutReportingJoins(t *testing.T) 
 func TestApply_EmptyPacketDoesNotConsumeTheSnapshot(t *testing.T) {
 	r := New()
 
-	if joins, _ := r.Apply(nil); len(joins) != 0 {
+	if joins, _, _ := r.Apply(nil); len(joins) != 0 {
 		t.Fatalf("got %d joins from an empty packet, want 0", len(joins))
 	}
 
-	joins, _ := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
+	joins, _, _ := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
 	if len(joins) != 0 {
 		t.Errorf("got %d joins, want 0 — the empty packet must not have consumed the snapshot", len(joins))
 	}
@@ -179,14 +179,36 @@ func TestBeginSession_NextSnapshotIsNotReportedAsJoins(t *testing.T) {
 	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
 	r.BeginSession()
 
-	joins, _ := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
+	joins, _, _ := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
 	if len(joins) != 0 {
 		t.Fatalf("got %d joins from the reconnect snapshot, want 0", len(joins))
 	}
 
-	joins, _ = r.Apply([]PlayerListEntry{{XUID: "222", Username: "Alex"}})
+	joins, _, _ = r.Apply([]PlayerListEntry{{XUID: "222", Username: "Alex"}})
 	if len(joins) != 1 {
 		t.Errorf("got %d joins for an arrival after the reconnect snapshot, want 1", len(joins))
+	}
+}
+
+// Whoever the snapshot shows is still playing, and their session has to be
+// reopened -- so they are reported, once, as present rather than dropped.
+func TestApply_SnapshotReportsPresentPlayersOnce(t *testing.T) {
+	r := New()
+
+	_, _, present := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}, {XUID: "111", Username: "Steve"}})
+	want := []Entry{{XUID: agentEntry.XUID, Username: agentEntry.Username}, {XUID: "111", Username: "Steve"}}
+	if len(present) != len(want) || present[0] != want[0] || present[1] != want[1] {
+		t.Errorf("present = %+v, want %+v", present, want)
+	}
+
+	joins, _, present := r.Apply([]PlayerListEntry{{XUID: "222", Username: "Alex"}})
+	if len(present) != 0 || len(joins) != 1 {
+		t.Errorf("after the snapshot: joins = %+v, present = %+v; want one join and nobody merely present", joins, present)
+	}
+
+	r.BeginSession()
+	if _, _, present := r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve"}}); len(present) != 1 {
+		t.Errorf("reconnect snapshot present = %+v, want Steve", present)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"slices"
 	"testing"
 	"time"
 
@@ -194,4 +195,76 @@ func TestPlayerListFlow(t *testing.T) {
 			t.Error("NameFor for a player absent from the reconnect snapshot = ok, want not-ok — a tellraw aimed at them would reach nobody")
 		}
 	})
+}
+
+// sessionCalls records the session writes handlePlayerList and beginWatching
+// make, in order, as "method:xuid". A join opens its session in the welcome
+// plugin, off the bus, so it shows up here only as a published join.
+type sessionCalls struct {
+	store.Nop
+	calls []string
+}
+
+func (s *sessionCalls) RecordLeave(_ context.Context, xuid string, _ time.Time) (store.Playtime, error) {
+	s.calls = append(s.calls, "leave:"+xuid)
+	return store.Playtime{}, nil
+}
+
+func (s *sessionCalls) ResumeSession(_ context.Context, xuid, _ string, _ time.Time) error {
+	s.calls = append(s.calls, "resume:"+xuid)
+	return nil
+}
+
+func (s *sessionCalls) CloseOrphans(context.Context, time.Time) (int, error) {
+	s.calls = append(s.calls, "close-orphans")
+	return 0, nil
+}
+
+// A player seen joining before a disconnect may have left and returned
+// while the agent was away, so their open session cannot be trusted to
+// measure anything. The reconnect closes it before the snapshot is read,
+// the snapshot opens a fresh one, and the eventual leave closes that --
+// never the session from before the gap. Nobody is greeted for being in
+// the snapshot.
+func TestReconnectRestartsTheSessionsOfPlayersStillOnline(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	events, _ := eventBus.Subscribe(roster.JoinKind, 8)
+	playerRoster := roster.New()
+	profiles := &sessionCalls{}
+
+	beginWatching(context.Background(), playerRoster, profiles, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	if joins := drainJoins(t, events); len(joins) != 1 {
+		t.Fatalf("got %d joins before the disconnect, want Steve's", len(joins))
+	}
+
+	beginWatching(context.Background(), playerRoster, profiles, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(siblingBot, "AfkBot"),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	handlePlayerList(context.Background(), wire(t,
+		removeEntry(playerXUID),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+
+	want := []string{
+		"close-orphans",
+		"close-orphans",
+		"resume:" + playerXUID,
+		"leave:" + playerXUID,
+	}
+	if !slices.Equal(profiles.calls, want) {
+		t.Errorf("session writes = %v, want %v", profiles.calls, want)
+	}
+	if joins := drainJoins(t, events); len(joins) != 0 {
+		t.Errorf("got %d joins from the reconnect snapshot, want 0: %+v", len(joins), joins)
+	}
 }
