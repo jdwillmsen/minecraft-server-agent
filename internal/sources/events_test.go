@@ -112,18 +112,20 @@ func TestJoinedWhispersOperatorsOnAFirstEverArrivalOnly(t *testing.T) {
 	e := inlineEvents(pub)
 	now := time.Now()
 
-	e.Joined("Returner", store.Profile{JoinCount: 2, FirstSeen: now.Add(-time.Hour)})
+	e.Joined("Returner", store.Profile{JoinCount: 2, FirstSeen: now.Add(-time.Hour), Sessions: 1})
 	if got := pub.all(); len(got) != 0 {
 		t.Fatalf("a returning player was announced: %+v", got)
 	}
-	// A row with no counted join: first met already online, and announced
-	// then. Their first watched arrival is not news a second time.
-	e.Joined("SeenOnline", store.Profile{JoinCount: 1, FirstSeen: now.Add(-time.Hour)})
+	// A session but no counted join: first met already online, and
+	// announced then. Their first watched arrival is not news a second time.
+	e.Joined("SeenOnline", store.Profile{JoinCount: 1, FirstSeen: now.Add(-time.Hour), Sessions: 1})
 	if got := pub.all(); len(got) != 0 {
-		t.Fatalf("a player the store already had a row for was announced as new: %+v", got)
+		t.Fatalf("a player with a recorded session was announced as new: %+v", got)
 	}
 
-	e.Joined("Newcomer", store.Profile{JoinCount: 1})
+	// A bare row written for an announcement, with no session: the join is
+	// still the first sight of them.
+	e.Joined("Newcomer", store.Profile{JoinCount: 1, FirstSeen: now.Add(-time.Minute)})
 	got := pub.all()
 	if len(got) != 1 {
 		t.Fatalf("published %d announcements, want 1", len(got))

@@ -279,12 +279,15 @@ func TestResumeSessionForAnUnrecordedPlayer(t *testing.T) {
 	xuid := fmt.Sprintf("25354%011d", time.Now().UnixNano()%1e11)
 	at := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
 
-	created, err := pg.ResumeSession(ctx, xuid, "Stranger", at)
+	if err := pg.EnsurePlayer(ctx, xuid, "Stranger", at); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	firstSeen, err := pg.ResumeSession(ctx, xuid, "Stranger", at)
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
-	if !created {
-		t.Error("resume reported an existing row for a player never recorded; nobody would hear of them")
+	if !firstSeen {
+		t.Error("resume reported a player with only a bare row as seen before; nobody would hear of them")
 	}
 	pt, err := pg.RecordLeave(ctx, xuid, time.Time{}, at.Add(time.Hour))
 	if err != nil {
@@ -300,15 +303,15 @@ func TestResumeSessionForAnUnrecordedPlayer(t *testing.T) {
 	if profile.JoinCount != 1 {
 		t.Errorf("JoinCount = %d on the first observed arrival, want 1", profile.JoinCount)
 	}
-	if profile.FirstSeen.IsZero() {
-		t.Error("the join reported no prior row; the player would be announced a second time")
+	if profile.Sessions != 1 {
+		t.Errorf("Sessions = %d before the first observed arrival, want the resumed one; the player would be announced a second time", profile.Sessions)
 	}
 	again, err := pg.ResumeSession(ctx, xuid, "Stranger", at.Add(3*time.Hour))
 	if err != nil {
 		t.Fatalf("second resume: %v", err)
 	}
 	if again {
-		t.Error("a second resume reported creating the row again")
+		t.Error("a second resume reported a first sight again")
 	}
 }
 
@@ -321,7 +324,7 @@ func TestUnknownSessionsWithADurationCountForNothing(t *testing.T) {
 	xuid := "2535400000000012"
 	t0 := time.Now().UTC().Add(-200 * time.Hour).Truncate(time.Second)
 
-	if _, err := pg.EnsurePlayer(ctx, xuid, "LegacyRow", t0); err != nil {
+	if err := pg.EnsurePlayer(ctx, xuid, "LegacyRow", t0); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	base, err := pg.RecordLeave(ctx, xuid, time.Time{}, t0)
@@ -505,7 +508,7 @@ func TestEnsurePlayerCreatesARowWithoutCountingAJoin(t *testing.T) {
 	xuid := "2535400000000005"
 	at := time.Now().UTC()
 
-	if _, err := pg.EnsurePlayer(ctx, xuid, "AlreadyOnline", at); err != nil {
+	if err := pg.EnsurePlayer(ctx, xuid, "AlreadyOnline", at); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	var joins int
@@ -523,8 +526,26 @@ func TestEnsurePlayerCreatesARowWithoutCountingAJoin(t *testing.T) {
 	if !profile.New() {
 		t.Error("the first observed join of an ensured player reported as a return; they would be greeted as a regular")
 	}
-	if profile.FirstSeen.IsZero() {
-		t.Error("the join reported no prior row; operators would hear of an ensured player a second time")
+}
+
+// A bare row the outbox wrote for a brand-new joiner, before the join itself
+// was recorded, is not a sighting: the join must still read as the player's
+// first.
+func TestAJoinAfterAnEnsureStillReadsAsUnseen(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := fmt.Sprintf("25355%011d", time.Now().UnixNano()%1e11)
+	at := time.Now().UTC().Truncate(time.Second)
+
+	if err := pg.EnsurePlayer(ctx, xuid, "RaceLoser", at); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	profile, err := pg.RecordJoin(ctx, xuid, "RaceLoser", at)
+	if err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if profile.Sessions != 0 {
+		t.Errorf("Sessions = %d before the first join, want 0: the first-join notice would be skipped", profile.Sessions)
 	}
 }
 
@@ -538,12 +559,8 @@ func TestEnsurePlayerLeavesAnExistingProfileAlone(t *testing.T) {
 	if _, err := pg.RecordJoin(ctx, xuid, "Regular", time.Now().UTC().Add(-time.Hour)); err != nil {
 		t.Fatalf("join: %v", err)
 	}
-	created, err := pg.EnsurePlayer(ctx, xuid, "SomethingElse", time.Now().UTC())
-	if err != nil {
+	if err := pg.EnsurePlayer(ctx, xuid, "SomethingElse", time.Now().UTC()); err != nil {
 		t.Fatalf("ensure: %v", err)
-	}
-	if created {
-		t.Error("ensure reported creating a row that already existed")
 	}
 
 	var gamertag string

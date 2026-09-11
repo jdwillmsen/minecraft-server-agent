@@ -74,11 +74,11 @@ type recordingPlayers struct {
 
 var _ playerRecorder = (*recordingPlayers)(nil)
 
-func (p *recordingPlayers) EnsurePlayer(_ context.Context, xuid, gamertag string, _ time.Time) (bool, error) {
+func (p *recordingPlayers) EnsurePlayer(_ context.Context, xuid, gamertag string, _ time.Time) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.ensured = append(p.ensured, xuid+" as "+gamertag)
-	return false, p.err
+	return p.err
 }
 
 func (p *recordingPlayers) all() []string {

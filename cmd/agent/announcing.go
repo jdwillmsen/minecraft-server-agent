@@ -145,7 +145,7 @@ func (l playerLookup) XUIDFor(ctx context.Context, name string) (string, bool, e
 // playerRecorder is the one thing an outbox needs from the profile store: a
 // row for a player, so a foreign key has something to point at.
 type playerRecorder interface {
-	EnsurePlayer(ctx context.Context, xuid, gamertag string, at time.Time) (created bool, err error)
+	EnsurePlayer(ctx context.Context, xuid, gamertag string, at time.Time) error
 }
 
 // outbox is the announcement store as this binary uses it: before writing a
@@ -263,7 +263,7 @@ func (o *outbox) ensure(ctx context.Context, xuid string) {
 	if !ok || gamertag == "" {
 		return
 	}
-	if _, err := o.players.EnsurePlayer(ctx, xuid, gamertag, time.Now()); err != nil {
+	if err := o.players.EnsurePlayer(ctx, xuid, gamertag, time.Now()); err != nil {
 		o.log.Error("announce_ensure_player_failed", logging.Fields{"xuid": xuid, "error": err.Error()})
 	}
 }

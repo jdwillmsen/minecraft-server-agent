@@ -92,21 +92,23 @@ func NewEvents(rootCtx context.Context, pub Publisher, log *logging.Logger) *Eve
 // caller must only pass a profile a real store produced; a disabled store
 // reports every arrival as new because it remembers nobody.
 //
-// First-ever means no row existed, not a join count of zero: a player first
-// met already online has a row and no counted join, and was announced by
-// FirstSeenOnline when that row was created. One notice per player, ever.
+// First-ever means no session recorded before this one, not a missing row
+// or a join count of zero. A bare row can be written for an announcement
+// before the player's own join is recorded, and a player first met already
+// online has a session but no counted join -- FirstSeenOnline announced
+// them then. One notice per player, ever.
 func (e *Events) Joined(gamertag string, prior store.Profile) {
-	if !prior.FirstSeen.IsZero() || gamertag == "" {
+	if prior.Sessions > 0 || gamertag == "" {
 		return
 	}
 	e.publish("first_join", announce.TargetPermission, operatorTarget,
 		fmt.Sprintf("First time here: %s just joined the server for the first time.", gamertag))
 }
 
-// FirstSeenOnline tells operators about a player the store just recorded for
-// the first time without watching them arrive -- one already connected when
-// the agent began watching. The same notice as Joined, worded for what the
-// agent actually saw.
+// FirstSeenOnline tells operators about a player whose first recorded
+// session is one resumed from a connection's opening roster -- already
+// connected when the agent began watching. The same notice as Joined,
+// worded for what the agent actually saw.
 func (e *Events) FirstSeenOnline(gamertag string) {
 	if gamertag == "" {
 		return

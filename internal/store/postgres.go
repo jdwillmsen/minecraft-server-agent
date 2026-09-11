@@ -86,13 +86,14 @@ func (p *Postgres) RecordJoin(ctx context.Context, xuid, gamertag string, at tim
 	err = tx.QueryRow(ctx, `
 		SELECT p.first_seen_at, p.last_seen_at, p.join_count,
 		       COALESCE(SUM(s.duration_seconds) FILTER (WHERE s.ended_reason = 'left'), 0)::BIGINT,
-		       COUNT(s.session_id) FILTER (WHERE s.ended_reason = 'unknown')
+		       COUNT(s.session_id) FILTER (WHERE s.ended_reason = 'unknown'),
+		       COUNT(s.session_id)
 		FROM minecraft.players p
 		LEFT JOIN minecraft.sessions s ON s.xuid = p.xuid
 		WHERE p.xuid = $1
 		GROUP BY p.first_seen_at, p.last_seen_at, p.join_count`,
 		xuid,
-	).Scan(&prior.FirstSeen, &prior.LastSeen, &prior.JoinCount, &prior.TotalSeconds, &prior.UncleanSessions)
+	).Scan(&prior.FirstSeen, &prior.LastSeen, &prior.JoinCount, &prior.TotalSeconds, &prior.UncleanSessions, &prior.Sessions)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return Profile{}, fmt.Errorf("store: read profile: %w", err)
 	}
@@ -172,9 +173,14 @@ func (p *Postgres) ResumeSession(ctx context.Context, xuid, gamertag string, at 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	created, err := ensurePlayer(ctx, tx, xuid, gamertag, at)
-	if err != nil {
+	if err := ensurePlayer(ctx, tx, xuid, gamertag, at); err != nil {
 		return false, err
+	}
+	var firstSeen bool
+	if err := tx.QueryRow(ctx,
+		`SELECT NOT EXISTS (SELECT 1 FROM minecraft.sessions WHERE xuid = $1)`, xuid,
+	).Scan(&firstSeen); err != nil {
+		return false, fmt.Errorf("store: read sessions: %w", err)
 	}
 	if err := openSession(ctx, tx, xuid, gamertag, at); err != nil {
 		return false, err
@@ -182,7 +188,7 @@ func (p *Postgres) ResumeSession(ctx context.Context, xuid, gamertag string, at 
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("store: commit: %w", err)
 	}
-	return created, nil
+	return firstSeen, nil
 }
 
 // EnsurePlayer inserts the minimum row a foreign key needs and leaves an
@@ -194,23 +200,22 @@ func (p *Postgres) ResumeSession(ctx context.Context, xuid, gamertag string, at 
 // first_seen_at is when this agent first had to write them down, which is
 // all it has ever meant -- the server saw them earlier, and nothing here can
 // know when.
-func (p *Postgres) EnsurePlayer(ctx context.Context, xuid, gamertag string, at time.Time) (bool, error) {
+func (p *Postgres) EnsurePlayer(ctx context.Context, xuid, gamertag string, at time.Time) error {
 	return ensurePlayer(ctx, p.pool, xuid, gamertag, at)
 }
 
 func ensurePlayer(ctx context.Context, db interface {
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
-}, xuid, gamertag string, at time.Time) (bool, error) {
-	tag, err := db.Exec(ctx, `
+}, xuid, gamertag string, at time.Time) error {
+	if _, err := db.Exec(ctx, `
 		INSERT INTO minecraft.players (xuid, current_gamertag, first_seen_at, last_seen_at)
 		VALUES ($1, $2, $3, $3)
 		ON CONFLICT (xuid) DO NOTHING`,
 		xuid, gamertag, at,
-	)
-	if err != nil {
-		return false, fmt.Errorf("store: ensure player: %w", err)
+	); err != nil {
+		return fmt.Errorf("store: ensure player: %w", err)
 	}
-	return tag.RowsAffected() == 1, nil
+	return nil
 }
 
 // XUIDForName resolves a gamertag through the two places one is recorded:

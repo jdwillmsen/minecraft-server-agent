@@ -34,6 +34,11 @@ type Profile struct {
 	// restart, an agent restart or a crash ended them instead. A profile with
 	// many of these has playtime that is a floor, not a measurement.
 	UncleanSessions int
+	// Sessions counts every visit recorded before this one, watched
+	// arrivals and presences resumed from a roster snapshot alike. Zero
+	// means the agent has never seen the player, whether or not a bare row
+	// was already written for them.
+	Sessions int
 }
 
 // New reports whether this is the first time the server has seen the player.
@@ -98,10 +103,7 @@ type Store interface {
 	// something puts them there first. This is that something, kept separate
 	// from RecordJoin because "has a row" and "just joined" are different
 	// facts and only one of them is worth greeting.
-	//
-	// created reports whether the row did not exist before: the agent's
-	// first sight of a player it met already online.
-	EnsurePlayer(ctx context.Context, xuid, gamertag string, at time.Time) (created bool, err error)
+	EnsurePlayer(ctx context.Context, xuid, gamertag string, at time.Time) error
 	// ResumeSession opens a session at `at` for a player who was already
 	// connected when the agent began watching -- one in a connection's
 	// opening roster snapshot -- without counting it as an arrival.
@@ -111,9 +113,9 @@ type Store interface {
 	// without a fresh session here the player's eventual departure would
 	// close nothing and the time watched from now on would be lost too.
 	//
-	// created reports whether the player's row did not exist before, as
-	// EnsurePlayer's does.
-	ResumeSession(ctx context.Context, xuid, gamertag string, at time.Time) (created bool, err error)
+	// firstSeen reports whether the player had no session before this one:
+	// the agent's first sight of them, whether or not a row existed.
+	ResumeSession(ctx context.Context, xuid, gamertag string, at time.Time) (firstSeen bool, err error)
 	// XUIDForName resolves a gamertag to the XUID it belongs to, from what
 	// this server has recorded rather than from who is connected.
 	//
@@ -149,9 +151,7 @@ func (Nop) RecordJoin(context.Context, string, string, time.Time) (Profile, erro
 func (Nop) RecordLeave(context.Context, string, time.Time, time.Time) (Playtime, error) {
 	return Playtime{}, nil
 }
-func (Nop) EnsurePlayer(context.Context, string, string, time.Time) (bool, error) {
-	return false, nil
-}
+func (Nop) EnsurePlayer(context.Context, string, string, time.Time) error { return nil }
 func (Nop) ResumeSession(context.Context, string, string, time.Time) (bool, error) {
 	return false, nil
 }

@@ -492,7 +492,7 @@ for 24 hours for anyone offline:
 | Event | Who hears it |
 |---|---|
 | A player's first-ever join | Operators, whispered - the welcome already greets the player in public, and a second public line is noise |
-| A player first seen already online (in the opening roster, or recorded for an announcement) | Operators, whispered, once - their later join says nothing, so every player is announced exactly once |
+| A player first seen already online, in a connection's opening roster | Operators, whispered, once - their later join says nothing, so every player is announced exactly once |
 | A player's total playtime reaches 10, 24, 100 or 500 hours | Everyone |
 | The server's Bedrock version changes | Everyone |
 | The world backup is older than the backup exporter's own max age | Operators, whispered |

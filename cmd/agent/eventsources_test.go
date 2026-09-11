@@ -64,56 +64,58 @@ func expectSilence(t *testing.T, pub signallingPublisher) {
 	}
 }
 
-// rememberedProfiles keeps player rows the way Postgres does: a join counts
-// and reports the row as it stood before, while a resume or an ensure only
-// creates a missing row, with no join counted.
+// rememberedProfiles keeps players the way Postgres does: a join and a
+// resume each record a session, and a join reports how many came before
+// it, while an ensure writes a bare row and records no session.
 type rememberedProfiles struct {
 	store.Nop
-	rows map[string]store.Profile
-}
-
-func newRememberedProfiles() *rememberedProfiles {
-	return &rememberedProfiles{rows: map[string]store.Profile{}}
+	rows     map[string]time.Time
+	sessions map[string]int
 }
 
 func (r *rememberedProfiles) Enabled() bool { return true }
 
-func (r *rememberedProfiles) RecordJoin(_ context.Context, xuid, gamertag string, at time.Time) (store.Profile, error) {
-	prior := r.rows[xuid]
-	row := prior
-	if row.FirstSeen.IsZero() {
-		row.FirstSeen = at
+func (r *rememberedProfiles) row(xuid string, at time.Time) time.Time {
+	if _, ok := r.rows[xuid]; !ok {
+		r.rows[xuid] = at
 	}
-	row.XUID, row.Gamertag, row.LastSeen = xuid, gamertag, at
-	row.JoinCount++
-	r.rows[xuid] = row
-	prior.XUID, prior.Gamertag = xuid, gamertag
-	prior.JoinCount++
+	return r.rows[xuid]
+}
+
+func (r *rememberedProfiles) RecordJoin(_ context.Context, xuid, gamertag string, at time.Time) (store.Profile, error) {
+	_, existed := r.rows[xuid]
+	prior := store.Profile{XUID: xuid, Gamertag: gamertag, JoinCount: 1, Sessions: r.sessions[xuid]}
+	if existed {
+		prior.FirstSeen = r.rows[xuid]
+	}
+	r.row(xuid, at)
+	r.sessions[xuid]++
 	return prior, nil
 }
 
-func (r *rememberedProfiles) EnsurePlayer(_ context.Context, xuid, gamertag string, at time.Time) (bool, error) {
-	if _, ok := r.rows[xuid]; ok {
-		return false, nil
-	}
-	r.rows[xuid] = store.Profile{XUID: xuid, Gamertag: gamertag, FirstSeen: at, LastSeen: at}
-	return true, nil
+func (r *rememberedProfiles) EnsurePlayer(_ context.Context, xuid, _ string, at time.Time) error {
+	r.row(xuid, at)
+	return nil
 }
 
-func (r *rememberedProfiles) ResumeSession(ctx context.Context, xuid, gamertag string, at time.Time) (bool, error) {
-	return r.EnsurePlayer(ctx, xuid, gamertag, at)
+func (r *rememberedProfiles) ResumeSession(_ context.Context, xuid, _ string, at time.Time) (bool, error) {
+	r.row(xuid, at)
+	firstSeen := r.sessions[xuid] == 0
+	r.sessions[xuid]++
+	return firstSeen, nil
 }
 
-func wrapRemembered() (store.Store, signallingPublisher) {
+func wrapRemembered() (*rememberedProfiles, store.Store, signallingPublisher) {
+	r := &rememberedProfiles{rows: map[string]time.Time{}, sessions: map[string]int{}}
 	pub := signallingPublisher{got: make(chan announce.Announcement, 4)}
-	return withPlayerEvents(newRememberedProfiles(), sources.NewEvents(context.Background(), pub, logging.New("error"))), pub
+	return r, withPlayerEvents(r, sources.NewEvents(context.Background(), pub, logging.New("error"))), pub
 }
 
 // A player who arrived while the agent was away is first seen in a
 // reconnect's snapshot. Operators hear of them once, then, worded for what
 // was seen; their later real join finds the row and is not a first time.
 func TestPlayerEventsAnnounceASnapshotFirstPlayerOnceAtResume(t *testing.T) {
-	s, pub := wrapRemembered()
+	_, s, pub := wrapRemembered()
 	now := time.Now()
 
 	if _, err := s.ResumeSession(t.Context(), playerXUID, "Newcomer", now); err != nil {
@@ -136,7 +138,7 @@ func TestPlayerEventsAnnounceASnapshotFirstPlayerOnceAtResume(t *testing.T) {
 }
 
 func TestPlayerEventsAnnounceANormalFirstJoinExactlyOnce(t *testing.T) {
-	s, pub := wrapRemembered()
+	_, s, pub := wrapRemembered()
 	now := time.Now()
 
 	if _, err := s.RecordJoin(t.Context(), playerXUID, "Newcomer", now); err != nil {
@@ -154,24 +156,40 @@ func TestPlayerEventsAnnounceANormalFirstJoinExactlyOnce(t *testing.T) {
 	expectSilence(t, pub)
 }
 
-// The outbox ensures a row for an operator already online when an
-// announcement names them. That is the agent's first sight of them, and
-// their next join must not be mistaken for a first-ever one.
-func TestPlayerEventsGiveAnEnsuredPlayerNoFalseFirstJoin(t *testing.T) {
-	s, pub := wrapRemembered()
+// The drain's delivery and the welcome's RecordJoin answer the same join on
+// different goroutines, so the outbox can write a brand-new joiner's bare
+// row first. That row is bookkeeping, not a sighting: the join is still
+// announced, once, as the join it was.
+func TestPlayerEventsAnnounceAJoinThatLostTheRowRaceAsAJoin(t *testing.T) {
+	_, s, pub := wrapRemembered()
 	now := time.Now()
 
-	if _, err := s.EnsurePlayer(t.Context(), playerXUID, "Operator", now); err != nil {
+	if err := s.EnsurePlayer(t.Context(), playerXUID, "Newcomer", now); err != nil {
 		t.Fatalf("EnsurePlayer: %v", err)
 	}
-	if a := expectPublished(t, pub); !strings.Contains(a.Body, "already online") {
-		t.Errorf("body %q, want the first-seen notice", a.Body)
+	expectSilence(t, pub)
+	if _, err := s.RecordJoin(t.Context(), playerXUID, "Newcomer", now); err != nil {
+		t.Fatalf("RecordJoin: %v", err)
 	}
-	if _, err := s.EnsurePlayer(t.Context(), playerXUID, "Operator", now); err != nil {
+	if a := expectPublished(t, pub); !strings.Contains(a.Body, "joined the server for the first time") || strings.Contains(a.Body, "already online") {
+		t.Errorf("body %q, want the first-join notice", a.Body)
+	}
+	if err := s.EnsurePlayer(t.Context(), playerXUID, "Newcomer", now); err != nil {
 		t.Fatalf("second EnsurePlayer: %v", err)
 	}
-	if _, err := s.RecordJoin(t.Context(), playerXUID, "Operator", now.Add(time.Hour)); err != nil {
+	expectSilence(t, pub)
+}
+
+func TestPlayerEventsSayNothingForAReturningPlayer(t *testing.T) {
+	r, s, pub := wrapRemembered()
+	now := time.Now()
+	r.rows[playerXUID], r.sessions[playerXUID] = now.Add(-100*time.Hour), 3
+
+	if _, err := s.RecordJoin(t.Context(), playerXUID, "Regular", now); err != nil {
 		t.Fatalf("RecordJoin: %v", err)
+	}
+	if _, err := s.ResumeSession(t.Context(), playerXUID, "Regular", now.Add(time.Hour)); err != nil {
+		t.Fatalf("ResumeSession: %v", err)
 	}
 	expectSilence(t, pub)
 }

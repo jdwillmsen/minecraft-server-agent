@@ -62,11 +62,11 @@ func TestNopStoreIsSafeAndInert(t *testing.T) {
 	if pt, err := s.RecordLeave(context.Background(), "xuid", at, at); err != nil || pt != (Playtime{}) {
 		t.Errorf("RecordLeave = (%+v, %v), want a zero Playtime and no error", pt, err)
 	}
-	if created, err := s.EnsurePlayer(context.Background(), "xuid", "Steve", at); err != nil || created {
-		t.Errorf("EnsurePlayer = (%v, %v), want (false, nil): a store that records nothing creates nothing", created, err)
+	if err := s.EnsurePlayer(context.Background(), "xuid", "Steve", at); err != nil {
+		t.Errorf("EnsurePlayer: %v", err)
 	}
-	if created, err := s.ResumeSession(context.Background(), "xuid", "Steve", at); err != nil || created {
-		t.Errorf("ResumeSession = (%v, %v), want (false, nil)", created, err)
+	if firstSeen, err := s.ResumeSession(context.Background(), "xuid", "Steve", at); err != nil || firstSeen {
+		t.Errorf("ResumeSession = (%v, %v), want (false, nil): a store that records nothing has seen nobody", firstSeen, err)
 	}
 	if n, err := s.CloseOrphans(context.Background(), at); err != nil || n != 0 {
 		t.Errorf("CloseOrphans = (%d, %v), want (0, nil)", n, err)
