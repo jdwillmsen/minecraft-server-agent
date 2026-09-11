@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/text"
@@ -239,6 +240,19 @@ const sentenceClosers = "\"')]}”’"
 // hyphen is not one: "-2291" is a coordinate.
 var clauseBreaks = []string{",", "，", " - ", "–", "—"}
 
+// questionWords open a sentence that asks from its first word, so nothing
+// before a break in it is an answer: "Did you mean the farm at 120, 64".
+var questionWords = map[string]bool{
+	"did": true, "do": true, "does": true, "can": true, "could": true,
+	"would": true, "will": true, "should": true, "is": true, "are": true,
+	"was": true, "what": true, "where": true, "when": true, "who": true,
+	"why": true, "how": true, "want": true, "shall": true, "may": true,
+}
+
+// minKeptWords is the shortest text before a break worth keeping. Anything
+// shorter is an address or an interjection, like "Sam" or "Sorry".
+const minKeptWords = 4
+
 // trimTrailingQuestions drops closing sentences that end in a question mark.
 //
 // The system prompt forbids ending on a question because a reply that asks
@@ -249,7 +263,9 @@ var clauseBreaks = []string{",", "，", " - ", "–", "—"}
 // reply that ends on a statement invites nothing. A closing question joined
 // to a statement by a comma or dash loses only the part after the last
 // break, so "Your base is at 1843 64 -2291, want directions?" keeps its
-// answer. A reply that is nothing but questions comes back empty.
+// answer; when in doubt the whole sentence goes, since silence is safer
+// than a half-quoted coordinate. A reply that is nothing but questions
+// comes back empty.
 func trimTrailingQuestions(s string) string {
 	for {
 		s = strings.TrimSpace(s)
@@ -259,7 +275,7 @@ func trimTrailingQuestions(s string) string {
 		}
 		body = strings.TrimRight(body, "?？")
 		start := lastSentenceEnd(body)
-		s = body[:start+lastClauseBreak(body[start:])]
+		s = body[:start+statementBefore(body[start:])]
 	}
 }
 
@@ -281,14 +297,43 @@ func lastSentenceEnd(s string) int {
 	return end
 }
 
-// lastClauseBreak is the index of the last clause break in sentence, or 0
-// when it has none.
-func lastClauseBreak(sentence string) int {
-	at := 0
+// statementBefore is the index of the last clause break in a closing
+// question when the text before it is a statement to keep, or 0 when the
+// whole sentence should go.
+func statementBefore(sentence string) int {
+	at, width := -1, 0
 	for _, b := range clauseBreaks {
-		at = max(at, strings.LastIndex(sentence, b))
+		if i := strings.LastIndex(sentence, b); i > at {
+			at, width = i, len(b)
+		}
+	}
+	if at <= 0 || startsNumber(sentence[at+width:]) {
+		return 0
+	}
+	words := strings.Fields(sentence[:at])
+	if len(words) < minKeptWords || questionWords[firstWord(words[0])] {
+		return 0
 	}
 	return at
+}
+
+// startsNumber reports whether what follows a break is a number, which
+// makes the break part of a list or range like "120, 64, -340" or "10–20"
+// rather than the end of a clause.
+func startsNumber(after string) bool {
+	after = strings.TrimLeft(after, " ")
+	return after != "" && (after[0] == '-' || (after[0] >= '0' && after[0] <= '9'))
+}
+
+// firstWord is the leading letters of w in lower case, so "\"What's" is
+// "what".
+func firstWord(w string) string {
+	notLetter := func(r rune) bool { return !unicode.IsLetter(r) }
+	w = strings.TrimLeftFunc(w, notLetter)
+	if end := strings.IndexFunc(w, notLetter); end >= 0 {
+		w = w[:end]
+	}
+	return strings.ToLower(w)
 }
 
 // ExtractToolCalls returns the tool calls in a completion, or nil when the

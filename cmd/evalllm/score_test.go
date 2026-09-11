@@ -257,3 +257,22 @@ func TestCleanAndNoQuestionJudgeTheModelsOwnText(t *testing.T) {
 		t.Errorf("a question the cleanup emptied: scored = %v, pass = %v, want a scored failure", got.Scored, got.Pass)
 	}
 }
+
+// A failed answer reached nobody, so the text of an earlier round must not
+// be scored as if it had.
+func TestCleanAndNoQuestionSkipAnAnswerThatFailed(t *testing.T) {
+	o := Observation{
+		Err:     errors.New("llm: backend returned HTTP 500"),
+		Latency: time.Second,
+		Rounds: []Round{
+			{Status: 200, Content: "Let me look that up.", ToolCalls: []ToolCall{{Name: "server_status", Arguments: "{}"}}},
+			{Status: 500},
+		},
+	}
+	r := Score(testCase(t, nil), o, testLimits())
+	for _, d := range []Dimension{DimClean, DimNoQuestion} {
+		if check(t, r, d).Scored {
+			t.Errorf("%s was scored on an answer that failed", d)
+		}
+	}
+}

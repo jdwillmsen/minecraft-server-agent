@@ -572,7 +572,15 @@ func TestExtractTextTrimsTrailingQuestions(t *testing.T) {
 		"(Rules are posted at spawn.) Anything else?":                   "(Rules are posted at spawn.)",
 		"Your base is at 1843 64 -2291, want directions?":               "Your base is at 1843 64 -2291",
 		"The gold farm is at 120 64 -340 in the nether, anything else?": "The gold farm is at 120 64 -340 in the nether",
-		"Found it — want the coordinates?":                              "Found it",
+		"Found it — want the coordinates?":                              "",
+		"Your stash is saved at spawn — want the coordinates?":          "Your stash is saved at spawn",
+		"Did you mean the farm at 120, 64, -340?":                       "",
+		"The farm is at 120, 64, -340?":                                 "",
+		"Want the farm at y 10–20?":                                     "",
+		"The farm spans y 10 – 20?":                                     "",
+		"Sorry, could you rephrase?":                                    "",
+		"Sam, do you want your coordinates?":                            "",
+		`"What's the farm near spawn, the gold one?`:                    "",
 		"Is it at -340?":                                                "",
 	} {
 		if got := ExtractText(contentPayload(t, in)); got != want {

@@ -177,6 +177,9 @@ var chatMarkup = []string{"<tool_call", "</tool_call", "<function=", "</function
 // would pass by construction and hide a model that still writes them. A
 // reply the cleanup emptied is still scored here.
 func modelText(o Observation) (string, bool) {
+	if o.Err != nil {
+		return "", false
+	}
 	final, ok := o.finalRound()
 	written := strings.Join(strings.Fields(final.Content), " ")
 	return written, ok && written != ""
