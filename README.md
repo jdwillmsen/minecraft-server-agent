@@ -511,10 +511,10 @@ Players the server reports as already online when the agent connects get a
 fresh session from that moment, without a greeting and without counting a
 join. A player who stays on through a reconnect loses the part of their
 visit before it, and nothing more. Operators are told only if this is the
-first time the agent has seen that player at all. A player first recorded because they were already
-online when the agent logged in is still greeted as a first-timer by the
-welcome on their next observed join, but operators, who heard of them when
-they were first seen, hear nothing more.
+first time the agent has seen that player at all. A player first recorded
+because they were already online when the agent logged in is still greeted
+as a first-timer by the welcome on their next observed join, but operators,
+who heard of them when they were first seen, hear nothing more.
 
 Version and backup are read from the exporters behind `!version` and
 `!backup` every five minutes, so they need `MC_MONITOR_URL` and
