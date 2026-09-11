@@ -344,7 +344,10 @@ func hasRule(flags []moderation.Flag, rule moderation.Rule) bool {
 // parseModlogArgs reads "[player] [n]". A trailing integer is the count and
 // everything before it is the name, so a gamertag with a space in it needs
 // no quoting. A gamertag can end in a number, so runModlog tries the whole
-// line as a name before taking this split.
+// line as a name before taking this split. A lone number is always the
+// count, and a whole-line lookup that fails falls back to the split rather
+// than failing the command: the split may well resolve from the live
+// roster alone.
 func parseModlogArgs(args []string) (player string, n int, ok bool) {
 	n = modlogDefault
 	if len(args) > 0 {
@@ -373,12 +376,8 @@ func runModlog(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation)
 	}
 	player, n, ok := parseModlogArgs(inv.Args)
 	var xuid string
-	if whole := strings.TrimPrefix(strings.Join(inv.Args, " "), "@"); whole != player && pctx.Roster != nil {
-		found, known, err := pctx.Roster.XUIDFor(ctx, whole)
-		if err != nil {
-			return "", fmt.Errorf("moderation: !modlog: resolve %s: %w", whole, err)
-		}
-		if known {
+	if whole := strings.TrimPrefix(strings.Join(inv.Args, " "), "@"); len(inv.Args) > 1 && whole != player && pctx.Roster != nil {
+		if found, known, err := pctx.Roster.XUIDFor(ctx, whole); err == nil && known {
 			player, n, ok, xuid = whole, modlogDefault, true, found
 		}
 	}

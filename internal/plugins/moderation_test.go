@@ -660,6 +660,68 @@ func TestModlogReadsAGamertagEndingInANumber(t *testing.T) {
 	}
 }
 
+// modRoster is the two-tier lookup with an archive that can fail, and a
+// note of every name it was asked for.
+type modRoster struct {
+	online     map[string]string
+	archived   map[string]string
+	archiveErr error
+	asked      []string
+}
+
+func (r *modRoster) XUIDFor(_ context.Context, name string) (string, bool, error) {
+	r.asked = append(r.asked, name)
+	if xuid, ok := r.online[name]; ok {
+		return xuid, true, nil
+	}
+	if r.archiveErr != nil {
+		return "", false, r.archiveErr
+	}
+	xuid, ok := r.archived[name]
+	return xuid, ok, nil
+}
+
+// A lone number is a count: it names nobody and asks the roster nothing.
+func TestModlogCountAloneLooksUpNoName(t *testing.T) {
+	store := &modStore{}
+	roster := &modRoster{archiveErr: errors.New("connection refused")}
+	reply := modlog(t, &plugin.Context{Moderation: store, Roster: roster}, plugin.PermissionOperator, "5")
+	if reply != "Nothing recorded." || store.recentXUID != "" || store.recentLimit != 5 {
+		t.Errorf("!modlog 5 = %q reading (%q, %d), want everyone's newest 5", reply, store.recentXUID, store.recentLimit)
+	}
+	if len(roster.asked) != 0 {
+		t.Errorf("!modlog 5 looked up %q", roster.asked)
+	}
+}
+
+// With the archive down, an online player is still found: the whole line
+// failing to resolve is not the command failing.
+func TestModlogFindsALivePlayerWithTheArchiveDown(t *testing.T) {
+	store := &modStore{}
+	roster := &modRoster{online: map[string]string{"Steve": modPlayer}, archiveErr: errors.New("connection refused")}
+	reply := modlog(t, &plugin.Context{Moderation: store, Roster: roster}, plugin.PermissionOperator, "Steve", "3")
+	if reply != "Nothing recorded for Steve." || store.recentXUID != modPlayer || store.recentLimit != 3 {
+		t.Errorf("!modlog Steve 3 = %q reading (%q, %d), want Steve's newest 3", reply, store.recentXUID, store.recentLimit)
+	}
+}
+
+// When neither reading can be resolved because the archive is down, that
+// is an error, not an answer that nobody has the name.
+func TestModlogSurfacesAFailedArchiveLookup(t *testing.T) {
+	m, _ := NewModeration(t.Context(), nil, logging.New("error"))
+	store := &modStore{}
+	pctx := &plugin.Context{Moderation: store, Roster: &modRoster{archiveErr: errors.New("connection refused")}}
+	for _, args := range [][]string{{"Alex", "3"}, {"Alex"}} {
+		if reply, err := m.Commands()[0].Run(context.Background(), pctx,
+			plugin.Invocation{ActorXUID: modPlayer, ActorPermission: plugin.PermissionOperator, Args: args}); err == nil {
+			t.Errorf("!modlog %v = %q, want the failed lookup surfaced", args, reply)
+		}
+	}
+	if store.recentCalls != 0 {
+		t.Errorf("read the log %d times without knowing whose it was", store.recentCalls)
+	}
+}
+
 func TestModlogSurfacesAFailedLookup(t *testing.T) {
 	m, _ := NewModeration(t.Context(), nil, logging.New("error"))
 	pctx := &plugin.Context{Moderation: &modStore{}, Roster: fakeAnnounceRoster{err: errors.New("connection refused")}}
