@@ -532,6 +532,15 @@ func TestExtractTextCutsToolCallMarkup(t *testing.T) {
 		"<tool_call> <function=shutdown_announcement> </function> </tool_call>":                     "",
 		`Done. <tool_call>{"name":"x","arguments":{}}</tool_call>`:                                  "Done.",
 		"Checking. [TOOL_CALLS] [{\"name\":\"x\"}]":                                                 "Checking.",
+		"Checking. [tool_calls] [{\"name\":\"x\"}]":                                                 "Checking.",
+		"Your stash is saved. <TOOL_CALL>":                                                          "Your stash is saved.",
+		"Done. <Function=waypoint_lookup>":                                                          "Done.",
+		"Done. <|python_tag|>{}":                                                                    "Done.",
+		"Done. <|tool_call_begin|>waypoint_lookup":                                                  "Done.",
+		"Done. <|TOOL_CALLS_BEGIN|><|tool_call_begin|>":                                             "Done.",
+		"Done. <function_calls><invoke name=\"x\">":                                                 "Done.",
+		"Done. <FUNCTION_CALLS>":                                                                    "Done.",
+		"İstanbul spawn is at 0 72 0. <TOOL_CALL>":                                                  "İstanbul spawn is at 0 72 0.",
 		"No markup here.": "No markup here.",
 	} {
 		if got := ExtractText(contentPayload(t, in)); got != want {
@@ -587,10 +596,26 @@ func TestExtractTextTrimsTrailingQuestions(t *testing.T) {
 		"Also, the farm is at spawn, want more?":                        "Also, the farm is at spawn",
 		`"What's the farm near spawn, the gold one?`:                    "",
 		"Is it at -340?":                                                "",
+		"服务器运行正常。还需要什么吗？":                                               "服务器运行正常。",
+		"The server is healthy！ Need anything else？":                    "The server is healthy！",
 	} {
 		if got := ExtractText(contentPayload(t, in)); got != want {
 			t.Errorf("ExtractText(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// A reply far past the cap costs the trim no more than one near it: this
+// input took about 50s when every dropped question rescanned the rest.
+func TestExtractTextTrimsHugeRepliesQuickly(t *testing.T) {
+	in := strings.Repeat("a? ", 100_000)
+	start := time.Now()
+	got := ExtractText(contentPayload(t, in))
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("ExtractText took %v on %d bytes", elapsed, len(in))
+	}
+	if strings.HasSuffix(got, "?") || len(got) > MaxReplyChars {
+		t.Errorf("ExtractText = %q, want at most %d bytes not ending on a question", got, MaxReplyChars)
 	}
 }
 

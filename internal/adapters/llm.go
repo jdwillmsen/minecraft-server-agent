@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/text"
@@ -202,6 +203,11 @@ func messageContent(payload []byte) string {
 func cleanReply(s string) string {
 	// Bedrock chat is single-line; collapse anything the model wrapped.
 	s = strings.Join(strings.Fields(cutToolMarkup(s)), " ")
+	// The trim rescans what is left for each question it drops, so a reply
+	// far past the cap is cut first. The room to spare covers any reply the
+	// default max_tokens allows, and the ellipsis keeps the trim from
+	// treating the cut as a closing question.
+	s = text.TruncateEllipsis(s, trimScanChars)
 	s = trimTrailingQuestions(s)
 	// Ellipsis rather than a bare cut: this string is read by a player, and
 	// a reply that stops mid-word looks like a complete, confident answer.
@@ -217,19 +223,38 @@ func cleanReply(s string) string {
 // second call, and stops before writing it. Without the cut the agent says
 // "<tool_call>" in chat, and once said an entire call to a tool that does
 // not exist.
-var toolCallMarkers = []string{"<tool_call", "</tool_call", "<function=", "[TOOL_CALLS]", "<|python_tag|>"}
+// Markers are lower case and matched without regard to case, since
+// templates disagree on it.
+var toolCallMarkers = []string{
+	"<tool_call", "</tool_call", "<function=", "<function_calls>",
+	"[tool_calls]", "<|python_tag|>", "<|tool_call_begin|>", "<|tool_calls_begin|>",
+}
 
 // cutToolMarkup keeps only what the model wrote before any tool-call
 // syntax. Everything after the first marker goes, not just the tags: what
 // follows a marker is a call's name and arguments, never prose for players.
 func cutToolMarkup(s string) string {
+	lower := asciiLower(s)
 	cut := len(s)
 	for _, m := range toolCallMarkers {
-		if i := strings.Index(s, m); i >= 0 && i < cut {
+		if i := strings.Index(lower, m); i >= 0 && i < cut {
 			cut = i
 		}
 	}
 	return s[:cut]
+}
+
+// asciiLower lower-cases only ASCII letters. strings.ToLower can change a
+// string's length in bytes, and cutToolMarkup indexes s with positions found
+// in the lowered copy.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 // sentenceClosers may follow a terminator without starting a new sentence:
@@ -269,6 +294,9 @@ var discourseWords = map[string]bool{
 // shorter is an address or an interjection, like "Sam" or "Sorry".
 const minKeptWords = 4
 
+// trimScanChars bounds the text trimTrailingQuestions works on, in bytes.
+const trimScanChars = 4 * MaxReplyChars
+
 // trimTrailingQuestions drops closing sentences that end in a question mark.
 //
 // The system prompt forbids ending on a question because a reply that asks
@@ -296,17 +324,19 @@ func trimTrailingQuestions(s string) string {
 }
 
 // lastSentenceEnd is the index just past the last sentence terminator, and
-// any closers after it, that is followed by a space, or 0 when s is a single
-// sentence. Requiring the space keeps a version like "1.21.100.7" from
-// reading as four sentences.
+// any closers after it, or 0 when s is a single sentence. An ASCII
+// terminator counts only when a space follows, which keeps a version like
+// "1.21.100.7" from reading as four sentences. A fullwidth one needs no
+// space: the scripts that use it, like Chinese, put none between sentences.
 func lastSentenceEnd(s string) int {
 	end := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] != '.' && s[i] != '!' && s[i] != '?' {
+	for i, r := range s {
+		spaced := r == '.' || r == '!' || r == '?'
+		if !spaced && r != '。' && r != '！' && r != '？' {
 			continue
 		}
-		rest := strings.TrimLeft(s[i+1:], sentenceClosers)
-		if strings.HasPrefix(rest, " ") {
+		rest := strings.TrimLeft(s[i+utf8.RuneLen(r):], sentenceClosers)
+		if !spaced || strings.HasPrefix(rest, " ") {
 			end = len(s) - len(rest)
 		}
 	}
