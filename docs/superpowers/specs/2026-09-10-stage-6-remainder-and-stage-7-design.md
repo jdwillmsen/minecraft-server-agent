@@ -213,7 +213,7 @@ are repeatable.
   with any prompt or parameter change it justifies. If the endpoint serves
   more than one model, compare them.
 - **Decision:** not in CI. It needs a GPU endpoint and is slow. It is run
-  by hand (`make eval`) before any model or prompt change.
+  by hand (`scripts/eval.sh`) before any model or prompt change.
 
 ## Release
 

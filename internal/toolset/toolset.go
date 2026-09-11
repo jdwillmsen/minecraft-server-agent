@@ -1,4 +1,10 @@
-package main
+// Package toolset wires the plugin context's capabilities into the tools
+// the @server answer path offers the model.
+//
+// A package of its own rather than part of cmd/agent so the offline
+// evaluation harness builds exactly the toolset production builds. A copy
+// there would measure whatever the copy said, not what players get.
+package toolset
 
 import (
 	"context"
@@ -13,7 +19,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
 )
 
-// callerScoped records whether a tool that reads the asking player's own
+// CallerScoped records whether a tool that reads the asking player's own
 // data ran while one question was being answered, so the answer can be
 // whispered rather than broadcast.
 //
@@ -21,22 +27,22 @@ import (
 // longer-lived: a registry is built fresh per answer, and a flag that
 // outlived one would carry a privacy decision into the next player's
 // question. Atomic because an answer runs on its own goroutine.
-type callerScoped struct{ used atomic.Bool }
+type CallerScoped struct{ used atomic.Bool }
 
 // mark is called on invocation rather than on a successful read: whether
 // the sentence the model finally writes contains someone's coordinates is
 // not something this side can tell, so the trigger is the model having
 // been given them at all.
-func (c *callerScoped) mark() { c.used.Store(true) }
+func (c *CallerScoped) mark() { c.used.Store(true) }
 
-func (c *callerScoped) happened() bool { return c != nil && c.used.Load() }
+func (c *CallerScoped) Happened() bool { return c != nil && c.used.Load() }
 
 // noArgs is the schema for a tool that takes nothing. Sent rather than
 // omitted because some OpenAI-compatible backends reject a function with no
 // parameters object at all.
 var noArgs = json.RawMessage(`{"type":"object","properties":{}}`)
 
-// buildToolset assembles the read-only tools for one answer.
+// Build assembles the read-only tools for one answer.
 //
 // A capability that is not configured contributes no tool. That is the
 // design's central safety property expressed in wiring: the model's
@@ -52,11 +58,11 @@ var noArgs = json.RawMessage(`{"type":"object","properties":{}}`)
 // writes nothing), implemented on store.Postgres and store.Nop, and a tool
 // built on that.
 //
-// The returned callerScoped reports whether the model was given the asking
+// The returned CallerScoped reports whether the model was given the asking
 // player's own data, which decides whether the answer is whispered.
-func buildToolset(pctx *plugin.Context) (*tools.Registry, *callerScoped) {
+func Build(pctx *plugin.Context) (*tools.Registry, *CallerScoped) {
 	var list []tools.Tool
-	scoped := &callerScoped{}
+	scoped := &CallerScoped{}
 
 	if pctx.Knowledge != nil && pctx.Knowledge.Enabled() {
 		list = append(list, tools.Tool{
@@ -118,10 +124,13 @@ func buildToolset(pctx *plugin.Context) (*tools.Registry, *callerScoped) {
 					if err != nil {
 						return "", err
 					}
+					// Worded as the asker's own. A bare "base is at ..." left
+					// the model to attach whichever player the question named,
+					// and it reported the asker's base as someone else's.
 					if !found {
-						return "no waypoint by that name", nil
+						return "you have no waypoint by that name", nil
 					}
-					return fmt.Sprintf("%s is at %d %d %d in the %s", wp.Name, wp.X, wp.Y, wp.Z, wp.Dimension), nil
+					return fmt.Sprintf("your waypoint %s is at %d %d %d in the %s", wp.Name, wp.X, wp.Y, wp.Z, wp.Dimension), nil
 				},
 			},
 			tools.Tool{
@@ -135,13 +144,13 @@ func buildToolset(pctx *plugin.Context) (*tools.Registry, *callerScoped) {
 						return "", err
 					}
 					if len(saved) == 0 {
-						return "no saved waypoints", nil
+						return "you have no saved waypoints", nil
 					}
 					names := make([]string, 0, len(saved))
 					for _, wp := range saved {
 						names = append(names, wp.Name)
 					}
-					return strings.Join(names, ", "), nil
+					return "your saved waypoints: " + strings.Join(names, ", "), nil
 				},
 			},
 		)

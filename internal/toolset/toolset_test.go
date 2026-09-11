@@ -1,4 +1,4 @@
-package main
+package toolset
 
 import (
 	"context"
@@ -18,7 +18,7 @@ func TestBuildToolsetOmitsAbsentCapabilities(t *testing.T) {
 	// A context with nothing configured must produce no tools at all: the
 	// model cannot call what it was never offered, which is stronger than
 	// refusing the call afterwards.
-	registry, _ := buildToolset(&plugin.Context{})
+	registry, _ := Build(&plugin.Context{})
 	if got := registry.Len(); got != 0 {
 		t.Errorf("empty context produced %d tools, want 0", got)
 	}
@@ -49,7 +49,7 @@ func (w *recordingWaypoints) List(_ context.Context, xuid string) ([]waypoints.W
 // injected caller.
 func TestWaypointToolsReadOnlyTheInjectedCaller(t *testing.T) {
 	store := &recordingWaypoints{}
-	registry, _ := buildToolset(&plugin.Context{Waypoints: store})
+	registry, _ := Build(&plugin.Context{Waypoints: store})
 
 	args := json.RawMessage(`{"name":"base","xuid":"2535499999999999","caller":"2535499999999999"}`)
 	if _, err := registry.Invoke(t.Context(), "waypoint_lookup", args, "2535411111111111"); err != nil {
@@ -99,7 +99,7 @@ func TestServerInfoToolsFollowTheExporters(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			registry, _ := buildToolset(&plugin.Context{ServerInfo: tc.serverInfo})
+			registry, _ := Build(&plugin.Context{ServerInfo: tc.serverInfo})
 			got := toolNames(registry)
 			if len(got) != len(tc.want) {
 				t.Fatalf("tools = %v, want %v", got, tc.want)
@@ -120,18 +120,18 @@ func TestServerInfoToolsFollowTheExporters(t *testing.T) {
 func TestOnlyCallerScopedToolsMarkAnAnswerAsPersonal(t *testing.T) {
 	pctx := &plugin.Context{Waypoints: &recordingWaypoints{}, Knowledge: enabledKnowledge{}}
 
-	registry, scoped := buildToolset(pctx)
+	registry, scoped := Build(pctx)
 	if _, err := registry.Invoke(t.Context(), "knowledge_lookup", json.RawMessage(`{"query":"rules"}`), "2535411111111111"); err != nil {
 		t.Fatalf("knowledge_lookup: %v", err)
 	}
-	if scoped.happened() {
+	if scoped.Happened() {
 		t.Error("a shared-knowledge answer was marked as the asker's own data")
 	}
 
 	if _, err := registry.Invoke(t.Context(), "waypoint_list", noArgs, "2535411111111111"); err != nil {
 		t.Fatalf("waypoint_list: %v", err)
 	}
-	if !scoped.happened() {
+	if !scoped.Happened() {
 		t.Error("reading the asker's own waypoints did not mark the answer personal")
 	}
 }
@@ -162,7 +162,7 @@ func (fallbackOnlyKnowledge) Lookup(context.Context, string, int) ([]knowledge.E
 
 func TestKnowledgeLookupToolFlagsAFallbackOnlyMatch(t *testing.T) {
 	pctx := &plugin.Context{Knowledge: fallbackOnlyKnowledge{}}
-	registry, _ := buildToolset(pctx)
+	registry, _ := Build(pctx)
 
 	out, err := registry.Invoke(t.Context(), "knowledge_lookup", json.RawMessage(`{"query":"nether"}`), "2535411111111111")
 	if err != nil {
@@ -175,7 +175,7 @@ func TestKnowledgeLookupToolFlagsAFallbackOnlyMatch(t *testing.T) {
 
 func TestKnowledgeLookupToolDoesNotFlagAConfirmedMatch(t *testing.T) {
 	pctx := &plugin.Context{Knowledge: enabledKnowledge{}}
-	registry, _ := buildToolset(pctx)
+	registry, _ := Build(pctx)
 
 	out, err := registry.Invoke(t.Context(), "knowledge_lookup", json.RawMessage(`{"query":"rules"}`), "2535411111111111")
 	if err != nil {

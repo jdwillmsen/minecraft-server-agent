@@ -127,6 +127,11 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   path may call. Every tool answers a question; none of them change
   anything, so a prompt-injection attempt sitting in player chat has nothing
   to call - see "Answering with tools" below
+- `internal/toolset` - builds the tool registry one `@server` answer is
+  offered from the configured capabilities; shared by `cmd/agent` and
+  `cmd/evalllm`
+- `cmd/evalllm` - the offline model evaluation, run by hand - see
+  "Evaluating the model" below
 - `internal/adapters` - implementations of the plugin package's capability
   interfaces: `BridgeClient` (shared HTTP transport to mc-console-bridge),
   `BridgeVoice`, `BridgeFacts`, `PermissionResolver` (cached
@@ -213,7 +218,8 @@ invents reaches one unfiltered:
   `undeliverable`, `send_failed`, `disabled`
 - answer `outcome`: `answered` or `failed`. An empty completion is timed as
   answered - the model came back - and counted as `empty` in the mentions
-  counter. Buckets 0.5-30s, matching the 30s answer budget
+  counter, as is a reply left empty once tool-call markup and closing
+  questions are cut from it. Buckets 0.5-30s, matching the 30s answer budget
 - `tool` is a name from the tool registry, or `unregistered` for one the
   model made up; `outcome` is `ok` or `error`
 - `delivery` is `broadcast`, `whisper`, or `summary` (the drain's "more are
@@ -257,7 +263,7 @@ An `@server` question is not a single completion: the model may call tools
 from `internal/tools` for up to two rounds before the next request
 withholds tools entirely, which is what forces text out of a model that
 would otherwise keep calling them instead of answering. The full surface,
-as wired in `cmd/agent/toolset.go`:
+as wired in `internal/toolset/toolset.go`:
 
 - `knowledge_lookup` - look up a recorded topic
 - `waypoint_lookup` - the asker's own coordinates saved under a name
@@ -498,6 +504,36 @@ go vet ./...
 go test -race ./...
 gofmt -l .
 ```
+
+### Evaluating the model
+
+`cmd/evalllm` puts the questions in `eval/cases.yaml` to the configured
+model through the real `@server` answer path: the same client, system
+prompt, tool-round cap and toolset production builds. Only the
+capabilities behind the tools are fixtures (a few knowledge facts,
+waypoints for two players, a canned server status), so two runs differ
+only in what the model did.
+
+```sh
+LLM_BASE_URL=http://<host>:8000/v1 LLM_MODEL=<model> scripts/eval.sh -label baseline -out /tmp/eval.md
+```
+
+Every setting defaults from the variable the agent reads (`LLM_MAX_TOKENS`,
+`LLM_TIMEOUT_MS`, `LLM_TOTAL_TIMEOUT_MS`, `LLM_API_KEY`), so a run with no
+flags measures production. `-only <regexp>` re-runs a subset by case id or
+category. Each case is scored on whether it got an answer, tool selection,
+content, no tool-call markup or markdown, privacy (whispered when it should
+be, never carrying another player's coordinates), length against the chat
+limit, not ending on a question, and latency. Markup, questions and length
+are judged on what the model wrote, before the agent's own cleanup, so the
+report measures the model rather than the cleanup. The report is markdown
+on stdout.
+
+Cases run one at a time, never in parallel: the endpoint also answers live
+players. Not wired into CI, because it needs a GPU endpoint and takes
+minutes. Run it by hand before changing the model, the prompt or the LLM
+settings, and commit the report under `docs/eval/`. The scorer's own tests
+need no endpoint and run with `go test ./...`.
 
 ### Testing the store against a real database
 
