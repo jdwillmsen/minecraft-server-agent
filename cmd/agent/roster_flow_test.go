@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
 	"testing"
+	"time"
 
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
@@ -13,12 +16,40 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
+// uuidFor gives each test player a distinct, stable UUID, the identity a
+// removal record is keyed by on the wire.
+func uuidFor(xuid string) [16]byte {
+	return md5.Sum([]byte(xuid))
+}
+
 func addEntry(xuid, username string) protocol.PlayerListEntry {
-	return protocol.PlayerListEntry{ActionType: protocol.PlayerListActionAdd, XUID: xuid, Username: username}
+	return protocol.PlayerListEntry{ActionType: protocol.PlayerListActionAdd, UUID: uuidFor(xuid), XUID: xuid, Username: username}
 }
 
 func removeEntry(xuid string) protocol.PlayerListEntry {
-	return protocol.PlayerListEntry{ActionType: protocol.PlayerListActionRemove, XUID: xuid}
+	return protocol.PlayerListEntry{ActionType: protocol.PlayerListActionRemove, UUID: uuidFor(xuid)}
+}
+
+// wire round-trips entries through gophertunnel's own PlayerList encoding,
+// so handlePlayerList sees exactly the shape the live connection decodes
+// rather than whatever fields a helper happened to fill in.
+func wire(t *testing.T, entries ...protocol.PlayerListEntry) *packet.PlayerList {
+	t.Helper()
+	var buf bytes.Buffer
+	(&packet.PlayerList{Entries: entries}).Marshal(protocol.NewWriter(&buf, 0))
+	var decoded packet.PlayerList
+	decoded.Marshal(protocol.NewReader(&buf, 0, false))
+	return &decoded
+}
+
+type leaveRecorder struct {
+	store.Nop
+	leaves []string
+}
+
+func (s *leaveRecorder) RecordLeave(_ context.Context, xuid string, _ time.Time) error {
+	s.leaves = append(s.leaves, xuid)
+	return nil
 }
 
 // drainJoins collects every join already delivered to events. Publish is
@@ -56,11 +87,11 @@ func TestPlayerListFlow(t *testing.T) {
 		events, _ := eventBus.Subscribe(roster.JoinKind, 8)
 		playerRoster := roster.New()
 
-		handlePlayerList(context.Background(), &packet.PlayerList{Entries: []protocol.PlayerListEntry{
+		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry(playerXUID, "Steve"),
 			addEntry("2535411111111111", "Alex"),
-		}}, selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
 
 		if joins := drainJoins(t, events); len(joins) != 0 {
 			t.Errorf("got %d joins from the opening snapshot, want 0: %+v", len(joins), joins)
@@ -75,12 +106,12 @@ func TestPlayerListFlow(t *testing.T) {
 		events, _ := eventBus.Subscribe(roster.JoinKind, 8)
 		playerRoster := roster.New()
 
-		handlePlayerList(context.Background(), &packet.PlayerList{Entries: []protocol.PlayerListEntry{
+		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
-		}}, selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
-		handlePlayerList(context.Background(), &packet.PlayerList{Entries: []protocol.PlayerListEntry{
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		handlePlayerList(context.Background(), wire(t,
 			addEntry(playerXUID, "Steve"),
-		}}, selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
 
 		joins := drainJoins(t, events)
 		if len(joins) != 1 {
@@ -96,13 +127,13 @@ func TestPlayerListFlow(t *testing.T) {
 		events, _ := eventBus.Subscribe(roster.JoinKind, 8)
 		playerRoster := roster.New()
 
-		handlePlayerList(context.Background(), &packet.PlayerList{Entries: []protocol.PlayerListEntry{
+		handlePlayerList(context.Background(), wire(t,
 			addEntry(playerXUID, "Steve"),
-		}}, selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
-		handlePlayerList(context.Background(), &packet.PlayerList{Entries: []protocol.PlayerListEntry{
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry(siblingBot, "AfkBot"),
-		}}, selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
 
 		if joins := drainJoins(t, events); len(joins) != 0 {
 			t.Errorf("got %d joins, want 0 — the agent and its sibling bots must never be greeted: %+v", len(joins), joins)
@@ -113,20 +144,28 @@ func TestPlayerListFlow(t *testing.T) {
 		eventBus := bus.New()
 		events, _ := eventBus.Subscribe(roster.JoinKind, 8)
 		playerRoster := roster.New()
+		playerStore := &leaveRecorder{}
 
-		handlePlayerList(context.Background(), &packet.PlayerList{Entries: []protocol.PlayerListEntry{
+		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry(playerXUID, "Steve"),
-		}}, selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
-		handlePlayerList(context.Background(), &packet.PlayerList{Entries: []protocol.PlayerListEntry{
+		), selfXUID, siblings, log, eventBus, playerRoster, playerStore)
+		handlePlayerList(context.Background(), wire(t,
 			removeEntry(playerXUID),
-		}}, selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
-		handlePlayerList(context.Background(), &packet.PlayerList{Entries: []protocol.PlayerListEntry{
+		), selfXUID, siblings, log, eventBus, playerRoster, playerStore)
+		handlePlayerList(context.Background(), wire(t,
 			addEntry(playerXUID, "Steve"),
-		}}, selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, playerStore)
 
-		if joins := drainJoins(t, events); len(joins) != 1 {
-			t.Errorf("got %d joins across leave+rejoin, want 1: %+v", len(joins), joins)
+		if len(playerStore.leaves) != 1 || playerStore.leaves[0] != playerXUID {
+			t.Errorf("RecordLeave calls = %v, want exactly [%s] — the departure must close Steve's session", playerStore.leaves, playerXUID)
+		}
+		joins := drainJoins(t, events)
+		if len(joins) != 1 {
+			t.Fatalf("got %d joins across leave+rejoin, want 1: %+v", len(joins), joins)
+		}
+		if joins[0].XUID != playerXUID {
+			t.Errorf("join = %+v, want Steve's rejoin", joins[0])
 		}
 	})
 
@@ -137,16 +176,16 @@ func TestPlayerListFlow(t *testing.T) {
 		events, _ := eventBus.Subscribe(roster.JoinKind, 8)
 		playerRoster := roster.New()
 
-		handlePlayerList(context.Background(), &packet.PlayerList{Entries: []protocol.PlayerListEntry{
+		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry(playerXUID, "Steve"),
-		}}, selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
 
 		playerRoster.BeginSession()
-		handlePlayerList(context.Background(), &packet.PlayerList{Entries: []protocol.PlayerListEntry{
+		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry("2535411111111111", "Alex"),
-		}}, selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
 
 		if joins := drainJoins(t, events); len(joins) != 0 {
 			t.Errorf("got %d joins after reconnecting, want 0: %+v", len(joins), joins)
