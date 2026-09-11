@@ -124,10 +124,13 @@ func Build(pctx *plugin.Context) (*tools.Registry, *CallerScoped) {
 					if err != nil {
 						return "", err
 					}
+					// Worded as the asker's own. A bare "base is at ..." left
+					// the model to attach whichever player the question named,
+					// and it reported the asker's base as someone else's.
 					if !found {
-						return "no waypoint by that name", nil
+						return "you have no waypoint by that name", nil
 					}
-					return fmt.Sprintf("%s is at %d %d %d in the %s", wp.Name, wp.X, wp.Y, wp.Z, wp.Dimension), nil
+					return fmt.Sprintf("your waypoint %s is at %d %d %d in the %s", wp.Name, wp.X, wp.Y, wp.Z, wp.Dimension), nil
 				},
 			},
 			tools.Tool{
@@ -141,13 +144,13 @@ func Build(pctx *plugin.Context) (*tools.Registry, *CallerScoped) {
 						return "", err
 					}
 					if len(saved) == 0 {
-						return "no saved waypoints", nil
+						return "you have no saved waypoints", nil
 					}
 					names := make([]string, 0, len(saved))
 					for _, wp := range saved {
 						names = append(names, wp.Name)
 					}
-					return strings.Join(names, ", "), nil
+					return "your saved waypoints: " + strings.Join(names, ", "), nil
 				},
 			},
 		)
