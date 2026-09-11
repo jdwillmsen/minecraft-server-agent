@@ -649,9 +649,15 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 // later departure to close: a player who left and came back unseen would
 // otherwise be credited with their whole absence. handlePlayerList reopens a
 // session for each player the snapshot shows is still here.
+//
+// The roster keeps when this began, and every departure passes it to
+// RecordLeave. If both this close and the snapshot's ResumeSession fail, a
+// session from before the gap is still open when the player leaves, and
+// that is what stops it being credited.
 func beginWatching(ctx context.Context, playerRoster *roster.Roster, playerStore store.Store, log *logging.Logger) {
-	playerRoster.BeginSession()
-	if n, err := playerStore.CloseOrphans(ctx, time.Now()); err != nil {
+	now := time.Now()
+	playerRoster.BeginSession(now)
+	if n, err := playerStore.CloseOrphans(ctx, now); err != nil {
 		log.Error("store_close_orphans_failed", logging.Fields{"error": err.Error()})
 	} else if n > 0 {
 		log.Info("store_closed_orphans", logging.Fields{"sessions": n})
@@ -804,14 +810,8 @@ func openStore(ctx context.Context, cfg config.Config, log *logging.Logger) stor
 		log.Error("store_open_failed", logging.Fields{"error": err.Error()})
 		return store.Nop{}
 	}
-	// Sessions still open belong to a previous run: the agent learns of a
-	// departure by being connected, so anything open at startup ended while
-	// it was away.
-	if n, err := pg.CloseOrphans(ctx, time.Now()); err != nil {
-		log.Error("store_close_orphans_failed", logging.Fields{"error": err.Error()})
-	} else if n > 0 {
-		log.Info("store_closed_orphans", logging.Fields{"sessions": n})
-	}
+	// Sessions a previous run left open are closed by beginWatching, at the
+	// start of every connection including the first.
 	log.Info("store_ready", logging.Fields{"database": cfg.PGDatabase})
 	return pg
 }
@@ -1009,9 +1009,10 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 			continue
 		}
 		log.Info("player_left", logging.Fields{"xuid": leave.XUID, "username": leave.Username})
-		if _, err := playerStore.RecordLeave(ctx, leave.XUID, time.Now()); err != nil {
-			// Logged, never fatal: an unclosed session is recoverable at the
-			// next startup, and a database problem must not disturb the game.
+		if _, err := playerStore.RecordLeave(ctx, leave.XUID, playerRoster.Since(), time.Now()); err != nil {
+			// Logged, never fatal: the session stays open until the next
+			// connection closes it at zero length, so this visit's time is
+			// lost, and a database problem must not disturb the game.
 			log.Error("store_record_leave_failed", logging.Fields{"xuid": leave.XUID, "error": err.Error()})
 		}
 	}

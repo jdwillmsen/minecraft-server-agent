@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -148,22 +149,26 @@ func bearerMatches(header string, want [sha256.Size]byte) bool {
 // maxAnnouncementRequest bytes. Unknown fields are refused rather than
 // ignored: a caller who wrote "expires_in" meant something by it, and
 // dropping it silently would give their announcement a lifetime they did not
-// choose.
+// choose. So are keys that encoding/json would otherwise accept -- one in
+// another case, or one given twice, where the last would silently win.
 func decodeAnnouncement(w http.ResponseWriter, r *http.Request) (announcementRequest, int, string) {
 	var req announcementRequest
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAnnouncementRequest))
-	dec.DisallowUnknownFields()
-	err := dec.Decode(&req)
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAnnouncementRequest))
 	if err == nil {
-		// The second read's own error is kept: a valid object followed by
-		// enough bytes to pass the cap is an oversized request, and reporting
-		// it as mere trailing data would hide which limit it broke.
-		switch extra := dec.Decode(&struct{}{}); {
-		case extra == io.EOF:
-		case extra != nil:
-			err = extra
-		default:
-			err = errors.New("trailing data after the JSON object")
+		err = checkKeys(json.NewDecoder(bytes.NewReader(raw)), announcementKeys)
+	}
+	if err == nil {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.DisallowUnknownFields()
+		err = dec.Decode(&req)
+		if err == nil {
+			switch extra := dec.Decode(&struct{}{}); {
+			case extra == io.EOF:
+			case extra != nil:
+				err = extra
+			default:
+				err = errors.New("trailing data after the JSON object")
+			}
 		}
 	}
 	var tooBig *http.MaxBytesError
@@ -174,6 +179,71 @@ func decodeAnnouncement(w http.ResponseWriter, r *http.Request) (announcementReq
 		return req, http.StatusBadRequest, "invalid JSON: " + err.Error()
 	}
 	return req, 0, ""
+}
+
+// jsonKeys is the exact set of keys an object may carry, each mapped to the
+// keys of the object it holds, or nil for any other value.
+type jsonKeys map[string]jsonKeys
+
+var announcementKeys = jsonKeys{
+	"body":               nil,
+	"target":             {"kind": nil, "value": nil},
+	"priority":           nil,
+	"expires_in_seconds": nil,
+}
+
+// checkKeys reads one value from dec and refuses any object key keys does
+// not name exactly, and any key given twice. A value of the wrong type is
+// left for the decode that follows to report.
+func checkKeys(dec *json.Decoder, keys jsonKeys) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if tok != json.Delim('{') || keys == nil {
+		return skipValue(dec, tok)
+	}
+	seen := make(map[string]bool, len(keys))
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, _ := tok.(string)
+		inner, known := keys[key]
+		switch {
+		case !known:
+			return fmt.Errorf("unknown field %q", key)
+		case seen[key]:
+			return fmt.Errorf("duplicate field %q", key)
+		}
+		seen[key] = true
+		if err := checkKeys(dec, inner); err != nil {
+			return err
+		}
+	}
+	_, err = dec.Token()
+	return err
+}
+
+// skipValue consumes the rest of a value whose first token was tok.
+func skipValue(dec *json.Decoder, tok json.Token) error {
+	if tok != json.Delim('{') && tok != json.Delim('[') {
+		return nil
+	}
+	for depth := 1; depth > 0; {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch tok {
+		case json.Delim('{'), json.Delim('['):
+			depth++
+		case json.Delim('}'), json.Delim(']'):
+			depth--
+		}
+	}
+	return nil
 }
 
 var permissionLevels = map[string]bool{

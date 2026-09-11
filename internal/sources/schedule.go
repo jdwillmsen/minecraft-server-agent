@@ -11,10 +11,12 @@ import (
 )
 
 // ScheduleRunner is the part of the schedule store the loop needs: what is
-// due, and a way to claim one occurrence of it.
+// due, a way to claim one occurrence of it, and a way to switch off a row
+// that can never fire.
 type ScheduleRunner interface {
 	DueSchedules(ctx context.Context, now time.Time, limit int) ([]announce.Schedule, error)
 	FireSchedule(ctx context.Context, s announce.Schedule, next time.Time, a announce.Announcement) (id int64, claimed bool, err error)
+	DeactivateSchedule(ctx context.Context, id int64) (ok bool, err error)
 	Enabled() bool
 }
 
@@ -84,11 +86,8 @@ func (s *Scheduler) Tick(ctx context.Context) (fired int) {
 		if ctx.Err() != nil {
 			break
 		}
-		if err := sch.Cadence.Validate(); err != nil || sch.TargetKind == announce.TargetPlayer {
-			// The table's CHECKs make this unreachable through the agent;
-			// a row that got past them anyway is logged every tick until a
-			// person looks, which is the point.
-			s.log.Error("schedule_invalid", logging.Fields{"schedule_id": sch.ID, "target": string(sch.TargetKind)})
+		if reason := unfireable(sch); reason != "" {
+			s.deactivate(ctx, sch, reason)
 			continue
 		}
 		next := sch.Cadence.Next(sch.NextFireAt, now)
@@ -113,6 +112,30 @@ func (s *Scheduler) Tick(ctx context.Context) (fired int) {
 		cancel()
 	}
 	return fired
+}
+
+// unfireable says why sch can never fire, or "" when it can.
+func unfireable(sch announce.Schedule) string {
+	if err := sch.Cadence.Validate(); err != nil {
+		return err.Error()
+	}
+	if sch.TargetKind == announce.TargetPlayer {
+		return "a schedule cannot target one player"
+	}
+	return ""
+}
+
+// deactivate switches off a row that can never fire. The table's CHECKs make
+// one unreachable through the agent; a row that got past them anyway would
+// stay due for good, and enough of them would fill every tick's batch and
+// starve the schedules that can fire. Soft-deleted like !schedule del, so a
+// person can still find it and see why.
+func (s *Scheduler) deactivate(ctx context.Context, sch announce.Schedule, reason string) {
+	if _, err := s.store.DeactivateSchedule(ctx, sch.ID); err != nil {
+		s.report("schedule_deactivate", err)
+		return
+	}
+	s.log.Error("schedule_invalid_deactivated", logging.Fields{"schedule_id": sch.ID, "target": string(sch.TargetKind), "reason": reason})
 }
 
 // report logs a store failure. A table not migrated or not granted yet is

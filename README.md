@@ -577,12 +577,13 @@ curl -sS -X POST http://<agent>:8080/announcements \
   `422`, not a message stored for nobody. `permission` takes `visitor`,
   `member` or `operator`. The other two take no value.
 - `priority` is `normal` (the default) or `expedited`.
-- `expires_in_seconds` is optional, between 1 and 30 days; without it the
-  target's default lifetime applies. `online_only` never queues and so
-  takes none.
+- `expires_in_seconds` is optional, from 1 second to 30 days (2592000);
+  without it the target's default lifetime applies. `online_only` never
+  queues and so takes none.
 - `201` carries the announcement id and how many players heard it
   immediately; the rest are the queue's to deliver.
-- `400` for an invalid request, including unknown fields, `401` without the
+- `400` for an invalid request, including unknown fields and keys that
+  differ in case or appear twice (keys match exactly), `401` without the
   right bearer token, `413` past the 16 KiB request cap, `422` for an
   unknown player, `503` when announcements are not configured or the
   database is not ready.

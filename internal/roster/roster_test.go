@@ -1,6 +1,9 @@
 package roster
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // agentEntry stands in for this process's own player list record, which is
 // always part of the server's opening snapshot.
@@ -97,7 +100,7 @@ func TestApply_RemovalDoesNotConsumeTheSnapshot(t *testing.T) {
 func TestBeginSession_ForgetsUUIDs(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve", UUID: "u-111"})
-	r.BeginSession()
+	r.BeginSession(time.Now())
 	absorbSnapshot(t, r, agentEntry)
 
 	if _, leaves, _ := r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}}); len(leaves) != 0 {
@@ -167,7 +170,7 @@ func TestBeginSession_ForgetsThePreviousSessionsPlayers(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
 
-	r.BeginSession()
+	r.BeginSession(time.Now())
 
 	if _, ok := r.NameFor("111"); ok {
 		t.Error("NameFor after BeginSession = ok, want not-ok — a player who may have left while disconnected must not still resolve")
@@ -177,7 +180,7 @@ func TestBeginSession_ForgetsThePreviousSessionsPlayers(t *testing.T) {
 func TestBeginSession_NextSnapshotIsNotReportedAsJoins(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
-	r.BeginSession()
+	r.BeginSession(time.Now())
 
 	joins, _, _ := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
 	if len(joins) != 0 {
@@ -206,7 +209,7 @@ func TestApply_SnapshotReportsPresentPlayersOnce(t *testing.T) {
 		t.Errorf("after the snapshot: joins = %+v, present = %+v; want one join and nobody merely present", joins, present)
 	}
 
-	r.BeginSession()
+	r.BeginSession(time.Now())
 	if _, _, present := r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve"}}); len(present) != 1 {
 		t.Errorf("reconnect snapshot present = %+v, want Steve", present)
 	}

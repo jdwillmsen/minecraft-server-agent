@@ -59,7 +59,7 @@ func TestNopStoreIsSafeAndInert(t *testing.T) {
 	}
 	// Equal totals, both zero: a departure that changed nothing, so no
 	// milestone can ever be read off a store that remembers nothing.
-	if pt, err := s.RecordLeave(context.Background(), "xuid", at); err != nil || pt != (Playtime{}) {
+	if pt, err := s.RecordLeave(context.Background(), "xuid", at, at); err != nil || pt != (Playtime{}) {
 		t.Errorf("RecordLeave = (%+v, %v), want a zero Playtime and no error", pt, err)
 	}
 	if err := s.EnsurePlayer(context.Background(), "xuid", "Steve", at); err != nil {

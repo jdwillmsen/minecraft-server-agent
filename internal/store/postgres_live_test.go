@@ -52,7 +52,7 @@ func TestJoinLeaveRejoinAgainstRealPostgres(t *testing.T) {
 		t.Errorf("a player's first join reported as returning: %+v", first)
 	}
 
-	if _, err := pg.RecordLeave(ctx, xuid, start.Add(30*time.Minute)); err != nil {
+	if _, err := pg.RecordLeave(ctx, xuid, time.Time{}, start.Add(30*time.Minute)); err != nil {
 		t.Fatalf("leave: %v", err)
 	}
 
@@ -88,7 +88,7 @@ func TestRecordLeaveReportsTheTotalsAroundTheSession(t *testing.T) {
 	if _, err := pg.RecordJoin(ctx, xuid, "Milestoner", start); err != nil {
 		t.Fatalf("first join: %v", err)
 	}
-	first, err := pg.RecordLeave(ctx, xuid, start.Add(2*time.Hour))
+	first, err := pg.RecordLeave(ctx, xuid, time.Time{}, start.Add(2*time.Hour))
 	if err != nil {
 		t.Fatalf("first leave: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestRecordLeaveReportsTheTotalsAroundTheSession(t *testing.T) {
 	if _, err := pg.RecordJoin(ctx, xuid, "Milestoner", start.Add(3*time.Hour)); err != nil {
 		t.Fatalf("second join: %v", err)
 	}
-	second, err := pg.RecordLeave(ctx, xuid, start.Add(11*time.Hour))
+	second, err := pg.RecordLeave(ctx, xuid, time.Time{}, start.Add(11*time.Hour))
 	if err != nil {
 		t.Fatalf("second leave: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestRecordLeaveReportsTheTotalsAroundTheSession(t *testing.T) {
 	}
 
 	// Nothing open any more: a departure that changed nothing.
-	again, err := pg.RecordLeave(ctx, xuid, start.Add(12*time.Hour))
+	again, err := pg.RecordLeave(ctx, xuid, time.Time{}, start.Add(12*time.Hour))
 	if err != nil {
 		t.Fatalf("repeated leave: %v", err)
 	}
@@ -123,10 +123,11 @@ func TestRecordLeaveReportsTheTotalsAroundTheSession(t *testing.T) {
 	}
 }
 
-// A session the agent never saw end is left open across a reconnect inside
-// the process. The next arrival must close it at zero length -- the player
-// was not playing through their absence -- and neither playtime total may
-// grow from it. If it did, a player back after three days would be broadcast
+// A session the agent never saw end should already be closed by the time the
+// player arrives again -- every connection starts by closing them -- but if
+// that close failed, the next arrival must close it at zero length -- the
+// player was not playing through their absence -- and neither playtime total
+// may grow from it. If it did, a player back after three days would be broadcast
 // as having played 72 hours more than they had.
 func TestAStaleSessionIsClosedAtZeroLengthAndCountsForNothing(t *testing.T) {
 	pg := liveStore(t)
@@ -134,8 +135,9 @@ func TestAStaleSessionIsClosedAtZeroLengthAndCountsForNothing(t *testing.T) {
 	xuid := "2535400000000011"
 	t0 := time.Now().UTC().Add(-100 * time.Hour).Truncate(time.Second)
 
-	// Closes nothing, so it reports the history this fixed XUID already has.
-	base, err := pg.RecordLeave(ctx, xuid, t0.Add(-time.Hour))
+	// Reports the history this fixed XUID already has, after closing anything
+	// an interrupted earlier run left open.
+	base, err := pg.RecordLeave(ctx, xuid, time.Time{}, t0.Add(-time.Hour))
 	if err != nil {
 		t.Fatalf("baseline leave: %v", err)
 	}
@@ -161,16 +163,16 @@ func TestAStaleSessionIsClosedAtZeroLengthAndCountsForNothing(t *testing.T) {
 	if duration != 0 || reason != "unknown" {
 		t.Errorf("stale session closed as (%ds, %s), want (0s, unknown): the absence was credited as playtime", duration, reason)
 	}
-	if want := int64(base.Before / time.Second); profile.TotalSeconds != want {
+	if want := int64(base.After / time.Second); profile.TotalSeconds != want {
 		t.Errorf("welcome total = %ds, want %ds: the unobserved session counted", profile.TotalSeconds, want)
 	}
 
-	pt, err := pg.RecordLeave(ctx, xuid, back.Add(time.Hour))
+	pt, err := pg.RecordLeave(ctx, xuid, time.Time{}, back.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("leave: %v", err)
 	}
-	if pt.Before != base.Before || pt.After != base.Before+time.Hour {
-		t.Errorf("totals = (%v, %v), want (%v, %v): only the observed hour counts", pt.Before, pt.After, base.Before, base.Before+time.Hour)
+	if pt.Before != base.After || pt.After != base.After+time.Hour {
+		t.Errorf("totals = (%v, %v), want (%v, %v): only the observed hour counts", pt.Before, pt.After, base.After, base.After+time.Hour)
 	}
 }
 
@@ -185,7 +187,7 @@ func TestAReconnectCreditsOnlyTheTimeWatchedSinceIt(t *testing.T) {
 	xuid := "2535400000000013"
 	t0 := time.Now().UTC().Add(-300 * time.Hour).Truncate(time.Second)
 
-	base, err := pg.RecordLeave(ctx, xuid, t0.Add(-time.Hour))
+	base, err := pg.RecordLeave(ctx, xuid, time.Time{}, t0.Add(-time.Hour))
 	if err != nil {
 		t.Fatalf("baseline leave: %v", err)
 	}
@@ -205,12 +207,12 @@ func TestAReconnectCreditsOnlyTheTimeWatchedSinceIt(t *testing.T) {
 		t.Fatalf("resume from the snapshot: %v", err)
 	}
 
-	pt, err := pg.RecordLeave(ctx, xuid, t4.Add(time.Hour))
+	pt, err := pg.RecordLeave(ctx, xuid, t4, t4.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("leave: %v", err)
 	}
-	if pt.Before != base.Before || pt.After != base.Before+time.Hour {
-		t.Errorf("totals = (%v, %v), want (%v, %v): only the hour since the reconnect was watched", pt.Before, pt.After, base.Before, base.Before+time.Hour)
+	if pt.Before != base.After || pt.After != base.After+time.Hour {
+		t.Errorf("totals = (%v, %v), want (%v, %v): only the hour since the reconnect was watched", pt.Before, pt.After, base.After, base.After+time.Hour)
 	}
 	if pt.Gamertag != "Reconnected" {
 		t.Errorf("gamertag = %q, want the resumed session's", pt.Gamertag)
@@ -225,6 +227,50 @@ func TestAReconnectCreditsOnlyTheTimeWatchedSinceIt(t *testing.T) {
 	}
 }
 
+// The reconnect sequence with both of its writes failing: the close every
+// connection starts with, and the snapshot's fresh session. The session
+// from before the gap is still open when the player leaves, and because it
+// began before the connection did, the leave closes it as unobserved rather
+// than crediting the absence it spans.
+func TestALeaveNeverCreditsASessionOlderThanTheConnection(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := "2535400000000014"
+	t0 := time.Now().UTC().Add(-400 * time.Hour).Truncate(time.Second)
+
+	base, err := pg.RecordLeave(ctx, xuid, time.Time{}, t0.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("baseline leave: %v", err)
+	}
+	if _, err := pg.RecordJoin(ctx, xuid, "Unwatched", t0); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+
+	t4 := t0.Add(72 * time.Hour)
+	pt, err := pg.RecordLeave(ctx, xuid, t4, t4.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	if pt.Before != base.After || pt.After != base.After {
+		t.Errorf("totals = (%v, %v), want both %v: a session from before the reconnect was credited", pt.Before, pt.After, base.After)
+	}
+	if pt.Gamertag != "" {
+		t.Errorf("gamertag = %q, want blank: the leave credited nothing", pt.Gamertag)
+	}
+
+	var duration int64
+	var reason string
+	if err := pg.pool.QueryRow(ctx,
+		`SELECT duration_seconds, ended_reason FROM minecraft.sessions WHERE xuid = $1 AND joined_at = $2`,
+		xuid, t0,
+	).Scan(&duration, &reason); err != nil {
+		t.Fatalf("read the stale session: %v", err)
+	}
+	if duration != 0 || reason != "unknown" {
+		t.Errorf("stale session closed as (%ds, %s), want (0s, unknown)", duration, reason)
+	}
+}
+
 // A player the agent has never recorded can be in a snapshot; resuming
 // their session must create the row the session's foreign key needs.
 func TestResumeSessionForAnUnrecordedPlayer(t *testing.T) {
@@ -236,7 +282,7 @@ func TestResumeSessionForAnUnrecordedPlayer(t *testing.T) {
 	if err := pg.ResumeSession(ctx, xuid, "Stranger", at); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
-	pt, err := pg.RecordLeave(ctx, xuid, at.Add(time.Hour))
+	pt, err := pg.RecordLeave(ctx, xuid, time.Time{}, at.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("leave: %v", err)
 	}
@@ -264,7 +310,7 @@ func TestUnknownSessionsWithADurationCountForNothing(t *testing.T) {
 	if err := pg.EnsurePlayer(ctx, xuid, "LegacyRow", t0); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
-	base, err := pg.RecordLeave(ctx, xuid, t0)
+	base, err := pg.RecordLeave(ctx, xuid, time.Time{}, t0)
 	if err != nil {
 		t.Fatalf("baseline leave: %v", err)
 	}
@@ -276,7 +322,7 @@ func TestUnknownSessionsWithADurationCountForNothing(t *testing.T) {
 		t.Fatalf("insert a legacy inflated session: %v", err)
 	}
 
-	pt, err := pg.RecordLeave(ctx, xuid, t0.Add(80*time.Hour))
+	pt, err := pg.RecordLeave(ctx, xuid, time.Time{}, t0.Add(80*time.Hour))
 	if err != nil {
 		t.Fatalf("leave: %v", err)
 	}
@@ -301,7 +347,7 @@ func TestGamertagChangeKeepsOneIdentity(t *testing.T) {
 	if _, err := pg.RecordJoin(ctx, xuid, "OldName", time.Now().UTC().Add(-time.Hour)); err != nil {
 		t.Fatalf("join as OldName: %v", err)
 	}
-	if _, err := pg.RecordLeave(ctx, xuid, time.Now().UTC().Add(-50*time.Minute)); err != nil {
+	if _, err := pg.RecordLeave(ctx, xuid, time.Time{}, time.Now().UTC().Add(-50*time.Minute)); err != nil {
 		t.Fatalf("leave: %v", err)
 	}
 	profile, err := pg.RecordJoin(ctx, xuid, "NewName", time.Now().UTC())
@@ -361,7 +407,7 @@ func TestXUIDForNameResolvesOfflineAndRenamedPlayers(t *testing.T) {
 	if _, err := pg.RecordJoin(ctx, xuid, "CalledThisNow", time.Now().UTC()); err != nil {
 		t.Fatalf("join under the new name: %v", err)
 	}
-	if _, err := pg.RecordLeave(ctx, xuid, time.Now().UTC()); err != nil {
+	if _, err := pg.RecordLeave(ctx, xuid, time.Time{}, time.Now().UTC()); err != nil {
 		t.Fatalf("leave: %v", err)
 	}
 

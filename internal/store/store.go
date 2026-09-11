@@ -55,9 +55,10 @@ func (p Profile) AwayFor(now time.Time) time.Duration {
 // an observed departure. Time in a session the agent never saw end is not
 // in either, even where the row records a duration, so both are lower
 // bounds and a milestone is never announced off time nobody watched. Equal
-// totals mean the departure closed nothing: no open session was found,
-// which is what a leave the agent already recorded, or never saw the start
-// of, looks like.
+// totals mean the departure credited nothing: no open session was found,
+// which is what a leave the agent already recorded looks like, or the only
+// one open began before the agent's current connection and so was never
+// watched through.
 type Playtime struct {
 	// Gamertag is who the closed session says they were, for a caller that
 	// names the player after the roster has already forgotten them.
@@ -77,11 +78,16 @@ type Store interface {
 	// RecordLeave closes the player's open session and reports their total
 	// playtime on either side of it.
 	//
+	// since is when the current connection began watching. Only a session
+	// that started at or after it is credited; an older one was open across
+	// a gap the agent never saw, so it is closed as unobserved and adds
+	// nothing, whatever the player did in between.
+	//
 	// Returned rather than read afterwards because "this session carried
 	// them past a milestone" is a comparison of the two, and two separate
 	// reads can straddle a concurrent write and disagree about what the
 	// session added.
-	RecordLeave(ctx context.Context, xuid string, at time.Time) (Playtime, error)
+	RecordLeave(ctx context.Context, xuid string, since, at time.Time) (Playtime, error)
 	// EnsurePlayer makes sure a row exists for xuid without treating it as
 	// an arrival: no join counted, no session opened, an existing row left
 	// exactly as it is.
@@ -114,9 +120,9 @@ type Store interface {
 	// message.
 	XUIDForName(ctx context.Context, gamertag string) (xuid string, ok bool, err error)
 	// CloseOrphans marks every open session as ended without observation.
-	// Called at startup and again at the start of every connection: the
-	// agent learns of a departure by being connected, so anything still open
-	// when it (re)connects is a visit whose end nobody saw.
+	// Called at the start of every connection: the agent learns of a
+	// departure by being connected, so anything still open when it
+	// (re)connects is a visit whose end nobody saw.
 	CloseOrphans(ctx context.Context, at time.Time) (int, error)
 	// Close releases resources.
 	Close()
@@ -134,7 +140,7 @@ var _ Store = Nop{}
 func (Nop) RecordJoin(context.Context, string, string, time.Time) (Profile, error) {
 	return Profile{}, nil
 }
-func (Nop) RecordLeave(context.Context, string, time.Time) (Playtime, error) {
+func (Nop) RecordLeave(context.Context, string, time.Time, time.Time) (Playtime, error) {
 	return Playtime{}, nil
 }
 func (Nop) EnsurePlayer(context.Context, string, string, time.Time) error  { return nil }

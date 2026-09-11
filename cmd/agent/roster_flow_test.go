@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"errors"
 	"slices"
 	"testing"
 	"time"
@@ -48,7 +49,7 @@ type leaveRecorder struct {
 	leaves []string
 }
 
-func (s *leaveRecorder) RecordLeave(_ context.Context, xuid string, _ time.Time) (store.Playtime, error) {
+func (s *leaveRecorder) RecordLeave(_ context.Context, xuid string, _, _ time.Time) (store.Playtime, error) {
 	s.leaves = append(s.leaves, xuid)
 	return store.Playtime{}, nil
 }
@@ -182,7 +183,7 @@ func TestPlayerListFlow(t *testing.T) {
 			addEntry(playerXUID, "Steve"),
 		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
 
-		playerRoster.BeginSession()
+		playerRoster.BeginSession(time.Now())
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry("2535411111111111", "Alex"),
@@ -203,20 +204,33 @@ func TestPlayerListFlow(t *testing.T) {
 type sessionCalls struct {
 	store.Nop
 	calls []string
+	// failOpening fails CloseOrphans and ResumeSession, the two writes a
+	// connection starts with.
+	failOpening bool
+	closedAt    []time.Time
+	leaveSince  []time.Time
 }
 
-func (s *sessionCalls) RecordLeave(_ context.Context, xuid string, _ time.Time) (store.Playtime, error) {
+func (s *sessionCalls) RecordLeave(_ context.Context, xuid string, since, _ time.Time) (store.Playtime, error) {
 	s.calls = append(s.calls, "leave:"+xuid)
+	s.leaveSince = append(s.leaveSince, since)
 	return store.Playtime{}, nil
 }
 
 func (s *sessionCalls) ResumeSession(_ context.Context, xuid, _ string, _ time.Time) error {
 	s.calls = append(s.calls, "resume:"+xuid)
+	if s.failOpening {
+		return errors.New("database unreachable")
+	}
 	return nil
 }
 
-func (s *sessionCalls) CloseOrphans(context.Context, time.Time) (int, error) {
+func (s *sessionCalls) CloseOrphans(_ context.Context, at time.Time) (int, error) {
 	s.calls = append(s.calls, "close-orphans")
+	s.closedAt = append(s.closedAt, at)
+	if s.failOpening {
+		return 0, errors.New("database unreachable")
+	}
 	return 0, nil
 }
 
@@ -266,5 +280,41 @@ func TestReconnectRestartsTheSessionsOfPlayersStillOnline(t *testing.T) {
 	}
 	if joins := drainJoins(t, events); len(joins) != 0 {
 		t.Errorf("got %d joins from the reconnect snapshot, want 0: %+v", len(joins), joins)
+	}
+}
+
+// When the close a connection starts with and the snapshot's fresh session
+// both fail, the session from before the gap is still open when the player
+// leaves. The leave must carry when this connection began, so the store can
+// tell that session was never watched through and credit none of it.
+func TestALeaveAfterFailedReconnectWritesCarriesTheConnectionStart(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	playerRoster := roster.New()
+	profiles := &sessionCalls{}
+
+	beginWatching(context.Background(), playerRoster, profiles, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+
+	profiles.failOpening = true
+	beginWatching(context.Background(), playerRoster, profiles, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	profiles.failOpening = false
+	handlePlayerList(context.Background(), wire(t,
+		removeEntry(playerXUID),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+
+	if len(profiles.closedAt) != 2 || len(profiles.leaveSince) != 1 {
+		t.Fatalf("session writes = %v, want two connection starts and one leave", profiles.calls)
+	}
+	if got, want := profiles.leaveSince[0], profiles.closedAt[1]; !got.Equal(want) {
+		t.Errorf("leave since = %v, want the reconnect's start %v", got, want)
 	}
 }

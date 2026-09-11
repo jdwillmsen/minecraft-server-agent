@@ -66,6 +66,18 @@ func (c *claimStore) FireSchedule(_ context.Context, s announce.Schedule, next t
 	return int64(len(c.fired)), true, nil
 }
 
+func (c *claimStore) DeactivateSchedule(_ context.Context, id int64) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	row, ok := c.rows[id]
+	if !ok || !row.Active {
+		return false, nil
+	}
+	row.Active = false
+	c.rows[id] = row
+	return true, nil
+}
+
 func (c *claimStore) row(id int64) announce.Schedule {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -244,5 +256,47 @@ func TestTickDegradesWithoutAUsableStore(t *testing.T) {
 
 	if fired := schedulerAt(announce.Nop{}, &recordingSender{}, tickNow).Tick(context.Background()); fired != 0 {
 		t.Errorf("a disabled store fired %d", fired)
+	}
+}
+
+// A row the agent could never have written -- an unusable cadence, a player
+// target -- is switched off rather than left due. Left due, a batch full of
+// them would be read every tick and the valid schedule behind them would
+// never fire.
+func TestTickDeactivatesUnfireableRowsSoTheyCannotStarveOthers(t *testing.T) {
+	var rows []announce.Schedule
+	for i := int64(1); i <= maxDuePerTick; i++ {
+		rows = append(rows, announce.Schedule{
+			ID: i, Body: "broken", TargetKind: announce.TargetEveryone, Priority: announce.PriorityNormal,
+			Cadence: announce.Cadence{Every: time.Minute}, NextFireAt: tickNow.Add(-time.Hour),
+		})
+	}
+	rows = append(rows, announce.Schedule{
+		ID: 100, Body: "whisper", TargetKind: announce.TargetPlayer, TargetValue: "2535400000000001", Priority: announce.PriorityNormal,
+		Cadence: announce.Cadence{Every: time.Hour}, NextFireAt: tickNow.Add(-time.Hour),
+	})
+	valid := announce.Schedule{
+		ID: 200, Body: "vote", TargetKind: announce.TargetEveryone, Priority: announce.PriorityNormal,
+		Cadence: announce.Cadence{Every: time.Hour}, NextFireAt: tickNow.Add(-time.Minute),
+	}
+	store := newClaimStore(append(rows, valid)...)
+	send := &recordingSender{}
+	s := schedulerAt(store, send, tickNow)
+
+	// Two ticks cover every row even at one batch per tick; with the
+	// unfireable rows left due, the valid one could lose every draw.
+	s.Tick(context.Background())
+	s.Tick(context.Background())
+
+	if got := store.row(valid.ID).NextFireAt; got.Equal(valid.NextFireAt) {
+		t.Fatalf("the valid schedule never fired: it stayed due at %v behind the unfireable rows", got)
+	}
+	for _, r := range rows {
+		if store.row(r.ID).Active {
+			t.Errorf("schedule %d is still active; an unfireable row must be switched off", r.ID)
+		}
+	}
+	if len(store.fired) != 1 || store.fired[0].ScheduleID != valid.ID {
+		t.Errorf("fired = %+v, want only the valid schedule", store.fired)
 	}
 }

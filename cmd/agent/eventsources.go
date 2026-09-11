@@ -45,8 +45,8 @@ func (p announcingProfiles) RecordJoin(ctx context.Context, xuid, gamertag strin
 }
 
 // RecordLeave satisfies store.Store.
-func (p announcingProfiles) RecordLeave(ctx context.Context, xuid string, at time.Time) (store.Playtime, error) {
-	pt, err := p.Store.RecordLeave(ctx, xuid, at)
+func (p announcingProfiles) RecordLeave(ctx context.Context, xuid string, since, at time.Time) (store.Playtime, error) {
+	pt, err := p.Store.RecordLeave(ctx, xuid, since, at)
 	if err == nil {
 		p.events.Left(pt)
 	}

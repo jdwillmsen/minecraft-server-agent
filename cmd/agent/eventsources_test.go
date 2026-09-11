@@ -25,7 +25,7 @@ func (s scriptedProfiles) Enabled() bool { return s.enabled }
 func (s scriptedProfiles) RecordJoin(context.Context, string, string, time.Time) (store.Profile, error) {
 	return s.profile, s.err
 }
-func (s scriptedProfiles) RecordLeave(context.Context, string, time.Time) (store.Playtime, error) {
+func (s scriptedProfiles) RecordLeave(context.Context, string, time.Time, time.Time) (store.Playtime, error) {
 	return s.leave, s.err
 }
 
@@ -96,7 +96,7 @@ func TestPlayerEventsIgnoreAFailedWrite(t *testing.T) {
 
 func TestPlayerEventsAnnounceAMilestoneOnLeave(t *testing.T) {
 	s, pub := wrapScripted(scriptedProfiles{enabled: true, leave: store.Playtime{Gamertag: "Steve", Before: 9 * time.Hour, After: 10 * time.Hour}})
-	if _, err := s.RecordLeave(t.Context(), playerXUID, time.Now()); err != nil {
+	if _, err := s.RecordLeave(t.Context(), playerXUID, time.Time{}, time.Now()); err != nil {
 		t.Fatalf("RecordLeave: %v", err)
 	}
 	if a := expectPublished(t, pub); a.TargetKind != announce.TargetEveryone {

@@ -266,16 +266,26 @@ func (p *Postgres) XUIDForName(ctx context.Context, gamertag string) (string, bo
 // hours nobody played. closed needs no filter; everything it returns has
 // just been set to 'left'.
 //
+// Only a session that began at or after since is closed as 'left'. One
+// older than that was open when the current connection began, which means
+// the close every connection starts with failed and nothing replaced it:
+// the player may have left and returned unseen, so stale closes it at its
+// own joined_at like CloseOrphans would, and it adds nothing.
+//
 // No open session is not an error: after equals before and the gamertag is
 // blank, which reads to the caller as a departure that changed nothing.
-func (p *Postgres) RecordLeave(ctx context.Context, xuid string, at time.Time) (Playtime, error) {
+func (p *Postgres) RecordLeave(ctx context.Context, xuid string, since, at time.Time) (Playtime, error) {
 	var gamertag string
 	var before, after int64
 	err := p.pool.QueryRow(ctx, `
-		WITH closed AS (
+		WITH stale AS (
+		    UPDATE minecraft.sessions
+		    SET left_at = joined_at, ended_reason = 'unknown'
+		    WHERE xuid = $1 AND ended_reason = 'open' AND joined_at < $3
+		), closed AS (
 		    UPDATE minecraft.sessions
 		    SET left_at = $2, ended_reason = 'left'
-		    WHERE xuid = $1 AND ended_reason = 'open'
+		    WHERE xuid = $1 AND ended_reason = 'open' AND joined_at >= $3
 		    RETURNING gamertag, duration_seconds
 		), prior AS (
 		    SELECT COALESCE(SUM(duration_seconds) FILTER (WHERE ended_reason = 'left'), 0)::BIGINT AS total
@@ -286,7 +296,7 @@ func (p *Postgres) RecordLeave(ctx context.Context, xuid string, at time.Time) (
 		       prior.total,
 		       prior.total + COALESCE((SELECT SUM(duration_seconds) FROM closed), 0)::BIGINT
 		FROM prior`,
-		xuid, at,
+		xuid, at, since,
 	).Scan(&gamertag, &before, &after)
 	if err != nil {
 		return Playtime{}, fmt.Errorf("store: close session: %w", err)
