@@ -670,7 +670,7 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 	case chat.TriggerCommand:
 		handleCommand(ctx, id, trigger, log, registry, pctx, limiter, permResolver, auditor, playerRoster)
 	case chat.TriggerMention:
-		startAnswer(ctx, id, trigger, log, pctx, ans, playerRoster)
+		startAnswer(ctx, id, trigger, chat.IsPrivateType(text.TextType), log, pctx, ans, playerRoster)
 	}
 }
 
@@ -772,7 +772,10 @@ func openStore(ctx context.Context, cfg config.Config, log *logging.Logger) stor
 // budget is per rolling minute, so four questions in one second are four
 // allowed answers, and spawning each one concurrently would interleave four
 // broadcasts. Running inline used to serialise them; nothing else does now.
-func startAnswer(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, pctx *plugin.Context, ans answering, playerRoster *roster.Roster) {
+// asked is how the question reached the agent. whispered carries through to
+// where the answer is sent, because a /tell had no audience and so needs no
+// public answer.
+func startAnswer(ctx context.Context, actorXUID string, trigger chat.Trigger, whispered bool, log *logging.Logger, pctx *plugin.Context, ans answering, playerRoster *roster.Roster) {
 	if ans.llm == nil || !ans.llm.Enabled() {
 		// Stage 1-3 behaviour, kept as the unconfigured path: detection is
 		// proven, nothing is answered.
@@ -806,7 +809,7 @@ func startAnswer(ctx context.Context, actorXUID string, trigger chat.Trigger, lo
 	// it. ans.total bounds how stale it can be.
 	go func() {
 		defer func() { <-ans.inFlight }()
-		handleMention(ctx, actorXUID, trigger, log, pctx, ans, playerRoster)
+		handleMention(ctx, actorXUID, trigger, whispered, log, pctx, ans, playerRoster)
 	}()
 }
 
@@ -819,7 +822,7 @@ func startAnswer(ctx context.Context, actorXUID string, trigger chat.Trigger, lo
 // reply with a question. Both matter because the answering AFK bot is still
 // running alongside this agent, and two automated speakers in one chat is the
 // shape of a loop.
-func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, log *logging.Logger, pctx *plugin.Context, ans answering, playerRoster *roster.Roster) {
+func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, whispered bool, log *logging.Logger, pctx *plugin.Context, ans answering, playerRoster *roster.Roster) {
 	name := actorXUID
 	if playerRoster != nil {
 		if resolved, ok := playerRoster.NameFor(actorXUID); ok && resolved != "" {
@@ -861,16 +864,24 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 		log.Error("mention_answer_undeliverable", logging.Fields{"actor": actorXUID})
 		return
 	}
-	// Broadcast rather than whispered: an @server question is asked in public
-	// chat, and an answer only the asker can see reads as no answer at all to
-	// everyone else who watched them ask.
+	// Broadcast by default: an @server question asked in open chat has an
+	// audience, and an answer only the asker can see reads as no answer at
+	// all to everyone else who watched them ask.
 	//
-	// The exception is an answer the model built from the asker's own
-	// waypoints. Those coordinates are personal -- !wp whispers them because
-	// broadcasting where a player lives is a griefing vector -- and they do
-	// not stop being personal because the question reached them through
-	// @server. The console has no player to whisper to, and nothing it asks
-	// about is its own, so it keeps the broadcast.
+	// Two things make an answer private instead.
+	//
+	// The question arrived as a whisper. A /tell was seen by nobody, so
+	// there is no audience the broadcast default exists to serve, and
+	// answering in open chat would publish a question its asker chose not
+	// to.
+	//
+	// Or the model built the answer from the asker's own waypoints. Those
+	// coordinates are personal -- !wp whispers them because broadcasting
+	// where a player lives is a griefing vector -- and they do not stop
+	// being personal because the question reached them through @server.
+	//
+	// The console has no player to whisper to, and nothing it asks about is
+	// its own, so it keeps the broadcast either way.
 	//
 	// Detached from ctx, and bounded by the operator's bridge timeout rather
 	// than a number chosen here: the client applies that same value to every
@@ -886,7 +897,7 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	sayCtx, sayCancel := context.WithTimeout(context.WithoutCancel(ctx), ans.broadcast)
 	defer sayCancel()
 
-	private := personal.happened() && actorXUID != chat.ServerOrigin
+	private := (whispered || personal.happened()) && actorXUID != chat.ServerOrigin
 	var sendErr error
 	if private {
 		sendErr = pctx.Voice.Tell(sayCtx, actorXUID, reply)

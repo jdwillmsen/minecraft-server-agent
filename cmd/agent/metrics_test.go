@@ -148,7 +148,7 @@ func TestAnUnreadyAuditTableCountsEveryLostRecordOnce(t *testing.T) {
 func TestAMentionWithAnsweringDisabledIsCounted(t *testing.T) {
 	_, pctx, _, _, _, playerRoster, _ := newHarness(t)
 	got := metricstest.Delta(t, func() {
-		startAnswer(context.Background(), playerXUID, chat.ParseTrigger("@server hi"), quietLog, pctx, testAnswering(), playerRoster)
+		startAnswer(context.Background(), playerXUID, chat.ParseTrigger("@server hi"), false, quietLog, pctx, testAnswering(), playerRoster)
 	}, mentionsMetric, "outcome", "disabled")
 	if got != 1 {
 		t.Errorf("disabled moved by %v, want 1", got)
@@ -169,7 +169,7 @@ func TestARateLimitedMentionIsCounted(t *testing.T) {
 	ans.limiter = ratelimit.NewPerActor(0, time.Minute)
 
 	got := metricstest.Delta(t, func() {
-		startAnswer(context.Background(), playerXUID, chat.ParseTrigger("@server hi"), quietLog, pctx, ans, playerRoster)
+		startAnswer(context.Background(), playerXUID, chat.ParseTrigger("@server hi"), false, quietLog, pctx, ans, playerRoster)
 	}, mentionsMetric, "outcome", "rate_limited")
 	if got != 1 {
 		t.Errorf("rate_limited moved by %v, want 1", got)
@@ -183,7 +183,7 @@ func TestAMentionDroppedAsBusyIsCounted(t *testing.T) {
 	ans.inFlight <- struct{}{}
 
 	got := metricstest.Delta(t, func() {
-		startAnswer(context.Background(), playerXUID, chat.ParseTrigger("@server hi"), quietLog, pctx, ans, playerRoster)
+		startAnswer(context.Background(), playerXUID, chat.ParseTrigger("@server hi"), false, quietLog, pctx, ans, playerRoster)
 	}, mentionsMetric, "outcome", "busy")
 	if got != 1 {
 		t.Errorf("busy moved by %v, want 1", got)
@@ -237,7 +237,7 @@ func TestEveryAnsweredMentionOutcomeIsCounted(t *testing.T) {
 			var mention float64
 			answer := metricstest.Delta(t, func() {
 				mention = metricstest.Delta(t, func() {
-					handleMention(context.Background(), playerXUID, chat.ParseTrigger("@server hi"), quietLog, pctx, ans, playerRoster)
+					handleMention(context.Background(), playerXUID, chat.ParseTrigger("@server hi"), false, quietLog, pctx, ans, playerRoster)
 				}, mentionsMetric, "outcome", tc.mention)
 			}, answerMetric, "outcome", tc.answerAs)
 

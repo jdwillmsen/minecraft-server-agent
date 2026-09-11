@@ -37,6 +37,29 @@ func IsAnswerableType(textType byte) bool {
 	return ok
 }
 
+// privateTypes are the answerable types that reached the agent without an
+// audience. Only the whisper qualifies: Bedrock's /tell (and its /msg and /w
+// aliases) is delivered to the recipient alone, so nobody else saw the
+// question asked.
+//
+// TextTypeObjectWhisper is deliberately absent. That is what a console
+// tellraw arrives as, not a player's /tell, and it is not answerable in the
+// first place -- adding it here would classify as private a message the
+// agent never reads.
+var privateTypes = map[byte]struct{}{
+	packet.TextTypeWhisper: {},
+}
+
+// IsPrivateType reports whether a message of this type was seen by anyone
+// but its sender and the agent. It decides where an @server answer goes: the
+// broadcast default exists because an answer only the asker can see reads as
+// no answer at all to the rest of the chat that watched them ask, and a
+// whisper has no such audience to answer to.
+func IsPrivateType(textType byte) bool {
+	_, ok := privateTypes[textType]
+	return ok
+}
+
 // Identity resolves the XUID-based identity of a Text packet's sender.
 //
 // A real player always carries a non-empty XUID on chat/whisper/announcement
