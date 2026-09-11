@@ -451,9 +451,12 @@ Moderation runs off the packet read loop and never delays a command or an
 answer. Rules are evaluated in memory, and the database write, the warning
 and the notice run on a worker of their own, each bounded by the command
 timeout. With no database the rules do not run at all: a warning with no
-record behind it is enforcement nobody can review. A table that has not
-been migrated or granted yet is reported once at INFO, and `!modlog`
-answers that plainly.
+record behind it is enforcement nobody can review. For the same reason a
+configured database is not enough: the warning is only whispered while the
+record is writable, judged by the last write, or by a zero-row read before
+the first one, so a deploy that runs ahead of its migration whispers no
+warning it has no record of. A table that has not been migrated or granted yet is
+reported once at INFO, and `!modlog` answers that plainly.
 
 ## Targeting a reply
 
