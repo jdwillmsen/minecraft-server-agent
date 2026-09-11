@@ -113,7 +113,7 @@ func wrapRemembered() (*rememberedProfiles, store.Store, signallingPublisher) {
 
 // A player who arrived while the agent was away is first seen in a
 // reconnect's snapshot. Operators hear of them once, then, worded for what
-// was seen; their later real join finds the row and is not a first time.
+// was seen; their later real join finds that session and is not a first time.
 func TestPlayerEventsAnnounceASnapshotFirstPlayerOnceAtResume(t *testing.T) {
 	_, s, pub := wrapRemembered()
 	now := time.Now()

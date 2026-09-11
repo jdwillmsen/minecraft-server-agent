@@ -984,8 +984,9 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 
 	joins, leaves, alreadyOnline := playerRoster.Apply(entries)
 	// Already here when this connection began, so their session restarts now
-	// -- playtime counts only what the agent watched -- and nothing greets or
-	// announces them: they did not just arrive.
+	// -- playtime counts only what the agent watched -- and nothing greets
+	// them: they did not just arrive. The one exception is a player the agent
+	// has never seen before, whom operators are told of once.
 	for _, p := range alreadyOnline {
 		if chat.IsSelfOrSibling(p.XUID, selfXUID, siblingXUIDs) {
 			continue

@@ -82,6 +82,9 @@ func (p *Postgres) RecordJoin(ctx context.Context, xuid, gamertag string, at tim
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if err := lockPlayer(ctx, tx, xuid); err != nil {
+		return Profile{}, err
+	}
 	prior := Profile{XUID: xuid, Gamertag: gamertag}
 	err = tx.QueryRow(ctx, `
 		SELECT p.first_seen_at, p.last_seen_at, p.join_count,
@@ -135,6 +138,18 @@ func (p *Postgres) RecordJoin(ctx context.Context, xuid, gamertag string, at tim
 	return prior, nil
 }
 
+// lockPlayer serializes the transactions that decide whether a player has
+// been seen before. RecordJoin runs on a dispatch goroutine and ResumeSession
+// on the read loop, so both can reach a brand-new player at once; under READ
+// COMMITTED neither would see the other's session, and operators would be
+// told twice. Held until the transaction ends.
+func lockPlayer(ctx context.Context, tx pgx.Tx, xuid string) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('minecraft.player:' || $1))`, xuid); err != nil {
+		return fmt.Errorf("store: lock player: %w", err)
+	}
+	return nil
+}
+
 // openSession starts the player's one open session, closing any other first.
 //
 // A session still open here belongs to a visit whose end was never observed.
@@ -173,6 +188,9 @@ func (p *Postgres) ResumeSession(ctx context.Context, xuid, gamertag string, at 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if err := lockPlayer(ctx, tx, xuid); err != nil {
+		return false, err
+	}
 	if err := ensurePlayer(ctx, tx, xuid, gamertag, at); err != nil {
 		return false, err
 	}
