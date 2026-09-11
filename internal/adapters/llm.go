@@ -249,6 +249,22 @@ var questionWords = map[string]bool{
 	"why": true, "how": true, "want": true, "shall": true, "may": true,
 }
 
+// subordinators open a clause that needs the rest of its sentence, so the
+// text before a break after one is a fragment: "If you need more help".
+var subordinators = map[string]bool{
+	"if": true, "when": true, "once": true, "before": true, "after": true,
+	"since": true, "unless": true, "while": true, "although": true,
+	"though": true, "because": true, "until": true,
+}
+
+// discourseWords can lead a sentence without deciding what kind it is, so
+// the word after them is the one that does: "Also, since you're new here".
+var discourseWords = map[string]bool{
+	"also": true, "and": true, "so": true, "but": true, "plus": true,
+	"then": true, "well": true, "anyway": true, "oh": true, "ok": true,
+	"okay": true,
+}
+
 // minKeptWords is the shortest text before a break worth keeping. Anything
 // shorter is an address or an interjection, like "Sam" or "Sorry".
 const minKeptWords = 4
@@ -311,10 +327,23 @@ func statementBefore(sentence string) int {
 		return 0
 	}
 	words := strings.Fields(sentence[:at])
-	if len(words) < minKeptWords || questionWords[firstWord(words[0])] {
+	if len(words) < minKeptWords {
+		return 0
+	}
+	if first := openingWord(words); questionWords[first] || subordinators[first] {
 		return 0
 	}
 	return at
+}
+
+// openingWord is the first word of words that is not a discourse word.
+func openingWord(words []string) string {
+	for _, w := range words {
+		if word := firstWord(w); !discourseWords[word] {
+			return word
+		}
+	}
+	return ""
 }
 
 // startsNumber reports whether what follows a break is a number, which

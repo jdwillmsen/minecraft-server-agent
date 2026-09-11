@@ -580,6 +580,11 @@ func TestExtractTextTrimsTrailingQuestions(t *testing.T) {
 		"The farm spans y 10 – 20?":                                     "",
 		"Sorry, could you rephrase?":                                    "",
 		"Sam, do you want your coordinates?":                            "",
+		"If you need more help, what else can I do?":                    "",
+		"Before you log off, did you want your coordinates?":            "",
+		"Also, since you're new here, do you want the rules?":           "",
+		"And did you mean the farm near spawn, the gold one?":           "",
+		"Also, the farm is at spawn, want more?":                        "Also, the farm is at spawn",
 		`"What's the farm near spawn, the gold one?`:                    "",
 		"Is it at -340?":                                                "",
 	} {
