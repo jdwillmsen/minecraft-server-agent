@@ -41,7 +41,10 @@ type Profile struct {
 	Sessions int
 }
 
-// New reports whether this is the first time the server has seen the player.
+// New reports whether this is the player's first counted join, which is what
+// the welcome greets as a first-timer. It is not whether the agent has seen
+// them before: a player first seen already online has Sessions but no
+// counted join, and stays New until their first watched arrival.
 func (p Profile) New() bool { return p.JoinCount <= 1 || p.FirstSeen.IsZero() }
 
 // AwayFor reports how long the player was gone before this visit. Zero for a

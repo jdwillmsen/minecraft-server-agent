@@ -485,7 +485,7 @@ yet is reported once at INFO, and `!modlog` answers that plainly.
 
 ## Event-driven announcements
 
-The agent announces four things it notices on its own, each through the
+The agent announces what it notices on its own, each through the
 same outbox as `!announce`, recorded with `source = 'event'`, and each kept
 for 24 hours for anyone offline:
 
@@ -511,8 +511,9 @@ Players the server reports as already online when the agent connects get a
 fresh session from that moment, without a greeting or an announcement: a
 player who stays on through a reconnect loses the part of their visit before
 it, and nothing more. A player first recorded because they were already
-online when the agent logged in reads as a first-time arrival on their next
-observed join, the same way the welcome treats them.
+online when the agent logged in is still greeted as a first-timer by the
+welcome on their next observed join, but operators, who heard of them when
+they were first seen, hear nothing more.
 
 Version and backup are read from the exporters behind `!version` and
 `!backup` every five minutes, so they need `MC_MONITOR_URL` and
