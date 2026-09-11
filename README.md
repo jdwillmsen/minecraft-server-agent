@@ -439,7 +439,10 @@ of this feature.
 `!modlog [player] [n]` (operator only) whispers the newest flags: 5 by
 default, at most 10, each with its time in UTC, rule, detail and the start
 of the message. A trailing number is the count and everything before it is
-the name, so a gamertag with a space in it needs no quoting; the name
+the name, so a gamertag with a space in it needs no quoting; a whole line
+that is itself a known gamertag, such as `Sniper 360`, is read as the name
+first. The operator notice suggests the command with an explicit count, and
+leaves the name out when the roster only knew the player's XUID. The name
 resolves through the same live-then-recorded lookup `!announce @player`
 uses. The console is refused, because a console reply is broadcast and
 would read every flag out to the server.

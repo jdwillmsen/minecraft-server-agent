@@ -61,12 +61,16 @@ type Moderation struct {
 	log     *logging.Logger
 	// now is replaceable so a test can place messages on a clock of its own.
 	now func() time.Time
-	// writable is whether the last write to the record, or the last probe of
-	// it, succeeded. Enabled cannot answer that: it is true whenever a pool
-	// exists, including while the table is missing or ungranted, which is
-	// exactly when a warning would go out with no record behind it. Only the
-	// worker touches it; atomic so that stays true if that ever changes.
+	// writable is whether the last write to the record succeeded, or, before
+	// any write, whether the last probe of it did. Enabled cannot answer
+	// that: it is true whenever a pool exists, including while the table is
+	// missing or ungranted, which is exactly when a warning would go out with
+	// no record behind it. Only the worker touches these; atomic so that
+	// stays true if that ever changes.
 	writable atomic.Bool
+	// written is whether any write has been attempted. From then on only a
+	// write can say whether the next one will be kept.
+	written atomic.Bool
 }
 
 type moderationJob struct {
@@ -227,6 +231,7 @@ func (m *Moderation) act(j moderationJob) {
 		})
 		cancel()
 		m.writable.Store(err == nil)
+		m.written.Store(true)
 		if err != nil {
 			// A missing table or grant is said once by the store the binary
 			// wires in; per flag it would bury the log for a whole release.
@@ -256,6 +261,10 @@ func (m *Moderation) act(j moderationJob) {
 // matched term. Announcements are kept indefinitely for their own audit,
 // and a copy of what was said there would outlive the 90 days the flag
 // itself is kept.
+//
+// The command it suggests carries an explicit count, so a gamertag ending
+// in a number is not read as one. A gamertag that is only the XUID the
+// roster fell back to is left out: digits alone would be read as the count.
 func (m *Moderation) notifyOperators(j moderationJob) {
 	if !j.pctx.AnnouncementsReady() {
 		return
@@ -267,8 +276,12 @@ func (m *Moderation) notifyOperators(j moderationJob) {
 	for i, f := range j.flags {
 		rules[i] = string(f.Rule)
 	}
+	body := fmt.Sprintf("Moderation: %s was flagged (%s). Say !modlog %s %d for details.", j.gamertag, strings.Join(rules, ", "), j.gamertag, modlogDefault)
+	if j.gamertag == j.xuid {
+		body = fmt.Sprintf("Moderation: a player was flagged (%s). Say !modlog %d for details.", strings.Join(rules, ", "), modlogDefault)
+	}
 	a := announce.Announcement{
-		Body:         fmt.Sprintf("Moderation: %s was flagged (%s). Say !modlog %s for details.", j.gamertag, strings.Join(rules, ", "), j.gamertag),
+		Body:         body,
 		Source:       announce.SourceEvent,
 		TargetKind:   announce.TargetPermission,
 		TargetValue:  plugin.PermissionOperator.String(),
@@ -295,15 +308,22 @@ func (m *Moderation) notifyOperators(j moderationJob) {
 // recordable reports whether a flag written now would be kept, so that a
 // warning is only whispered when its record can follow it.
 //
-// Once a write has succeeded that is taken as the answer until one fails.
-// Until then, and after any failure, it asks with a zero-row read: the
-// same table and the same deploy-ordering failures a write would hit,
-// without writing anything. A table that disappears between two flags
-// still costs one unrecorded warning, because nothing short of the write
-// can know that in advance.
+// Before any write it asks with a zero-row read: the same table and the
+// same deploy-ordering failures a write would hit, without writing
+// anything. Once a write has been attempted its result is the only answer.
+// A read can succeed where a write cannot -- a read-only failover, an
+// INSERT grant revoked with SELECT left, a CHECK the row breaks -- so after
+// a failed write only the next good one reopens the gate. Every flag is
+// still written, as logged when no warning went out, so that write comes
+// with the next flag. A table that disappears between two flags still
+// costs one unrecorded warning, because nothing short of the write can
+// know that in advance.
 func (m *Moderation) recordable(pctx *plugin.Context) bool {
 	if m.writable.Load() {
 		return true
+	}
+	if m.written.Load() {
+		return false
 	}
 	ctx, cancel := context.WithTimeout(m.rootCtx, plugin.DefaultDispatchTimeout)
 	defer cancel()
@@ -323,8 +343,8 @@ func hasRule(flags []moderation.Flag, rule moderation.Rule) bool {
 
 // parseModlogArgs reads "[player] [n]". A trailing integer is the count and
 // everything before it is the name, so a gamertag with a space in it needs
-// no quoting. An Xbox gamertag cannot be only digits, so the count cannot
-// be mistaken for one.
+// no quoting. A gamertag can end in a number, so runModlog tries the whole
+// line as a name before taking this split.
 func parseModlogArgs(args []string) (player string, n int, ok bool) {
 	n = modlogDefault
 	if len(args) > 0 {
@@ -352,12 +372,21 @@ func runModlog(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation)
 		return noModlog, nil
 	}
 	player, n, ok := parseModlogArgs(inv.Args)
+	var xuid string
+	if whole := strings.TrimPrefix(strings.Join(inv.Args, " "), "@"); whole != player && pctx.Roster != nil {
+		found, known, err := pctx.Roster.XUIDFor(ctx, whole)
+		if err != nil {
+			return "", fmt.Errorf("moderation: !modlog: resolve %s: %w", whole, err)
+		}
+		if known {
+			player, n, ok, xuid = whole, modlogDefault, true, found
+		}
+	}
 	if !ok {
 		return modlogUsage, nil
 	}
 
-	var xuid string
-	if player != "" {
+	if player != "" && xuid == "" {
 		if pctx.Roster == nil {
 			return "I don't know a player named " + player + ".", nil
 		}

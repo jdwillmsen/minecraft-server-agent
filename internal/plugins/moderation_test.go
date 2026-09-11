@@ -379,7 +379,7 @@ func TestModerationNotifiesOperatorsAtMostOncePerTenMinutes(t *testing.T) {
 	if n.ExpiresAt == nil || !n.ExpiresAt.Equal(modEpoch.Add(24*time.Hour)) {
 		t.Errorf("notice expires %v, want a day after the flag", n.ExpiresAt)
 	}
-	if want := "Moderation: Steve was flagged (term). Say !modlog Steve for details."; n.Body != want {
+	if want := "Moderation: Steve was flagged (term). Say !modlog Steve 5 for details."; n.Body != want {
 		t.Errorf("body = %q, want %q", n.Body, want)
 	}
 	if strings.Contains(strings.ToLower(n.Body), "griefer") {
@@ -483,6 +483,57 @@ func TestModerationStopsWarningOnceTheRecordFails(t *testing.T) {
 	}
 }
 
+// A table that still reads but no longer takes writes -- a read-only
+// failover, an INSERT grant revoked with SELECT left -- must not let a read
+// reopen the gate a failed write closed. The next good write does.
+func TestModerationKeepsWarningsOffWhileOnlyReadsSucceed(t *testing.T) {
+	r := newModRig(t, "griefer")
+	r.say(t, modPlayer, "griefer")
+	r.waitRecorded(t, 1)
+
+	r.store.mu.Lock()
+	r.store.recordErr = &pgconn.PgError{Code: "25006"}
+	r.store.mu.Unlock()
+	for i := 1; i <= 3; i++ {
+		r.clock.set(time.Duration(i) * time.Minute)
+		r.say(t, modPlayer, "griefer")
+	}
+	r.waitAttempts(t, 4)
+	if n := len(r.voice.told()); n != 2 {
+		t.Errorf("%d warnings, want 2: the good one and the one that found writes refused", n)
+	}
+
+	r.store.setErr(nil)
+	r.clock.set(4 * time.Minute)
+	r.say(t, modPlayer, "griefer")
+	r.clock.set(5 * time.Minute)
+	r.say(t, modPlayer, "griefer")
+	got := r.waitRecorded(t, 3)
+	if got[1].Action != moderation.ActionLogged || got[2].Action != moderation.ActionWarned {
+		t.Errorf("after writes recover: actions %q then %q, want logged then warned", got[1].Action, got[2].Action)
+	}
+}
+
+// A player the roster could not name is recorded under their XUID, and
+// digits in the suggested command would be read as the count.
+func TestModerationNoticeLeavesOutAnXUIDForAName(t *testing.T) {
+	r := newModRig(t, "griefer")
+	r.sayOn(t, r.pctx, chat.MessageEvent{ActorXUID: modPlayer, Gamertag: modPlayer, Message: "griefer", Public: true})
+	r.waitRecorded(t, 1)
+	deadline := time.Now().Add(5 * time.Second)
+	for r.deliverer.count() < 1 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	notices := r.announcements.all()
+	if len(notices) != 1 {
+		t.Fatalf("%d notices, want 1", len(notices))
+	}
+	if want := "Moderation: a player was flagged (term). Say !modlog 5 for details."; notices[0].Body != want {
+		t.Errorf("body = %q, want %q", notices[0].Body, want)
+	}
+}
+
 func TestModerationNeverBlocksTheDispatcher(t *testing.T) {
 	r := newModRig(t)
 	r.store.block = make(chan struct{})
@@ -583,6 +634,29 @@ func TestModlogFiltersByPlayerThroughTheLookup(t *testing.T) {
 	}
 	if reply := modlog(t, &plugin.Context{Moderation: store}, plugin.PermissionOperator, "Steve"); !strings.Contains(reply, "don't know") {
 		t.Errorf("no roster = %q, want a refusal", reply)
+	}
+}
+
+// A gamertag can end in a number, so the whole line is tried as a name
+// before a trailing number is taken as the count.
+func TestModlogReadsAGamertagEndingInANumber(t *testing.T) {
+	store := &modStore{}
+	pctx := &plugin.Context{Moderation: store, Roster: fakeAnnounceRoster{
+		online: map[string]string{"Sniper": modPlayer, "Sniper 360": modOther},
+	}}
+
+	modlog(t, pctx, plugin.PermissionOperator, "Sniper", "360")
+	if store.recentXUID != modOther || store.recentLimit != 5 {
+		t.Errorf("read (%q, %d), want Sniper 360's newest 5", store.recentXUID, store.recentLimit)
+	}
+	// The form the operator notice suggests: the count is explicit.
+	modlog(t, pctx, plugin.PermissionOperator, "Sniper", "360", "5")
+	if store.recentXUID != modOther || store.recentLimit != 5 {
+		t.Errorf("read (%q, %d), want Sniper 360's newest 5", store.recentXUID, store.recentLimit)
+	}
+	modlog(t, pctx, plugin.PermissionOperator, "Sniper", "3")
+	if store.recentXUID != modPlayer || store.recentLimit != 3 {
+		t.Errorf("read (%q, %d), want Sniper's newest 3", store.recentXUID, store.recentLimit)
 	}
 }
 
