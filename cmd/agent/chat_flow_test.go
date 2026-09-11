@@ -749,6 +749,14 @@ const (
 // recorded.
 func answerMention(t *testing.T, configure func(*plugin.Context), replies ...string) []string {
 	t.Helper()
+	return answerMentionPacket(t, chatPacket(playerXUID, "Steve", "@server where is my base"), configure, replies...)
+}
+
+// answerMentionPacket is answerMention with the incoming packet chosen by the
+// caller, so a test can vary how the question arrived rather than only what
+// the backend answers.
+func answerMentionPacket(t *testing.T, pk *packet.Text, configure func(*plugin.Context), replies ...string) []string {
+	t.Helper()
 	backend := newHeldBackend(t, replies...)
 	backend.serve()
 
@@ -758,9 +766,36 @@ func answerMention(t *testing.T, configure func(*plugin.Context), replies ...str
 	ans := testAnswering()
 	ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
 
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server where is my base"),
+	handlePacket(context.Background(), pk,
 		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
 	return waitForOutput(t, voice)
+}
+
+// whisperPacket is the same question arriving through /tell rather than open
+// chat. Bedrock delivers that as TextTypeWhisper, which only the sender and
+// the recipient see.
+func whisperPacket(xuid, sourceName, message string) *packet.Text {
+	return &packet.Text{
+		TextType:   packet.TextTypeWhisper,
+		XUID:       xuid,
+		SourceName: sourceName,
+		Message:    message,
+	}
+}
+
+// A question nobody else saw asked should not be answered in front of
+// everybody. The broadcast default exists because an answer only the asker
+// sees reads as no answer to the rest of the chat that watched them ask --
+// which is not true of a whisper, where there is no such audience.
+func TestWhisperedQuestionIsAnsweredPrivately(t *testing.T) {
+	said := answerMentionPacket(t, whisperPacket(playerXUID, "Steve", "@server what are the rules"),
+		func(pctx *plugin.Context) { pctx.Knowledge = stubKnowledge{} },
+		knowledgeLookupCall, rulesAnswer)
+
+	want := "tell " + playerXUID + ": Be nice to each other."
+	if said[0] != want {
+		t.Errorf("answer = %q, want %q -- a whispered question must not be answered in open chat", said[0], want)
+	}
 }
 
 // Coordinates are personal. !wp whispers them because broadcasting where

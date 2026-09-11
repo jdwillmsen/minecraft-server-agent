@@ -7,6 +7,27 @@ import (
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 )
 
+func TestIsPrivateTypeIsOnlyTheWhisper(t *testing.T) {
+	if !IsPrivateType(packet.TextTypeWhisper) {
+		t.Error("a /tell arrives as TextTypeWhisper and must count as private")
+	}
+	for _, tt := range []byte{packet.TextTypeChat, packet.TextTypeAnnouncement, packet.TextTypeRaw, packet.TextTypeSystem} {
+		if IsPrivateType(tt) {
+			t.Errorf("text type %d is not private and must not be treated as such", tt)
+		}
+	}
+}
+
+// Every private type has to be answerable too, or the agent would be
+// classifying as private a message it never looks at in the first place.
+func TestEveryPrivateTypeIsAlsoAnswerable(t *testing.T) {
+	for tt := byte(0); tt < 32; tt++ {
+		if IsPrivateType(tt) && !IsAnswerableType(tt) {
+			t.Errorf("text type %d is private but not answerable", tt)
+		}
+	}
+}
+
 func TestIsAnswerableType(t *testing.T) {
 	cases := map[byte]bool{
 		packet.TextTypeChat:         true,
