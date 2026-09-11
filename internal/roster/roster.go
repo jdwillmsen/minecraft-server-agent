@@ -48,6 +48,13 @@ func (LeaveEvent) Kind() string { return LeaveKind }
 type Roster struct {
 	mu      sync.Mutex
 	players map[string]string
+	// xuidByUUID exists because Bedrock's removal record carries only the
+	// player's UUID: gophertunnel decodes nothing past it for a remove, so
+	// the XUID the rest of this type keys on is blank on exactly the record
+	// that says someone left. Learned from each add record, which carries
+	// both. Without it every departure was dropped as an unusable entry, and
+	// the agent never saw a single player leave.
+	xuidByUUID map[string]string
 	// snapshotSeen is false until this session's opening PlayerList has
 	// been absorbed. The server sends every already-connected player as an
 	// add record immediately after login, so without this the whole
@@ -57,7 +64,7 @@ type Roster struct {
 
 // New builds an empty Roster awaiting its first session snapshot.
 func New() *Roster {
-	return &Roster{players: make(map[string]string)}
+	return &Roster{players: make(map[string]string), xuidByUUID: make(map[string]string)}
 }
 
 // BeginSession discards everything the Roster knows and puts it back into
@@ -70,6 +77,7 @@ func (r *Roster) BeginSession() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.players = make(map[string]string)
+	r.xuidByUUID = make(map[string]string)
 	r.snapshotSeen = false
 }
 
@@ -77,15 +85,18 @@ func (r *Roster) BeginSession() {
 // reports every player who is newly present — an add whose XUID this
 // Roster had not already recorded. A player already known who reappears
 // (e.g. a duplicate add, which the protocol permits) is not reported
-// again. A blank XUID is ignored outright: it carries no usable identity
-// and must never be treated as a join.
+// again. An add with a blank XUID is ignored outright: it carries no usable
+// identity and must never be treated as a join.
 //
-// The first packet of a session carrying at least one usable entry is the
+// A removal is resolved by its UUID when it carries no XUID, which on the
+// wire is always -- see xuidByUUID. A removal that resolves to nobody this
+// session recorded is dropped: there is no one to report as leaving.
+//
+// The first packet of a session carrying at least one usable add is the
 // server's roster snapshot: those players were already connected before
 // this process was watching, so they are recorded but never reported as
-// joins. A packet with no usable entry leaves the snapshot unconsumed, so
-// an empty update cannot cause the real snapshot behind it to be mistaken
-// for arrivals.
+// joins. Neither an empty packet nor a removal consumes it, so neither can
+// cause the real snapshot behind it to be mistaken for arrivals.
 func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves []Entry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -93,25 +104,38 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves []Entry) {
 	snapshot := !r.snapshotSeen
 
 	for _, e := range entries {
+		if e.Remove {
+			xuid := e.XUID
+			if xuid == "" {
+				xuid = r.xuidByUUID[e.UUID]
+			}
+			if e.UUID != "" {
+				delete(r.xuidByUUID, e.UUID)
+			}
+			if xuid == "" {
+				continue
+			}
+			// Reported, not just forgotten. A departure is half of a play
+			// session, and the roster is the only place the agent learns of
+			// one -- the server sends a removal record, and nothing else does.
+			if name, known := r.players[xuid]; known {
+				leaves = append(leaves, Entry{XUID: xuid, Username: name})
+			}
+			delete(r.players, xuid)
+			continue
+		}
+
 		if e.XUID == "" {
 			continue
 		}
 		r.snapshotSeen = true
-		switch {
-		case e.Remove:
-			// Reported, not just forgotten. A departure is half of a play
-			// session, and the roster is the only place the agent learns of
-			// one -- the server sends a removal record, and nothing else does.
-			if name, known := r.players[e.XUID]; known {
-				leaves = append(leaves, Entry{XUID: e.XUID, Username: name})
-			}
-			delete(r.players, e.XUID)
-		default:
-			if _, known := r.players[e.XUID]; !known && !snapshot {
-				joins = append(joins, Entry{XUID: e.XUID, Username: e.Username})
-			}
-			r.players[e.XUID] = e.Username
+		if e.UUID != "" {
+			r.xuidByUUID[e.UUID] = e.XUID
 		}
+		if _, known := r.players[e.XUID]; !known && !snapshot {
+			joins = append(joins, Entry{XUID: e.XUID, Username: e.Username})
+		}
+		r.players[e.XUID] = e.Username
 	}
 	return joins, leaves
 }
@@ -182,6 +206,8 @@ func (r *Roster) XUIDFor(name string) (xuid string, ok bool) {
 type PlayerListEntry struct {
 	XUID     string
 	Username string
+	// UUID is the only identity a removal record carries on the wire.
+	UUID string
 	// Remove is true for a removal record, false for an add. Named for
 	// what it means here rather than mirroring the protocol's numeric
 	// ActionType, which callers translate at the boundary.
