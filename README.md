@@ -456,8 +456,8 @@ record behind it is enforcement nobody can review. For the same reason a
 configured database is not enough: the warning is only whispered while the
 record is writable, judged by the last write, or by a zero-row read before
 the first one, so a deploy that runs ahead of its migration whispers no
-warning it has no record of. A table that has not been migrated or granted yet is
-reported once at INFO, and `!modlog` answers that plainly.
+warning it has no record of. A table that has not been migrated or granted
+yet is reported once at INFO, and `!modlog` answers that plainly.
 
 ## Targeting a reply
 
