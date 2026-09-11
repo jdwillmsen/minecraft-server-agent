@@ -156,6 +156,85 @@ func TestWPSetRefusesReservedName(t *testing.T) {
 	}
 }
 
+func TestWPHelpExplainsTheSubcommands(t *testing.T) {
+	cmd := wpCommand(t)
+	pctx := &plugin.Context{Waypoints: newFakeWaypoints()}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"help"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// Without a help case this falls through to the name lookup and answers
+	// "You have no waypoint called help", which reads as a broken command.
+	if strings.Contains(strings.ToLower(reply), "no waypoint called") {
+		t.Fatalf("!wp help was treated as a waypoint name: %q", reply)
+	}
+	for _, want := range []string{"set", "del", "list"} {
+		if !strings.Contains(strings.ToLower(reply), want) {
+			t.Errorf("help reply %q does not mention %q", reply, want)
+		}
+	}
+}
+
+func TestWPHelpIsCaseInsensitiveLikeTheOtherSubcommands(t *testing.T) {
+	cmd := wpCommand(t)
+	pctx := &plugin.Context{Waypoints: newFakeWaypoints()}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"HELP"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.Contains(strings.ToLower(reply), "no waypoint called") {
+		t.Errorf("uppercase HELP was treated as a waypoint name: %q", reply)
+	}
+}
+
+func TestWPSetRefusesHelpAsAName(t *testing.T) {
+	// Same reason set and del are reserved: a waypoint stored under "help"
+	// could never be read back, because !wp help now resolves to the help
+	// text instead of a lookup.
+	cmd := wpCommand(t)
+	fake := newFakeWaypoints()
+	pctx := &plugin.Context{Waypoints: fake}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"set", "help", "1", "2", "3"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(fake.byOwner["a"]) != 0 {
+		t.Fatal("a waypoint named help was stored and would be unreadable")
+	}
+	if !strings.Contains(strings.ToLower(reply), "reserved") {
+		t.Errorf("reply %q should say the name is reserved", reply)
+	}
+}
+
+func TestWPHelpFitsOneChatLine(t *testing.T) {
+	cmd := wpCommand(t)
+	pctx := &plugin.Context{Waypoints: newFakeWaypoints()}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionMember,
+		Args: []string{"help"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(reply) > wpListReplyCap {
+		t.Errorf("help reply is %d bytes, over the %d-byte cap this command holds itself to",
+			len(reply), wpListReplyCap)
+	}
+}
+
 func TestWPDeleteReportsWhenNothingExisted(t *testing.T) {
 	cmd := wpCommand(t)
 	pctx := &plugin.Context{Waypoints: newFakeWaypoints()}

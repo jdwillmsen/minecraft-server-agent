@@ -189,6 +189,50 @@ func TestKBSetRefusesReservedTopic(t *testing.T) {
 	}
 }
 
+func TestKBHelpExplainsTheSubcommands(t *testing.T) {
+	cmd := kbCommand(t)
+	pctx := &plugin.Context{Knowledge: newFakeKnowledge()}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "a", ActorPermission: plugin.PermissionVisitor,
+		Args: []string{"help"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// Without a help case this is a lookup for a topic called "help", which
+	// answers "I don't know anything about help" -- indistinguishable from
+	// the command being broken.
+	if strings.Contains(strings.ToLower(reply), "don't know anything about") {
+		t.Fatalf("!kb help was treated as a topic lookup: %q", reply)
+	}
+	for _, want := range []string{"set", "del", "list"} {
+		if !strings.Contains(strings.ToLower(reply), want) {
+			t.Errorf("help reply %q does not mention %q", reply, want)
+		}
+	}
+}
+
+func TestKBSetRefusesHelpAsATopic(t *testing.T) {
+	cmd := kbCommand(t)
+	fake := newFakeKnowledge()
+	pctx := &plugin.Context{Knowledge: fake}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "op", ActorPermission: plugin.PermissionOperator,
+		Args: []string{"set", "help", "this", "would", "be", "unreadable"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if fake.upserted != 0 {
+		t.Fatal("a fact stored under help would be unreachable through !kb help")
+	}
+	if !strings.Contains(strings.ToLower(reply), "reserved") {
+		t.Errorf("reply %q should say the name is reserved", reply)
+	}
+}
+
 // A confirmed delete of a topic that was never there teaches an operator
 // that the fact is gone, so the one that is still being quoted at players
 // goes unexamined. The waypoint store already reports this honestly.
