@@ -32,6 +32,7 @@ type modStore struct {
 	mu          sync.Mutex
 	disabled    bool
 	events      []moderation.Event
+	attempts    int
 	recordErr   error
 	recent      []moderation.Event
 	recentErr   error
@@ -55,6 +56,7 @@ func (s *modStore) Record(ctx context.Context, e moderation.Event) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.attempts++
 	if s.recordErr != nil {
 		return s.recordErr
 	}
@@ -388,36 +390,96 @@ func TestModerationNotifiesOperatorsAtMostOncePerTenMinutes(t *testing.T) {
 	}
 }
 
-// The notice points at !modlog, so a flag that was never written must not
-// send an operator looking for it -- and must not spend the throttle.
-func TestModerationDoesNotNotifyAboutAFlagItCouldNotRecord(t *testing.T) {
-	r := newModRig(t, "griefer")
-	r.store.recordErr = &pgconn.PgError{Code: "42P01"}
-	r.say(t, modPlayer, "griefer")
+func (s *modStore) setErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordErr, s.recentErr = err, err
+}
+
+func (s *modStore) recordAttempts() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
+}
+
+// waitAttempts waits for the worker to have tried n writes, successful or
+// not: the sync point for a flag whose write is meant to fail.
+func (r *modRig) waitAttempts(t *testing.T, n int) {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for len(r.voice.told()) == 0 {
+	for r.store.recordAttempts() < n {
 		if time.Now().After(deadline) {
-			t.Fatal("the flag was never processed")
+			t.Fatalf("%d write attempts, want %d", r.store.recordAttempts(), n)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	time.Sleep(20 * time.Millisecond)
-	if n := len(r.announcements.all()); n != 0 {
-		t.Fatalf("%d notices about an unrecorded flag", n)
+}
+
+// With the table missing, a flag can be neither warned nor reported: a
+// warning with no record behind it is enforcement nobody can review, and a
+// notice would send an operator to !modlog for a flag that is not there.
+// Neither spends its throttle, so the first flag that can be written gets
+// both.
+func TestModerationNeitherWarnsNorNotifiesAboutAFlagItCannotRecord(t *testing.T) {
+	r := newModRig(t, "griefer")
+	r.store.setErr(&pgconn.PgError{Code: "42P01"})
+	r.say(t, modPlayer, "griefer")
+	r.waitAttempts(t, 1)
+	// The notice would follow the failed write on the same worker; this
+	// flag's job is the next thing it does, so once it is written the first
+	// job is wholly finished.
+	r.say(t, modOther, shouting)
+	r.store.setErr(nil)
+	r.waitRecorded(t, 1)
+
+	for _, line := range r.voice.told() {
+		if strings.HasPrefix(line, modPlayer) {
+			t.Errorf("warned %q with the record unwritable", line)
+		}
+	}
+	for _, n := range r.announcements.all() {
+		if strings.Contains(n.Body, "(term)") {
+			t.Errorf("notified operators about an unrecorded flag: %q", n.Body)
+		}
 	}
 
-	r.store.mu.Lock()
-	r.store.recordErr = nil
-	r.store.mu.Unlock()
-	r.clock.set(time.Minute)
 	r.say(t, modPlayer, "griefer")
-	r.waitRecorded(t, 1)
-	deadline = time.Now().Add(5 * time.Second)
-	for len(r.announcements.all()) == 0 {
+	got := r.waitRecorded(t, 2)
+	if got[1].XUID != modPlayer || got[1].Action != moderation.ActionWarned {
+		t.Errorf("first writable flag = %+v, want it warned: the failed one must not spend the throttle", got[1])
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		reported := false
+		for _, n := range r.announcements.all() {
+			reported = reported || strings.Contains(n.Body, "(term)")
+		}
+		if reported {
+			break
+		}
 		if time.Now().After(deadline) {
-			t.Fatal("the first recorded flag was not reported; the failed one spent the throttle")
+			t.Fatal("the first writable flag was not reported; the failed one spent the throttle")
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// A table lost after a good write costs one unrecorded warning -- nothing
+// short of the write can know in advance -- and no more after that.
+func TestModerationStopsWarningOnceTheRecordFails(t *testing.T) {
+	r := newModRig(t, "griefer")
+	r.say(t, modPlayer, "griefer")
+	r.waitRecorded(t, 1)
+
+	r.store.setErr(&pgconn.PgError{Code: "42501"})
+	r.clock.set(time.Minute)
+	r.say(t, modPlayer, "griefer")
+	r.clock.set(2 * time.Minute)
+	r.say(t, modPlayer, "griefer")
+	r.waitAttempts(t, 3)
+
+	if n := len(r.voice.told()); n != 2 {
+		t.Errorf("%d warnings, want 2: the good one and the one that found the grant gone", n)
 	}
 }
 

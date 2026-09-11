@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
@@ -60,6 +61,12 @@ type Moderation struct {
 	log     *logging.Logger
 	// now is replaceable so a test can place messages on a clock of its own.
 	now func() time.Time
+	// writable is whether the last write to the record, or the last probe of
+	// it, succeeded. Enabled cannot answer that: it is true whenever a pool
+	// exists, including while the table is missing or ungranted, which is
+	// exactly when a warning would go out with no record behind it. Only the
+	// worker touches it; atomic so that stays true if that ever changes.
+	writable atomic.Bool
 }
 
 type moderationJob struct {
@@ -196,7 +203,7 @@ func (m *Moderation) work() {
 // hung bridge or database holds this worker for seconds, never for good.
 func (m *Moderation) act(j moderationJob) {
 	warned := false
-	if hasRule(j.flags, moderation.RuleTerm) && j.pctx.Voice != nil && m.tracker.ClaimWarning(j.xuid, j.at) {
+	if hasRule(j.flags, moderation.RuleTerm) && j.pctx.Voice != nil && m.recordable(j.pctx) && m.tracker.ClaimWarning(j.xuid, j.at) {
 		ctx, cancel := context.WithTimeout(m.rootCtx, plugin.DefaultDispatchTimeout)
 		err := j.pctx.Voice.Tell(ctx, j.xuid, moderationWarning)
 		cancel()
@@ -219,6 +226,7 @@ func (m *Moderation) act(j moderationJob) {
 			Rule: f.Rule, Detail: f.Detail, Action: action, OccurredAt: j.at,
 		})
 		cancel()
+		m.writable.Store(err == nil)
 		if err != nil {
 			// A missing table or grant is said once by the store the binary
 			// wires in; per flag it would bury the log for a whole release.
@@ -282,6 +290,26 @@ func (m *Moderation) notifyOperators(j moderationJob) {
 		// Stored, so it still reaches operators at their next join.
 		m.log.Error("moderation_notice_send_failed", logging.Fields{"xuid": j.xuid, "announcement_id": id, "error": err.Error()})
 	}
+}
+
+// recordable reports whether a flag written now would be kept, so that a
+// warning is only whispered when its record can follow it.
+//
+// Once a write has succeeded that is taken as the answer until one fails.
+// Until then, and after any failure, it asks with a zero-row read: the
+// same table and the same deploy-ordering failures a write would hit,
+// without writing anything. A table that disappears between two flags
+// still costs one unrecorded warning, because nothing short of the write
+// can know that in advance.
+func (m *Moderation) recordable(pctx *plugin.Context) bool {
+	if m.writable.Load() {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(m.rootCtx, plugin.DefaultDispatchTimeout)
+	defer cancel()
+	_, err := pctx.Moderation.Recent(ctx, "", 0)
+	m.writable.Store(err == nil)
+	return err == nil
 }
 
 func hasRule(flags []moderation.Flag, rule moderation.Rule) bool {
