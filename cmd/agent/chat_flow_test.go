@@ -227,9 +227,12 @@ func TestChatCommandFlow(t *testing.T) {
 			want: []string{"say: pong"},
 		},
 		{
-			name: "operator-only command is refused for a visitor",
+			// Refused, and told so. A denial can only happen for a command
+			// that actually exists, so unlike the unknown case below there
+			// is no stray-"!" traffic to stay quiet for.
+			name: "operator-only command is refused for a visitor, and says so",
 			pk:   chatPacket(playerXUID, "Steve", "!shutdown"),
-			want: nil,
+			want: []string{"tell " + playerXUID + ": !shutdown isn't available to you - !help lists what is."},
 		},
 		{
 			// The scenario the Stage 1 TODO explicitly called out: an XUID
@@ -256,9 +259,31 @@ func TestChatCommandFlow(t *testing.T) {
 			want: nil,
 		},
 		{
-			name: "unknown command is silently ignored",
+			// Still silent in open chat, and deliberately: ParseTrigger
+			// treats any message opening with "!" as a command, so "!!!"
+			// and "!nice" arrive here too. Answering each one would have
+			// the agent talking over ordinary conversation.
+			name: "unknown command is silently ignored in open chat",
 			pk:   chatPacket(playerXUID, "Steve", "!nope"),
 			want: nil,
+		},
+		{
+			// Whispered is the opposite case: the player addressed the
+			// agent directly and nobody else can see it, so silence is
+			// indistinguishable from the agent being down.
+			name: "unknown command whispered is answered",
+			pk:   whisperPacket(playerXUID, "Steve", "!nope"),
+			want: []string{"tell " + playerXUID + ": I don't know !nope. Try !help to see what I can do."},
+		},
+		{
+			name: "stray punctuation whispered is still answered, since it was aimed at the agent",
+			pk:   whisperPacket(playerXUID, "Steve", "!!!"),
+			want: []string{"tell " + playerXUID + ": I don't know !!!. Try !help to see what I can do."},
+		},
+		{
+			name: "a known command still works when whispered",
+			pk:   whisperPacket(playerXUID, "Steve", "!ping"),
+			want: []string{"tell " + playerXUID + ": pong"},
 		},
 		{
 			name: "ordinary conversation produces no reply",
@@ -846,7 +871,7 @@ func TestEveryCommandOutcomeIsAudited(t *testing.T) {
 			log := logging.New("info")
 			rec := &recordingAudit{}
 
-			handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!"+tc.command), log,
+			handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!"+tc.command), false, log,
 				registry, pctx, unlimitedRateLimit(), permResolver, rec, playerRoster)
 
 			records := rec.all()
@@ -885,7 +910,7 @@ func TestAFailingAuditWriteDoesNotFailTheCommand(t *testing.T) {
 	log := logging.New("info")
 	rec := &recordingAudit{err: errors.New("database on fire")}
 
-	handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!ping"), log,
+	handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!ping"), false, log,
 		registry, pctx, unlimitedRateLimit(), permResolver, rec, playerRoster)
 
 	got := voice.output()
@@ -909,7 +934,7 @@ func TestRateLimitedCommandIsAudited(t *testing.T) {
 	// reaches Dispatch.
 	deniedLimiter := ratelimit.NewPerActor(0, time.Minute)
 
-	handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!ping"), log,
+	handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!ping"), false, log,
 		registry, pctx, deniedLimiter, permResolver, rec, playerRoster)
 
 	records := rec.all()
@@ -934,7 +959,7 @@ func TestErroredCommandIsAudited(t *testing.T) {
 	log := logging.New("info")
 	rec := &recordingAudit{}
 
-	handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!boom"), log,
+	handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!boom"), false, log,
 		registry, pctx, unlimitedRateLimit(), fakePermResolver(t, nil), rec, roster.New())
 
 	records := rec.all()
@@ -971,7 +996,7 @@ func TestTimedOutCommandIsAudited(t *testing.T) {
 	plugin.DefaultDispatchTimeout = 10 * time.Millisecond
 	defer func() { plugin.DefaultDispatchTimeout = orig }()
 
-	handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!slow"), log,
+	handleCommand(context.Background(), playerXUID, chat.ParseTrigger("!slow"), false, log,
 		registry, pctx, unlimitedRateLimit(), fakePermResolver(t, nil), rec, roster.New())
 
 	records := rec.all()
@@ -997,7 +1022,7 @@ func TestAFailedConsoleCommandIsAnsweredOnTheConsolePath(t *testing.T) {
 	voice := &recordingVoice{}
 	pctx := &plugin.Context{Voice: voice, Directory: registry}
 
-	handleCommand(context.Background(), chat.ServerOrigin, chat.ParseTrigger("!boom"), logging.New("info"),
+	handleCommand(context.Background(), chat.ServerOrigin, chat.ParseTrigger("!boom"), false, logging.New("info"),
 		registry, pctx, unlimitedRateLimit(), fakePermResolver(t, nil), &recordingAudit{}, roster.New())
 
 	out := voice.output()

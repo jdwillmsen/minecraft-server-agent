@@ -37,7 +37,7 @@ var quietLog = logging.New("error")
 func runCommand(t *testing.T, line string, limiter *ratelimit.PerActor, auditor audit.Store) {
 	t.Helper()
 	registry, pctx, _, _, _, playerRoster, permResolver := newHarness(t)
-	handleCommand(context.Background(), playerXUID, chat.ParseTrigger(line), quietLog,
+	handleCommand(context.Background(), playerXUID, chat.ParseTrigger(line), false, quietLog,
 		registry, pctx, limiter, permResolver, auditor, playerRoster)
 }
 
