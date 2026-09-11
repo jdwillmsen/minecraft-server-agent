@@ -61,8 +61,8 @@ func CrossedMilestone(before, after time.Duration) (time.Duration, bool) {
 var operatorTarget = plugin.PermissionOperator.String()
 
 // Events turns what the agent observes about players into announcements:
-// a first-ever arrival, whispered to operators, and a playtime milestone,
-// broadcast.
+// the first sight of a player, whispered to operators, and a playtime
+// milestone, broadcast.
 type Events struct {
 	// rootCtx is the process lifetime: an event is observed on the packet
 	// read loop, and its delivery must outlive the moment that noticed it.
@@ -91,12 +91,28 @@ func NewEvents(rootCtx context.Context, pub Publisher, log *logging.Logger) *Eve
 // in public, and a second public line about the same arrival is noise. The
 // caller must only pass a profile a real store produced; a disabled store
 // reports every arrival as new because it remembers nobody.
+//
+// First-ever means no row existed, not a join count of zero: a player first
+// met already online has a row and no counted join, and was announced by
+// FirstSeenOnline when that row was created. One notice per player, ever.
 func (e *Events) Joined(gamertag string, prior store.Profile) {
-	if !prior.New() || gamertag == "" {
+	if !prior.FirstSeen.IsZero() || gamertag == "" {
 		return
 	}
 	e.publish("first_join", announce.TargetPermission, operatorTarget,
 		fmt.Sprintf("First time here: %s just joined the server for the first time.", gamertag))
+}
+
+// FirstSeenOnline tells operators about a player the store just recorded for
+// the first time without watching them arrive -- one already connected when
+// the agent began watching. The same notice as Joined, worded for what the
+// agent actually saw.
+func (e *Events) FirstSeenOnline(gamertag string) {
+	if gamertag == "" {
+		return
+	}
+	e.publish("first_seen", announce.TargetPermission, operatorTarget,
+		fmt.Sprintf("New player: %s, first seen while already online.", gamertag))
 }
 
 // Left announces a playtime milestone the departure just carried the player

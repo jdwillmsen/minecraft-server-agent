@@ -44,6 +44,29 @@ func (p announcingProfiles) RecordJoin(ctx context.Context, xuid, gamertag strin
 	return profile, err
 }
 
+// EnsurePlayer satisfies store.Store. A row it creates is the agent's first
+// sight of a player it never watched arrive, so that is when operators hear
+// of them; their later join finds the row and says nothing.
+func (p announcingProfiles) EnsurePlayer(ctx context.Context, xuid, gamertag string, at time.Time) (bool, error) {
+	created, err := p.Store.EnsurePlayer(ctx, xuid, gamertag, at)
+	p.firstSeen(gamertag, created, err)
+	return created, err
+}
+
+// ResumeSession satisfies store.Store, announcing a first sight exactly as
+// EnsurePlayer does.
+func (p announcingProfiles) ResumeSession(ctx context.Context, xuid, gamertag string, at time.Time) (bool, error) {
+	created, err := p.Store.ResumeSession(ctx, xuid, gamertag, at)
+	p.firstSeen(gamertag, created, err)
+	return created, err
+}
+
+func (p announcingProfiles) firstSeen(gamertag string, created bool, err error) {
+	if err == nil && created && p.Store.Enabled() {
+		p.events.FirstSeenOnline(gamertag)
+	}
+}
+
 // RecordLeave satisfies store.Store.
 func (p announcingProfiles) RecordLeave(ctx context.Context, xuid string, since, at time.Time) (store.Playtime, error) {
 	pt, err := p.Store.RecordLeave(ctx, xuid, since, at)

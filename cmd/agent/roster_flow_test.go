@@ -217,12 +217,12 @@ func (s *sessionCalls) RecordLeave(_ context.Context, xuid string, since, _ time
 	return store.Playtime{}, nil
 }
 
-func (s *sessionCalls) ResumeSession(_ context.Context, xuid, _ string, _ time.Time) error {
+func (s *sessionCalls) ResumeSession(_ context.Context, xuid, _ string, _ time.Time) (bool, error) {
 	s.calls = append(s.calls, "resume:"+xuid)
 	if s.failOpening {
-		return errors.New("database unreachable")
+		return false, errors.New("database unreachable")
 	}
-	return nil
+	return false, nil
 }
 
 func (s *sessionCalls) CloseOrphans(_ context.Context, at time.Time) (int, error) {

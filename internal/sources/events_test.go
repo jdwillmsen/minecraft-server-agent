@@ -116,8 +116,14 @@ func TestJoinedWhispersOperatorsOnAFirstEverArrivalOnly(t *testing.T) {
 	if got := pub.all(); len(got) != 0 {
 		t.Fatalf("a returning player was announced: %+v", got)
 	}
+	// A row with no counted join: first met already online, and announced
+	// then. Their first watched arrival is not news a second time.
+	e.Joined("SeenOnline", store.Profile{JoinCount: 1, FirstSeen: now.Add(-time.Hour)})
+	if got := pub.all(); len(got) != 0 {
+		t.Fatalf("a player the store already had a row for was announced as new: %+v", got)
+	}
 
-	e.Joined("Newcomer", store.Profile{JoinCount: 1, FirstSeen: now})
+	e.Joined("Newcomer", store.Profile{JoinCount: 1})
 	got := pub.all()
 	if len(got) != 1 {
 		t.Fatalf("published %d announcements, want 1", len(got))
@@ -131,12 +137,33 @@ func TestJoinedWhispersOperatorsOnAFirstEverArrivalOnly(t *testing.T) {
 	}
 }
 
+func TestFirstSeenOnlineWhispersOperatorsWithoutClaimingAJoin(t *testing.T) {
+	pub := &recordingPublisher{}
+	before := time.Now()
+	inlineEvents(pub).FirstSeenOnline("Stranger")
+
+	got := pub.all()
+	if len(got) != 1 {
+		t.Fatalf("published %d announcements, want 1", len(got))
+	}
+	a := got[0]
+	if a.Source != announce.SourceEvent || a.TargetKind != announce.TargetPermission || a.TargetValue != "operator" || a.Delivery != announce.DeliveryWhisper {
+		t.Errorf("announcement = %s/%s/%s/%s, want an event whispered to the operator permission", a.Source, a.TargetKind, a.TargetValue, a.Delivery)
+	}
+	if !strings.Contains(a.Body, "Stranger") || !strings.Contains(a.Body, "already online") || strings.Contains(a.Body, "joined") {
+		t.Errorf("body %q should name the player as first seen already online, not as having joined", a.Body)
+	}
+	if a.ExpiresAt == nil || a.ExpiresAt.Sub(before) < 23*time.Hour || a.ExpiresAt.Sub(before) > 25*time.Hour {
+		t.Errorf("expiry = %v, want about 24h out, as a first-join notice has", a.ExpiresAt)
+	}
+}
+
 // The production spawn is a goroutine; this is the one test that proves the
 // publish still happens off the caller.
 func TestEventsPublishOffTheCallersGoroutine(t *testing.T) {
 	pub := &recordingPublisher{sent: make(chan struct{}, 1)}
 	NewEvents(context.Background(), pub, logging.New("error")).
-		Joined("Newcomer", store.Profile{JoinCount: 1, FirstSeen: time.Now()})
+		Joined("Newcomer", store.Profile{JoinCount: 1})
 	select {
 	case <-pub.sent:
 	case <-time.After(5 * time.Second):

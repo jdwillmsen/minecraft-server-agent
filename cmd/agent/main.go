@@ -130,6 +130,7 @@ func main() {
 	var scheduleStore announce.ScheduleStore = announce.Nop{}
 	var auditor audit.Store = audit.Nop{}
 	var moderationStore moderation.Store = moderation.Nop{}
+	var ob *outbox
 	if pg, ok := playerStore.(*store.Postgres); ok && pg.Pool() != nil {
 		knowledgeStore = knowledge.NewPostgres(pg.Pool())
 		moderationStore = newModerationLog(moderation.NewPostgres(pg.Pool()), log)
@@ -138,7 +139,7 @@ func main() {
 		// Wrapped rather than used directly: every announcement row names a
 		// player that minecraft.players must already hold -- see outbox.
 		announcePG := announce.NewPostgres(pg.Pool())
-		ob := newOutbox(announcePG, pg, playerRoster, log)
+		ob = newOutbox(announcePG, pg, playerRoster, log)
 		announceStore = ob
 		scheduleStore = scheduleBook{ScheduleStore: announcePG, outbox: ob}
 		log.Info("knowledge_ready", nil)
@@ -164,8 +165,13 @@ func main() {
 		log,
 	)
 	// Wrapped only now: the stores above type-assert the concrete Postgres
-	// to borrow its pool, which the wrapper would hide from them.
+	// to borrow its pool, which the wrapper would hide from them. The outbox
+	// is handed the wrapper once it exists, so a player row it creates is
+	// announced like any other first sight.
 	playerStore = withPlayerEvents(playerStore, sources.NewEvents(ctx, deliverer, log))
+	if ob != nil {
+		ob.players = playerStore
+	}
 
 	registry := plugin.NewRegistry()
 	if err := registerPlugins(ctx, registry, deliverer, cfg.ModerationTerms, log); err != nil {
@@ -990,7 +996,7 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 		if chat.IsSelfOrSibling(p.XUID, selfXUID, siblingXUIDs) {
 			continue
 		}
-		if err := playerStore.ResumeSession(ctx, p.XUID, p.Username, time.Now()); err != nil {
+		if _, err := playerStore.ResumeSession(ctx, p.XUID, p.Username, time.Now()); err != nil {
 			log.Error("store_resume_session_failed", logging.Fields{"xuid": p.XUID, "error": err.Error()})
 		}
 	}

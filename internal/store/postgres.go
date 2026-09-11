@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -164,28 +165,24 @@ func openSession(ctx context.Context, tx pgx.Tx, xuid, gamertag string, at time.
 // their profile as it was: no join counted, last_seen_at not advanced, the
 // player row created bare if this is the first the agent has heard of them,
 // exactly as EnsurePlayer would.
-func (p *Postgres) ResumeSession(ctx context.Context, xuid, gamertag string, at time.Time) error {
+func (p *Postgres) ResumeSession(ctx context.Context, xuid, gamertag string, at time.Time) (bool, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("store: begin: %w", err)
+		return false, fmt.Errorf("store: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO minecraft.players (xuid, current_gamertag, first_seen_at, last_seen_at)
-		VALUES ($1, $2, $3, $3)
-		ON CONFLICT (xuid) DO NOTHING`,
-		xuid, gamertag, at,
-	); err != nil {
-		return fmt.Errorf("store: ensure player: %w", err)
+	created, err := ensurePlayer(ctx, tx, xuid, gamertag, at)
+	if err != nil {
+		return false, err
 	}
 	if err := openSession(ctx, tx, xuid, gamertag, at); err != nil {
-		return err
+		return false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("store: commit: %w", err)
+		return false, fmt.Errorf("store: commit: %w", err)
 	}
-	return nil
+	return created, nil
 }
 
 // EnsurePlayer inserts the minimum row a foreign key needs and leaves an
@@ -197,16 +194,23 @@ func (p *Postgres) ResumeSession(ctx context.Context, xuid, gamertag string, at 
 // first_seen_at is when this agent first had to write them down, which is
 // all it has ever meant -- the server saw them earlier, and nothing here can
 // know when.
-func (p *Postgres) EnsurePlayer(ctx context.Context, xuid, gamertag string, at time.Time) error {
-	if _, err := p.pool.Exec(ctx, `
+func (p *Postgres) EnsurePlayer(ctx context.Context, xuid, gamertag string, at time.Time) (bool, error) {
+	return ensurePlayer(ctx, p.pool, xuid, gamertag, at)
+}
+
+func ensurePlayer(ctx context.Context, db interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}, xuid, gamertag string, at time.Time) (bool, error) {
+	tag, err := db.Exec(ctx, `
 		INSERT INTO minecraft.players (xuid, current_gamertag, first_seen_at, last_seen_at)
 		VALUES ($1, $2, $3, $3)
 		ON CONFLICT (xuid) DO NOTHING`,
 		xuid, gamertag, at,
-	); err != nil {
-		return fmt.Errorf("store: ensure player: %w", err)
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: ensure player: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() == 1, nil
 }
 
 // XUIDForName resolves a gamertag through the two places one is recorded:
