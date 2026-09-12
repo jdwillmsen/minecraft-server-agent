@@ -67,8 +67,9 @@ const announceDrainDelay = welcomeDelay + 3*time.Second
 
 // freshJoinGrace is how long after an arrival the deliverer treats a player
 // as still loading, and leaves their copy of an announcement pending rather
-// than recorded. Shorter than announceDrainDelay so a player's own drain,
-// which waits that long, is never deferred by it.
+// than recorded. The join drain reads the same clock when it wakes, so this
+// must stay shorter than announceDrainDelay: at grace >= delay every drain
+// would defer itself and the backlog would never go out at all.
 const freshJoinGrace = announceDrainDelay - time.Second
 
 // stableSessionThreshold mirrors minecraft-afk-bot: the reconnect backoff
@@ -673,9 +674,10 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 func beginWatching(ctx context.Context, playerRoster *roster.Roster, playerStore store.Store, joinClock *joinTimes, log *logging.Logger) {
 	now := time.Now()
 	playerRoster.BeginSession(now)
-	// Nobody the next snapshot reports is a new arrival: their clients have
-	// been rendering chat for as long as they have been playing.
-	joinClock.forget()
+	// Arrivals from the previous connection mean nothing here, and anyone
+	// the next snapshot reports may have reconnected moments before the
+	// agent did, so this connection's start stands in for their arrival.
+	joinClock.connected()
 	if n, err := playerStore.CloseOrphans(ctx, now); err != nil {
 		log.Error("store_close_orphans_failed", logging.Fields{"error": err.Error()})
 	} else if n > 0 {

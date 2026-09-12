@@ -389,9 +389,11 @@ An announcement published in that same window - a schedule firing, an event
 source, `!announce` - reaches everyone else as usual, but a player who has
 only just arrived is not recorded as having heard it. A broadcast still goes
 out, since it is heard by every client that is up; a whisper to a loading
-client is not even sent. Either way the row stays pending and that player's
-own drain owes it to them, which is the only thing that retries. The grace
-is shorter than the drain's wait, so a drain never defers its own delivery.
+client is not even sent. For every target that queues the row stays pending
+and that player's own drain owes it to them, which is the only thing that
+retries; `!now` queues for nobody, so a player who arrives into one has
+simply missed it. The join drain reads the same clock, so the grace is
+shorter than its wait - otherwise a drain would defer itself forever.
 
 Join delivery sends every expedited message first, uncapped, then up to
 three ordinary ones, oldest first, then - only if something is still left -

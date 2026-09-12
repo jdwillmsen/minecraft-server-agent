@@ -35,9 +35,9 @@ type Roster interface {
 // a client that cannot render it yet. Not part of Roster: Roster answers who
 // is reachable, this answers how recently, and only one caller needs it.
 type JoinClock interface {
-	// SinceJoin is how long ago xuid joined, and whether that is known at
-	// all -- a player already online when the agent connected is not a
-	// fresh arrival and reports false.
+	// SinceJoin is how long ago xuid arrived, and whether that is known at
+	// all -- an implementation with no idea when this connection began, and
+	// no arrival of its own to report, answers false.
 	SinceJoin(xuid string) (time.Duration, bool)
 }
 
@@ -87,9 +87,9 @@ type Option func(*Deliverer)
 // A whisper or broadcast that lands within grace of an arrival reaches a
 // client that is still loading: the server accepts it, the player never sees
 // it, and a delivery row would stop anything from ever retrying it. Leaving
-// the row pending hands the message to that player's own join drain, which
-// waits out the same window. grace should therefore be shorter than the
-// drain's wait, or the drain would defer its own delivery.
+// the row pending hands the message to that player's own join drain -- which
+// reads this same clock and defers too, so grace must be shorter than the
+// drain's wait or a drain would never deliver anything.
 func WithFreshJoinGrace(j JoinClock, grace time.Duration) Option {
 	return func(d *Deliverer) { d.joins, d.joinGrace = j, grace }
 }
@@ -194,7 +194,9 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 			if d.stillLoading(xuid) {
 				// Heard by everyone whose client is up, but not by this one:
 				// recording it would be the same permanent loss a whisper to
-				// a loading client used to be. Left pending for their drain.
+				// a loading client used to be. Left pending, so their own
+				// drain owes it to them -- unless the target is one that
+				// never queues, in which case they have simply missed it.
 				deferred++
 				continue
 			}
@@ -346,6 +348,16 @@ func (d *Deliverer) DrainForJoin(ctx context.Context, xuid string, now time.Time
 	defer mu.Unlock()
 
 	if !d.store.Enabled() {
+		return 0, 0, nil
+	}
+	if d.stillLoading(xuid) {
+		// This drain belongs to an arrival the player has already replaced:
+		// they dropped and rejoined inside its wait. Whispering the backlog
+		// now would hand it to a loading client and record it, which is the
+		// permanent loss the wait exists to prevent. Nothing delivered and
+		// nothing owed to report, so no summary line is spoken either --
+		// the newer arrival's own drain, a full wait behind it, owes them
+		// everything.
 		return 0, 0, nil
 	}
 	permission := d.perms.Resolve(ctx, xuid)

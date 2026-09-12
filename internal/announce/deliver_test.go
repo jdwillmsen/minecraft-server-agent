@@ -651,3 +651,52 @@ func TestSendNowWithoutAJoinClockDefersNothing(t *testing.T) {
 		t.Errorf("delivered = %d, want 1", delivered)
 	}
 }
+
+// The drain of an arrival the player has already replaced must deliver
+// nothing: they crashed on join and came back inside the first drain's wait,
+// so when it wakes it is looking at a client that is loading all over again.
+// Whispering then would record the backlog against a player who never saw
+// it, and the second drain would find nothing left to send.
+func TestDrainForJoinDefersToTheDrainOfANewerArrival(t *testing.T) {
+	pending := []Announcement{
+		{ID: 1, Body: "one", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
+		{ID: 2, Body: "two", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
+	}
+	store := &fakeStore{enabled: true, pending: pending}
+	voice := &fakeVoice{}
+	// The player joined at T=0 and rejoined at T=5; this first drain fires
+	// at T=8, three seconds into the new arrival.
+	joins := fakeJoins{since: map[string]time.Duration{"rejoiner": 3 * time.Second}}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"rejoiner"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	delivered, remaining, err := d.DrainForJoin(context.Background(), "rejoiner", time.Now())
+	if err != nil {
+		t.Fatalf("DrainForJoin: %v", err)
+	}
+	if delivered != 0 {
+		t.Errorf("delivered = %d, want 0: the client cannot render it yet", delivered)
+	}
+	if remaining != 0 {
+		t.Errorf("remaining = %d, want 0: a summary line is as unrenderable as the backlog", remaining)
+	}
+	if len(voice.tells) != 0 {
+		t.Errorf("told %v, want nothing sent to a loading client", voice.tells)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("recorded %v, want nothing: the newer arrival's drain owes it", store.delivered)
+	}
+
+	// The second drain, a full wait after the rejoin, is the one that pays.
+	joins.since["rejoiner"] = 8 * time.Second
+	delivered, remaining, err = d.DrainForJoin(context.Background(), "rejoiner", time.Now())
+	if err != nil {
+		t.Fatalf("DrainForJoin: %v", err)
+	}
+	if delivered != 2 || remaining != 0 {
+		t.Errorf("delivered = %d, remaining = %d, want 2 and 0", delivered, remaining)
+	}
+	if len(store.delivered) != 2 {
+		t.Errorf("store recorded %v, want both announcements", store.delivered)
+	}
+}
