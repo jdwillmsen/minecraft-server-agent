@@ -86,9 +86,11 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   `add_player` proximity packet) and the name source `Voice.Tell` resolves
   a reply target from
 - `internal/bus` - typed pub/sub event bus; every answerable chat message
-  (`chat.MessageEvent`) and every genuinely new arrival
-  (`roster.JoinEvent`) is published here, so event-driven plugins subscribe
-  instead of touching the connection
+  (`chat.MessageEvent`), every genuinely new arrival (`roster.JoinEvent`)
+  and every player a session's opening snapshot finds already online
+  (`roster.PresentEvent`, never greeted - see "Announcements and the command
+  audit trail") is published here, so event-driven plugins subscribe instead
+  of touching the connection
 - `internal/plugin` - the `Plugin`/`Context`/`Registry` extension surface
 - `internal/plugins` - concrete plugins: `core` (`!help`/`!ping`), `stats`
   (`!players`, `!online`, `!version`, `!backup`), `welcome` (event-driven, no
