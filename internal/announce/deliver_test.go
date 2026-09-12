@@ -637,8 +637,8 @@ func TestSendNowBroadcastsButDoesNotRecordAFreshArrival(t *testing.T) {
 	if len(voice.says) != 1 {
 		t.Fatalf("says = %v, want the broadcast to go out once", voice.says)
 	}
-	if delivered != 2 {
-		t.Errorf("delivered = %d, want 2: both clients heard the one Say", delivered)
+	if delivered != 1 {
+		t.Errorf("delivered = %d, want 1: the player who just arrived rendered nothing", delivered)
 	}
 	if len(store.delivered) != 1 {
 		t.Errorf("recorded %v, want only the settled player", store.delivered)
@@ -784,5 +784,36 @@ func TestSendNowCountsDeferredBroadcastRecipientsAsReached(t *testing.T) {
 	}
 	if len(store.delivered) != 0 {
 		t.Errorf("recorded %v, want nothing recorded inside the connect window", store.delivered)
+	}
+}
+
+// Reached counts hearing, not bookkeeping, and the two deferrals are not the
+// same fact. A player whose arrival the agent saw inside the grace demonstrably
+// rendered nothing and is owed the text again by their own drain; a player
+// withheld only because the agent itself just connected almost certainly heard
+// the one Say, and saying otherwise would tell an operator nobody was online
+// moments after they watched their own line go out.
+func TestSendNowCountsOnlyGuessedDeferralsAsReached(t *testing.T) {
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	joins := fakeJoins{
+		since:     map[string]time.Duration{"arrival": 2 * time.Second},
+		connected: 3 * time.Second,
+	}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"arrival", "snapshot"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	sent, err := d.SendNow(context.Background(), Announcement{Body: "server restarting", TargetKind: TargetEveryone}, 9)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 {
+		t.Fatalf("says = %v, want the broadcast to go out once", voice.says)
+	}
+	if sent != 1 {
+		t.Errorf("sent = %d, want 1: the snapshot player heard it, the fresh arrival did not", sent)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("recorded %v, want nothing: neither copy may be marked", store.delivered)
 	}
 }

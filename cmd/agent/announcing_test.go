@@ -338,7 +338,7 @@ func TestEveryPluginThisBinaryServesIsRegistered(t *testing.T) {
 		announcePermissions{resolver: fakePermResolver(t, nil)},
 		logging.New("error"),
 	)
-	if err := registerPlugins(t.Context(), registry, deliverer, []string{"griefer"}, logging.New("error")); err != nil {
+	if err := registerPlugins(t.Context(), registry, deliverer, newJoinTimes(), []string{"griefer"}, logging.New("error")); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 

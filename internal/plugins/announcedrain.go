@@ -23,6 +23,15 @@ type AnnounceDeliverer interface {
 	DrainForJoin(ctx context.Context, xuid string, now time.Time) (delivered, remaining int, err error)
 }
 
+// Connections reports which of the agent's connections is live right now,
+// as a number that only ever grows. A drain waits before it delivers, and
+// the connection it was scheduled in can end inside that wait; the one that
+// replaces it re-reports everyone still online, so the waiting drain is a
+// duplicate whose player may by then be loading a fresh client.
+type Connections interface {
+	Generation() uint64
+}
+
 // drainTimeout bounds one join's delivery. A backlog can be several
 // messages, each its own bridge call, so this is generous compared to a
 // single command dispatch's DefaultDispatchTimeout — but it is still a
@@ -71,6 +80,10 @@ type AnnounceDrain struct {
 	// the release and its migration are out of step, and nothing after the
 	// first one carries information.
 	unready sync.Once
+	// conns tells a woken drain whether the connection it was scheduled in
+	// is still the current one. Nil unless WithConnections is passed, which
+	// leaves every existing caller and test delivering unconditionally.
+	conns Connections
 	// inFlight is a counting semaphore over drains in progress, capped at
 	// maxConcurrentDrains. Claimed non-blockingly, after the wait and inside
 	// the goroutine: a caller that blocked for it would stall the dispatcher
@@ -79,10 +92,23 @@ type AnnounceDrain struct {
 	inFlight chan struct{}
 }
 
+// DrainOption configures an AnnounceDrain at construction.
+type DrainOption func(*AnnounceDrain)
+
+// WithConnections makes a drain abandon itself when the connection it was
+// scheduled in ends before its wait does.
+func WithConnections(c Connections) DrainOption {
+	return func(a *AnnounceDrain) { a.conns = c }
+}
+
 // NewAnnounceDrain builds the announce-drain plugin. rootCtx should be the
 // process lifetime context (cancelled on shutdown), not a per-request one.
-func NewAnnounceDrain(rootCtx context.Context, deliverer AnnounceDeliverer, delay time.Duration, log *logging.Logger) *AnnounceDrain {
-	return &AnnounceDrain{rootCtx: rootCtx, deliverer: deliverer, delay: delay, log: log, inFlight: make(chan struct{}, maxConcurrentDrains)}
+func NewAnnounceDrain(rootCtx context.Context, deliverer AnnounceDeliverer, delay time.Duration, log *logging.Logger, opts ...DrainOption) *AnnounceDrain {
+	a := &AnnounceDrain{rootCtx: rootCtx, deliverer: deliverer, delay: delay, log: log, inFlight: make(chan struct{}, maxConcurrentDrains)}
+	for _, opt := range opts {
+		opt(a)
+	}
+	return a
 }
 
 func (*AnnounceDrain) Name() string { return "announce-drain" }
@@ -91,8 +117,12 @@ func (*AnnounceDrain) Name() string { return "announce-drain" }
 // commands.
 func (*AnnounceDrain) Commands() []plugin.Command { return nil }
 
-// Kinds satisfies plugin.EventHandler.
-func (*AnnounceDrain) Kinds() []string { return []string{roster.JoinKind} }
+// Kinds satisfies plugin.EventHandler. A player already online when a
+// connection opens gets the same delayed delivery as an arrival: they are
+// not greeted and they are not new, but they may have reconnected moments
+// before the agent did, and nothing else will ever owe them their backlog
+// for this connection.
+func (*AnnounceDrain) Kinds() []string { return []string{roster.JoinKind, roster.PresentKind} }
 
 var _ plugin.Plugin = (*AnnounceDrain)(nil)
 var _ plugin.EventHandler = (*AnnounceDrain)(nil)
@@ -102,8 +132,14 @@ var _ plugin.EventHandler = (*AnnounceDrain)(nil)
 // calling this runs on the Bedrock packet read loop, and delivery makes one
 // bridge call per queued message.
 func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, ev bus.Event) error {
-	join, ok := ev.(roster.JoinEvent)
-	if !ok {
+	var xuid string
+	var generation uint64
+	switch e := ev.(type) {
+	case roster.JoinEvent:
+		xuid, generation = e.XUID, e.Generation
+	case roster.PresentEvent:
+		xuid, generation = e.XUID, e.Generation
+	default:
 		return fmt.Errorf("announcedrain: unexpected event type %T for kind %s", ev, ev.Kind())
 	}
 	if a.deliverer == nil {
@@ -128,14 +164,23 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 		// doing nothing, and the sixth onwards would be dropped -- which is
 		// exactly the shape of the rejoin wave after a restart, when
 		// backlogs are likeliest to be owed.
+		if a.conns != nil && a.conns.Generation() != generation {
+			// The connection this was scheduled in has ended. Its
+			// replacement re-reported everyone still online and owes them
+			// their own delivery a full wait from now, so speaking here
+			// would whisper a backlog to a client that may be loading all
+			// over again -- and record it, which is the loss the wait
+			// exists to prevent.
+			return
+		}
 		select {
 		case a.inFlight <- struct{}{}:
 		default:
-			a.log.Info("announce_drain_dropped_busy", logging.Fields{"xuid": join.XUID, "max_concurrent": cap(a.inFlight)})
+			a.log.Info("announce_drain_dropped_busy", logging.Fields{"xuid": xuid, "max_concurrent": cap(a.inFlight)})
 			return
 		}
 		defer func() { <-a.inFlight }()
-		a.drain(voice, join.XUID)
+		a.drain(voice, xuid)
 	}()
 	return nil
 }

@@ -33,7 +33,12 @@ type joinTimes struct {
 	mu    sync.Mutex
 	at    map[string]time.Time
 	since time.Time
-	now   func() time.Time
+	// gen counts connections. It is what tells a delivery scheduled before
+	// a reconnect that it no longer speaks for anyone: the connection it
+	// was scheduled in is gone, and the one that replaced it has reported
+	// every player still there.
+	gen uint64
+	now func() time.Time
 }
 
 func newJoinTimes() *joinTimes {
@@ -69,6 +74,14 @@ func (j *joinTimes) connected() {
 	defer j.mu.Unlock()
 	j.at = make(map[string]time.Time)
 	j.since = j.now()
+	j.gen++
+}
+
+// Generation implements plugins.Connections.
+func (j *joinTimes) Generation() uint64 {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.gen
 }
 
 // SinceJoin implements announce.JoinClock.

@@ -207,6 +207,7 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 		// their next join.
 		delivered := 0
 		deferred := 0
+		heard := 0
 		for _, xuid := range targets {
 			if ctx.Err() != nil {
 				// Cancelled: stop rather than attempt (and log) a store
@@ -220,6 +221,13 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 				// drain owes it to them -- unless the target is one that
 				// never queues, in which case they have simply missed it.
 				deferred++
+				if !d.justArrived(xuid) {
+					// Withheld on a guess, not on an arrival: nothing says
+					// this player is loading beyond the agent having only
+					// just connected, and one Say reaches every client that
+					// is up. They heard it; only their row was skipped.
+					heard++
+				}
 				continue
 			}
 			if err := d.store.MarkDelivered(ctx, id, xuid, now); err != nil {
@@ -231,11 +239,11 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 		if deferred > 0 {
 			d.log.Info("announce_deferred_for_joining", logging.Fields{"announcement_id": id, "players": deferred})
 		}
-		// Say reached every client that is up, deferred ones included --
-		// only their bookkeeping was skipped, not their hearing. Counting
-		// them keeps a caller that reports "nobody was online" from saying
-		// it to an operator who just watched the line go out.
-		return delivered + deferred, nil
+		// Counted as reached: everyone recorded, plus everyone withheld on
+		// nothing worse than a guess. A player who demonstrably just
+		// arrived is not counted -- their client rendered nothing, and
+		// their own drain still owes them the same text.
+		return delivered + heard, nil
 	}
 
 	// Whisper: each recipient gets their own Tell, and only a recipient

@@ -72,11 +72,40 @@ func joinEvent(xuid string) roster.JoinEvent {
 	return roster.JoinEvent{Entry: roster.Entry{XUID: xuid, Username: "Steve"}}
 }
 
+func joinEventAt(xuid string, generation uint64) roster.JoinEvent {
+	return roster.JoinEvent{Entry: roster.Entry{XUID: xuid, Username: "Steve"}, Generation: generation}
+}
+
+func presentEvent(xuid string, generation uint64) roster.PresentEvent {
+	return roster.PresentEvent{Entry: roster.Entry{XUID: xuid, Username: "Steve"}, Generation: generation}
+}
+
+// fakeConnections is a settable connection counter, so a test can end the
+// connection a drain is waiting in.
+type fakeConnections struct {
+	mu  sync.Mutex
+	gen uint64
+}
+
+var _ Connections = (*fakeConnections)(nil)
+
+func (c *fakeConnections) Generation() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gen
+}
+
+func (c *fakeConnections) reconnect() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gen++
+}
+
 func TestAnnounceDrain_Kinds(t *testing.T) {
 	d := NewAnnounceDrain(context.Background(), &fakeJoinDeliverer{}, 0, logging.New("info"))
 	kinds := d.Kinds()
-	if len(kinds) != 1 || kinds[0] != roster.JoinKind {
-		t.Errorf("Kinds() = %v, want [%s]", kinds, roster.JoinKind)
+	if len(kinds) != 2 || kinds[0] != roster.JoinKind || kinds[1] != roster.PresentKind {
+		t.Errorf("Kinds() = %v, want [%s %s]", kinds, roster.JoinKind, roster.PresentKind)
 	}
 }
 
@@ -440,5 +469,59 @@ func TestAnnounceDrain_ShutdownDuringTheWaitDeliversNothing(t *testing.T) {
 	case <-deliverer.calls:
 		t.Error("drained after shutdown, want nothing delivered")
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// A drain outliving its own connection must not deliver. The player joined,
+// the server blipped, and by the time the wait expired both they and the
+// agent had reconnected: whispering the backlog then would hand it to a
+// client that is loading all over again and record it, which is the loss the
+// wait exists to prevent. The new connection reports them present and owes
+// them the same backlog a full wait later, so exactly one delivery happens.
+func TestDrainAbandonedByAReconnectIsReplacedByTheNewConnections(t *testing.T) {
+	deliverer := &fakeJoinDeliverer{calls: make(chan struct{}, 4)}
+	voice := newRecordingTellVoice()
+	conns := &fakeConnections{gen: 1}
+	d := NewAnnounceDrain(context.Background(), deliverer, 40*time.Millisecond, logging.New("error"), WithConnections(conns))
+	pctx := &plugin.Context{Voice: voice}
+
+	if err := d.HandleEvent(context.Background(), pctx, joinEventAt("xuid-1", 1)); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	conns.reconnect()
+
+	select {
+	case <-deliverer.calls:
+		t.Fatal("a drain from the ended connection delivered: its player may be mid-load on a fresh client")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	if err := d.HandleEvent(context.Background(), pctx, presentEvent("xuid-1", 2)); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	select {
+	case <-deliverer.calls:
+	case <-time.After(time.Second):
+		t.Fatal("the new connection never drained the player it reported present: their backlog is stranded")
+	}
+	if deliverer.xuid != "xuid-1" {
+		t.Errorf("DrainForJoin xuid = %q, want %q", deliverer.xuid, "xuid-1")
+	}
+}
+
+// The ordinary join, with the connection still current when the wait ends.
+func TestDrainDeliversWhenItsConnectionIsStillCurrent(t *testing.T) {
+	deliverer := &fakeJoinDeliverer{calls: make(chan struct{}, 4)}
+	conns := &fakeConnections{gen: 3}
+	d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("error"), WithConnections(conns))
+	pctx := &plugin.Context{Voice: newRecordingTellVoice()}
+
+	if err := d.HandleEvent(context.Background(), pctx, joinEventAt("xuid-1", 3)); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	select {
+	case <-deliverer.calls:
+	case <-time.After(time.Second):
+		t.Fatal("a join on the current connection was never drained")
 	}
 }

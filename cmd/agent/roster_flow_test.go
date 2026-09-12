@@ -352,3 +352,96 @@ func TestSamePacketRejoinKeepsTheArrival(t *testing.T) {
 		t.Errorf("got %d joins from the rejoin packet, want 1", len(got))
 	}
 }
+
+func drainPresent(t *testing.T, events <-chan bus.Event) []roster.PresentEvent {
+	t.Helper()
+	var present []roster.PresentEvent
+	for {
+		select {
+		case ev := <-events:
+			p, ok := ev.(roster.PresentEvent)
+			if !ok {
+				t.Fatalf("got event %T on the present channel, want roster.PresentEvent", ev)
+			}
+			present = append(present, p)
+		default:
+			return present
+		}
+	}
+}
+
+// A player the opening snapshot reports is announced as present, never as a
+// join: they must not be greeted for reappearing, but whoever owes them a
+// delayed delivery has to hear about them on this connection, since a
+// reconnect may have left one stranded. The event carries the connection
+// that reported it, so a delivery scheduled by the previous one can tell it
+// has been replaced.
+func TestOpeningSnapshotReportsPlayersPresentWithTheirConnection(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	presentEvents, _ := eventBus.Subscribe(roster.PresentKind, 8)
+	joinEvents, _ := eventBus.Subscribe(roster.JoinKind, 8)
+	playerRoster := roster.New()
+	joinClock := newJoinTimes()
+
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(siblingBot, "AfkBot"),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	present := drainPresent(t, presentEvents)
+	if len(present) != 1 || present[0].XUID != playerXUID {
+		t.Fatalf("present events = %+v, want only Steve: the agent and its siblings are not players", present)
+	}
+	first := present[0].Generation
+	if got := drainJoins(t, joinEvents); len(got) != 0 {
+		t.Errorf("got %d joins from the opening snapshot, want 0: nobody in it arrived", len(got))
+	}
+	if _, ok := joinClock.SinceJoin(playerXUID); ok {
+		t.Error("the snapshot recorded an arrival: the clock must keep answering that honestly")
+	}
+
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	present = drainPresent(t, presentEvents)
+	if len(present) != 1 {
+		t.Fatalf("present events after the reconnect = %+v, want Steve reported again", present)
+	}
+	if present[0].Generation == first {
+		t.Errorf("generation = %d on both connections: a delivery scheduled by the first cannot tell it was replaced", first)
+	}
+}
+
+// A genuine arrival carries the connection it happened on, which is what
+// lets a drain scheduled by it abandon itself if that connection ends first.
+func TestAJoinCarriesItsConnection(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	events, _ := eventBus.Subscribe(roster.JoinKind, 8)
+	playerRoster := roster.New()
+	joinClock := newJoinTimes()
+
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	joins := drainJoins(t, events)
+	if len(joins) != 1 {
+		t.Fatalf("got %d joins, want Steve's", len(joins))
+	}
+	if joins[0].Generation != joinClock.Generation() {
+		t.Errorf("join generation = %d, want the live connection %d", joins[0].Generation, joinClock.Generation())
+	}
+}

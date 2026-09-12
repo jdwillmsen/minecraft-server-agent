@@ -185,7 +185,7 @@ func main() {
 	playerStore = withPlayerEvents(playerStore, sources.NewEvents(ctx, deliverer, log))
 
 	registry := plugin.NewRegistry()
-	if err := registerPlugins(ctx, registry, deliverer, cfg.ModerationTerms, log); err != nil {
+	if err := registerPlugins(ctx, registry, deliverer, joins, cfg.ModerationTerms, log); err != nil {
 		log.Error("plugin_register_failed", logging.Fields{"error": err.Error()})
 		os.Exit(1)
 	}
@@ -264,7 +264,7 @@ func main() {
 //
 // The error carries the plugin's own name, because "registration failed" on
 // its own does not say which one.
-func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer plugins.AnnounceDeliverer, moderationTerms []string, log *logging.Logger) error {
+func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer plugins.AnnounceDeliverer, conns plugins.Connections, moderationTerms []string, log *logging.Logger) error {
 	mod, err := plugins.NewModeration(ctx, moderationTerms, log)
 	if err != nil {
 		return fmt.Errorf("moderation: %w", err)
@@ -276,7 +276,7 @@ func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer p
 		plugins.NewWaypoints(),
 		plugins.NewWelcome(ctx, welcomeDelay, log),
 		plugins.NewAnnounce(),
-		plugins.NewAnnounceDrain(ctx, deliverer, announceDrainDelay, log),
+		plugins.NewAnnounceDrain(ctx, deliverer, announceDrainDelay, log, plugins.WithConnections(conns)),
 		mod,
 		plugins.NewSchedule(),
 	} {
@@ -1008,6 +1008,7 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 	// -- playtime counts only what the agent watched -- and nothing greets
 	// them: they did not just arrive. The one exception is a player the agent
 	// has never seen before, whom operators are told of once.
+	generation := joinClock.Generation()
 	for _, p := range alreadyOnline {
 		if chat.IsSelfOrSibling(p.XUID, selfXUID, siblingXUIDs) {
 			continue
@@ -1015,6 +1016,11 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 		if _, err := playerStore.ResumeSession(ctx, p.XUID, p.Username, time.Now()); err != nil {
 			log.Error("store_resume_session_failed", logging.Fields{"xuid": p.XUID, "error": err.Error()})
 		}
+		// No arrival is recorded for them: this is not one, and the clock
+		// must keep answering that honestly. What they get is the event,
+		// so whoever owes them something delayed can pay it on this
+		// connection instead of leaving it for a join that may never come.
+		eventBus.Publish(roster.PresentEvent{Entry: p, Generation: generation})
 	}
 	// Departures close a session rather than reaching a plugin. Nothing
 	// greets a player for leaving, and publishing an event no handler wants
@@ -1043,7 +1049,7 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 		// Recorded before the event is published, so anything the join sets
 		// off already sees this player as the fresh arrival they are.
 		joinClock.joined(join.XUID)
-		eventBus.Publish(roster.JoinEvent{Entry: join})
+		eventBus.Publish(roster.JoinEvent{Entry: join, Generation: generation})
 	}
 }
 

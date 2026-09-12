@@ -385,6 +385,14 @@ lost exactly that way on 2026-09-11, 0.8s after the join. The wait sits past
 the welcome's own, so the greeting owns the join moment and the backlog
 follows it.
 
+A delivery belongs to the connection that scheduled it. If the agent
+reconnects during the wait, that drain abandons itself without a word: the
+new connection re-reports everyone still online, and a player who came back
+in the same outage would be mid-load all over again. Those players get a
+delivery of their own instead - the same wait, from the connection that
+found them there - so a backlog is never stranded by a reconnect and never
+whispered twice. They are not greeted for it; they did not arrive.
+
 An announcement published in that same window - a schedule firing, an event
 source, `!announce` - reaches everyone else as usual, but a player who has
 only just arrived is not recorded as having heard it. A broadcast still goes
@@ -394,10 +402,16 @@ and that player's own drain owes it to them, which is the only thing that
 retries; `!now` queues for nobody, so a player who arrives into one has
 simply missed it. The drain defers on the same grace when it wakes, so the
 grace is shorter than its wait - otherwise a drain would defer itself
-forever. Only an arrival defers a drain: for the first seconds after the
-agent itself connects, everyone already online is treated as possibly
-loading for the purpose of recording a delivery, but a drain a real join
-scheduled still delivers.
+forever.
+
+For the first seconds after the agent itself connects it cannot tell a
+builder of an hour from someone who reconnected a second earlier, so it
+records a delivery against neither. That is a guess rather than a fact, and
+the two are counted differently: the reported reach of a broadcast includes
+a player withheld on the guess, since one `say` is heard by every client
+that is up, and excludes a player whose arrival was actually seen inside the
+grace, whose client rendered nothing and whose own drain still owes them the
+text.
 
 Join delivery sends every expedited message first, uncapped, then up to
 three ordinary ones, oldest first, then - only if something is still left -
