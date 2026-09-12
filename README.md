@@ -392,8 +392,12 @@ out, since it is heard by every client that is up; a whisper to a loading
 client is not even sent. For every target that queues the row stays pending
 and that player's own drain owes it to them, which is the only thing that
 retries; `!now` queues for nobody, so a player who arrives into one has
-simply missed it. The join drain reads the same clock, so the grace is
-shorter than its wait - otherwise a drain would defer itself forever.
+simply missed it. The drain defers on the same grace when it wakes, so the
+grace is shorter than its wait - otherwise a drain would defer itself
+forever. Only an arrival defers a drain: for the first seconds after the
+agent itself connects, everyone already online is treated as possibly
+loading for the purpose of recording a delivery, but a drain a real join
+scheduled still delivers.
 
 Join delivery sends every expedited message first, uncapped, then up to
 three ordinary ones, oldest first, then - only if something is still left -

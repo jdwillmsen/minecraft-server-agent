@@ -318,3 +318,37 @@ func TestALeaveAfterFailedReconnectWritesCarriesTheConnectionStart(t *testing.T)
 		t.Errorf("leave since = %v, want the reconnect's start %v", got, want)
 	}
 }
+
+// One PlayerList may carry a removal and a re-add for the same player. The
+// departure has to be applied before the arrival, or it erases the arrival
+// the same packet just reported -- and the deliverer then reads a client
+// that is mid-load as settled, which is the loss the join clock exists for.
+func TestSamePacketRejoinKeepsTheArrival(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	events, _ := eventBus.Subscribe(roster.JoinKind, 8)
+	playerRoster := roster.New()
+	joinClock := newJoinTimes()
+
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+	if _, ok := joinClock.SinceJoin(playerXUID); ok {
+		t.Fatal("a player in the opening snapshot was recorded as an arrival")
+	}
+
+	handlePlayerList(context.Background(), wire(t,
+		removeEntry(playerXUID),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	if _, ok := joinClock.SinceJoin(playerXUID); !ok {
+		t.Error("the rejoin's arrival was erased by the departure in the same packet")
+	}
+	if got := drainJoins(t, events); len(got) != 1 {
+		t.Errorf("got %d joins from the rejoin packet, want 1", len(got))
+	}
+}

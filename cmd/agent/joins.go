@@ -18,11 +18,12 @@ const staleJoin = time.Hour
 // delivered loses it for good, so a fresh arrival's copy is left pending for
 // their own join drain instead.
 //
-// A connection's own start counts as an arrival for everyone in its opening
-// roster snapshot. The agent cannot tell a player who has been building for
-// an hour from one who reconnected a second before it did -- and the second
-// is exactly who is around during the restart wave this exists for -- so
-// both read as fresh until the grace has passed since the connection began.
+// It also remembers when this connection began, which is all the agent
+// knows about anyone in the opening roster snapshot: it cannot tell a player
+// who has been building for an hour from one who reconnected a second before
+// it did, and the second is exactly who is around during a restart wave. The
+// two are reported separately, because withholding a delivery row on a guess
+// costs a duplicate whisper while acting on one can cancel a real drain.
 //
 // Deliberately not part of the roster. The roster answers who is here from
 // the packets it is given and has no clock of its own; adding one would put
@@ -70,16 +71,21 @@ func (j *joinTimes) connected() {
 	j.since = j.now()
 }
 
-// SinceJoin implements announce.JoinClock. A player's own arrival wins; a
-// player without one is measured from the connection, which grows past any
-// grace within seconds and leaves them reading as the settled player they
-// almost certainly are.
+// SinceJoin implements announce.JoinClock.
 func (j *joinTimes) SinceJoin(xuid string) (time.Duration, bool) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if at, ok := j.at[xuid]; ok {
-		return j.now().Sub(at), true
+	at, ok := j.at[xuid]
+	if !ok {
+		return 0, false
 	}
+	return j.now().Sub(at), true
+}
+
+// SinceConnect implements announce.JoinClock.
+func (j *joinTimes) SinceConnect() (time.Duration, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	if j.since.IsZero() {
 		return 0, false
 	}

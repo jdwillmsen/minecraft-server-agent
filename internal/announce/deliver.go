@@ -35,10 +35,15 @@ type Roster interface {
 // a client that cannot render it yet. Not part of Roster: Roster answers who
 // is reachable, this answers how recently, and only one caller needs it.
 type JoinClock interface {
-	// SinceJoin is how long ago xuid arrived, and whether that is known at
-	// all -- an implementation with no idea when this connection began, and
-	// no arrival of its own to report, answers false.
+	// SinceJoin is how long ago xuid was seen to arrive, and whether an
+	// arrival of their own was seen at all -- a player already online when
+	// the agent connected has none.
 	SinceJoin(xuid string) (time.Duration, bool)
+	// SinceConnect is how long ago the agent's own connection began, and
+	// whether it has begun at all. It stands in for the arrival of everyone
+	// in the opening roster snapshot, who may have reconnected moments
+	// before the agent did and be loading still.
+	SinceConnect() (time.Duration, bool)
 }
 
 // Permissions resolves a player's current permission level, as a plain
@@ -87,9 +92,9 @@ type Option func(*Deliverer)
 // A whisper or broadcast that lands within grace of an arrival reaches a
 // client that is still loading: the server accepts it, the player never sees
 // it, and a delivery row would stop anything from ever retrying it. Leaving
-// the row pending hands the message to that player's own join drain -- which
-// reads this same clock and defers too, so grace must be shorter than the
-// drain's wait or a drain would never deliver anything.
+// the row pending hands the message to that player's own join drain, which
+// defers on the same grace when it wakes -- so grace must be shorter than
+// the drain's wait, or a drain would never deliver anything.
 func WithFreshJoinGrace(j JoinClock, grace time.Duration) Option {
 	return func(d *Deliverer) { d.joins, d.joinGrace = j, grace }
 }
@@ -104,9 +109,26 @@ func NewDeliverer(s Store, v Voice, r Roster, p Permissions, log *logging.Logger
 	return d
 }
 
-// stillLoading reports whether xuid joined too recently to see a message
-// sent right now.
+// stillLoading reports whether xuid's client may be too freshly loaded to
+// see a message sent right now: their own arrival if one was seen, and
+// otherwise the agent's connection, since the opening snapshot cannot tell
+// an hour-old builder from a player who reconnected a second earlier.
 func (d *Deliverer) stillLoading(xuid string) bool {
+	if d.joins == nil || d.joinGrace <= 0 {
+		return false
+	}
+	if since, ok := d.joins.SinceJoin(xuid); ok {
+		return since < d.joinGrace
+	}
+	since, ok := d.joins.SinceConnect()
+	return ok && since < d.joinGrace
+}
+
+// justArrived reports whether xuid made an arrival of their own too recently
+// to be served. Only an arrival counts: the connection standing in for one
+// is a guess about who might be loading, fine for withholding a delivery row
+// but not for cancelling a drain that a real join scheduled.
+func (d *Deliverer) justArrived(xuid string) bool {
 	if d.joins == nil || d.joinGrace <= 0 {
 		return false
 	}
@@ -209,7 +231,11 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 		if deferred > 0 {
 			d.log.Info("announce_deferred_for_joining", logging.Fields{"announcement_id": id, "players": deferred})
 		}
-		return delivered, nil
+		// Say reached every client that is up, deferred ones included --
+		// only their bookkeeping was skipped, not their hearing. Counting
+		// them keeps a caller that reports "nobody was online" from saying
+		// it to an operator who just watched the line go out.
+		return delivered + deferred, nil
 	}
 
 	// Whisper: each recipient gets their own Tell, and only a recipient
@@ -350,7 +376,7 @@ func (d *Deliverer) DrainForJoin(ctx context.Context, xuid string, now time.Time
 	if !d.store.Enabled() {
 		return 0, 0, nil
 	}
-	if d.stillLoading(xuid) {
+	if d.justArrived(xuid) {
 		// This drain belongs to an arrival the player has already replaced:
 		// they dropped and rejoined inside its wait. Whispering the backlog
 		// now would hand it to a loading client and record it, which is the

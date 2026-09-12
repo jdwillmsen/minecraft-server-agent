@@ -38,56 +38,49 @@ func TestJoinTimesForgetsADeparture(t *testing.T) {
 	}
 }
 
-// A new connection drops the previous one's arrivals, and stands in for the
-// arrival of anyone in its opening snapshot: they may have reconnected
-// moments before the agent did.
-func TestJoinTimesMeasuresAnUnknownPlayerFromTheConnection(t *testing.T) {
+// A new connection drops the previous one's arrivals, and times itself: the
+// two are separate answers, because everyone in the opening snapshot may
+// have reconnected moments before the agent did, and that is a guess where
+// an arrival is a fact.
+func TestJoinTimesReportsTheConnectionSeparatelyFromAnArrival(t *testing.T) {
 	now := time.Now()
 	j := fixedJoinTimes(&now)
 	j.joined("111")
 	now = now.Add(time.Hour)
 	j.connected()
 
-	since, ok := j.SinceJoin("111")
-	if !ok || since != 0 {
-		t.Errorf("SinceJoin = %v, %v, want 0, true: the previous connection's arrival must not survive", since, ok)
+	if _, ok := j.SinceJoin("111"); ok {
+		t.Error("a previous connection's arrival survived into this one")
 	}
 
 	now = now.Add(2 * time.Second)
-	if since, ok := j.SinceJoin("111"); !ok || since != 2*time.Second {
-		t.Errorf("SinceJoin = %v, %v, want 2s, true", since, ok)
+	if since, ok := j.SinceConnect(); !ok || since != 2*time.Second {
+		t.Errorf("SinceConnect = %v, %v, want 2s, true", since, ok)
+	}
+	if _, ok := j.SinceJoin("111"); ok {
+		t.Error("reported an arrival for a player who only appeared in the snapshot")
 	}
 
-	now = now.Add(time.Minute)
-	if since, ok := j.SinceJoin("111"); !ok || since != 62*time.Second {
-		t.Errorf("SinceJoin = %v, %v, want 62s, true: past any grace, they read as settled", since, ok)
+	j.joined("111")
+	now = now.Add(time.Second)
+	if since, ok := j.SinceJoin("111"); !ok || since != time.Second {
+		t.Errorf("SinceJoin = %v, %v, want 1s, true: an arrival of their own is known exactly", since, ok)
+	}
+	if since, ok := j.SinceConnect(); !ok || since != 3*time.Second {
+		t.Errorf("SinceConnect = %v, %v, want 3s, true: an arrival does not restart the connection", since, ok)
 	}
 }
 
-// Nothing is known before the first connection, so there is no arrival to
-// measure anyone against.
+// Nothing is known before the first connection.
 func TestJoinTimesKnowsNothingBeforeAConnection(t *testing.T) {
 	now := time.Now()
 	j := fixedJoinTimes(&now)
 
-	if _, ok := j.SinceJoin("111"); ok {
-		t.Error("reported an arrival with no connection to measure it from")
+	if _, ok := j.SinceConnect(); ok {
+		t.Error("reported a connection before one began")
 	}
-}
-
-// An arrival of the player's own is what the deliverer must see, not the
-// older connection time that would read as settled.
-func TestJoinTimesPrefersAnArrivalOverTheConnection(t *testing.T) {
-	now := time.Now()
-	j := fixedJoinTimes(&now)
-	j.connected()
-	now = now.Add(time.Hour)
-	j.joined("111")
-	now = now.Add(time.Second)
-
-	since, ok := j.SinceJoin("111")
-	if !ok || since != time.Second {
-		t.Errorf("SinceJoin = %v, %v, want 1s, true", since, ok)
+	if _, ok := j.SinceJoin("111"); ok {
+		t.Error("reported an arrival nobody made")
 	}
 }
 
