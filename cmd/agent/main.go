@@ -57,6 +57,14 @@ import (
 // defect on this server.
 const welcomeDelay = 5 * time.Second
 
+// announceDrainDelay is how long the announce drain waits after a join
+// before whispering a player their backlog. Past welcomeDelay so the
+// greeting owns the join moment and the backlog follows it, and far enough
+// past the join itself that the client is rendering chat: delivered at
+// 0.8s, two announcements were accepted by the server, recorded as
+// delivered and seen by nobody.
+const announceDrainDelay = welcomeDelay + 3*time.Second
+
 // stableSessionThreshold mirrors minecraft-afk-bot: the reconnect backoff
 // only resets to its minimum once a session has stayed up at least this
 // long, so a server that accepts a connection and immediately drops it
@@ -259,7 +267,7 @@ func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer p
 		plugins.NewWaypoints(),
 		plugins.NewWelcome(ctx, welcomeDelay, log),
 		plugins.NewAnnounce(),
-		plugins.NewAnnounceDrain(ctx, deliverer, log),
+		plugins.NewAnnounceDrain(ctx, deliverer, announceDrainDelay, log),
 		mod,
 		plugins.NewSchedule(),
 	} {

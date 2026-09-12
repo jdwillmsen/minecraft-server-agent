@@ -55,7 +55,15 @@ type AnnounceDrain struct {
 	// several-message drain before it finished.
 	rootCtx   context.Context
 	deliverer AnnounceDeliverer
-	log       *logging.Logger
+	// delay is how long to wait after a join before delivering. A whisper
+	// sent the moment the roster reports a join is accepted by the server
+	// and shown to nobody: the client is still loading, and the delivery is
+	// recorded, so nothing ever retries it. Two announcements were lost
+	// that way on 2026-09-11, 0.8s after the join. Long enough that the
+	// greeting has already spoken, so the backlog follows it rather than
+	// racing it.
+	delay time.Duration
+	log   *logging.Logger
 	// unready fires for the first drain the database refuses because its
 	// tables are missing or ungranted. Every join hits the same wall until
 	// the deploy that fixes it, so this is said once and at INFO: an
@@ -72,8 +80,8 @@ type AnnounceDrain struct {
 
 // NewAnnounceDrain builds the announce-drain plugin. rootCtx should be the
 // process lifetime context (cancelled on shutdown), not a per-request one.
-func NewAnnounceDrain(rootCtx context.Context, deliverer AnnounceDeliverer, log *logging.Logger) *AnnounceDrain {
-	return &AnnounceDrain{rootCtx: rootCtx, deliverer: deliverer, log: log, inFlight: make(chan struct{}, maxConcurrentDrains)}
+func NewAnnounceDrain(rootCtx context.Context, deliverer AnnounceDeliverer, delay time.Duration, log *logging.Logger) *AnnounceDrain {
+	return &AnnounceDrain{rootCtx: rootCtx, deliverer: deliverer, delay: delay, log: log, inFlight: make(chan struct{}, maxConcurrentDrains)}
 }
 
 func (*AnnounceDrain) Name() string { return "announce-drain" }
@@ -119,6 +127,15 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 	voice := pctx.Voice
 	go func() {
 		defer func() { <-a.inFlight }()
+		// The slot is held across the wait on purpose: it caps arrivals
+		// being delivered to, and a player waiting is one of them.
+		if a.delay > 0 {
+			select {
+			case <-time.After(a.delay):
+			case <-a.rootCtx.Done():
+				return
+			}
+		}
 		a.drain(voice, join.XUID)
 	}()
 	return nil

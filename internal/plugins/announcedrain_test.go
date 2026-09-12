@@ -72,7 +72,7 @@ func joinEvent(xuid string) roster.JoinEvent {
 }
 
 func TestAnnounceDrain_Kinds(t *testing.T) {
-	d := NewAnnounceDrain(context.Background(), &fakeJoinDeliverer{}, logging.New("info"))
+	d := NewAnnounceDrain(context.Background(), &fakeJoinDeliverer{}, 0, logging.New("info"))
 	kinds := d.Kinds()
 	if len(kinds) != 1 || kinds[0] != roster.JoinKind {
 		t.Errorf("Kinds() = %v, want [%s]", kinds, roster.JoinKind)
@@ -80,7 +80,7 @@ func TestAnnounceDrain_Kinds(t *testing.T) {
 }
 
 func TestAnnounceDrain_NoCommands(t *testing.T) {
-	d := NewAnnounceDrain(context.Background(), &fakeJoinDeliverer{}, logging.New("info"))
+	d := NewAnnounceDrain(context.Background(), &fakeJoinDeliverer{}, 0, logging.New("info"))
 	if cmds := d.Commands(); len(cmds) != 0 {
 		t.Errorf("Commands() = %v, want none", cmds)
 	}
@@ -92,7 +92,7 @@ func TestJoinDeliversAndThenSummarises(t *testing.T) {
 	// expedited plus three normal as delivered, one normal left over.
 	deliverer := &fakeJoinDeliverer{delivered: 5, remaining: 1}
 	voice := newRecordingTellVoice()
-	d := NewAnnounceDrain(context.Background(), deliverer, logging.New("info"))
+	d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("info"))
 	pctx := &plugin.Context{Voice: voice}
 
 	if err := d.HandleEvent(context.Background(), pctx, joinEvent("xuid-1")); err != nil {
@@ -120,7 +120,7 @@ func TestJoinWithNothingPendingSaysNothing(t *testing.T) {
 	// add a line to it.
 	deliverer := &fakeJoinDeliverer{delivered: 0, remaining: 0, calls: make(chan struct{}, 1)}
 	voice := newRecordingTellVoice()
-	d := NewAnnounceDrain(context.Background(), deliverer, logging.New("info"))
+	d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("info"))
 	pctx := &plugin.Context{Voice: voice}
 
 	if err := d.HandleEvent(context.Background(), pctx, joinEvent("xuid-1")); err != nil {
@@ -149,7 +149,7 @@ func TestDrainRunsOffTheReadLoop(t *testing.T) {
 	// HandleEvent ever starts waiting on the drain itself.
 	deliverer := &fakeJoinDeliverer{delivered: 1, remaining: 1, delay: 500 * time.Millisecond}
 	voice := newRecordingTellVoice()
-	d := NewAnnounceDrain(context.Background(), deliverer, logging.New("info"))
+	d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("info"))
 	pctx := &plugin.Context{Voice: voice}
 
 	start := time.Now()
@@ -168,7 +168,7 @@ func TestDrainRunsOffTheReadLoop(t *testing.T) {
 }
 
 func TestAnnounceDrain_WrongEventTypeErrors(t *testing.T) {
-	d := NewAnnounceDrain(context.Background(), &fakeJoinDeliverer{}, logging.New("info"))
+	d := NewAnnounceDrain(context.Background(), &fakeJoinDeliverer{}, 0, logging.New("info"))
 	pctx := &plugin.Context{Voice: newRecordingTellVoice()}
 
 	if err := d.HandleEvent(context.Background(), pctx, notAJoinEvent{}); err == nil {
@@ -180,7 +180,7 @@ func TestAnnounceDrain_NilDelivererIsSilent(t *testing.T) {
 	// No database configured: DrainForJoin has nothing to report on, so
 	// HandleEvent has nothing to say either, rather than panicking on a nil
 	// dependency.
-	d := NewAnnounceDrain(context.Background(), nil, logging.New("info"))
+	d := NewAnnounceDrain(context.Background(), nil, 0, logging.New("info"))
 	voice := newRecordingTellVoice()
 	pctx := &plugin.Context{Voice: voice}
 
@@ -198,7 +198,7 @@ func TestAnnounceDrain_NilDelivererIsSilent(t *testing.T) {
 func TestAnnounceDrain_DrainErrorIsLoggedNotPanicked(t *testing.T) {
 	deliverer := &fakeJoinDeliverer{err: errors.New("db unreachable"), calls: make(chan struct{}, 1)}
 	voice := newRecordingTellVoice()
-	d := NewAnnounceDrain(context.Background(), deliverer, logging.New("info"))
+	d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("info"))
 	pctx := &plugin.Context{Voice: voice}
 
 	if err := d.HandleEvent(context.Background(), pctx, joinEvent("xuid-1")); err != nil {
@@ -222,7 +222,7 @@ func TestAnnounceDrain_RootCtxCancelledStopsTheDrain(t *testing.T) {
 	deliverer := &fakeJoinDeliverer{delivered: 1, remaining: 1, delay: time.Hour}
 	voice := newRecordingTellVoice()
 	rootCtx, cancel := context.WithCancel(context.Background())
-	d := NewAnnounceDrain(rootCtx, deliverer, logging.New("info"))
+	d := NewAnnounceDrain(rootCtx, deliverer, 0, logging.New("info"))
 	pctx := &plugin.Context{Voice: voice}
 
 	if err := d.HandleEvent(context.Background(), pctx, joinEvent("xuid-1")); err != nil {
@@ -275,7 +275,7 @@ func TestAnnounceDrain_DroppedWhenAlreadyAtTheConcurrencyCap(t *testing.T) {
 		// Built inside the capture, not before it: *logging.Logger resolves
 		// os.Stdout at construction, so a logger built before the swap would
 		// keep writing to the real stdout regardless of the redirect.
-		d := NewAnnounceDrain(context.Background(), deliverer, logging.New("info"))
+		d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("info"))
 		d.inFlight = make(chan struct{}, 1)
 		d.inFlight <- struct{}{} // the one slot is already taken
 
@@ -314,7 +314,7 @@ func TestAnnounceDrain_MissingTablesAreOneNoticeNotAnErrorPerJoin(t *testing.T) 
 			pctx := &plugin.Context{Voice: newRecordingTellVoice()}
 
 			out := captureStdout(t, func() {
-				d := NewAnnounceDrain(context.Background(), deliverer, logging.New("info"))
+				d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("info"))
 				// One join at a time: two drains sharing this fake would
 				// race on what it records, which is a property of the fake
 				// and not of the plugin under test.
@@ -346,5 +346,45 @@ func TestAnnounceDrain_MissingTablesAreOneNoticeNotAnErrorPerJoin(t *testing.T) 
 				t.Errorf("stdout carried %d announce_drain_unready events, want exactly 1:\n%s", got, out)
 			}
 		})
+	}
+}
+
+// A whisper sent the instant the roster reports a join is accepted by the
+// server and shown to nobody, because the client is still loading -- and the
+// delivery is recorded, so nothing retries it. The drain must wait.
+func TestAnnounceDrain_WaitsBeforeDelivering(t *testing.T) {
+	deliverer := &fakeJoinDeliverer{calls: make(chan struct{}, 1)}
+	d := NewAnnounceDrain(context.Background(), deliverer, 75*time.Millisecond, logging.New("info"))
+
+	if err := d.HandleEvent(t.Context(), &plugin.Context{Voice: newRecordingTellVoice()}, joinEvent("111")); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	select {
+	case <-deliverer.calls:
+		t.Fatal("drained immediately: the joining client is still loading and would never see the messages")
+	case <-time.After(20 * time.Millisecond):
+	}
+	select {
+	case <-deliverer.calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("never drained after the delay")
+	}
+}
+
+// Shutdown during the wait must deliver nothing: the process is going away
+// and the backlog is still owed, so the next join retries it.
+func TestAnnounceDrain_ShutdownDuringTheWaitDeliversNothing(t *testing.T) {
+	rootCtx, cancel := context.WithCancel(context.Background())
+	deliverer := &fakeJoinDeliverer{calls: make(chan struct{}, 1)}
+	d := NewAnnounceDrain(rootCtx, deliverer, time.Hour, logging.New("info"))
+
+	if err := d.HandleEvent(t.Context(), &plugin.Context{Voice: newRecordingTellVoice()}, joinEvent("111")); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	cancel()
+	select {
+	case <-deliverer.calls:
+		t.Error("drained after shutdown, want nothing delivered")
+	case <-time.After(100 * time.Millisecond):
 	}
 }

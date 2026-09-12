@@ -377,6 +377,14 @@ no expiry to speak of. Expiry is what keeps this a queue instead of a nag:
 without it, a message would eventually reach whoever logs in next no matter
 how stale it had gone.
 
+Join delivery waits for the greeting before it starts. A whisper sent the
+instant the roster reports a join is accepted by the server and displayed to
+nobody, because the joining client is not rendering chat yet - and the
+delivery is recorded, so nothing ever retries it. Two announcements were
+lost exactly that way on 2026-09-11, 0.8s after the join. The wait sits past
+the welcome's own, so the greeting owns the join moment and the backlog
+follows it.
+
 Join delivery sends every expedited message first, uncapped, then up to
 three ordinary ones, oldest first, then - only if something is still left -
 one summary line naming how many messages remain and pointing at `!inbox`.

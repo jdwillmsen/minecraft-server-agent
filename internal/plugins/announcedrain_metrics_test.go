@@ -15,7 +15,7 @@ import (
 // so taking every one of them is the plugin's own proof it is done.
 func drainToCompletion(t *testing.T, voice plugin.Voice) {
 	t.Helper()
-	d := NewAnnounceDrain(context.Background(), &fakeJoinDeliverer{delivered: 3, remaining: 2}, logging.New("error"))
+	d := NewAnnounceDrain(context.Background(), &fakeJoinDeliverer{delivered: 3, remaining: 2}, 0, logging.New("error"))
 	if err := d.HandleEvent(context.Background(), &plugin.Context{Voice: voice}, joinEvent("xuid-1")); err != nil {
 		t.Fatalf("HandleEvent: %v", err)
 	}
