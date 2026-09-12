@@ -1013,10 +1013,16 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 	// Already here when this connection began, so their session restarts now
 	// -- playtime counts only what the agent watched -- and nothing greets
 	// them: they did not just arrive. The one exception is a player the agent
-	// has never seen before, whom operators are told of once.
+	// has never seen before, whom operators are told of once. A snapshot
+	// that adds and then removes the same player is read the same way the
+	// arrivals below are: what the roster holds at the end of the packet is
+	// who is here.
 	generation := joinClock.Generation()
 	for _, p := range alreadyOnline {
 		if chat.IsSelfOrSibling(p.XUID, selfXUID, siblingXUIDs) {
+			continue
+		}
+		if _, stillHere := playerRoster.NameFor(p.XUID); !stillHere {
 			continue
 		}
 		if _, err := playerStore.ResumeSession(ctx, p.XUID, p.Username, time.Now()); err != nil {

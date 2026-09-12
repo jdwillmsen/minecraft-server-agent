@@ -631,3 +631,34 @@ func TestDrainWithNoDelayIsNotSpread(t *testing.T) {
 		t.Fatal("the drain never delivered")
 	}
 }
+
+// Queueing for a slot is a second wait, and a connection can die inside it.
+// A drain that held for a slot across a disconnect must abandon like one that
+// slept through the delay: the bridge is a separate process and would accept
+// the whisper, recording it against a player who is mid-reconnect.
+func TestDrainHoldingForASlotAbandonsWhenItsConnectionEnds(t *testing.T) {
+	deliverer := &fakeJoinDeliverer{calls: make(chan struct{}, 1)}
+	conns := &fakeConnections{gen: 1}
+	d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("error"), WithConnections(conns))
+	d.inFlight = make(chan struct{}, 1)
+	d.inFlight <- struct{}{} // the only slot is taken, so the drain queues for it
+	d.slotWait = 5 * time.Second
+	pctx := &plugin.Context{Voice: newRecordingTellVoice()}
+
+	if err := d.HandleEvent(context.Background(), pctx, joinEventAt("xuid-1", 1)); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	// Wait for the drain to actually be blocked on the slot before ending
+	// the connection under it, so the pre-wait check is not what catches it.
+	for i := 0; i < 200 && len(d.inFlight) == 1; i++ {
+		time.Sleep(time.Millisecond)
+	}
+	conns.reconnect()
+	<-d.inFlight // release the slot it has been queueing for
+
+	select {
+	case <-deliverer.calls:
+		t.Fatal("a drain that queued for a slot across a disconnect delivered: its player may be mid-reconnect")
+	case <-time.After(250 * time.Millisecond):
+	}
+}

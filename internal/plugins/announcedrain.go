@@ -161,6 +161,16 @@ func (a *AnnounceDrain) wait() time.Duration {
 	return a.delay + a.jitter(spread)
 }
 
+// stale reports whether the connection this drain was scheduled in has
+// ended. Its replacement re-reports everyone still online and owes them
+// their own delivery a full wait from now, so speaking here would whisper a
+// backlog to a client that may be loading all over again -- and record it,
+// which is the loss the wait exists to prevent. The bridge is a separate
+// process and answers either way, so nothing else stops it.
+func (a *AnnounceDrain) stale(generation uint64) bool {
+	return a.conns != nil && a.conns.Generation() != generation
+}
+
 func (*AnnounceDrain) Name() string { return "announce-drain" }
 
 // Commands is empty: this plugin only reacts to a join, it exposes no !
@@ -214,13 +224,7 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 		// doing nothing, and the sixth onwards would be dropped -- which is
 		// exactly the shape of the rejoin wave after a restart, when
 		// backlogs are likeliest to be owed.
-		if a.conns != nil && a.conns.Generation() != generation {
-			// The connection this was scheduled in has ended. Its
-			// replacement re-reported everyone still online and owes them
-			// their own delivery a full wait from now, so speaking here
-			// would whisper a backlog to a client that may be loading all
-			// over again -- and record it, which is the loss the wait
-			// exists to prevent.
+		if a.stale(generation) {
 			return
 		}
 		waited, cancelWait := context.WithTimeout(a.rootCtx, a.slotWait)
@@ -238,6 +242,12 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 			return
 		}
 		defer func() { <-a.inFlight }()
+		// Read again: queueing for a slot is a second wait, and a drain
+		// that spent it while the connection died would deliver into the
+		// gap exactly as one that slept through the first would.
+		if a.stale(generation) {
+			return
+		}
 		a.drain(voice, xuid)
 	}()
 	return nil

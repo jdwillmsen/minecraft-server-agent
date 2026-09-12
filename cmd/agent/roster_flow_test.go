@@ -476,3 +476,32 @@ func TestSamePacketJoinAndLeaveGreetsNobody(t *testing.T) {
 		t.Error("recorded an arrival for a player who is gone")
 	}
 }
+
+// The opening snapshot is read the same way every other packet is: a player
+// it adds and then removes is not here, so no session is resumed for them
+// and nothing is scheduled to whisper at a client that is gone.
+func TestSnapshotAddAndRemoveLeavesNobodyPresent(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	presentEvents, _ := eventBus.Subscribe(roster.PresentKind, 8)
+	playerRoster := roster.New()
+	profiles := &sessionCalls{}
+	joinClock := newJoinTimes()
+
+	beginWatching(context.Background(), playerRoster, profiles, joinClock, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(playerXUID, "Steve"),
+		removeEntry(playerXUID),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, joinClock)
+
+	if present := drainPresent(t, presentEvents); len(present) != 0 {
+		t.Errorf("present events = %+v, want none: the snapshot removed that player again", present)
+	}
+	for _, call := range profiles.calls {
+		if call == "resume:"+playerXUID {
+			t.Errorf("session writes = %v, want no resume for a player the snapshot removed", profiles.calls)
+		}
+	}
+}
