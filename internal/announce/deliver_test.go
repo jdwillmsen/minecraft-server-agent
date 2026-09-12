@@ -556,3 +556,98 @@ func TestDrainAllUnderTheCapLeavesNothingOwed(t *testing.T) {
 		t.Errorf("DrainAll = (%d, %d), want (2, 0)", delivered, remaining)
 	}
 }
+
+// fakeJoins reports a fixed "joined this long ago" per xuid, and nothing for
+// anyone it wasn't told about -- a player already online when the agent
+// connected, whose client has been rendering chat all along.
+type fakeJoins struct{ since map[string]time.Duration }
+
+var _ JoinClock = fakeJoins{}
+
+func (f fakeJoins) SinceJoin(xuid string) (time.Duration, bool) {
+	d, ok := f.since[xuid]
+	return d, ok
+}
+
+// A whisper to someone who joined a second ago is accepted by the server and
+// rendered by nobody, and recording it would lose the message for good.
+func TestSendNowDefersAWhisperToAFreshArrival(t *testing.T) {
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	joins := fakeJoins{since: map[string]time.Duration{"fresh": time.Second}}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"fresh", "settled"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	delivered, err := d.SendNow(context.Background(), Announcement{Body: "hello", TargetKind: TargetPlayer, TargetValue: "fresh"}, 9)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if delivered != 0 {
+		t.Errorf("delivered = %d, want 0: the joining client cannot render it yet", delivered)
+	}
+	if len(voice.tells) != 0 {
+		t.Errorf("told %v, want nothing sent to a loading client", voice.tells)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("recorded %v, want nothing: the row must stay pending for their join drain", store.delivered)
+	}
+}
+
+// The same announcement reaches a player who has been on for a while.
+func TestSendNowStillWhispersASettledPlayer(t *testing.T) {
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	joins := fakeJoins{since: map[string]time.Duration{"settled": time.Hour}}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"settled"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	delivered, err := d.SendNow(context.Background(), Announcement{Body: "hello", TargetKind: TargetPlayer, TargetValue: "settled"}, 9)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if delivered != 1 || len(voice.tells) != 1 {
+		t.Errorf("delivered = %d, tells = %v, want one of each", delivered, voice.tells)
+	}
+}
+
+// A broadcast is heard by everyone whose client is up, so it still goes out --
+// but the fresh arrival is not recorded as having heard it.
+func TestSendNowBroadcastsButDoesNotRecordAFreshArrival(t *testing.T) {
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	joins := fakeJoins{since: map[string]time.Duration{"fresh": time.Second}}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"fresh", "settled"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	delivered, err := d.SendNow(context.Background(), Announcement{Body: "everyone hears this", TargetKind: TargetEveryone}, 9)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 {
+		t.Fatalf("says = %v, want the broadcast to go out once", voice.says)
+	}
+	if delivered != 1 {
+		t.Errorf("delivered = %d, want 1: only the settled player is recorded", delivered)
+	}
+	for _, got := range store.delivered {
+		if got.xuid == "fresh" {
+			t.Errorf("recorded a delivery for the joining player: %+v", store.delivered)
+		}
+	}
+}
+
+// Without the option nothing defers: every existing caller keeps the old
+// behaviour, including a Deliverer built with no join clock at all.
+func TestSendNowWithoutAJoinClockDefersNothing(t *testing.T) {
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"fresh"}}, fakePermissions{}, testLogger())
+
+	delivered, err := d.SendNow(context.Background(), Announcement{Body: "hello", TargetKind: TargetPlayer, TargetValue: "fresh"}, 9)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if delivered != 1 {
+		t.Errorf("delivered = %d, want 1", delivered)
+	}
+}

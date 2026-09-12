@@ -160,7 +160,7 @@ func TestChatEventCarriesTheGamertagAndWhetherItWasPublic(t *testing.T) {
 	whisper := chatPacket(playerXUID, "Impostor", "hello")
 	whisper.TextType = packet.TextTypeWhisper
 	for _, pk := range []*packet.Text{chatPacket(playerXUID, "Impostor", "hello"), whisper} {
-		handlePacket(context.Background(), pk, selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
+		handlePacket(context.Background(), pk, selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{}, newJoinTimes())
 	}
 
 	want := []bool{true, false}
@@ -197,9 +197,9 @@ func TestModerationNeverDelaysACommand(t *testing.T) {
 
 	start := time.Now()
 	for i := 0; i < 200; i++ {
-		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "GRIEFER GRIEFER EVERYONE LOOK AT THIS"), selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
+		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "GRIEFER GRIEFER EVERYONE LOOK AT THIS"), selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{}, newJoinTimes())
 	}
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{}, newJoinTimes())
 	elapsed := time.Since(start)
 
 	if elapsed > 2*time.Second {

@@ -72,9 +72,10 @@ type AnnounceDrain struct {
 	// first one carries information.
 	unready sync.Once
 	// inFlight is a counting semaphore over drains in progress, capped at
-	// maxConcurrentDrains. Acquired non-blockingly in HandleEvent, before
-	// the goroutine is even spawned: a caller that blocked here would stall
-	// the dispatcher this plugin exists to get off of.
+	// maxConcurrentDrains. Claimed non-blockingly, after the wait and inside
+	// the goroutine: a caller that blocked for it would stall the dispatcher
+	// this plugin exists to get off of, and claiming it before the wait
+	// would let waiting players crowd out delivering ones.
 	inFlight chan struct{}
 }
 
@@ -113,22 +114,8 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 		return nil
 	}
 
-	select {
-	case a.inFlight <- struct{}{}:
-	default:
-		// Dropped, not queued: queued announcements aren't urgent, so
-		// deferring them to this player's next join or their own !inbox
-		// costs nothing that a wait would preserve -- unlike startAnswer's
-		// drop, there is no reply being discarded here, only a delay.
-		a.log.Info("announce_drain_dropped_busy", logging.Fields{"xuid": join.XUID, "max_concurrent": cap(a.inFlight)})
-		return nil
-	}
-
 	voice := pctx.Voice
 	go func() {
-		defer func() { <-a.inFlight }()
-		// The slot is held across the wait on purpose: it caps arrivals
-		// being delivered to, and a player waiting is one of them.
 		if a.delay > 0 {
 			select {
 			case <-time.After(a.delay):
@@ -136,6 +123,18 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 				return
 			}
 		}
+		// Claimed after the wait, never across it. Held across it, five
+		// players rejoining inside one wait would take every slot while
+		// doing nothing, and the sixth onwards would be dropped -- which is
+		// exactly the shape of the rejoin wave after a restart, when
+		// backlogs are likeliest to be owed.
+		select {
+		case a.inFlight <- struct{}{}:
+		default:
+			a.log.Info("announce_drain_dropped_busy", logging.Fields{"xuid": join.XUID, "max_concurrent": cap(a.inFlight)})
+			return
+		}
+		defer func() { <-a.inFlight }()
 		a.drain(voice, join.XUID)
 	}()
 	return nil

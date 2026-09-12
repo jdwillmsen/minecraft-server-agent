@@ -385,6 +385,14 @@ lost exactly that way on 2026-09-11, 0.8s after the join. The wait sits past
 the welcome's own, so the greeting owns the join moment and the backlog
 follows it.
 
+An announcement published in that same window - a schedule firing, an event
+source, `!announce` - reaches everyone else as usual, but a player who has
+only just arrived is not recorded as having heard it. A broadcast still goes
+out, since it is heard by every client that is up; a whisper to a loading
+client is not even sent. Either way the row stays pending and that player's
+own drain owes it to them, which is the only thing that retries. The grace
+is shorter than the drain's wait, so a drain never defers its own delivery.
+
 Join delivery sends every expedited message first, uncapped, then up to
 three ordinary ones, oldest first, then - only if something is still left -
 one summary line naming how many messages remain and pointing at `!inbox`.

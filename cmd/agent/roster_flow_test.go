@@ -93,7 +93,7 @@ func TestPlayerListFlow(t *testing.T) {
 			addEntry(selfXUID, "Agent"),
 			addEntry(playerXUID, "Steve"),
 			addEntry("2535411111111111", "Alex"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 
 		if joins := drainJoins(t, events); len(joins) != 0 {
 			t.Errorf("got %d joins from the opening snapshot, want 0: %+v", len(joins), joins)
@@ -110,10 +110,10 @@ func TestPlayerListFlow(t *testing.T) {
 
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(playerXUID, "Steve"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 
 		joins := drainJoins(t, events)
 		if len(joins) != 1 {
@@ -131,11 +131,11 @@ func TestPlayerListFlow(t *testing.T) {
 
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(playerXUID, "Steve"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry(siblingBot, "AfkBot"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 
 		if joins := drainJoins(t, events); len(joins) != 0 {
 			t.Errorf("got %d joins, want 0 — the agent and its sibling bots must never be greeted: %+v", len(joins), joins)
@@ -151,13 +151,13 @@ func TestPlayerListFlow(t *testing.T) {
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry(playerXUID, "Steve"),
-		), selfXUID, siblings, log, eventBus, playerRoster, playerStore)
+		), selfXUID, siblings, log, eventBus, playerRoster, playerStore, newJoinTimes())
 		handlePlayerList(context.Background(), wire(t,
 			removeEntry(playerXUID),
-		), selfXUID, siblings, log, eventBus, playerRoster, playerStore)
+		), selfXUID, siblings, log, eventBus, playerRoster, playerStore, newJoinTimes())
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(playerXUID, "Steve"),
-		), selfXUID, siblings, log, eventBus, playerRoster, playerStore)
+		), selfXUID, siblings, log, eventBus, playerRoster, playerStore, newJoinTimes())
 
 		if len(playerStore.leaves) != 1 || playerStore.leaves[0] != playerXUID {
 			t.Errorf("RecordLeave calls = %v, want exactly [%s] — the departure must close Steve's session", playerStore.leaves, playerXUID)
@@ -181,13 +181,13 @@ func TestPlayerListFlow(t *testing.T) {
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry(playerXUID, "Steve"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 
 		playerRoster.BeginSession(time.Now())
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry("2535411111111111", "Alex"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 
 		if joins := drainJoins(t, events); len(joins) != 0 {
 			t.Errorf("got %d joins after reconnecting, want 0: %+v", len(joins), joins)
@@ -248,26 +248,26 @@ func TestReconnectRestartsTheSessionsOfPlayersStillOnline(t *testing.T) {
 	playerRoster := roster.New()
 	profiles := &sessionCalls{}
 
-	beginWatching(context.Background(), playerRoster, profiles, log)
+	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(playerXUID, "Steve"),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 	if joins := drainJoins(t, events); len(joins) != 1 {
 		t.Fatalf("got %d joins before the disconnect, want Steve's", len(joins))
 	}
 
-	beginWatching(context.Background(), playerRoster, profiles, log)
+	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 		addEntry(siblingBot, "AfkBot"),
 		addEntry(playerXUID, "Steve"),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 	handlePlayerList(context.Background(), wire(t,
 		removeEntry(playerXUID),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 
 	want := []string{
 		"close-orphans",
@@ -294,22 +294,22 @@ func TestALeaveAfterFailedReconnectWritesCarriesTheConnectionStart(t *testing.T)
 	playerRoster := roster.New()
 	profiles := &sessionCalls{}
 
-	beginWatching(context.Background(), playerRoster, profiles, log)
+	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 		addEntry(playerXUID, "Steve"),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 
 	profiles.failOpening = true
-	beginWatching(context.Background(), playerRoster, profiles, log)
+	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 		addEntry(playerXUID, "Steve"),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 	profiles.failOpening = false
 	handlePlayerList(context.Background(), wire(t,
 		removeEntry(playerXUID),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 
 	if len(profiles.closedAt) != 2 || len(profiles.leaveSince) != 1 {
 		t.Fatalf("session writes = %v, want two connection starts and one leave", profiles.calls)

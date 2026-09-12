@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -261,6 +262,59 @@ func captureStdout(t *testing.T, fn func()) string {
 	return buf.String()
 }
 
+// captureStdoutUntil is captureStdout for output a background goroutine
+// writes: it reads the pipe while fn runs and waits, bounded, for want to
+// appear. The drain claims its slot after its wait, inside the goroutine, so
+// the decision to drop a join is not made by the time HandleEvent returns.
+func captureStdoutUntil(t *testing.T, want string, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+
+	var mu sync.Mutex
+	var buf bytes.Buffer
+	read := make(chan struct{})
+	go func() {
+		defer close(read)
+		chunk := make([]byte, 4096)
+		for {
+			n, err := r.Read(chunk)
+			if n > 0 {
+				mu.Lock()
+				buf.Write(chunk[:n])
+				mu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	fn()
+
+	seen := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.String()
+	}
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if strings.Contains(seen(), want) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe: %v", err)
+	}
+	<-read
+	return seen()
+}
+
 func TestAnnounceDrain_DroppedWhenAlreadyAtTheConcurrencyCap(t *testing.T) {
 	// A reconnect storm (a restart, a network blip) spawns one drain per
 	// returning player; without a cap that's one open bridge connection per
@@ -271,7 +325,7 @@ func TestAnnounceDrain_DroppedWhenAlreadyAtTheConcurrencyCap(t *testing.T) {
 	voice := newRecordingTellVoice()
 	pctx := &plugin.Context{Voice: voice}
 
-	out := captureStdout(t, func() {
+	out := captureStdoutUntil(t, `"event":"announce_drain_dropped_busy"`, func() {
 		// Built inside the capture, not before it: *logging.Logger resolves
 		// os.Stdout at construction, so a logger built before the swap would
 		// keep writing to the real stdout regardless of the redirect.
