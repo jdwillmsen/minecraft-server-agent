@@ -85,6 +85,10 @@ func presentEvent(xuid string, generation uint64) roster.PresentEvent {
 type fakeConnections struct {
 	mu  sync.Mutex
 	gen uint64
+	// reads reports each answer given, so a test can order itself against
+	// the drain goroutine instead of guessing how far along it is. Nil
+	// unless a test wants it; the send never blocks either way.
+	reads chan struct{}
 }
 
 var _ Connections = (*fakeConnections)(nil)
@@ -92,6 +96,10 @@ var _ Connections = (*fakeConnections)(nil)
 func (c *fakeConnections) Generation() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	select {
+	case c.reads <- struct{}{}:
+	default:
+	}
 	return c.gen
 }
 
@@ -636,9 +644,15 @@ func TestDrainWithNoDelayIsNotSpread(t *testing.T) {
 // A drain that held for a slot across a disconnect must abandon like one that
 // slept through the delay: the bridge is a separate process and would accept
 // the whisper, recording it against a player who is mid-reconnect.
+//
+// What this catches is a drain that reads the connection only before it
+// queues. The connection is ended strictly after that first read and
+// strictly before the slot frees, so the read before the queue cannot be
+// what abandons this drain -- only a second read, taken once the slot is
+// held, sees the connection it waited through end.
 func TestDrainHoldingForASlotAbandonsWhenItsConnectionEnds(t *testing.T) {
 	deliverer := &fakeJoinDeliverer{calls: make(chan struct{}, 1)}
-	conns := &fakeConnections{gen: 1}
+	conns := &fakeConnections{gen: 1, reads: make(chan struct{}, 8)}
 	d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("error"), WithConnections(conns))
 	d.inFlight = make(chan struct{}, 1)
 	d.inFlight <- struct{}{} // the only slot is taken, so the drain queues for it
@@ -648,11 +662,14 @@ func TestDrainHoldingForASlotAbandonsWhenItsConnectionEnds(t *testing.T) {
 	if err := d.HandleEvent(context.Background(), pctx, joinEventAt("xuid-1", 1)); err != nil {
 		t.Fatalf("HandleEvent: %v", err)
 	}
-	// Wait for the drain to actually be blocked on the slot before ending
-	// the connection under it, so the pre-wait check is not what catches it.
-	for i := 0; i < 200 && len(d.inFlight) == 1; i++ {
-		time.Sleep(time.Millisecond)
+	select {
+	case <-conns.reads:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the drain never read the connection it was scheduled in")
 	}
+
+	// From here the drain has already been told its connection is current,
+	// so everything below happens behind that answer.
 	conns.reconnect()
 	<-d.inFlight // release the slot it has been queueing for
 

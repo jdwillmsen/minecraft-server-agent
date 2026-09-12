@@ -219,14 +219,14 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 				return
 			}
 		}
-		// Claimed after the wait, never across it. Held across it, five
-		// players rejoining inside one wait would take every slot while
-		// doing nothing, and the sixth onwards would be dropped -- which is
-		// exactly the shape of the rejoin wave after a restart, when
-		// backlogs are likeliest to be owed.
 		if a.stale(generation) {
 			return
 		}
+		// Claimed after the wait, never across it. Held across it, five
+		// players rejoining inside one wait would take every slot while
+		// doing nothing, and the sixth onwards would be shed -- which is
+		// exactly the shape of the rejoin wave after a restart, when
+		// backlogs are likeliest to be owed.
 		waited, cancelWait := context.WithTimeout(a.rootCtx, a.slotWait)
 		select {
 		case a.inFlight <- struct{}{}:
