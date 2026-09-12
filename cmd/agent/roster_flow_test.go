@@ -445,3 +445,34 @@ func TestAJoinCarriesItsConnection(t *testing.T) {
 		t.Errorf("join generation = %d, want the live connection %d", joins[0].Generation, joinClock.Generation())
 	}
 }
+
+// The mirror of the rejoin packet: one PlayerList that adds a player and
+// then removes them again. They are gone by the end of it, so nothing greets
+// them and nothing schedules a delivery to a client that is not there --
+// Apply's two slices cannot say which record came first, but the roster it
+// leaves behind can.
+func TestSamePacketJoinAndLeaveGreetsNobody(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	events, _ := eventBus.Subscribe(roster.JoinKind, 8)
+	playerRoster := roster.New()
+	joinClock := newJoinTimes()
+
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(playerXUID, "Steve"),
+		removeEntry(playerXUID),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	if got := drainJoins(t, events); len(got) != 0 {
+		t.Errorf("got %d joins for a player who left in the same packet, want 0: %+v", len(got), got)
+	}
+	if _, ok := joinClock.SinceJoin(playerXUID); ok {
+		t.Error("recorded an arrival for a player who is gone")
+	}
+}

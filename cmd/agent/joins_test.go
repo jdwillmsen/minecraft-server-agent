@@ -100,3 +100,35 @@ func TestJoinTimesDropsEntriesOlderThanStale(t *testing.T) {
 		t.Error("dropped the arrival that was just recorded")
 	}
 }
+
+// A connection that ends is as final as one that begins. Between the two the
+// bridge is still up and still accepts a whisper, so anything scheduled under
+// the dead connection has to be able to tell that it no longer speaks for
+// anyone -- otherwise it delivers into the gap and records it against players
+// who are mid-reconnect.
+func TestJoinTimesAdvancesTheGenerationWhenAConnectionEnds(t *testing.T) {
+	now := time.Now()
+	j := fixedJoinTimes(&now)
+	j.connected()
+	live := j.Generation()
+
+	j.joined("111")
+	now = now.Add(2 * time.Second)
+	j.disconnected()
+
+	if j.Generation() == live {
+		t.Error("the generation survived the connection it belonged to: a delivery scheduled under it still believes it is current")
+	}
+	// The arrival outlives the connection on purpose: that player is still
+	// loading, and a message published in the gap must not be marked
+	// against them.
+	if since, ok := j.SinceJoin("111"); !ok || since != 2*time.Second {
+		t.Errorf("SinceJoin = %v, %v, want 2s, true", since, ok)
+	}
+
+	ended := j.Generation()
+	j.connected()
+	if j.Generation() == ended {
+		t.Error("the next connection reused the generation of the gap before it")
+	}
+}

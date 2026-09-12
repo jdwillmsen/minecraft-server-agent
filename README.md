@@ -385,13 +385,23 @@ lost exactly that way on 2026-09-11, 0.8s after the join. The wait sits past
 the welcome's own, so the greeting owns the join moment and the backlog
 follows it.
 
-A delivery belongs to the connection that scheduled it. If the agent
-reconnects during the wait, that drain abandons itself without a word: the
-new connection re-reports everyone still online, and a player who came back
-in the same outage would be mid-load all over again. Those players get a
-delivery of their own instead - the same wait, from the connection that
-found them there - so a backlog is never stranded by a reconnect and never
-whispered twice. They are not greeted for it; they did not arrive.
+A delivery belongs to the connection that scheduled it, and that connection
+is over the moment it drops - not when the next one opens. A drain whose
+wait outlives its connection abandons itself without a word, because the
+bridge is a separate process that stays up: a whisper sent into the gap is
+accepted by the server and recorded against players who are mid-reconnect,
+which is the loss all of this exists to prevent. The next connection
+re-reports everyone still online and gives them a delivery of their own -
+the same wait, from the connection that found them there - so a backlog is
+never stranded by a reconnect and never whispered twice. They are not
+greeted for it; they did not arrive.
+
+Those snapshot deliveries would otherwise all come due in the same
+millisecond, so each is spread by a random fraction of the wait, never more
+than the wait itself. Five deliver at a time; the rest wait their turn
+rather than being dropped, up to a bound, because the cap is there to limit
+how many are served at once and not how many are served at all. A player
+actually shed past that bound is logged.
 
 An announcement published in that same window - a schedule firing, an event
 source, `!announce` - reaches everyone else as usual, but a player who has

@@ -3,6 +3,7 @@ package plugins
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -52,6 +53,21 @@ const drainTimeout = 30 * time.Second
 // one bridge connection per returning player.
 const maxConcurrentDrains = 5
 
+// drainSpread is how far apart drains scheduled in the same instant are
+// pulled. A connection's opening snapshot reports everyone already online
+// at once, so without this their waits expire together and the cap turns a
+// crowd into a queue of one batch. Never longer than the wait itself, so a
+// delay of zero still delivers immediately.
+const drainSpread = 3 * time.Second
+
+// slotWait is how long a woken drain will wait for one of the
+// maxConcurrentDrains slots before giving up. The cap exists to limit how
+// many players are served at once, not how many are served at all: a
+// reconnect wave that fills every slot should take longer, not lose people.
+// Still bounded, because a drain that waited forever would outlive the
+// reason anyone wanted it.
+const slotWait = drainTimeout
+
 // AnnounceDrain hands a newly-joined player everything queued for them, then
 // — only when the per-join cap left something behind — says one line
 // pointing at !inbox. Kept separate from Welcome even though both react to
@@ -84,11 +100,18 @@ type AnnounceDrain struct {
 	// is still the current one. Nil unless WithConnections is passed, which
 	// leaves every existing caller and test delivering unconditionally.
 	conns Connections
+	// slotWait bounds how long this drain waits for a free slot, from
+	// slotWait unless a test shortens it.
+	slotWait time.Duration
+	// jitter picks how much to add to delay for one drain, given the widest
+	// spread that fits. Injectable so a test gets the same schedule every
+	// run; random otherwise, which is the whole point of it.
+	jitter func(spread time.Duration) time.Duration
 	// inFlight is a counting semaphore over drains in progress, capped at
-	// maxConcurrentDrains. Claimed non-blockingly, after the wait and inside
-	// the goroutine: a caller that blocked for it would stall the dispatcher
-	// this plugin exists to get off of, and claiming it before the wait
-	// would let waiting players crowd out delivering ones.
+	// maxConcurrentDrains. Claimed after the wait and inside the goroutine,
+	// never across the wait: held across it, players still waiting would
+	// occupy every slot while doing nothing and the rest would be shed --
+	// exactly the shape of a rejoin wave after a restart.
 	inFlight chan struct{}
 }
 
@@ -101,14 +124,41 @@ func WithConnections(c Connections) DrainOption {
 	return func(a *AnnounceDrain) { a.conns = c }
 }
 
+// WithJitter replaces the random spread between simultaneous drains, so a
+// test can schedule them deterministically.
+func WithJitter(f func(spread time.Duration) time.Duration) DrainOption {
+	return func(a *AnnounceDrain) { a.jitter = f }
+}
+
 // NewAnnounceDrain builds the announce-drain plugin. rootCtx should be the
 // process lifetime context (cancelled on shutdown), not a per-request one.
 func NewAnnounceDrain(rootCtx context.Context, deliverer AnnounceDeliverer, delay time.Duration, log *logging.Logger, opts ...DrainOption) *AnnounceDrain {
-	a := &AnnounceDrain{rootCtx: rootCtx, deliverer: deliverer, delay: delay, log: log, inFlight: make(chan struct{}, maxConcurrentDrains)}
+	a := &AnnounceDrain{rootCtx: rootCtx, deliverer: deliverer, delay: delay, log: log, slotWait: slotWait, jitter: randomJitter, inFlight: make(chan struct{}, maxConcurrentDrains)}
 	for _, opt := range opts {
 		opt(a)
 	}
 	return a
+}
+
+func randomJitter(spread time.Duration) time.Duration {
+	if spread <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(spread)))
+}
+
+// wait is how long this drain sleeps before delivering: the shared delay,
+// plus a spread that keeps a snapshot's worth of players from waking as one.
+// A zero delay stays zero, so a test that asked for no wait gets none.
+func (a *AnnounceDrain) wait() time.Duration {
+	if a.delay <= 0 {
+		return 0
+	}
+	spread := drainSpread
+	if a.delay < spread {
+		spread = a.delay
+	}
+	return a.delay + a.jitter(spread)
 }
 
 func (*AnnounceDrain) Name() string { return "announce-drain" }
@@ -152,9 +202,9 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 
 	voice := pctx.Voice
 	go func() {
-		if a.delay > 0 {
+		if wait := a.wait(); wait > 0 {
 			select {
-			case <-time.After(a.delay):
+			case <-time.After(wait):
 			case <-a.rootCtx.Done():
 				return
 			}
@@ -173,10 +223,18 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 			// exists to prevent.
 			return
 		}
+		waited, cancelWait := context.WithTimeout(a.rootCtx, a.slotWait)
 		select {
 		case a.inFlight <- struct{}{}:
-		default:
-			a.log.Info("announce_drain_dropped_busy", logging.Fields{"xuid": xuid, "max_concurrent": cap(a.inFlight)})
+			cancelWait()
+		case <-waited.Done():
+			cancelWait()
+			if a.rootCtx.Err() != nil {
+				// Shutting down, not shedding: nothing is owed a log line
+				// for a wait the process itself ended.
+				return
+			}
+			a.log.Info("announce_drain_dropped_busy", logging.Fields{"xuid": xuid, "max_concurrent": cap(a.inFlight), "waited_ms": a.slotWait.Milliseconds()})
 			return
 		}
 		defer func() { <-a.inFlight }()

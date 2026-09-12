@@ -77,6 +77,17 @@ func (j *joinTimes) connected() {
 	j.gen++
 }
 
+// disconnected ends the current connection. Arrivals are kept: a player who
+// joined moments before the drop is still loading, and a message published
+// during the gap must not be recorded against them. What changes is the
+// generation, so nothing scheduled under the dead connection still believes
+// it speaks for anyone.
+func (j *joinTimes) disconnected() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.gen++
+}
+
 // Generation implements plugins.Connections.
 func (j *joinTimes) Generation() uint64 {
 	j.mu.Lock()

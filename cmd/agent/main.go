@@ -385,6 +385,12 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblingXUIDs, permResolver, ans, playerStore, auditor, link, joinClock)
 		lasted := time.Since(started)
 		httpServer.SetReady(false)
+		// The connection is dead here, not merely about to be replaced.
+		// Anything scheduled under it must abandon rather than speak into
+		// the gap: the bridge is a separate process and still answers, so a
+		// whisper sent now is accepted by a server whose players are
+		// reconnecting, and recorded against clients that are mid-load.
+		joinClock.disconnected()
 
 		if ctx.Err() != nil {
 			return
@@ -1022,27 +1028,16 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 		// connection instead of leaving it for a join that may never come.
 		eventBus.Publish(roster.PresentEvent{Entry: p, Generation: generation})
 	}
-	// Departures close a session rather than reaching a plugin. Nothing
-	// greets a player for leaving, and publishing an event no handler wants
-	// would be scaffolding for its own sake. Taken before the arrivals: one
-	// packet may carry a removal and a re-add for the same player, and
-	// leaving them in wire order would have this loop erase the arrival the
-	// next one just recorded and close the session it just opened.
-	for _, leave := range leaves {
-		if chat.IsSelfOrSibling(leave.XUID, selfXUID, siblingXUIDs) {
-			continue
-		}
-		log.Info("player_left", logging.Fields{"xuid": leave.XUID, "username": leave.Username})
-		joinClock.left(leave.XUID)
-		if _, err := playerStore.RecordLeave(ctx, leave.XUID, playerRoster.Since(), time.Now()); err != nil {
-			// Logged, never fatal: the session stays open until the next
-			// connection closes it at zero length, so this visit's time is
-			// lost, and a database problem must not disturb the game.
-			log.Error("store_record_leave_failed", logging.Fields{"xuid": leave.XUID, "error": err.Error()})
-		}
-	}
+	// One packet can carry both directions for the same player, and Apply
+	// reports them in two slices that no longer say which came first --
+	// what the roster holds afterwards does. A player added and then
+	// removed inside one packet is gone: nothing greets them and nothing
+	// schedules them a delivery they cannot receive.
 	for _, join := range joins {
 		if chat.IsSelfOrSibling(join.XUID, selfXUID, siblingXUIDs) {
+			continue
+		}
+		if _, stillHere := playerRoster.NameFor(join.XUID); !stillHere {
 			continue
 		}
 		log.Info("player_joined", logging.Fields{"xuid": join.XUID, "username": join.Username})
@@ -1050,6 +1045,29 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 		// off already sees this player as the fresh arrival they are.
 		joinClock.joined(join.XUID)
 		eventBus.Publish(roster.JoinEvent{Entry: join, Generation: generation})
+	}
+	// Departures close a session rather than reaching a plugin. Nothing
+	// greets a player for leaving, and publishing an event no handler wants
+	// would be scaffolding for its own sake.
+	for _, leave := range leaves {
+		if chat.IsSelfOrSibling(leave.XUID, selfXUID, siblingXUIDs) {
+			continue
+		}
+		log.Info("player_left", logging.Fields{"xuid": leave.XUID, "username": leave.Username})
+		if _, backAlready := playerRoster.NameFor(leave.XUID); !backAlready {
+			// Still gone at the end of the packet, so this departure is the
+			// last word on them. When it isn't -- a removal and a re-add in
+			// one packet -- the arrival above is newer than this and must
+			// survive, or the returning client reads as settled while it
+			// loads.
+			joinClock.left(leave.XUID)
+		}
+		if _, err := playerStore.RecordLeave(ctx, leave.XUID, playerRoster.Since(), time.Now()); err != nil {
+			// Logged, never fatal: the session stays open until the next
+			// connection closes it at zero length, so this visit's time is
+			// lost, and a database problem must not disturb the game.
+			log.Error("store_record_leave_failed", logging.Fields{"xuid": leave.XUID, "error": err.Error()})
+		}
 	}
 }
 

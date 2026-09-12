@@ -347,9 +347,10 @@ func captureStdoutUntil(t *testing.T, want string, fn func()) string {
 func TestAnnounceDrain_DroppedWhenAlreadyAtTheConcurrencyCap(t *testing.T) {
 	// A reconnect storm (a restart, a network blip) spawns one drain per
 	// returning player; without a cap that's one open bridge connection per
-	// arrival. One slot, pre-occupied here exactly like startAnswer's own
-	// busy-agent test occupies its inFlight channel, so the next join meets
-	// a full drain plugin rather than a real held goroutine.
+	// arrival. A drain waits for a slot rather than giving it up at once,
+	// so this holds the only slot for longer than that wait: what is pinned
+	// here is that a player really shed is still reported, not lost in
+	// silence.
 	deliverer := &fakeJoinDeliverer{delivered: 0, remaining: 0}
 	voice := newRecordingTellVoice()
 	pctx := &plugin.Context{Voice: voice}
@@ -361,6 +362,7 @@ func TestAnnounceDrain_DroppedWhenAlreadyAtTheConcurrencyCap(t *testing.T) {
 		d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("info"))
 		d.inFlight = make(chan struct{}, 1)
 		d.inFlight <- struct{}{} // the one slot is already taken
+		d.slotWait = 50 * time.Millisecond
 
 		if err := d.HandleEvent(context.Background(), pctx, joinEvent("xuid-1")); err != nil {
 			t.Fatalf("HandleEvent: %v", err)
@@ -523,5 +525,109 @@ func TestDrainDeliversWhenItsConnectionIsStillCurrent(t *testing.T) {
 	case <-deliverer.calls:
 	case <-time.After(time.Second):
 		t.Fatal("a join on the current connection was never drained")
+	}
+}
+
+// countingDeliverer records every player it was asked to drain and holds
+// each call long enough that more of them are in flight than the cap allows.
+type countingDeliverer struct {
+	hold time.Duration
+	done chan string
+}
+
+var _ AnnounceDeliverer = (*countingDeliverer)(nil)
+
+func (d *countingDeliverer) DrainForJoin(ctx context.Context, xuid string, _ time.Time) (int, int, error) {
+	select {
+	case <-time.After(d.hold):
+	case <-ctx.Done():
+		return 0, 0, ctx.Err()
+	}
+	d.done <- xuid
+	return 0, 0, nil
+}
+
+// A connection's opening snapshot reports everyone already online at once,
+// and the cap is five. It exists to limit how many are served at a time, not
+// how many are served at all: every one of them is owed their backlog, and a
+// player shed here waits for a join that may not come for days.
+func TestEveryPresentPlayerIsDrainedWhenTheCapIsFull(t *testing.T) {
+	const players = 10
+	deliverer := &countingDeliverer{hold: 20 * time.Millisecond, done: make(chan string, players)}
+	d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("error"))
+	pctx := &plugin.Context{Voice: newRecordingTellVoice()}
+
+	for i := range players {
+		if err := d.HandleEvent(context.Background(), pctx, presentEvent(fmt.Sprintf("xuid-%d", i), 0)); err != nil {
+			t.Fatalf("HandleEvent: %v", err)
+		}
+	}
+
+	seen := make(map[string]bool, players)
+	deadline := time.After(10 * time.Second)
+	for len(seen) < players {
+		select {
+		case xuid := <-deliverer.done:
+			seen[xuid] = true
+		case <-deadline:
+			t.Fatalf("only %d of %d present players were drained: the rest were shed and are owed until they next join", len(seen), players)
+		}
+	}
+}
+
+// Drains scheduled in the same instant must not wake in the same instant.
+// The spread is bounded by the wait itself, so a caller that asked for no
+// wait still gets none.
+func TestDrainSpreadsItsWaitAndNeverExceedsIt(t *testing.T) {
+	spreads := make(chan time.Duration, 1)
+	deliverer := &fakeJoinDeliverer{calls: make(chan struct{}, 1)}
+	delay := 60 * time.Millisecond
+	d := NewAnnounceDrain(context.Background(), deliverer, delay, logging.New("error"),
+		WithJitter(func(spread time.Duration) time.Duration {
+			spreads <- spread
+			return spread
+		}))
+	pctx := &plugin.Context{Voice: newRecordingTellVoice()}
+
+	started := time.Now()
+	if err := d.HandleEvent(context.Background(), pctx, joinEvent("xuid-1")); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	select {
+	case <-deliverer.calls:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the drain never delivered")
+	}
+
+	if elapsed := time.Since(started); elapsed < delay {
+		t.Errorf("delivered after %v, want at least the %v wait plus its spread", elapsed, delay)
+	}
+	select {
+	case spread := <-spreads:
+		if spread != delay {
+			t.Errorf("spread offered = %v, want %v: it may never outrun the wait it is spreading", spread, delay)
+		}
+	default:
+		t.Error("the wait was never spread: a snapshot's worth of players would wake together")
+	}
+}
+
+// A caller that asked for no wait gets no spread either.
+func TestDrainWithNoDelayIsNotSpread(t *testing.T) {
+	deliverer := &fakeJoinDeliverer{calls: make(chan struct{}, 1)}
+	d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("error"),
+		WithJitter(func(time.Duration) time.Duration {
+			t.Error("spread a drain that was asked to wait for nothing")
+			return time.Hour
+		}))
+	pctx := &plugin.Context{Voice: newRecordingTellVoice()}
+
+	if err := d.HandleEvent(context.Background(), pctx, joinEvent("xuid-1")); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	select {
+	case <-deliverer.calls:
+	case <-time.After(time.Second):
+		t.Fatal("the drain never delivered")
 	}
 }
