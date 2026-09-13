@@ -993,7 +993,7 @@ git commit -m "feat(census): resolve actor dimensions from digp chunk records"
 
 **Interfaces:**
 - Consumes: `Entity`, `EntityFromNBT`, `dimensionIndex` from Tasks 1 and 5.
-- Produces: `func Scan(dbPath string) ([]Entity, ScanStats, error)`; `type ScanStats struct { Records, Decoded, Unparsable, Unplaced int }`. Test helper: `func writeFixtureWorld(t *testing.T, actors []fixtureActor) string` and `type fixtureActor struct { ID uint64; Dimension *int32; NBT map[string]any }`.
+- Produces: `func Scan(dbPath string) ([]Entity, ScanStats, error)`; `type ScanStats struct { Records, Decoded, Unparsable, Unplaced int; FirstUnparsableErr string }`. Test helper: `func writeFixtureWorld(t *testing.T, actors []fixtureActor) string` and `type fixtureActor struct { ID uint64; Dimension *int32; NBT map[string]any }`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1163,11 +1163,11 @@ Expected: FAIL, `undefined: Scan`.
 package census
 
 import (
-	"bytes"
 	"fmt"
 
 	"github.com/df-mc/goleveldb/leveldb"
 	"github.com/df-mc/goleveldb/leveldb/opt"
+	"github.com/df-mc/goleveldb/leveldb/util"
 	"github.com/sandertv/gophertunnel/minecraft/nbt"
 )
 
@@ -1178,10 +1178,11 @@ const actorPrefix = "actorprefix"
 // ScanStats records what the scan saw, so a census can state how much of the
 // world it failed to read instead of quietly reporting a short count.
 type ScanStats struct {
-	Records    int // actorprefix keys seen
-	Decoded    int // records that became entities
-	Unparsable int // records whose NBT would not decode
-	Unplaced   int // records decoded but carrying no usable position
+	Records           int    // actorprefix keys seen
+	Decoded           int    // records that became entities
+	Unparsable        int    // records whose NBT would not decode
+	Unplaced          int    // records decoded but carrying no usable position
+	FirstUnparsableErr string // first decode failure seen, or empty if none
 }
 
 // Scan reads every entity out of a Bedrock world's LevelDB.
@@ -1216,6 +1217,9 @@ func Scan(dbPath string) ([]Entity, ScanStats, error) {
 		var m map[string]any
 		if err := nbt.UnmarshalEncoding(v, &m, nbt.LittleEndian); err != nil {
 			stats.Unparsable++
+			if stats.FirstUnparsableErr == "" {
+				stats.FirstUnparsableErr = err.Error()
+			}
 			return
 		}
 		e, ok := EntityFromNBT(m)
@@ -1232,15 +1236,12 @@ func Scan(dbPath string) ([]Entity, ScanStats, error) {
 	return entities, stats, nil
 }
 
-// iterate walks every key carrying the given prefix. The callback must not
-// retain k or v: the iterator reuses their backing arrays between steps.
+// iterate seeks the prefix range and calls fn for each key in it. The callback
+// must not retain k or v: the iterator reuses their backing arrays between steps.
 func iterate(db *leveldb.DB, prefix []byte, fn func(k, v []byte)) error {
-	it := db.NewIterator(nil, nil)
+	it := db.NewIterator(util.BytesPrefix(prefix), nil)
 	defer it.Release()
 	for it.Next() {
-		if !bytes.HasPrefix(it.Key(), prefix) {
-			continue
-		}
 		fn(it.Key(), it.Value())
 	}
 	if err := it.Error(); err != nil {
@@ -1253,7 +1254,7 @@ func iterate(db *leveldb.DB, prefix []byte, fn func(k, v []byte)) error {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/census/ -run TestScan -v`
-Expected: PASS, three tests.
+Expected: PASS, four tests.
 
 - [ ] **Step 5: Commit**
 

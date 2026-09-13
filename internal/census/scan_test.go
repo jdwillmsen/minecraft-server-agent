@@ -1,6 +1,11 @@
 package census
 
-import "testing"
+import (
+	"encoding/binary"
+	"testing"
+
+	"github.com/df-mc/goleveldb/leveldb"
+)
 
 func TestScanReadsEntitiesWithTheirDimensions(t *testing.T) {
 	nether := int32(1)
@@ -66,5 +71,39 @@ func TestScanCountsUnplacedEntities(t *testing.T) {
 func TestScanRejectsAMissingWorld(t *testing.T) {
 	if _, _, err := Scan(t.TempDir() + "/does-not-exist"); err == nil {
 		t.Error("Scan of a missing world returned nil error")
+	}
+}
+
+func TestScanCapturesFirstUnparsableError(t *testing.T) {
+	path := writeFixtureWorld(t, []fixtureActor{
+		{ID: 1, NBT: map[string]any{
+			"identifier": "minecraft:zombie",
+			"Pos":        pos(10, 64, 20),
+			"UniqueID":   int64(1),
+		}},
+	})
+
+	// Add a corrupt actorprefix record
+	db, err := leveldb.OpenFile(path, nil)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	corruptID := make([]byte, 8)
+	binary.LittleEndian.PutUint64(corruptID, 999)
+	if err := db.Put(append([]byte("actorprefix"), corruptID...), []byte{0xff, 0xff, 0xff}, nil); err != nil {
+		db.Close()
+		t.Fatalf("put corrupt record: %v", err)
+	}
+	db.Close()
+
+	_, stats, err := Scan(path)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if stats.Unparsable != 1 {
+		t.Errorf("Unparsable = %d, want 1", stats.Unparsable)
+	}
+	if stats.FirstUnparsableErr == "" {
+		t.Error("FirstUnparsableErr is empty, want error message")
 	}
 }

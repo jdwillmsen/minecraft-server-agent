@@ -1,11 +1,11 @@
 package census
 
 import (
-	"bytes"
 	"fmt"
 
 	"github.com/df-mc/goleveldb/leveldb"
 	"github.com/df-mc/goleveldb/leveldb/opt"
+	"github.com/df-mc/goleveldb/leveldb/util"
 	"github.com/sandertv/gophertunnel/minecraft/nbt"
 )
 
@@ -16,10 +16,11 @@ const actorPrefix = "actorprefix"
 // ScanStats records what the scan saw, so a census can state how much of the
 // world it failed to read instead of quietly reporting a short count.
 type ScanStats struct {
-	Records    int // actorprefix keys seen
-	Decoded    int // records that became entities
-	Unparsable int // records whose NBT would not decode
-	Unplaced   int // records decoded but carrying no usable position
+	Records            int    // actorprefix keys seen
+	Decoded            int    // records that became entities
+	Unparsable         int    // records whose NBT would not decode
+	Unplaced           int    // records decoded but carrying no usable position
+	FirstUnparsableErr string // first decode failure seen, or empty if none
 }
 
 // Scan reads every entity out of a Bedrock world's LevelDB.
@@ -54,6 +55,9 @@ func Scan(dbPath string) ([]Entity, ScanStats, error) {
 		var m map[string]any
 		if err := nbt.UnmarshalEncoding(v, &m, nbt.LittleEndian); err != nil {
 			stats.Unparsable++
+			if stats.FirstUnparsableErr == "" {
+				stats.FirstUnparsableErr = err.Error()
+			}
 			return
 		}
 		e, ok := EntityFromNBT(m)
@@ -70,15 +74,12 @@ func Scan(dbPath string) ([]Entity, ScanStats, error) {
 	return entities, stats, nil
 }
 
-// iterate walks every key carrying the given prefix. The callback must not
-// retain k or v: the iterator reuses their backing arrays between steps.
+// iterate seeks the prefix range and calls fn for each key in it. The callback
+// must not retain k or v: the iterator reuses their backing arrays between steps.
 func iterate(db *leveldb.DB, prefix []byte, fn func(k, v []byte)) error {
-	it := db.NewIterator(nil, nil)
+	it := db.NewIterator(util.BytesPrefix(prefix), nil)
 	defer it.Release()
 	for it.Next() {
-		if !bytes.HasPrefix(it.Key(), prefix) {
-			continue
-		}
 		fn(it.Key(), it.Value())
 	}
 	if err := it.Error(); err != nil {
