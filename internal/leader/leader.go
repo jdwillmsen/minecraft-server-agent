@@ -20,6 +20,17 @@
 // ends when its connection ends -- so the kernel closing a dead pod's socket
 // is the release, with no duration to wait out.
 //
+// An advisory lock also has one sharp edge that a lease does not: it is
+// released when its connection ends, which is instant for a process that
+// exits but not for a pod that dies without closing its socket. PostgreSQL
+// keeps that backend, and its lock, until TCP keepalive reaps it -- on this
+// cluster's inherited node defaults, over two hours. Waiting that out would
+// replace a 29-second planned gap with a multi-hour unplanned one, so the
+// wait is bounded: at the end of it the agent goes live without the lock and
+// lets the Xbox Live kick evict whatever is still logged in, which is exactly
+// what every release did before this package existed. The guarantee is given
+// up loudly and only after the bound -- see Campaign.
+//
 // The hazard that shape brings is the one this package is built around: a
 // session-scoped advisory lock belongs to one connection. Taking it on a
 // pooled connection that is later recycled releases it silently, leaving an
@@ -34,6 +45,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -57,6 +69,16 @@ const DefaultPoll = 500 * time.Millisecond
 // and the agent is then playing on a claim another process can already have
 // taken. The interval bounds how long that can stay unnoticed.
 const DefaultProbe = 5 * time.Second
+
+// DefaultMaxWait is how long a standby waits for the lock before going live
+// without it.
+//
+// Long enough that no ordinary handover reaches it: the departing agent
+// releases the lock as it leaves, and a standby has it one poll later. Short
+// enough that a pod killed without a chance to release costs the server a
+// minute of agent rather than the hours PostgreSQL would take to reap the
+// dead backend holding the lock.
+const DefaultMaxWait = 60 * time.Second
 
 // Session is one dedicated database connection an Election runs on, and the
 // lock it holds.
@@ -89,10 +111,11 @@ type Dial func(ctx context.Context) (Session, error)
 
 // Election waits for the agent lock and reports when it is held.
 type Election struct {
-	dial  Dial
-	poll  time.Duration
-	probe time.Duration
-	log   *logging.Logger
+	dial    Dial
+	poll    time.Duration
+	probe   time.Duration
+	maxWait time.Duration
+	log     *logging.Logger
 }
 
 // Option configures an Election.
@@ -116,6 +139,13 @@ func WithProbe(d time.Duration) Option {
 	}
 }
 
+// WithMaxWait overrides DefaultMaxWait. A value of zero or less waits
+// forever, which no production path asks for and which only a test that wants
+// to prove the waiting itself should.
+func WithMaxWait(d time.Duration) Option {
+	return func(e *Election) { e.maxWait = d }
+}
+
 // WithLogger attaches a logger. Without one the election is silent, which is
 // only ever right in a test: in production the standby's wait and the
 // holder's loss are the two lines that explain a handover afterwards.
@@ -125,28 +155,83 @@ func WithLogger(l *logging.Logger) Option {
 
 // New builds an Election over dial.
 func New(dial Dial, opts ...Option) *Election {
-	e := &Election{dial: dial, poll: DefaultPoll, probe: DefaultProbe}
+	e := &Election{dial: dial, poll: DefaultPoll, probe: DefaultProbe, maxWait: DefaultMaxWait}
 	for _, opt := range opts {
 		opt(e)
 	}
 	return e
 }
 
-// Campaign blocks until this process holds the lock, and returns the Term
-// that holds it. The only error it returns is ctx's own: a database that is
-// unreachable, a pool with nothing to spare and a lock somebody else holds
-// are all the same situation from here -- not yet -- and the standby's job
-// in all three is to keep waiting while the live agent carries on playing.
+// Campaign waits for the lock and returns the Term to lead under.
+//
+// The only error it returns is ctx's own: a database that is unreachable, a
+// pool with nothing to spare and a lock somebody else holds are all the same
+// situation from here -- not yet -- and the standby's job in all three is to
+// keep waiting while the live agent carries on playing.
+//
+// The wait is bounded (see DefaultMaxWait). When the bound is reached the
+// returned Term does not hold the lock -- Held reports false -- and the caller
+// is expected to go live anyway: the only thing that can hold a lock nobody
+// releases is a process that is already gone, and the Xbox Live login kicks
+// whatever is still connected as the account. That is precisely how every
+// release worked before this package existed, so the worst case is no worse
+// than it used to be, and the best case is the handover this is all for.
+//
+// Such a term keeps chasing the lock in the background and adopts it the
+// moment it frees, which is not tidiness: an unlocked leader has no
+// connection to watch, so until it adopts one nothing can tell it another
+// agent has taken the login from it.
 func (e *Election) Campaign(ctx context.Context) (*Term, error) {
+	sess, err := e.pursue(ctx, e.maxWait)
+	if err != nil {
+		return nil, err
+	}
+	if sess != nil {
+		return newTerm(sess, e.probe, e.log), nil
+	}
+
+	// Error, not warning: the process is knowingly giving up the one
+	// guarantee this package provides, and the line has to be findable
+	// afterwards when somebody asks how two agents were in the game at once.
+	if e.log != nil {
+		e.log.Error("leading_without_the_lock", logging.Fields{
+			"waited_ms": e.maxWait.Milliseconds(),
+			"reason":    "lock still held after the maximum wait; going live and letting the Xbox Live kick evict whoever holds it",
+		})
+	}
+	term := newUnlockedTerm(e.log)
+	// Detached from ctx deliberately. ctx bounds the *wait* -- a caller that
+	// cancels it is a caller that stopped wanting to become the live agent --
+	// while this chase belongs to the term, which ends at Release like the
+	// probe on a held lock does. A caller that cancelled its campaign context
+	// the moment Campaign returned would otherwise get a term that could never
+	// adopt, and so could never notice a conflict again.
+	go term.adopt(context.WithoutCancel(ctx), e)
+	return term, nil
+}
+
+// pursue polls for the lock until it has it, until limit elapses, or until ctx
+// ends. It returns the locked session, which the caller then owns; (nil, nil)
+// means limit elapsed with the lock still held elsewhere.
+//
+// A limit of zero or less never elapses. The session is this function's own
+// until it hands one back: a poll that finds the lock taken keeps it for the
+// next attempt, a failed attempt discards it, and a wait that gives up returns
+// it to the pool rather than leaving a connection checked out for nothing.
+func (e *Election) pursue(ctx context.Context, limit time.Duration) (Session, error) {
 	var sess Session
-	// Closed on every path out that is not a term: a standby that is
-	// shutting down must not leave a connection checked out of a pool its
-	// process is about to stop using.
 	defer func() {
 		if sess != nil {
 			sess.Close()
 		}
 	}()
+
+	var giveUp <-chan time.Time
+	if limit > 0 {
+		timer := time.NewTimer(limit)
+		defer timer.Stop()
+		giveUp = timer.C
+	}
 
 	waiting := false
 	for {
@@ -174,9 +259,9 @@ func (e *Election) Campaign(ctx context.Context) (*Term, error) {
 				sess.Close()
 				sess = nil
 			case held:
-				term := newTerm(sess, e.probe, e.log)
-				sess = nil // The term owns the connection now.
-				return term, nil
+				taken := sess
+				sess = nil // The caller owns it now; the defer must not close it.
+				return taken, nil
 			case !waiting:
 				// Once, not per attempt: a handover that takes a minute
 				// would otherwise be a hundred identical lines.
@@ -188,6 +273,8 @@ func (e *Election) Campaign(ctx context.Context) (*Term, error) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-giveUp:
+			return nil, nil
 		case <-time.After(e.poll):
 		}
 	}
@@ -209,9 +296,17 @@ func (e *Election) note(event string, fields logging.Fields) {
 type Term struct {
 	mu   sync.Mutex
 	sess Session
+	// held is read without the mutex, by a caller deciding how loudly to
+	// report what it is about to do. It is false for a term that went live
+	// after the bounded wait expired, and becomes true if that term later
+	// adopts the lock.
+	held atomic.Bool
 
 	lost   chan struct{}
 	closed sync.Once
+
+	adopted     chan struct{}
+	adoptedOnce sync.Once
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -221,16 +316,98 @@ type Term struct {
 
 func newTerm(sess Session, probe time.Duration, log *logging.Logger) *Term {
 	t := &Term{
-		sess: sess,
-		lost: make(chan struct{}),
-		stop: make(chan struct{}),
-		log:  log,
+		sess:    sess,
+		lost:    make(chan struct{}),
+		adopted: make(chan struct{}),
+		stop:    make(chan struct{}),
+		log:     log,
 	}
+	t.held.Store(true)
+	// Closed from the start: this term has the lock, so there is no later
+	// moment at which it acquires one, and a caller waiting on Adopted for a
+	// term that already holds the lock must not wait forever.
+	t.markAdopted()
 	go t.watch(probe)
 	if log != nil {
 		log.Info("leader_acquired", nil)
 	}
 	return t
+}
+
+// newUnlockedTerm is the term a caller leads under when the bounded wait
+// expired: live, and honest about holding no lock.
+func newUnlockedTerm(log *logging.Logger) *Term {
+	return &Term{
+		lost:    make(chan struct{}),
+		adopted: make(chan struct{}),
+		stop:    make(chan struct{}),
+		log:     log,
+	}
+}
+
+// Held reports whether this term is backed by the lock.
+//
+// False only for a term that went live after the bounded wait expired, and
+// only until it adopts one. A caller reads it to decide how loudly to report
+// what it is doing, never to decide whether to play: by the time it has a
+// term, it is the live agent either way.
+func (t *Term) Held() bool { return t.held.Load() }
+
+// Adopted is closed once this term holds the lock: immediately for a term that
+// was given one, and at the moment a term that went live without one finally
+// takes it. It never fires for a term that has been released.
+func (t *Term) Adopted() <-chan struct{} { return t.adopted }
+
+// adopt chases the lock for a term that went live without it, and installs it
+// if it ever comes free.
+//
+// Unbounded on purpose: the bound exists to stop a standby waiting out of the
+// game, and this process is already in it. What ends it is this term being
+// released, which every turn does -- the same act that gives a held lock back.
+func (t *Term) adopt(ctx context.Context, e *Election) {
+	adoptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-t.stop:
+			cancel()
+		case <-adoptCtx.Done():
+		}
+	}()
+
+	sess, err := e.pursue(adoptCtx, 0)
+	if err != nil || sess == nil {
+		return
+	}
+	if t.install(sess, e.probe) {
+		if t.log != nil {
+			t.log.Info("leader_lock_adopted", nil)
+		}
+		return
+	}
+	// Released while this was still chasing: the lock must not be left taken
+	// on a connection nobody is watching, so it goes straight back.
+	if err := sess.Unlock(adoptCtx); err != nil && t.log != nil {
+		t.log.Error("leader_release_failed", logging.Fields{"error": err.Error()})
+	}
+	sess.Close()
+}
+
+// install makes a late-acquired lock this term's own, reporting false if the
+// term has already been released.
+func (t *Term) install(sess Session, probe time.Duration) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	select {
+	case <-t.stop:
+		return false
+	default:
+	}
+	t.sess = sess
+	t.held.Store(true)
+	t.markAdopted()
+	go t.watch(probe)
+	return true
 }
 
 // Lost is closed the moment this process stops holding the lock, whether
@@ -260,7 +437,12 @@ func (t *Term) Release(ctx context.Context) error {
 	defer t.mu.Unlock()
 	sess := t.sess
 	t.sess = nil
+	t.held.Store(false)
 	if sess == nil {
+		// Already released, or a term that led without the lock and never
+		// adopted one: there is nothing to hand back, and nothing a successor
+		// is waiting on.
+		t.markLost()
 		return nil
 	}
 
@@ -338,6 +520,10 @@ func (t *Term) drop() {
 
 func (t *Term) markLost() {
 	t.closed.Do(func() { close(t.lost) })
+}
+
+func (t *Term) markAdopted() {
+	t.adoptedOnce.Do(func() { close(t.adopted) })
 }
 
 // PoolDial takes the dedicated connection this package needs out of an

@@ -360,3 +360,127 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 	}
 	t.Error(msg)
 }
+
+func TestAPermanentlyHeldLockIsGivenUpOnWithinTheBound(t *testing.T) {
+	// A pod that died without closing its socket -- SIGKILL, an OOM kill, a
+	// node losing power -- leaves its backend and its lock behind until TCP
+	// keepalive reaps it, which on this cluster's inherited defaults is over
+	// two hours. Waiting that out would turn a hard kill into an outage far
+	// longer than the one this package exists to shorten, so the wait is
+	// bounded and the agent goes live without the lock at the end of it.
+	sess := &fakeSession{heldElsewhere: 1 << 30}
+	spare := &fakeSession{heldElsewhere: 1 << 30}
+	d := &dialing{sessions: []*fakeSession{sess, spare}}
+	bound := 50 * time.Millisecond
+
+	started := time.Now()
+	term, err := New(d.dial, WithPoll(time.Millisecond), WithMaxWait(bound)).Campaign(t.Context())
+	if err != nil {
+		t.Fatalf("Campaign: %v", err)
+	}
+	defer func() { _ = term.Release(t.Context()) }()
+
+	if took := time.Since(started); took > 2*time.Second {
+		t.Errorf("the campaign waited %v before going live, want about %v", took, bound)
+	}
+	if term.Held() {
+		t.Error("the term reports it holds a lock another connection is holding")
+	}
+	// Live, and not pretending otherwise: nothing has been lost, because
+	// nothing was ever held.
+	select {
+	case <-term.Lost():
+		t.Error("a term that never held the lock reports it lost one")
+	default:
+	}
+}
+
+func TestTheBoundIsNotReachedWhenTheLockFreesNormally(t *testing.T) {
+	// An ordinary release: the departing agent gives the lock up as it leaves,
+	// and the standby has it on its next poll. The bound exists for the pod
+	// that never gets to release anything, and a handover must never touch it.
+	sess := &fakeSession{heldElsewhere: 5}
+	d := &dialing{sessions: []*fakeSession{sess}}
+
+	term, err := New(d.dial, WithPoll(time.Millisecond), WithMaxWait(10*time.Second)).Campaign(t.Context())
+	if err != nil {
+		t.Fatalf("Campaign: %v", err)
+	}
+	defer func() { _ = term.Release(t.Context()) }()
+
+	if !term.Held() {
+		t.Error("the standby went live without the lock although the lock came free")
+	}
+	if tries, _, _ := sess.counts(); tries != 6 {
+		t.Errorf("try attempts = %d, want 6 (five refusals then the lock)", tries)
+	}
+}
+
+func TestATermThatWentLiveUnlockedAdoptsTheLockWhenItFrees(t *testing.T) {
+	// Otherwise the process spends the rest of its life unable to notice a
+	// genuine conflict: with no lock held there is no connection to watch, so
+	// nothing would tell it that another agent had taken over.
+	sess := &fakeSession{heldElsewhere: 1 << 30}
+	// The lock is free by the time the background pursuit dials again.
+	later := &fakeSession{}
+	d := &dialing{sessions: []*fakeSession{sess, later}}
+
+	term, err := New(d.dial, WithPoll(time.Millisecond), WithMaxWait(20*time.Millisecond), WithProbe(time.Millisecond)).Campaign(t.Context())
+	if err != nil {
+		t.Fatalf("Campaign: %v", err)
+	}
+	defer func() { _ = term.Release(t.Context()) }()
+
+	select {
+	case <-term.Adopted():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the lock came free and the term never adopted it")
+	}
+	if !term.Held() {
+		t.Error("the term adopted the lock and still reports it does not hold one")
+	}
+
+	// And the guarantee is back: the connection carrying the adopted lock is
+	// watched like any other, so a conflict is noticed again.
+	later.mu.Lock()
+	later.aliveErr = errors.New("connection closed")
+	later.mu.Unlock()
+	select {
+	case <-term.Lost():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the adopted lock is not being watched")
+	}
+}
+
+func TestReleasingAnUnlockedTermStopsItChasingTheLock(t *testing.T) {
+	// A released term must not end up holding a lock: nothing is watching its
+	// connection any more, and a lock held by a process that has stood down is
+	// a lock no successor can ever take.
+	sess := &fakeSession{heldElsewhere: 1 << 30}
+	later := &fakeSession{}
+	d := &dialing{sessions: []*fakeSession{sess, later}}
+
+	term, err := New(d.dial, WithPoll(time.Millisecond), WithMaxWait(time.Millisecond)).Campaign(t.Context())
+	if err != nil {
+		t.Fatalf("Campaign: %v", err)
+	}
+	if err := term.Release(t.Context()); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	select {
+	case <-term.Adopted():
+		t.Error("a released term reported adopting the lock")
+	default:
+	}
+	if term.Held() {
+		t.Error("a released term reports it holds the lock")
+	}
+	// Whether the background pursuit got as far as taking the lock before the
+	// release landed is a race, and both outcomes are acceptable. What is not
+	// acceptable is taking it and keeping it.
+	waitFor(t, func() bool {
+		tries, unlocked, closed := later.counts()
+		return tries == 0 || (unlocked == 1 && closed == 1)
+	}, "the lock was left taken on a connection the released term abandoned")
+}

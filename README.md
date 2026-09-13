@@ -202,6 +202,7 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 | `PG_PASSWORD` | *(empty)* | Database password |
 | `PG_CONNECT_TIMEOUT_MS` | `5000` | Bounds the startup connection check, so a slow database costs persistence, not the ability to start |
 | `LEADER_POLL_MS` | `500` | How often a warm standby asks whether the agent lock has come free. The dominant term in how long a release leaves the server without an agent; only meaningful with a database configured, since without one there is no lock and no standby |
+| `LEADER_MAX_WAIT_MS` | `60000` | How long a standby waits for the lock before going live without it, because a lock nobody will release would otherwise cost hours - see "When nobody releases the lock" below. Must be at least `LEADER_POLL_MS`, and is deliberately far above the few seconds an ordinary handover takes, so a release never reaches it |
 | `LLM_BASE_URL` | *(empty disables answering)* | Base URL of the OpenAI-compatible backend behind `@server` |
 | `LLM_MODEL` | *(empty)* | Model name sent with each request |
 | `LLM_API_KEY` | *(empty)* | Bearer token for the LLM backend, if it requires one |
@@ -224,7 +225,8 @@ breaking change.
 | Name | Type | Labels | Recorded |
 |---|---|---|---|
 | `mc_agent_connected` | gauge | none | 1 while a Bedrock session is up |
-| `mc_agent_leader` | gauge | none | 1 while this process holds the agent lock, 0 while it is a warm standby |
+| `mc_agent_leader` | gauge | none | 1 while this process is the live agent, 0 while it is a warm standby |
+| `mc_agent_leader_unlocked` | gauge | none | 1 while this process is the live agent *without* holding the lock |
 | `mc_agent_reconnects_total` | counter | none | per reconnect attempt |
 | `mc_agent_commands_total` | counter | `command`, `outcome` | once per dispatch, beside the audit write |
 | `mc_agent_mentions_total` | counter | `outcome` | once per `@server` mention |
@@ -268,6 +270,13 @@ pods: two agents reporting 1 are two processes kicking each other out of one
 Xbox Live account, and none reporting 1 is a server with nobody answering
 it. Mid-rollout it is briefly 0 everywhere - that gap is the handover, and
 it is the number "Handing over to a standby" below exists to keep small.
+
+`mc_agent_leader_unlocked` is the other half of that question and a separate
+series on purpose: a pod leading without the lock **is** the live agent and
+reports 1 in `mc_agent_leader` like any other, so the thing worth alerting on
+- that nothing is currently stopping a second agent joining - is invisible
+there. It is a gauge rather than a counter because it stops being true: the
+agent adopts the lock if it ever frees, and the series clears when it does.
 
 `mc_agent_server_tps` and `mc_agent_link_rtt_seconds` do not exist until
 first measured, and a failed measurement never resets them: a zero would
@@ -777,6 +786,32 @@ counts for nothing, and a clean handover is never recorded as one. No schema
 change was needed for any of this; `'agent_restart'` has been a permitted
 `ended_reason` since the first migration and nothing had ever written it.
 
+**When nobody releases the lock.** An advisory lock is released when the
+connection holding it ends, which is immediate for a process that exits and
+slow for a pod that dies without closing its socket - a `SIGKILL`, an OOM
+kill, a node losing power. PostgreSQL keeps that backend, and its lock, until
+TCP keepalive reaps it. On `platform-postgresql-cluster-prd` the server-side
+settings are all zero (`idle_session_timeout`, `tcp_keepalives_idle`,
+`tcp_keepalives_interval`, `tcp_keepalives_count`), meaning they inherit the
+node's `7200 / 75 / 9` - so worst case the lock stays taken for about 2h11m.
+
+Waiting that out would trade a 29-second planned gap for a multi-hour
+unplanned one, so the wait is bounded by `LEADER_MAX_WAIT_MS`. At the end of
+it the agent goes live **without** the lock and lets the Xbox Live kick evict
+whatever is still logged in - which is exactly how every release worked before
+any of this existed, so the worst case is no worse than it used to be. That
+decision is logged at ERROR (`leading_without_the_lock`), because it is the
+process knowingly giving up the guarantee the lock provides, and it shows up
+in `mc_agent_leader_unlocked` for as long as it lasts.
+
+Such a process keeps chasing the lock in the background and adopts it the
+moment it frees. That is not tidiness: an agent with no lock has no connection
+to watch, so until it adopts one nothing can tell it that another agent has
+taken the login - and `Lost()` detection, the thing that makes a conflict
+survivable, is dead for the rest of the process's life. Adoption logs
+`leader_lock_adopted`, clears `mc_agent_leader_unlocked`, and puts the
+connection under the same probe a lock held from the start gets.
+
 **What the chart still has to do.** The agent side of this is only half the
 fix. Until the Helm chart moves from `Recreate` to `RollingUpdate` with
 `maxSurge: 1` and `maxUnavailable: 0`, the old pod is still stopped before
@@ -874,7 +909,8 @@ disposable database built from the migrations, never at production.
 locks are server state, not schema - so the same `MC_TEST_DSN` works:
 `go test -tags livedb ./internal/leader/`. It is worth more than its size
 suggests: it asserts that two processes never hold the lock at once, that a
-terminated connection releases it, and that a lock taken on a *pooled*
+terminated connection releases it, that a lock nobody releases is outwaited
+and then adopted once it frees, and that a lock taken on a *pooled*
 connection is silently lost when the pool retires it - the bug the dedicated
 connection exists to avoid, written down so nobody optimises it back in. One
 of its cases terminates connections by `application_name`, so it can run

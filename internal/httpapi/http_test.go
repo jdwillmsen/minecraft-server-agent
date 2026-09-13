@@ -124,7 +124,7 @@ func TestServer_Readyz_AStandbyIsReadyWithoutASession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer srv.ln.Close()
+	defer func() { _ = srv.ln.Close() }()
 
 	srv.SetRole(RoleStandby)
 	rec := readyz(srv)
@@ -144,7 +144,7 @@ func TestServer_Readyz_TheLiveAgentStillAnswersForItsSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer srv.ln.Close()
+	defer func() { _ = srv.ln.Close() }()
 
 	srv.SetRole(RoleLive)
 	if rec := readyz(srv); rec.Code != http.StatusServiceUnavailable {
@@ -164,7 +164,7 @@ func TestServer_Readyz_AnAgentThatGaveUpTheLockIsAStandbyAgain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer srv.ln.Close()
+	defer func() { _ = srv.ln.Close() }()
 
 	srv.SetRole(RoleLive)
 	srv.SetReady(true)
@@ -184,7 +184,7 @@ func TestSetRoleMovesTheLeaderGauge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer srv.ln.Close()
+	defer func() { _ = srv.ln.Close() }()
 
 	srv.SetRole(RoleLive)
 	if got := testutil.ToFloat64(leaderGauge); got != 1 {

@@ -13,7 +13,7 @@ func clearEnv(t *testing.T) {
 		"COMMAND_RATE_LIMIT_PER_MINUTE", "LOG_LEVEL",
 		"CONSOLE_BRIDGE_URL", "CONSOLE_BRIDGE_TOKEN", "CONSOLE_BRIDGE_TIMEOUT_MS",
 		"LLM_MAX_TOKENS", "LLM_TIMEOUT_MS", "LLM_TOTAL_TIMEOUT_MS",
-		"LEADER_POLL_MS",
+		"LEADER_POLL_MS", "LEADER_MAX_WAIT_MS",
 	} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
@@ -113,6 +113,37 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.LeaderPollMs != 500 {
 		t.Errorf("LeaderPollMs = %d, want 500", cfg.LeaderPollMs)
+	}
+	if cfg.LeaderMaxWaitMs != 60000 {
+		t.Errorf("LeaderMaxWaitMs = %d, want 60000", cfg.LeaderMaxWaitMs)
+	}
+}
+
+// The bound is what stops a lock nobody will release becoming an outage, so a
+// value that gives up before the first poll has even been repeated is refused
+// rather than quietly treated as "no lock".
+func TestLoad_LeaderMaxWaitBelowThePollIntervalFails(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("LEADER_POLL_MS", "5000")
+	t.Setenv("LEADER_MAX_WAIT_MS", "1000")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error when LEADER_MAX_WAIT_MS is below LEADER_POLL_MS")
+	}
+}
+
+func TestLoad_LeaderMaxWaitOverride(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("LEADER_MAX_WAIT_MS", "120000")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.LeaderMaxWaitMs != 120000 {
+		t.Errorf("LeaderMaxWaitMs = %d, want 120000", cfg.LeaderMaxWaitMs)
 	}
 }
 

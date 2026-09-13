@@ -28,7 +28,18 @@ var (
 	// with nobody answering it.
 	leaderGauge = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "mc_agent_leader",
-		Help: "1 if this process holds the agent lock and is the live agent, 0 if it is a standby.",
+		Help: "1 if this process is the live agent, 0 if it is a standby.",
+	})
+	// A second series rather than a third value of the one above, because the
+	// two questions are independent and both have to stay answerable: this
+	// process is the live agent (mc_agent_leader is 1, like any other live
+	// agent) and it is leading without the lock that makes that exclusive. A
+	// gauge rather than a counter so it stops being true when it stops being
+	// true -- the agent adopts the lock if it ever frees, and an alert that
+	// could not clear would outlive the condition.
+	leaderUnlockedGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "mc_agent_leader_unlocked",
+		Help: "1 if this process is the live agent without holding the agent lock, after the bounded wait for it expired.",
 	})
 )
 
@@ -50,6 +61,20 @@ func setLeader(leader bool) {
 		return
 	}
 	leaderGauge.Set(0)
+}
+
+// SetLeaderUnlocked records whether this process is leading without the lock.
+//
+// Exported, unlike setLeader, because nothing about readiness changes when it
+// moves: an agent leading unlocked is live and serving players, and the only
+// thing that differs is the guarantee behind it -- which is a thing to alert
+// on, not a thing to take a pod out of service for.
+func SetLeaderUnlocked(unlocked bool) {
+	if unlocked {
+		leaderUnlockedGauge.Set(1)
+		return
+	}
+	leaderUnlockedGauge.Set(0)
 }
 
 // IncReconnect records one reconnect attempt.

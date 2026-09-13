@@ -46,6 +46,12 @@ const handoverTimeout = 5 * time.Second
 type leadership interface {
 	// Lost is closed the moment this process no longer holds the lock.
 	Lost() <-chan struct{}
+	// Held reports whether the lock is actually held. False for a turn that
+	// began after the bounded wait for the lock expired.
+	Held() bool
+	// Adopted is closed once the lock is held: at once for a turn that began
+	// with it, later for one that took it after going live without it.
+	Adopted() <-chan struct{}
 	// Release gives the lock up, which is what lets a standby join.
 	Release(ctx context.Context) error
 }
@@ -79,6 +85,7 @@ func newElection(cfg config.Config, pool *pgxpool.Pool, log *logging.Logger) cam
 	return agentElection{election: leader.New(
 		leader.PoolDial(pool, cfg.MCUsername),
 		leader.WithPoll(time.Duration(cfg.LeaderPollMs)*time.Millisecond),
+		leader.WithMaxWait(time.Duration(cfg.LeaderMaxWaitMs)*time.Millisecond),
 		leader.WithLogger(log),
 	)}
 }
@@ -115,6 +122,38 @@ func awaitLeadership(ctx context.Context, election campaigner, setRole func(http
 	}
 	setRole(httpapi.RoleLive)
 	return term, true
+}
+
+// watchForcedLeadership reports, for as long as it is true, that this process
+// is the live agent without holding the lock.
+//
+// That happens when the bounded wait expired, which means the lock is held by
+// something that never released it -- in practice a pod that died without
+// closing its socket, whose lock PostgreSQL will keep until TCP keepalive
+// reaps the backend, hours later. The agent goes live anyway and lets the Xbox
+// Live kick evict whatever is still connected, which is what every release did
+// before the lock existed: the guarantee is worth a minute of waiting, not an
+// afternoon.
+//
+// It is not reported through mc_agent_leader, which stays 1: this pod really is
+// the live agent. The separate series is what an alert needs to say that
+// nothing is currently stopping a second one. Both clear when the condition
+// does -- the term adopts the lock if it frees, or the turn ends.
+//
+// The going-live line itself is logged by the election, at ERROR, where the
+// decision is made.
+func watchForcedLeadership(ctx context.Context, term leadership, log *logging.Logger) {
+	if term == nil || term.Held() {
+		return
+	}
+	httpapi.SetLeaderUnlocked(true)
+	defer httpapi.SetLeaderUnlocked(false)
+
+	select {
+	case <-ctx.Done():
+	case <-term.Adopted():
+		log.Info("leader_lock_adopted", logging.Fields{"was_leading_unlocked": true})
+	}
 }
 
 // endTermOnLockLoss ends this process's turn as the live agent as soon as the

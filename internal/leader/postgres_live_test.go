@@ -243,3 +243,56 @@ func TestLeadershipEndsWhenTheServerTerminatesTheConnection(t *testing.T) {
 		t.Errorf("releasing a lost term: %v", err)
 	}
 }
+
+func TestAnAbandonedLockIsOutwaitedAndThenAdopted(t *testing.T) {
+	// The failure the bound exists for, against a real server: a lock held by
+	// a connection that never releases it. In production that connection
+	// belongs to a pod that died without closing its socket, and PostgreSQL
+	// keeps it -- and the lock -- until TCP keepalive reaps the backend, which
+	// on this cluster's inherited defaults is over two hours away.
+	abandoned := livePool(t, "abandoned-holder")
+	taker := livePool(t, "abandoned-taker")
+	acct := account(t)
+
+	dead, err := abandoned.Acquire(t.Context())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	var held bool
+	if err := dead.QueryRow(t.Context(), tryLockSQL, acct).Scan(&held); err != nil {
+		t.Fatalf("take lock: %v", err)
+	}
+	if !held {
+		t.Fatal("the lock was not free at the start of the test")
+	}
+
+	term, err := campaignWithin(t,
+		New(PoolDial(taker, acct),
+			WithPoll(20*time.Millisecond),
+			WithMaxWait(100*time.Millisecond),
+			WithProbe(50*time.Millisecond)),
+		5*time.Second)
+	if err != nil {
+		t.Fatalf("the campaign never gave up on an abandoned lock: %v", err)
+	}
+	defer func() { _ = term.Release(t.Context()) }()
+	if term.Held() {
+		t.Fatal("the term claims a lock the abandoned connection is still holding")
+	}
+
+	// Whenever that connection does finally go -- keepalive, a failover, an
+	// operator -- the live agent takes the lock and is protected again.
+	if _, err := dead.Exec(t.Context(), `SELECT pg_advisory_unlock_all()`); err != nil {
+		t.Fatalf("release the abandoned lock: %v", err)
+	}
+	dead.Release()
+
+	select {
+	case <-term.Adopted():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the lock came free and the unlocked agent never adopted it")
+	}
+	if !term.Held() {
+		t.Error("the term adopted the lock and still reports it holds none")
+	}
+}

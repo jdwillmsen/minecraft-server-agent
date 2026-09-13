@@ -10,6 +10,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/httpapi"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics/metricstest"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
@@ -20,6 +21,8 @@ import (
 type fakeTerm struct {
 	mu       sync.Mutex
 	lost     chan struct{}
+	adopted  chan struct{}
+	held     bool
 	released int
 	// order is shared with the store below, so a test can say what happened
 	// before what. The ordering is the whole point of the handover: anything
@@ -29,10 +32,22 @@ type fakeTerm struct {
 }
 
 func newFakeTerm(order *steps) *fakeTerm {
-	return &fakeTerm{lost: make(chan struct{}), order: order}
+	// Holding the lock is the ordinary case, so Adopted is already closed --
+	// see leader.Term.
+	adopted := make(chan struct{})
+	close(adopted)
+	return &fakeTerm{lost: make(chan struct{}), adopted: adopted, held: true, order: order}
 }
 
-func (f *fakeTerm) Lost() <-chan struct{} { return f.lost }
+// newUnlockedFakeTerm is the term a process leads under when the bounded wait
+// for the lock expired.
+func newUnlockedFakeTerm(order *steps) *fakeTerm {
+	return &fakeTerm{lost: make(chan struct{}), adopted: make(chan struct{}), order: order}
+}
+
+func (f *fakeTerm) Lost() <-chan struct{}    { return f.lost }
+func (f *fakeTerm) Adopted() <-chan struct{} { return f.adopted }
+func (f *fakeTerm) Held() bool               { return f.held }
 
 func (f *fakeTerm) Release(context.Context) error {
 	f.mu.Lock()
@@ -436,4 +451,68 @@ func TestAFailedTokenRefreshIsNotFatal(t *testing.T) {
 	ts := &tokenSource{err: errors.New("invalid_grant")}
 
 	warmXboxToken(ts, quiet())
+}
+
+// An agent that is live without the lock has given up the one guarantee the
+// lock provides, and it cannot be seen in mc_agent_leader: the pod genuinely
+// is the live agent and reports 1 there like any other. A separate series is
+// what lets an alert say "live, but unprotected".
+func TestLeadingWithoutTheLockIsVisibleToAnAlert(t *testing.T) {
+	term := newUnlockedFakeTerm(&steps{})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		watchForcedLeadership(ctx, term, quiet())
+		close(done)
+	}()
+
+	waitUntil(t, func() bool {
+		return metricstest.Value(t, "mc_agent_leader_unlocked") == 1
+	}, "leading without the lock was never reported")
+
+	// And it clears the moment the lock is adopted, because the claim it makes
+	// has stopped being true: from here on a conflict is noticed again.
+	close(term.adopted)
+	waitUntil(t, func() bool {
+		return metricstest.Value(t, "mc_agent_leader_unlocked") == 0
+	}, "adopting the lock did not clear the unlocked report")
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the watcher outlived the condition it was watching")
+	}
+}
+
+func TestAnAgentHoldingTheLockIsNotReportedUnlocked(t *testing.T) {
+	term := newFakeTerm(&steps{})
+
+	if got := metricstest.Delta(t, func() {
+		watchForcedLeadership(t.Context(), term, quiet())
+	}, "mc_agent_leader_unlocked"); got != 0 {
+		t.Errorf("mc_agent_leader_unlocked moved by %v for an agent that holds the lock, want 0", got)
+	}
+}
+
+// The end of a turn ends the claim too: the process is a standby again, or
+// gone, and either way it is no longer an unprotected live agent.
+func TestTheUnlockedReportClearsWhenTheTurnEnds(t *testing.T) {
+	term := newUnlockedFakeTerm(&steps{})
+	ctx, cancel := context.WithCancel(t.Context())
+
+	done := make(chan struct{})
+	go func() {
+		watchForcedLeadership(ctx, term, quiet())
+		close(done)
+	}()
+	waitUntil(t, func() bool {
+		return metricstest.Value(t, "mc_agent_leader_unlocked") == 1
+	}, "leading without the lock was never reported")
+
+	cancel()
+	<-done
+	if got := metricstest.Value(t, "mc_agent_leader_unlocked"); got != 0 {
+		t.Errorf("mc_agent_leader_unlocked = %v after the turn ended, want 0", got)
+	}
 }

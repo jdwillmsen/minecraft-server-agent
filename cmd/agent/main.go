@@ -271,6 +271,10 @@ func main() {
 		// the agent out of the game without taking the process down.
 		liveCtx, endTurn := context.WithCancel(ctx)
 		go endTermOnLockLoss(liveCtx, term, endTurn, log)
+		// A turn that began without the lock -- because whoever holds it is
+		// gone without having released it -- is a turn worth flagging for as
+		// long as it lasts.
+		go watchForcedLeadership(liveCtx, term, log)
 		startLiveWork(liveCtx, cfg, bridgeTimeout, pinger, link, announceStore, deliverer, scheduleStore, moderationStore, log)
 
 		runConnectLoop(liveCtx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblings, permResolver, ans, playerStore, auditor, link, joins)
