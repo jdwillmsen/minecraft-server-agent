@@ -189,6 +189,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		LatencyBudget: o.latencyBudget,
 		KnownTools:    knownTools,
 		Owners:        coordinateOwners(),
+		Facts:         fixtureFacts(),
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)

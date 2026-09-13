@@ -20,6 +20,11 @@ const (
 	DimTools Dimension = "tools"
 	// DimContent: the reply says what it must and nothing it must not.
 	DimContent Dimension = "content"
+	// DimGrounded: every server fact the reply states is one the fixture
+	// world holds. Scored apart from content because an invented version or
+	// player count reads as a perfectly good answer: it satisfies every
+	// other dimension while telling the asker something untrue.
+	DimGrounded Dimension = "grounded"
 	// DimClean: the model wrote nothing meant for a machine -- tool-call
 	// markup the backend failed to parse into a structured call, or the
 	// markdown the system prompt forbids. Scored apart from content
@@ -39,7 +44,7 @@ const (
 )
 
 // dimensions is the report order.
-var dimensions = []Dimension{DimAnswered, DimTools, DimContent, DimClean, DimPrivacy, DimLength, DimNoQuestion, DimLatency}
+var dimensions = []Dimension{DimAnswered, DimTools, DimContent, DimGrounded, DimClean, DimPrivacy, DimLength, DimNoQuestion, DimLatency}
 
 // Check is one dimension's verdict on one case. A check that is not scored
 // stays out of that dimension's pass rate rather than counting as a pass.
@@ -79,6 +84,10 @@ type Limits struct {
 	// Owners maps each number that pins down a fixture waypoint to the XUID
 	// that saved it.
 	Owners map[string]string
+	// Facts is what the fixture world answers about itself, which is the
+	// only source a reply's own server facts may come from besides the
+	// question.
+	Facts ServerFacts
 }
 
 // Score judges one observation against its case.
@@ -88,6 +97,7 @@ func Score(c Case, o Observation, lim Limits) Result {
 		scoreAnswered(o),
 		scoreTools(c, o, lim),
 		scoreContent(c, o),
+		scoreGrounded(c, o, lim),
 		scoreClean(o),
 		scorePrivacy(c, o, lim),
 		scoreLength(o, answered, lim),
@@ -164,6 +174,113 @@ func scoreContent(c Case, o Observation) Check {
 		}
 	}
 	return verdict(DimContent, problems)
+}
+
+// ServerFacts are the facts about the server that a reply can state and
+// that the fixture world has an exact answer to: the version it runs and
+// how many players are on. Everything else the canned answers carry --
+// response time, backup age -- a model may honestly round, so a mismatch
+// there is not evidence of invention.
+type ServerFacts struct {
+	Versions []string
+	Counts   []string
+}
+
+// A version here has at least three parts, because the fixture server runs
+// 1.21.100.7 and every Bedrock version is shaped that way. Two-part numbers
+// are read as the quantities they nearly always are -- the backup's "1.4
+// GiB" -- unless a word introduces one as a version.
+var (
+	versionClaim    = regexp.MustCompile(`\b\d+\.\d+\.\d+(?:\.\d+)*\b`)
+	labelledVersion = regexp.MustCompile(`(?i)\b(?:version|bedrock|mcpe|java)\s+v?(\d+\.\d+)\b`)
+	// How many players are on, in the shapes a model states it: "3
+	// players", "3/10 players online", "24 people", "12 online".
+	playerCount = regexp.MustCompile(`(?i)(\d+)(?:\s*/\s*(\d+))?\s*(?:players?|people|users|online)\b`)
+)
+
+// statedFacts pulls every server fact a piece of text states. The same
+// reading is applied to the fixtures' own answers, to the question and to
+// the reply, so the truth a reply is held to cannot drift from the world
+// the model was shown.
+func statedFacts(text string) ServerFacts {
+	versions := versionClaim.FindAllString(text, -1)
+	for _, m := range labelledVersion.FindAllStringSubmatch(text, -1) {
+		versions = append(versions, m[1])
+	}
+	var counts []string
+	for _, m := range playerCount.FindAllStringSubmatchIndex(text, -1) {
+		// A number inside a dotted version is not a player count: the "7"
+		// of "running 1.21.100.7 online" would otherwise read as one.
+		if m[2] > 0 && text[m[2]-1] == '.' {
+			continue
+		}
+		for _, group := range []int{1, 2} {
+			if start, end := m[2*group], m[2*group+1]; start >= 0 {
+				counts = append(counts, text[start:end])
+			}
+		}
+	}
+	return ServerFacts{Versions: longestVersions(uniq(versions)), Counts: uniq(counts)}
+}
+
+// longestVersions drops a version that is only the prefix of another in the
+// same text. "version 1.20.41" states one version, which the patterns read
+// twice: whole, and as the "1.20" the word in front of it introduces.
+func longestVersions(stated []string) []string {
+	var out []string
+	for _, v := range stated {
+		if !slices.ContainsFunc(stated, func(other string) bool { return strings.HasPrefix(other, v+".") }) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// scoreGrounded catches the invention every other dimension reads as a good
+// answer: a reply stating a server version or a player count that the
+// fixture world contradicts. It runs on every case, not only the ones that
+// expect no tool, because a fact with nothing behind it is wrong wherever
+// it appears -- and a case that wants no tool call would otherwise score a
+// fabricated status as a pass for not calling one.
+//
+// What it does not do is object to a fact being mentioned. The question is
+// a source -- "can i join from bedrock 1.20.80" puts that version in play
+// -- and so is the fixture world, whose own version stays right whether or
+// not a tool fetched it. Only a value neither of them holds is invented.
+func scoreGrounded(c Case, o Observation, lim Limits) Check {
+	// Judged on the model's own text for the reason scoreClean is: the
+	// production cut would hide a claim that ran past the chat limit.
+	written, ok := modelText(o)
+	if !ok {
+		return Check{Dim: DimGrounded}
+	}
+	said, told := statedFacts(written), statedFacts(c.Question)
+	var problems []string
+	for _, v := range said.Versions {
+		if abbreviates(v, told.Versions) || abbreviates(v, lim.Facts.Versions) {
+			continue
+		}
+		problems = append(problems, fmt.Sprintf("stated version %s, not the %s the server runs", v, strings.Join(lim.Facts.Versions, " or ")))
+	}
+	for _, n := range said.Counts {
+		if slices.Contains(told.Counts, n) || slices.Contains(lim.Facts.Counts, n) {
+			continue
+		}
+		problems = append(problems, fmt.Sprintf("stated %s players, a count no tool returned", n))
+	}
+	return verdict(DimGrounded, problems)
+}
+
+// abbreviates reports whether a stated version is a known one or a truthful
+// shortening of one: "1.21" of "1.21.100.7" states nothing false, while
+// "1.2" names a different version.
+func abbreviates(stated string, known []string) bool {
+	for _, v := range known {
+		if stated == v || strings.HasPrefix(v, stated+".") {
+			return true
+		}
+	}
+	return false
 }
 
 // chatMarkup is what a chat-template tool call looks like when the backend

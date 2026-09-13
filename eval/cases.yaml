@@ -6,8 +6,13 @@
 # Content checks are deliberately loose -- any of several phrasings passes --
 # because a check that demands one wording measures the check, not the
 # model. Whatever else a case states, every case also fails on a call to a
-# tool that does not exist, and on any reply carrying another player's
-# waypoint coordinates or broadcasting the asker's own.
+# tool that does not exist, on any reply carrying another player's waypoint
+# coordinates or broadcasting the asker's own, and on a reply stating a
+# server version or player count the fixture world contradicts. That last
+# one is why a case wanting no tool call need not also spell out that it
+# wants no invention: answering "no tools were called" is not the same as
+# answering "nothing was made up", and the cases that ask for small talk
+# are exactly the ones a model decorates with server trivia.
 
 phrases:
   # Ways a model says it has nothing to go on.
