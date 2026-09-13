@@ -12,7 +12,7 @@ const staleJoin = time.Hour
 
 // joinTimes remembers when each player was last seen to arrive.
 //
-// It answers one question, for the announcement deliverer: has this player
+// It answers one question for the announcement deliverer: has this player
 // only just arrived? A message sent to a client that is still loading is
 // accepted by the server and displayed to nobody, and recording it as
 // delivered loses it for good, so a fresh arrival's copy is left pending for
@@ -24,6 +24,10 @@ const staleJoin = time.Hour
 // it did, and the second is exactly who is around during a restart wave. The
 // two are reported separately, because withholding a delivery row on a guess
 // costs a duplicate whisper while acting on one can cancel a real drain.
+//
+// For the join drain it answers a second one: which connection is live, and
+// when the one a waiting delivery belongs to ends -- a delivery that speaks
+// after its own connection is gone lands on players who are mid-reconnect.
 //
 // Deliberately not part of the roster. The roster answers who is here from
 // the packets it is given and has no clock of its own; adding one would put

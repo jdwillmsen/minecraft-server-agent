@@ -24,12 +24,13 @@ type AnnounceDeliverer interface {
 	DrainForJoin(ctx context.Context, xuid string, now time.Time) (delivered, remaining int, err error)
 }
 
-// Connections reports which of the agent's connections is live right now,
-// as a number that only ever grows. A drain waits before it delivers, and
-// the connection it was scheduled in can end inside that wait; the one that
+// Connections reports which of the agent's connections is live, and when
+// the one live now ends. A drain waits before it delivers, and the
+// connection it was scheduled in can end inside that wait; the one that
 // replaces it re-reports everyone still online, so the waiting drain is a
 // duplicate whose player may by then be loading a fresh client.
 type Connections interface {
+	// Generation counts connections, and only ever grows.
 	Generation() uint64
 	// Ended is closed when the connection live at the time of the call
 	// ends. Captured before a delivery starts, it is what stops a backlog
