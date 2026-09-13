@@ -673,9 +673,9 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		return fmt.Errorf("spawn: %w", err)
 	}
 
-	beginWatching(ctx, playerRoster, playerStore, joinClock, log)
-
 	selfXUID := conn.IdentityData().XUID
+	beginWatching(ctx, playerRoster, playerStore, joinClock, selfXUID, log)
+
 	log.Info("spawned", logging.Fields{"self_xuid": selfXUID})
 	// The agent is on the roster like any other player, so the announcement
 	// audience has to be told which entry is its own before anything is
@@ -723,9 +723,9 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 // RecordLeave. If both this close and the snapshot's ResumeSession fail, a
 // session from before the gap is still open when the player leaves, and
 // that is what stops it being credited.
-func beginWatching(ctx context.Context, playerRoster *roster.Roster, playerStore store.Store, joinClock *joinTimes, log *logging.Logger) {
+func beginWatching(ctx context.Context, playerRoster *roster.Roster, playerStore store.Store, joinClock *joinTimes, selfXUID string, log *logging.Logger) {
 	now := time.Now()
-	playerRoster.BeginSession(now)
+	playerRoster.BeginSession(now, selfXUID)
 	// Arrivals from the previous connection mean nothing here, and anyone
 	// the next snapshot reports may have reconnected moments before the
 	// agent did, so this connection's start stands in for their arrival.

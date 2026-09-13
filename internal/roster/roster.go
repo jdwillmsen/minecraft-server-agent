@@ -83,11 +83,16 @@ type Roster struct {
 	// both. Without it every departure was dropped as an unusable entry, and
 	// the agent never saw a single player leave.
 	xuidByUUID map[string]string
-	// snapshotSeen is false until this session's opening PlayerList has
-	// been absorbed. The server sends every already-connected player as an
-	// add record immediately after login, so without this the whole
-	// existing population would look like a burst of arrivals.
-	snapshotSeen bool
+	// agentXUID is this process's own entry in the player list, learned at
+	// login and given to BeginSession. It is what marks the opening burst:
+	// see Apply. Empty until a session supplies it.
+	agentXUID string
+	// snapshotStarted is false until this session has absorbed a packet
+	// carrying at least one usable add. snapshotEnded is false until the
+	// server has finished describing the world to this client. Between the
+	// two, every add is a player who was already online -- see Apply.
+	snapshotStarted bool
+	snapshotEnded   bool
 	// since is when the current session began watching; zero before the
 	// first one.
 	since time.Time
@@ -104,14 +109,22 @@ func New() *Roster {
 // wrong: it would claim players who have since left are still online (and
 // suppress a genuine rejoin as already-known). Call this at the start of
 // every session, before any packet from it is applied, with the moment it
-// began watching.
-func (r *Roster) BeginSession(at time.Time) {
+// began watching and the XUID this connection logged in as.
+//
+// The agent's own XUID is session state rather than a constructor argument
+// because it is not known until the connection has logged in, which is
+// after the process (and this Roster) already exist. Left empty, Apply
+// cannot tell the agent's own entry from a player's and falls back to
+// treating the first add of the session as the whole snapshot.
+func (r *Roster) BeginSession(at time.Time, agentXUID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.since = at
+	r.agentXUID = agentXUID
 	r.players = make(map[string]string)
 	r.xuidByUUID = make(map[string]string)
-	r.snapshotSeen = false
+	r.snapshotStarted = false
+	r.snapshotEnded = false
 }
 
 // Since reports when the current session began watching, as given to
@@ -135,16 +148,52 @@ func (r *Roster) Since() time.Time {
 // wire is always -- see xuidByUUID. A removal that resolves to nobody this
 // session recorded is dropped: there is no one to report as leaving.
 //
-// The first packet of a session carrying at least one usable add is the
-// server's roster snapshot: those players were already connected before
+// A session opens with the server describing the world to this client in a
+// burst of PlayerList packets, and it names this client in every one of
+// them: the agent's own entry arrives alone first, then again at the head of
+// the full roster. Everyone that burst adds was already connected before
 // this process was watching, so they are recorded and reported as present
-// rather than as joins. Neither an empty packet nor a removal consumes it, so
-// neither can cause the real snapshot behind it to be mistaken for arrivals.
+// rather than as joins.
+//
+// The burst ends at the first packet that adds somebody without naming the
+// agent, because nothing after it ever does -- an arrival or a departure
+// carries only the player it concerns. That boundary is the agent's own
+// entry rather than simply the first add, because the first add *is* the
+// agent, alone: ending the burst there left the entire already-online
+// population to arrive in the packet behind it, each one greeted as a fresh
+// arrival with their join counted, on every connect. Nor is it enough to
+// refuse the agent's entry the boundary while giving it to the next add,
+// since an empty server sends that entry twice and nothing else, which would
+// hand the boundary to the day's first genuine arrival and swallow their
+// greeting instead.
+//
+// Neither an empty packet nor a removal carries an add, so neither can end
+// the burst or start it, and neither can cause the roster behind it to be
+// mistaken for arrivals.
 func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	snapshot := !r.snapshotSeen
+	var namesAgent, adds bool
+	for _, e := range entries {
+		if e.Remove || e.XUID == "" {
+			continue
+		}
+		adds = true
+		// An unset agentXUID matches nobody, since a usable add always
+		// carries one: a Roster never told who it is falls back to treating
+		// the first add of the session as the whole burst.
+		if e.XUID == r.agentXUID {
+			namesAgent = true
+		}
+	}
+	if r.snapshotStarted && adds && !namesAgent {
+		r.snapshotEnded = true
+	}
+	snapshot := !r.snapshotEnded
+	if adds {
+		r.snapshotStarted = true
+	}
 
 	for _, e := range entries {
 		if e.Remove {
@@ -171,7 +220,6 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entr
 		if e.XUID == "" {
 			continue
 		}
-		r.snapshotSeen = true
 		if e.UUID != "" {
 			r.xuidByUUID[e.UUID] = e.XUID
 		}

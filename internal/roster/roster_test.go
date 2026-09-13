@@ -100,7 +100,7 @@ func TestApply_RemovalDoesNotConsumeTheSnapshot(t *testing.T) {
 func TestBeginSession_ForgetsUUIDs(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve", UUID: "u-111"})
-	r.BeginSession(time.Now())
+	r.BeginSession(time.Now(), agentEntry.XUID)
 	absorbSnapshot(t, r, agentEntry)
 
 	if _, leaves, _ := r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}}); len(leaves) != 0 {
@@ -170,7 +170,7 @@ func TestBeginSession_ForgetsThePreviousSessionsPlayers(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
 
-	r.BeginSession(time.Now())
+	r.BeginSession(time.Now(), agentEntry.XUID)
 
 	if _, ok := r.NameFor("111"); ok {
 		t.Error("NameFor after BeginSession = ok, want not-ok — a player who may have left while disconnected must not still resolve")
@@ -180,7 +180,7 @@ func TestBeginSession_ForgetsThePreviousSessionsPlayers(t *testing.T) {
 func TestBeginSession_NextSnapshotIsNotReportedAsJoins(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
-	r.BeginSession(time.Now())
+	r.BeginSession(time.Now(), agentEntry.XUID)
 
 	joins, _, _ := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
 	if len(joins) != 0 {
@@ -209,7 +209,7 @@ func TestApply_SnapshotReportsPresentPlayersOnce(t *testing.T) {
 		t.Errorf("after the snapshot: joins = %+v, present = %+v; want one join and nobody merely present", joins, present)
 	}
 
-	r.BeginSession(time.Now())
+	r.BeginSession(time.Now(), agentEntry.XUID)
 	if _, _, present := r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve"}}); len(present) != 1 {
 		t.Errorf("reconnect snapshot present = %+v, want Steve", present)
 	}
@@ -304,5 +304,72 @@ func TestXUIDFor_StaleAfterRemove(t *testing.T) {
 
 	if _, ok := r.XUIDFor("Steve"); ok {
 		t.Error("XUIDFor after removal = ok, want not-ok")
+	}
+}
+
+// The shape a Bedrock server actually sends a joining client, captured off
+// the wire: the client's own entry alone, then the whole roster with that
+// same entry at its head. Reading the first of those as the entire snapshot
+// left everyone already online to arrive in the second, where each was
+// counted as a fresh arrival on every single connect.
+func TestApply_AgentsOwnEntryDoesNotEndTheOpeningSnapshot(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+
+	if joins, _, _ := r.Apply([]PlayerListEntry{agentEntry}); len(joins) != 0 {
+		t.Fatalf("got %d joins from the agent's own entry arriving alone, want 0", len(joins))
+	}
+
+	joins, _, present := r.Apply([]PlayerListEntry{
+		agentEntry,
+		{XUID: "111", Username: "Steve"},
+		{XUID: "222", Username: "Alex"},
+	})
+	if len(joins) != 0 {
+		t.Fatalf("got %d joins from the roster behind the agent's own entry, want 0 — those players were already online: %+v", len(joins), joins)
+	}
+	if len(present) != 2 || present[0].XUID != "111" || present[1].XUID != "222" {
+		t.Fatalf("present = %+v, want Steve and Alex", present)
+	}
+
+	joins, _, present = r.Apply([]PlayerListEntry{{XUID: "333", Username: "Notch"}})
+	if len(joins) != 1 || joins[0].XUID != "333" {
+		t.Fatalf("joins = %+v, want the arrival after the burst reported as one", joins)
+	}
+	if len(present) != 0 {
+		t.Errorf("present = %+v, want none: the opening burst is over", present)
+	}
+}
+
+// An empty server sends the agent its own entry twice and nothing else, so
+// the agent's entry is the only thing that can mark where the burst ends.
+// The first player of the day arrives long afterwards and is a genuine join:
+// suppressing that greeting would trade this bug for its mirror image.
+func TestApply_FirstArrivalOnAnEmptyServerIsAJoin(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+	r.Apply([]PlayerListEntry{agentEntry})
+	r.Apply([]PlayerListEntry{agentEntry})
+
+	joins, _, present := r.Apply([]PlayerListEntry{{XUID: "111", Username: "Steve"}})
+	if len(joins) != 1 || joins[0].XUID != "111" {
+		t.Fatalf("joins = %+v, want Steve greeted as the arrival he is", joins)
+	}
+	if len(present) != 0 {
+		t.Errorf("present = %+v, want none: Steve was not already online", present)
+	}
+}
+
+// A departure carries no adds, so it can neither end the opening burst nor
+// be mistaken for the traffic that does.
+func TestApply_DepartureDoesNotEndTheOpeningSnapshot(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+	r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve", UUID: "u-111"}})
+	r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}})
+
+	_, _, present := r.Apply([]PlayerListEntry{agentEntry, {XUID: "222", Username: "Alex"}})
+	if len(present) != 1 || present[0].XUID != "222" {
+		t.Errorf("present = %+v, want Alex: a removal must not end the burst behind it", present)
 	}
 }

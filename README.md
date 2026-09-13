@@ -90,7 +90,12 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 - `internal/roster` - live XUID<->gamertag mapping from `PlayerList`
   packets; the authoritative join/leave signal (not chat, not the raw
   `add_player` proximity packet) and the name source `Voice.Tell` resolves
-  a reply target from
+  a reply target from. A session opens with the server describing the world
+  to the agent across several `PlayerList` packets, each of which names the
+  agent's own entry - alone in the first, then at the head of the full
+  roster. Everyone that burst reports was already online, so the roster ends
+  it at the first packet that adds somebody without naming the agent, which
+  is the earliest point a genuine arrival can appear
 - `internal/bus` - typed pub/sub event bus; every answerable chat message
   (`chat.MessageEvent`), every genuinely new arrival (`roster.JoinEvent`)
   and every player a session's opening snapshot finds already online
@@ -602,8 +607,10 @@ by closing the sessions still open at zero length, never at the moment the
 player next leaves or arrives, so an absence is never credited as playtime.
 Players the server reports as already online when the agent connects get a
 fresh session from that moment, without a greeting and without counting a
-join. A player who stays on through a reconnect loses the part of their
-visit before it, and nothing more. Operators are told only if this is the
+join - which holds however the server splits its opening burst across
+packets, including when the agent's own entry arrives in one of its own
+ahead of the roster. A player who stays on through a reconnect loses the
+part of their visit before it, and nothing more. Operators are told only if this is the
 first time the agent has seen that player at all. A player first recorded
 because they were already online when the agent logged in is still greeted
 as a first-timer by the welcome on their next observed join, but operators,
