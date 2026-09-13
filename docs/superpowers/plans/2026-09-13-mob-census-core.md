@@ -605,7 +605,7 @@ git commit -m "feat(census): bucket entities into 144-block population regions"
 
 **Interfaces:**
 - Consumes: `Dimension`, `Category` from Tasks 1 and 2.
-- Produces: `type Caps struct { Surface, Cave int }`; `func CapsFor(d Dimension, c Category) (Caps, bool)`; `type Status int` with `Headroom`, `AtRisk`, `Capped`, `StatusUnknown`; `func (s Status) String() string`; `func StatusOf(d Dimension, c Category, count int) Status`; `const GlobalCap = 200`.
+- Produces: `type Caps struct { Surface, Cave int }`; `func (c Caps) Range() (lower, upper int)`; `func CapsFor(d Dimension, c Category) (Caps, bool)`; `type Status int` with `Headroom`, `AtRisk`, `Capped`, `StatusUnknown`; `func (s Status) String() string`; `func StatusOf(d Dimension, c Category, count int) Status`; `const GlobalCap = 200`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -689,6 +689,25 @@ func TestStatusOfIsUnknownForUncountedCategories(t *testing.T) {
 		t.Errorf("StatusOf(ignored) = %v, want StatusUnknown", got)
 	}
 }
+
+func TestStatusOfGradesTheEndsInvertedCaps(t *testing.T) {
+	// The End's monster caps are 10 surface / 8 cave - inverted relative to
+	// every other dimension in the table - so this is the one boundary
+	// where getting Range() backwards would actually change the answer.
+	for _, tc := range []struct {
+		count int
+		want  Status
+	}{
+		{8, Headroom},
+		{9, AtRisk},
+		{10, AtRisk},
+		{11, Capped},
+	} {
+		if got := StatusOf(End, Monster, tc.count); got != tc.want {
+			t.Errorf("StatusOf(end,monster,%d) = %v, want %v", tc.count, got, tc.want)
+		}
+	}
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -711,6 +730,16 @@ const GlobalCap = 200
 // separate ceilings for the same category.
 type Caps struct {
 	Surface, Cave int
+}
+
+// Range returns the caps as an ordered pair. The End inverts the usual
+// relationship — its monster caps are 10 surface and 8 cave — so callers
+// must never assume Surface is the lower bound.
+func (c Caps) Range() (lower, upper int) {
+	if c.Surface > c.Cave {
+		return c.Cave, c.Surface
+	}
+	return c.Surface, c.Cave
 }
 
 var capTable = map[Dimension]map[Category]Caps{
@@ -786,10 +815,7 @@ func StatusOf(d Dimension, c Category, count int) Status {
 	if !ok {
 		return StatusUnknown
 	}
-	lower, upper := caps.Surface, caps.Cave
-	if lower > upper {
-		lower, upper = upper, lower
-	}
+	lower, upper := caps.Range()
 	switch {
 	case count > upper:
 		return Capped
@@ -804,7 +830,8 @@ func StatusOf(d Dimension, c Category, count int) Status {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/census/ -run 'TestCaps|TestStatus' -v`
-Expected: PASS, five tests.
+Expected: PASS, six tests (the original five, plus
+TestStatusOfGradesTheEndsInvertedCaps).
 
 - [ ] **Step 5: Commit**
 
@@ -1078,7 +1105,12 @@ Create `internal/census/scan_test.go`:
 ```go
 package census
 
-import "testing"
+import (
+	"encoding/binary"
+	"testing"
+
+	"github.com/df-mc/goleveldb/leveldb"
+)
 
 func TestScanReadsEntitiesWithTheirDimensions(t *testing.T) {
 	nether := int32(1)
@@ -1144,6 +1176,42 @@ func TestScanCountsUnplacedEntities(t *testing.T) {
 func TestScanRejectsAMissingWorld(t *testing.T) {
 	if _, _, err := Scan(t.TempDir() + "/does-not-exist"); err == nil {
 		t.Error("Scan of a missing world returned nil error")
+	}
+}
+
+func TestScanCapturesFirstUnparsableError(t *testing.T) {
+	path := writeFixtureWorld(t, []fixtureActor{
+		{ID: 1, NBT: map[string]any{
+			"identifier": "minecraft:zombie",
+			"Pos":        pos(10, 64, 20),
+			"UniqueID":   int64(1),
+		}},
+	})
+
+	// Bytes that are not valid NBT at all stand in for a torn write during
+	// a backup snapshot - the kind of corruption FirstUnparsableErr exists
+	// to let an operator diagnose.
+	db, err := leveldb.OpenFile(path, nil)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	corruptID := make([]byte, 8)
+	binary.LittleEndian.PutUint64(corruptID, 999)
+	if err := db.Put(append([]byte("actorprefix"), corruptID...), []byte{0xff, 0xff, 0xff}, nil); err != nil {
+		db.Close()
+		t.Fatalf("put corrupt record: %v", err)
+	}
+	db.Close()
+
+	_, stats, err := Scan(path)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if stats.Unparsable != 1 {
+		t.Errorf("Unparsable = %d, want 1", stats.Unparsable)
+	}
+	if stats.FirstUnparsableErr == "" {
+		t.Error("FirstUnparsableErr is empty, want error message")
 	}
 }
 ```
