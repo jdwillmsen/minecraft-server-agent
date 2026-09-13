@@ -93,7 +93,7 @@ func TestPlayerListFlow(t *testing.T) {
 			addEntry(selfXUID, "Agent"),
 			addEntry(playerXUID, "Steve"),
 			addEntry("2535411111111111", "Alex"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 
 		if joins := drainJoins(t, events); len(joins) != 0 {
 			t.Errorf("got %d joins from the opening snapshot, want 0: %+v", len(joins), joins)
@@ -110,10 +110,10 @@ func TestPlayerListFlow(t *testing.T) {
 
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(playerXUID, "Steve"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 
 		joins := drainJoins(t, events)
 		if len(joins) != 1 {
@@ -131,11 +131,11 @@ func TestPlayerListFlow(t *testing.T) {
 
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(playerXUID, "Steve"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry(siblingBot, "AfkBot"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 
 		if joins := drainJoins(t, events); len(joins) != 0 {
 			t.Errorf("got %d joins, want 0 — the agent and its sibling bots must never be greeted: %+v", len(joins), joins)
@@ -151,13 +151,13 @@ func TestPlayerListFlow(t *testing.T) {
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry(playerXUID, "Steve"),
-		), selfXUID, siblings, log, eventBus, playerRoster, playerStore)
+		), selfXUID, siblings, log, eventBus, playerRoster, playerStore, newJoinTimes())
 		handlePlayerList(context.Background(), wire(t,
 			removeEntry(playerXUID),
-		), selfXUID, siblings, log, eventBus, playerRoster, playerStore)
+		), selfXUID, siblings, log, eventBus, playerRoster, playerStore, newJoinTimes())
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(playerXUID, "Steve"),
-		), selfXUID, siblings, log, eventBus, playerRoster, playerStore)
+		), selfXUID, siblings, log, eventBus, playerRoster, playerStore, newJoinTimes())
 
 		if len(playerStore.leaves) != 1 || playerStore.leaves[0] != playerXUID {
 			t.Errorf("RecordLeave calls = %v, want exactly [%s] — the departure must close Steve's session", playerStore.leaves, playerXUID)
@@ -181,13 +181,13 @@ func TestPlayerListFlow(t *testing.T) {
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry(playerXUID, "Steve"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 
 		playerRoster.BeginSession(time.Now())
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry("2535411111111111", "Alex"),
-		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{})
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 
 		if joins := drainJoins(t, events); len(joins) != 0 {
 			t.Errorf("got %d joins after reconnecting, want 0: %+v", len(joins), joins)
@@ -248,26 +248,26 @@ func TestReconnectRestartsTheSessionsOfPlayersStillOnline(t *testing.T) {
 	playerRoster := roster.New()
 	profiles := &sessionCalls{}
 
-	beginWatching(context.Background(), playerRoster, profiles, log)
+	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(playerXUID, "Steve"),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 	if joins := drainJoins(t, events); len(joins) != 1 {
 		t.Fatalf("got %d joins before the disconnect, want Steve's", len(joins))
 	}
 
-	beginWatching(context.Background(), playerRoster, profiles, log)
+	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 		addEntry(siblingBot, "AfkBot"),
 		addEntry(playerXUID, "Steve"),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 	handlePlayerList(context.Background(), wire(t,
 		removeEntry(playerXUID),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 
 	want := []string{
 		"close-orphans",
@@ -294,27 +294,216 @@ func TestALeaveAfterFailedReconnectWritesCarriesTheConnectionStart(t *testing.T)
 	playerRoster := roster.New()
 	profiles := &sessionCalls{}
 
-	beginWatching(context.Background(), playerRoster, profiles, log)
+	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 		addEntry(playerXUID, "Steve"),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 
 	profiles.failOpening = true
-	beginWatching(context.Background(), playerRoster, profiles, log)
+	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 		addEntry(playerXUID, "Steve"),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 	profiles.failOpening = false
 	handlePlayerList(context.Background(), wire(t,
 		removeEntry(playerXUID),
-	), selfXUID, siblings, log, eventBus, playerRoster, profiles)
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 
 	if len(profiles.closedAt) != 2 || len(profiles.leaveSince) != 1 {
 		t.Fatalf("session writes = %v, want two connection starts and one leave", profiles.calls)
 	}
 	if got, want := profiles.leaveSince[0], profiles.closedAt[1]; !got.Equal(want) {
 		t.Errorf("leave since = %v, want the reconnect's start %v", got, want)
+	}
+}
+
+// One PlayerList may carry a removal and a re-add for the same player.
+// Arrivals are applied first and the departure is then skipped, because the
+// roster shows the player back at the end of the packet -- applying it would
+// erase the arrival the same packet just reported, and the deliverer would
+// read a client that is mid-load as settled, which is the loss the join
+// clock exists for.
+func TestSamePacketRejoinKeepsTheArrival(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	events, _ := eventBus.Subscribe(roster.JoinKind, 8)
+	playerRoster := roster.New()
+	joinClock := newJoinTimes()
+
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+	if _, ok := joinClock.SinceJoin(playerXUID); ok {
+		t.Fatal("a player in the opening snapshot was recorded as an arrival")
+	}
+
+	handlePlayerList(context.Background(), wire(t,
+		removeEntry(playerXUID),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	if _, ok := joinClock.SinceJoin(playerXUID); !ok {
+		t.Error("the rejoin's arrival was erased by the departure in the same packet")
+	}
+	if got := drainJoins(t, events); len(got) != 1 {
+		t.Errorf("got %d joins from the rejoin packet, want 1", len(got))
+	}
+}
+
+func drainPresent(t *testing.T, events <-chan bus.Event) []roster.PresentEvent {
+	t.Helper()
+	var present []roster.PresentEvent
+	for {
+		select {
+		case ev := <-events:
+			p, ok := ev.(roster.PresentEvent)
+			if !ok {
+				t.Fatalf("got event %T on the present channel, want roster.PresentEvent", ev)
+			}
+			present = append(present, p)
+		default:
+			return present
+		}
+	}
+}
+
+// A player the opening snapshot reports is announced as present, never as a
+// join: they must not be greeted for reappearing, but whoever owes them a
+// delayed delivery has to hear about them on this connection, since a
+// reconnect may have left one stranded. The event carries the connection
+// that reported it, so a delivery scheduled by the previous one can tell it
+// has been replaced.
+func TestOpeningSnapshotReportsPlayersPresentWithTheirConnection(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	presentEvents, _ := eventBus.Subscribe(roster.PresentKind, 8)
+	joinEvents, _ := eventBus.Subscribe(roster.JoinKind, 8)
+	playerRoster := roster.New()
+	joinClock := newJoinTimes()
+
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(siblingBot, "AfkBot"),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	present := drainPresent(t, presentEvents)
+	if len(present) != 1 || present[0].XUID != playerXUID {
+		t.Fatalf("present events = %+v, want only Steve: the agent and its siblings are not players", present)
+	}
+	first := present[0].Generation
+	if got := drainJoins(t, joinEvents); len(got) != 0 {
+		t.Errorf("got %d joins from the opening snapshot, want 0: nobody in it arrived", len(got))
+	}
+	if _, ok := joinClock.SinceJoin(playerXUID); ok {
+		t.Error("the snapshot recorded an arrival: the clock must keep answering that honestly")
+	}
+
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	present = drainPresent(t, presentEvents)
+	if len(present) != 1 {
+		t.Fatalf("present events after the reconnect = %+v, want Steve reported again", present)
+	}
+	if present[0].Generation == first {
+		t.Errorf("generation = %d on both connections: a delivery scheduled by the first cannot tell it was replaced", first)
+	}
+}
+
+// A genuine arrival carries the connection it happened on, which is what
+// lets a drain scheduled by it abandon itself if that connection ends first.
+func TestAJoinCarriesItsConnection(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	events, _ := eventBus.Subscribe(roster.JoinKind, 8)
+	playerRoster := roster.New()
+	joinClock := newJoinTimes()
+
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	joins := drainJoins(t, events)
+	if len(joins) != 1 {
+		t.Fatalf("got %d joins, want Steve's", len(joins))
+	}
+	if joins[0].Generation != joinClock.Generation() {
+		t.Errorf("join generation = %d, want the live connection %d", joins[0].Generation, joinClock.Generation())
+	}
+}
+
+// The mirror of the rejoin packet: one PlayerList that adds a player and
+// then removes them again. They are gone by the end of it, so nothing greets
+// them and nothing schedules a delivery to a client that is not there --
+// Apply's two slices cannot say which record came first, but the roster it
+// leaves behind can.
+func TestSamePacketJoinAndLeaveGreetsNobody(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	events, _ := eventBus.Subscribe(roster.JoinKind, 8)
+	playerRoster := roster.New()
+	joinClock := newJoinTimes()
+
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(playerXUID, "Steve"),
+		removeEntry(playerXUID),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	if got := drainJoins(t, events); len(got) != 0 {
+		t.Errorf("got %d joins for a player who left in the same packet, want 0: %+v", len(got), got)
+	}
+	if _, ok := joinClock.SinceJoin(playerXUID); ok {
+		t.Error("recorded an arrival for a player who is gone")
+	}
+}
+
+// The opening snapshot is read the same way every other packet is: a player
+// it adds and then removes is not here, so no session is resumed for them
+// and nothing is scheduled to whisper at a client that is gone.
+func TestSnapshotAddAndRemoveLeavesNobodyPresent(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	presentEvents, _ := eventBus.Subscribe(roster.PresentKind, 8)
+	playerRoster := roster.New()
+	profiles := &sessionCalls{}
+	joinClock := newJoinTimes()
+
+	beginWatching(context.Background(), playerRoster, profiles, joinClock, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(playerXUID, "Steve"),
+		removeEntry(playerXUID),
+	), selfXUID, siblings, log, eventBus, playerRoster, profiles, joinClock)
+
+	if present := drainPresent(t, presentEvents); len(present) != 0 {
+		t.Errorf("present events = %+v, want none: the snapshot removed that player again", present)
+	}
+	for _, call := range profiles.calls {
+		if call == "resume:"+playerXUID {
+			t.Errorf("session writes = %v, want no resume for a player the snapshot removed", profiles.calls)
+		}
 	}
 }

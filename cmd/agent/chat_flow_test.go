@@ -312,7 +312,7 @@ func TestChatCommandFlow(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			registry, pctx, voice, eventBus, _, playerRoster, permResolver := newHarness(t)
-			handlePacket(context.Background(), tc.pk, selfXUID, siblings, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
+			handlePacket(context.Background(), tc.pk, selfXUID, siblings, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{}, newJoinTimes())
 
 			got := voice.output()
 			if len(got) != len(tc.want) {
@@ -338,9 +338,9 @@ func TestHandleCommand_RateLimitBlocksASpammingActorButNotOthers(t *testing.T) {
 
 	const otherPlayer = "2535499999999998"
 	for i := 0; i < 5; i++ {
-		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
+		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{}, newJoinTimes())
 	}
-	handlePacket(context.Background(), chatPacket(otherPlayer, "Alex", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
+	handlePacket(context.Background(), chatPacket(otherPlayer, "Alex", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{}, newJoinTimes())
 
 	got := voice.output()
 	want := []string{
@@ -366,9 +366,9 @@ func TestChatMessagePublishedOnBus(t *testing.T) {
 	log := logging.New("info")
 	limiter := unlimitedRateLimit()
 
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping now"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
-	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server hello"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
-	handlePacket(context.Background(), chatPacket(selfXUID, "Agent", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "!ping now"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{}, newJoinTimes())
+	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server hello"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{}, newJoinTimes())
+	handlePacket(context.Background(), chatPacket(selfXUID, "Agent", "!ping"), selfXUID, nil, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{}, newJoinTimes())
 
 	first, ok := (<-events).(chat.MessageEvent)
 	if !ok {
@@ -547,13 +547,13 @@ func TestMentionIsAnsweredWithoutBlockingTheReadLoop(t *testing.T) {
 			if i%2 == 1 {
 				pk = &packet.PlayerList{Entries: []protocol.PlayerListEntry{removeEntry(bystanderXUID)}}
 			}
-			handlePacket(context.Background(), pk, selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
+			handlePacket(context.Background(), pk, selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{}, newJoinTimes())
 			churns.Add(1)
 		}
 	}()
 
 	handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server where is my base"),
-		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
+		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{}, newJoinTimes())
 
 	<-backend.arrived
 	if got := voice.output(); len(got) != 0 {
@@ -605,13 +605,13 @@ func TestMentionIsDroppedWhenTheAgentIsAlreadyBusy(t *testing.T) {
 		ans.inFlight = make(chan struct{}, 1)
 
 		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server first"),
-			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{}, newJoinTimes())
 		<-backend.arrived
 
 		// A different player, so the per-player limiter has nothing to say
 		// about this one: only the global cap can refuse it.
 		handlePacket(context.Background(), chatPacket(otherPlayerXUID, "Alex", "@server second"),
-			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{}, newJoinTimes())
 
 		backend.serve()
 		waitForOutput(t, voice)
@@ -644,11 +644,11 @@ func TestRateLimitedMentionIsRefusedBeforeAGoroutineExists(t *testing.T) {
 		ans.inFlight = make(chan struct{}, 1)
 
 		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server first"),
-			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{}, newJoinTimes())
 		<-backend.arrived
 
 		handlePacket(context.Background(), chatPacket(playerXUID, "Steve", "@server second"),
-			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
+			selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{}, newJoinTimes())
 
 		backend.serve()
 		waitForOutput(t, voice)
@@ -709,7 +709,7 @@ func answerOnce(t *testing.T, ctx context.Context, voice *broadcastVoice, adjust
 	adjust(&ans)
 
 	handlePacket(ctx, chatPacket(playerXUID, "Steve", "@server hello"),
-		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
+		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{}, newJoinTimes())
 	waitForOutput(t, &voice.recordingVoice)
 }
 
@@ -792,7 +792,7 @@ func answerMentionPacket(t *testing.T, pk *packet.Text, configure func(*plugin.C
 	ans.llm = adapters.NewLLMClient(backend.srv.URL, "test-model", "", 192, 5*time.Second, log)
 
 	handlePacket(context.Background(), pk,
-		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{})
+		selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, ans, store.Nop{}, audit.Nop{}, newJoinTimes())
 	return waitForOutput(t, voice)
 }
 

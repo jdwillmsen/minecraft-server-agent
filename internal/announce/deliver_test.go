@@ -556,3 +556,264 @@ func TestDrainAllUnderTheCapLeavesNothingOwed(t *testing.T) {
 		t.Errorf("DrainAll = (%d, %d), want (2, 0)", delivered, remaining)
 	}
 }
+
+// fakeJoins reports a fixed "joined this long ago" per xuid, and for anyone
+// it wasn't told about -- a player already online when the agent connected --
+// only how long ago that connection began. connected is zero unless a test
+// sets it, standing for a clock that has seen no connection at all.
+type fakeJoins struct {
+	since     map[string]time.Duration
+	connected time.Duration
+}
+
+var _ JoinClock = fakeJoins{}
+
+func (f fakeJoins) SinceJoin(xuid string) (time.Duration, bool) {
+	d, ok := f.since[xuid]
+	return d, ok
+}
+
+func (f fakeJoins) SinceConnect() (time.Duration, bool) {
+	if f.connected == 0 {
+		return 0, false
+	}
+	return f.connected, true
+}
+
+// A whisper to someone who joined a second ago is accepted by the server and
+// rendered by nobody, and recording it would lose the message for good.
+func TestSendNowDefersAWhisperToAFreshArrival(t *testing.T) {
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	joins := fakeJoins{since: map[string]time.Duration{"fresh": time.Second}}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"fresh", "settled"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	delivered, err := d.SendNow(context.Background(), Announcement{Body: "hello", TargetKind: TargetPlayer, TargetValue: "fresh"}, 9)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if delivered != 0 {
+		t.Errorf("delivered = %d, want 0: the joining client cannot render it yet", delivered)
+	}
+	if len(voice.tells) != 0 {
+		t.Errorf("told %v, want nothing sent to a loading client", voice.tells)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("recorded %v, want nothing: the row must stay pending for their join drain", store.delivered)
+	}
+}
+
+// The same announcement reaches a player who has been on for a while.
+func TestSendNowStillWhispersASettledPlayer(t *testing.T) {
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	joins := fakeJoins{since: map[string]time.Duration{"settled": time.Hour}}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"settled"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	delivered, err := d.SendNow(context.Background(), Announcement{Body: "hello", TargetKind: TargetPlayer, TargetValue: "settled"}, 9)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if delivered != 1 || len(voice.tells) != 1 {
+		t.Errorf("delivered = %d, tells = %v, want one of each", delivered, voice.tells)
+	}
+}
+
+// A broadcast is heard by everyone whose client is up, so it still goes out --
+// but the fresh arrival is not recorded as having heard it.
+func TestSendNowBroadcastsButDoesNotRecordAFreshArrival(t *testing.T) {
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	joins := fakeJoins{since: map[string]time.Duration{"fresh": time.Second}}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"fresh", "settled"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	delivered, err := d.SendNow(context.Background(), Announcement{Body: "everyone hears this", TargetKind: TargetEveryone}, 9)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 {
+		t.Fatalf("says = %v, want the broadcast to go out once", voice.says)
+	}
+	if delivered != 1 {
+		t.Errorf("delivered = %d, want 1: the player who just arrived rendered nothing", delivered)
+	}
+	if len(store.delivered) != 1 {
+		t.Errorf("recorded %v, want only the settled player", store.delivered)
+	}
+	for _, got := range store.delivered {
+		if got.xuid == "fresh" {
+			t.Errorf("recorded a delivery for the joining player: %+v", store.delivered)
+		}
+	}
+}
+
+// Without the option nothing defers: every existing caller keeps the old
+// behaviour, including a Deliverer built with no join clock at all.
+func TestSendNowWithoutAJoinClockDefersNothing(t *testing.T) {
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"fresh"}}, fakePermissions{}, testLogger())
+
+	delivered, err := d.SendNow(context.Background(), Announcement{Body: "hello", TargetKind: TargetPlayer, TargetValue: "fresh"}, 9)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if delivered != 1 {
+		t.Errorf("delivered = %d, want 1", delivered)
+	}
+}
+
+// The drain of an arrival the player has already replaced must deliver
+// nothing: they crashed on join and came back inside the first drain's wait,
+// so when it wakes it is looking at a client that is loading all over again.
+// Whispering then would record the backlog against a player who never saw
+// it, and the second drain would find nothing left to send.
+func TestDrainForJoinDefersToTheDrainOfANewerArrival(t *testing.T) {
+	pending := []Announcement{
+		{ID: 1, Body: "one", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
+		{ID: 2, Body: "two", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
+	}
+	store := &fakeStore{enabled: true, pending: pending}
+	voice := &fakeVoice{}
+	// The player joined at T=0 and rejoined at T=5; this first drain fires
+	// at T=8, three seconds into the new arrival.
+	joins := fakeJoins{since: map[string]time.Duration{"rejoiner": 3 * time.Second}}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"rejoiner"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	delivered, remaining, err := d.DrainForJoin(context.Background(), "rejoiner", time.Now())
+	if err != nil {
+		t.Fatalf("DrainForJoin: %v", err)
+	}
+	if delivered != 0 {
+		t.Errorf("delivered = %d, want 0: the client cannot render it yet", delivered)
+	}
+	if remaining != 0 {
+		t.Errorf("remaining = %d, want 0: a summary line is as unrenderable as the backlog", remaining)
+	}
+	if len(voice.tells) != 0 {
+		t.Errorf("told %v, want nothing sent to a loading client", voice.tells)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("recorded %v, want nothing: the newer arrival's drain owes it", store.delivered)
+	}
+
+	// The second drain, a full wait after the rejoin, is the one that pays.
+	joins.since["rejoiner"] = 8 * time.Second
+	delivered, remaining, err = d.DrainForJoin(context.Background(), "rejoiner", time.Now())
+	if err != nil {
+		t.Fatalf("DrainForJoin: %v", err)
+	}
+	if delivered != 2 || remaining != 0 {
+		t.Errorf("delivered = %d, remaining = %d, want 2 and 0", delivered, remaining)
+	}
+	if len(store.delivered) != 2 {
+		t.Errorf("store recorded %v, want both announcements", store.delivered)
+	}
+}
+
+// An agent reconnect must not cancel a drain a real join scheduled. The
+// player joined eight seconds ago and their client is long since loaded, but
+// the agent dropped and came back four seconds in, taking its record of
+// their arrival with it -- all that is left is a connection younger than the
+// grace. A guess about who might be loading may withhold a delivery row; it
+// may not cancel the drain a real join scheduled, which nothing replaces.
+func TestDrainForJoinDeliversAcrossAnAgentReconnect(t *testing.T) {
+	pending := []Announcement{
+		{ID: 1, Body: "one", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
+	}
+	store := &fakeStore{enabled: true, pending: pending}
+	voice := &fakeVoice{}
+	joins := fakeJoins{connected: 4 * time.Second}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"steve"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	delivered, remaining, err := d.DrainForJoin(context.Background(), "steve", time.Now())
+	if err != nil {
+		t.Fatalf("DrainForJoin: %v", err)
+	}
+	if delivered != 1 || remaining != 0 {
+		t.Errorf("delivered = %d, remaining = %d, want 1 and 0: the reconnect is not their arrival", delivered, remaining)
+	}
+	if len(store.delivered) != 1 {
+		t.Errorf("store recorded %v, want the one announcement", store.delivered)
+	}
+}
+
+// A player with no arrival of their own is measured from the connection --
+// they may have reconnected moments before the agent did -- so their copy is
+// withheld from the books even though the drain would have served them.
+func TestSendNowDefersInsideTheConnectWindow(t *testing.T) {
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	joins := fakeJoins{connected: 3 * time.Second}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"unknown"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	if _, err := d.SendNow(context.Background(), Announcement{Body: "hello", TargetKind: TargetPlayer, TargetValue: "unknown"}, 9); err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.tells) != 0 || len(store.delivered) != 0 {
+		t.Errorf("told %v and recorded %v, want neither inside the connect window", voice.tells, store.delivered)
+	}
+}
+
+// A broadcast is one Say heard by every client that is up, so a recipient
+// whose bookkeeping was deferred still heard it. Reporting zero here is what
+// makes !announce !now tell an operator nobody was online moments after they
+// watched their own line go out.
+func TestSendNowCountsDeferredBroadcastRecipientsAsReached(t *testing.T) {
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	joins := fakeJoins{connected: 3 * time.Second}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"operator", "builder"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	sent, err := d.SendNow(context.Background(), Announcement{Body: "server restarting", TargetKind: TargetOnlineOnly}, 9)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 {
+		t.Fatalf("says = %v, want the broadcast to go out once", voice.says)
+	}
+	if sent != 2 {
+		t.Errorf("sent = %d, want 2: both heard it, only their delivery rows were withheld", sent)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("recorded %v, want nothing recorded inside the connect window", store.delivered)
+	}
+}
+
+// Reached counts hearing, not bookkeeping, and the two deferrals are not the
+// same fact. A player whose arrival the agent saw inside the grace demonstrably
+// rendered nothing and is owed the text again by their own drain; a player
+// withheld only because the agent itself just connected almost certainly heard
+// the one Say, and saying otherwise would tell an operator nobody was online
+// moments after they watched their own line go out.
+func TestSendNowCountsOnlyGuessedDeferralsAsReached(t *testing.T) {
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	joins := fakeJoins{
+		since:     map[string]time.Duration{"arrival": 2 * time.Second},
+		connected: 3 * time.Second,
+	}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"arrival", "snapshot"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	sent, err := d.SendNow(context.Background(), Announcement{Body: "server restarting", TargetKind: TargetEveryone}, 9)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 {
+		t.Fatalf("says = %v, want the broadcast to go out once", voice.says)
+	}
+	if sent != 1 {
+		t.Errorf("sent = %d, want 1: the snapshot player heard it, the fresh arrival did not", sent)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("recorded %v, want nothing: neither copy may be marked", store.delivered)
+	}
+}

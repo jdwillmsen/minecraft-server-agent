@@ -45,7 +45,7 @@ func TestRedactedReplyNeverReachesTheLog(t *testing.T) {
 	out := captureAgentStdout(t, func() {
 		log := logging.New("debug")
 		for _, line := range []string{"!whereami", "!echo"} {
-			handlePacket(context.Background(), chatPacket(playerXUID, "Steve", line), selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{})
+			handlePacket(context.Background(), chatPacket(playerXUID, "Steve", line), selfXUID, nil, log, registry, pctx, eventBus, unlimitedRateLimit(), playerRoster, permResolver, testAnswering(), store.Nop{}, audit.Nop{}, newJoinTimes())
 		}
 	})
 
@@ -70,7 +70,7 @@ func TestPrivateRepliesAreRedacted(t *testing.T) {
 	deliverer := announce.NewDeliverer(&recordingAnnounceStore{}, &recordingVoice{},
 		newDeliveryAudience(roster.New(), siblingBotXUIDs()),
 		announcePermissions{resolver: fakePermResolver(t, nil)}, logging.New("error"))
-	if err := registerPlugins(t.Context(), registry, deliverer, nil, logging.New("error")); err != nil {
+	if err := registerPlugins(t.Context(), registry, deliverer, newJoinTimes(), nil, logging.New("error")); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	for _, name := range []string{"wp", "modlog"} {

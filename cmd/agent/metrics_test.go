@@ -101,7 +101,7 @@ func TestCommandsAreCountedWithNoAuditStore(t *testing.T) {
 
 func TestEveryRegisteredCommandStartsAtZero(t *testing.T) {
 	registry := plugin.NewRegistry()
-	if err := registerPlugins(t.Context(), registry, nil, nil, quietLog); err != nil {
+	if err := registerPlugins(t.Context(), registry, nil, newJoinTimes(), nil, quietLog); err != nil {
 		t.Fatalf("registerPlugins: %v", err)
 	}
 

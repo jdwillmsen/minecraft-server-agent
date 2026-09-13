@@ -57,6 +57,21 @@ import (
 // defect on this server.
 const welcomeDelay = 5 * time.Second
 
+// announceDrainDelay is how long the announce drain waits after a join
+// before whispering a player their backlog. Past welcomeDelay so the
+// greeting owns the join moment and the backlog follows it, and far enough
+// past the join itself that the client is rendering chat: delivered at
+// 0.8s, two announcements were accepted by the server, recorded as
+// delivered and seen by nobody.
+const announceDrainDelay = welcomeDelay + 3*time.Second
+
+// freshJoinGrace is how long after an arrival the deliverer treats a player
+// as still loading, and leaves their copy of an announcement pending rather
+// than recorded. The join drain reads the same clock when it wakes, so this
+// must stay shorter than announceDrainDelay: at grace >= delay every drain
+// would defer itself and the backlog would never go out at all.
+const freshJoinGrace = announceDrainDelay - time.Second
+
 // stableSessionThreshold mirrors minecraft-afk-bot: the reconnect backoff
 // only resets to its minimum once a session has stayed up at least this
 // long, so a server that accepts a connection and immediately drops it
@@ -156,19 +171,21 @@ func main() {
 	// before it touches any of them, which made a nil safe here while this
 	// was a placeholder -- and would have made it a nil dereference the first
 	// time those early returns moved.
+	joins := newJoinTimes()
 	deliverer := announce.NewDeliverer(
 		announceStore,
 		voice,
 		audience,
 		announcePermissions{resolver: permResolver},
 		log,
+		announce.WithFreshJoinGrace(joins, freshJoinGrace),
 	)
 	// Wrapped only now: the stores above type-assert the concrete Postgres
 	// to borrow its pool, which the wrapper would hide from them.
 	playerStore = withPlayerEvents(playerStore, sources.NewEvents(ctx, deliverer, log))
 
 	registry := plugin.NewRegistry()
-	if err := registerPlugins(ctx, registry, deliverer, cfg.ModerationTerms, log); err != nil {
+	if err := registerPlugins(ctx, registry, deliverer, joins, cfg.ModerationTerms, log); err != nil {
 		log.Error("plugin_register_failed", logging.Fields{"error": err.Error()})
 		os.Exit(1)
 	}
@@ -226,7 +243,7 @@ func main() {
 	}
 
 	log.Info("starting", logging.Fields{"mc_host": cfg.MCHost, "mc_port": cfg.MCPort})
-	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblings, permResolver, ans, playerStore, auditor, link)
+	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblings, permResolver, ans, playerStore, auditor, link, joins)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
@@ -247,7 +264,7 @@ func main() {
 //
 // The error carries the plugin's own name, because "registration failed" on
 // its own does not say which one.
-func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer plugins.AnnounceDeliverer, moderationTerms []string, log *logging.Logger) error {
+func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer plugins.AnnounceDeliverer, conns plugins.Connections, moderationTerms []string, log *logging.Logger) error {
 	mod, err := plugins.NewModeration(ctx, moderationTerms, log)
 	if err != nil {
 		return fmt.Errorf("moderation: %w", err)
@@ -259,7 +276,7 @@ func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer p
 		plugins.NewWaypoints(),
 		plugins.NewWelcome(ctx, welcomeDelay, log),
 		plugins.NewAnnounce(),
-		plugins.NewAnnounceDrain(ctx, deliverer, log),
+		plugins.NewAnnounceDrain(ctx, deliverer, announceDrainDelay, log, plugins.WithConnections(conns)),
 		mod,
 		plugins.NewSchedule(),
 	} {
@@ -343,7 +360,7 @@ func sampleOnce(ctx context.Context, pinger *adapters.ServerPinger, link func() 
 
 // runConnectLoop owns the reconnect/backoff policy. Each iteration runs one
 // session to completion (or failure), then waits before trying again.
-func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store, link *linkMeter) {
+func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store, link *linkMeter, joinClock *joinTimes) {
 	minDelay := time.Duration(cfg.ReconnectMinMs) * time.Millisecond
 	maxDelay := time.Duration(cfg.ReconnectMaxMs) * time.Millisecond
 	// authDelay does not enter the doubling ladder: nextDelay never sees it,
@@ -365,9 +382,15 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		firstAttempt = false
 
 		started := time.Now()
-		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblingXUIDs, permResolver, ans, playerStore, auditor, link)
+		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblingXUIDs, permResolver, ans, playerStore, auditor, link, joinClock)
 		lasted := time.Since(started)
 		httpServer.SetReady(false)
+		// The connection is dead here, not merely about to be replaced.
+		// Anything scheduled under it must abandon rather than speak into
+		// the gap: the bridge is a separate process and still answers, so a
+		// whisper sent now is accepted by a server whose players are
+		// reconnecting, and recorded against clients that are mid-load.
+		joinClock.disconnected()
 
 		if ctx.Err() != nil {
 			return
@@ -541,7 +564,7 @@ func isAuthRejection(err error) bool {
 // clean disconnect and a non-nil error on anything else (including ctx
 // cancellation surfaced as a read error, which the caller ignores because
 // it checks ctx.Err() itself).
-func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store, link *linkMeter) error {
+func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store, link *linkMeter, joinClock *joinTimes) error {
 	// Without this the agent joins as a solid black silhouette under a
 	// SkinID regenerated every connect: Bedrock skins are uploaded by the
 	// client from its own installation, and a headless client has none, so
@@ -604,7 +627,7 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		return fmt.Errorf("spawn: %w", err)
 	}
 
-	beginWatching(ctx, playerRoster, playerStore, log)
+	beginWatching(ctx, playerRoster, playerStore, joinClock, log)
 
 	selfXUID := conn.IdentityData().XUID
 	log.Info("spawned", logging.Fields{"self_xuid": selfXUID})
@@ -635,7 +658,7 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		// chunks, and nothing outside this loop can tell that it is dead.
 		handleLiveness(pk, respawner, conn, log, httpServer.SetReady)
 
-		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, ans, playerStore, auditor)
+		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, ans, playerStore, auditor, joinClock)
 	}
 }
 
@@ -654,9 +677,13 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 // RecordLeave. If both this close and the snapshot's ResumeSession fail, a
 // session from before the gap is still open when the player leaves, and
 // that is what stops it being credited.
-func beginWatching(ctx context.Context, playerRoster *roster.Roster, playerStore store.Store, log *logging.Logger) {
+func beginWatching(ctx context.Context, playerRoster *roster.Roster, playerStore store.Store, joinClock *joinTimes, log *logging.Logger) {
 	now := time.Now()
 	playerRoster.BeginSession(now)
+	// Arrivals from the previous connection mean nothing here, and anyone
+	// the next snapshot reports may have reconnected moments before the
+	// agent did, so this connection's start stands in for their arrival.
+	joinClock.connected()
 	if n, err := playerStore.CloseOrphans(ctx, now); err != nil {
 		log.Error("store_close_orphans_failed", logging.Fields{"error": err.Error()})
 	} else if n > 0 {
@@ -688,12 +715,12 @@ func handleLiveness(pk packet.Packet, respawner *liveness.Respawner, w liveness.
 	setReady(!respawner.Dead())
 }
 
-func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store) {
+func handlePacket(ctx context.Context, pk packet.Packet, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, playerRoster *roster.Roster, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store, joinClock *joinTimes) {
 	switch pk := pk.(type) {
 	case *packet.Text:
 		handleText(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, permResolver, ans, playerRoster, auditor)
 	case *packet.PlayerList:
-		handlePlayerList(ctx, pk, selfXUID, siblingXUIDs, log, eventBus, playerRoster, playerStore)
+		handlePlayerList(ctx, pk, selfXUID, siblingXUIDs, log, eventBus, playerRoster, playerStore, joinClock)
 	}
 }
 
@@ -971,7 +998,7 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 // handleText filters chat before publishing chat.MessageEvent, so every
 // event-driven plugin downstream can assume it never sees this agent's own
 // presence or a sibling bot's.
-func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, eventBus *bus.Bus, playerRoster *roster.Roster, playerStore store.Store) {
+func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID string, siblingXUIDs map[string]struct{}, log *logging.Logger, eventBus *bus.Bus, playerRoster *roster.Roster, playerStore store.Store, joinClock *joinTimes) {
 	entries := make([]roster.PlayerListEntry, len(pk.Entries))
 	for i, e := range pk.Entries {
 		entries[i] = roster.PlayerListEntry{
@@ -986,21 +1013,44 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 	// Already here when this connection began, so their session restarts now
 	// -- playtime counts only what the agent watched -- and nothing greets
 	// them: they did not just arrive. The one exception is a player the agent
-	// has never seen before, whom operators are told of once.
+	// has never seen before, whom operators are told of once. A snapshot
+	// that adds and then removes the same player is read the same way the
+	// arrivals below are: what the roster holds at the end of the packet is
+	// who is here.
+	generation := joinClock.Generation()
 	for _, p := range alreadyOnline {
 		if chat.IsSelfOrSibling(p.XUID, selfXUID, siblingXUIDs) {
+			continue
+		}
+		if _, stillHere := playerRoster.NameFor(p.XUID); !stillHere {
 			continue
 		}
 		if _, err := playerStore.ResumeSession(ctx, p.XUID, p.Username, time.Now()); err != nil {
 			log.Error("store_resume_session_failed", logging.Fields{"xuid": p.XUID, "error": err.Error()})
 		}
+		// No arrival is recorded for them: this is not one, and the clock
+		// must keep answering that honestly. What they get is the event,
+		// so whoever owes them something delayed can pay it on this
+		// connection instead of leaving it for a join that may never come.
+		eventBus.Publish(roster.PresentEvent{Entry: p, Generation: generation})
 	}
+	// One packet can carry both directions for the same player, and Apply
+	// reports them in two slices that no longer say which came first --
+	// what the roster holds afterwards does. A player added and then
+	// removed inside one packet is gone: nothing greets them and nothing
+	// schedules them a delivery they cannot receive.
 	for _, join := range joins {
 		if chat.IsSelfOrSibling(join.XUID, selfXUID, siblingXUIDs) {
 			continue
 		}
+		if _, stillHere := playerRoster.NameFor(join.XUID); !stillHere {
+			continue
+		}
 		log.Info("player_joined", logging.Fields{"xuid": join.XUID, "username": join.Username})
-		eventBus.Publish(roster.JoinEvent{Entry: join})
+		// Recorded before the event is published, so anything the join sets
+		// off already sees this player as the fresh arrival they are.
+		joinClock.joined(join.XUID)
+		eventBus.Publish(roster.JoinEvent{Entry: join, Generation: generation})
 	}
 	// Departures close a session rather than reaching a plugin. Nothing
 	// greets a player for leaving, and publishing an event no handler wants
@@ -1010,6 +1060,14 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 			continue
 		}
 		log.Info("player_left", logging.Fields{"xuid": leave.XUID, "username": leave.Username})
+		if _, backAlready := playerRoster.NameFor(leave.XUID); !backAlready {
+			// Still gone at the end of the packet, so this departure is the
+			// last word on them. When it isn't -- a removal and a re-add in
+			// one packet -- the arrival above is newer than this and must
+			// survive, or the returning client reads as settled while it
+			// loads.
+			joinClock.left(leave.XUID)
+		}
 		if _, err := playerStore.RecordLeave(ctx, leave.XUID, playerRoster.Since(), time.Now()); err != nil {
 			// Logged, never fatal: the session stays open until the next
 			// connection closes it at zero length, so this visit's time is

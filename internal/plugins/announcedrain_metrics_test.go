@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics/metricstest"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
@@ -11,13 +12,24 @@ import (
 )
 
 // drainToCompletion runs one join drain and returns only once it has
-// finished: a semaphore slot is released only when the whole drain returns,
-// so taking every one of them is the plugin's own proof it is done.
+// finished: the summary is the last thing said, and a semaphore slot is
+// released only when the whole drain returns, so waiting for the line and
+// then taking every slot is the plugin's own proof it is done.
 func drainToCompletion(t *testing.T, voice plugin.Voice) {
 	t.Helper()
-	d := NewAnnounceDrain(context.Background(), &fakeJoinDeliverer{delivered: 3, remaining: 2}, logging.New("error"))
+	d := NewAnnounceDrain(context.Background(), &fakeJoinDeliverer{delivered: 3, remaining: 2}, 0, logging.New("error"))
 	if err := d.HandleEvent(context.Background(), &plugin.Context{Voice: voice}, joinEvent("xuid-1")); err != nil {
 		t.Fatalf("HandleEvent: %v", err)
+	}
+	// The summary line is the last thing the drain says, and the slot is
+	// claimed inside the goroutine now, so waiting for the line and then for
+	// the slot is what "completed" means here.
+	if rec, ok := voice.(*recordingTellVoice); ok {
+		select {
+		case <-rec.told:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the drain never said its summary")
+		}
 	}
 	for i := 0; i < cap(d.inFlight); i++ {
 		d.inFlight <- struct{}{}

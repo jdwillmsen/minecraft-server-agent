@@ -30,6 +30,22 @@ type Roster interface {
 	Online() []string
 }
 
+// JoinClock tells a Deliverer how long ago a player joined, so a message
+// sent in the seconds right after an arrival is not recorded as delivered to
+// a client that cannot render it yet. Not part of Roster: Roster answers who
+// is reachable, this answers how recently, and only one caller needs it.
+type JoinClock interface {
+	// SinceJoin is how long ago xuid was seen to arrive, and whether an
+	// arrival of their own was seen at all -- a player already online when
+	// the agent connected has none.
+	SinceJoin(xuid string) (time.Duration, bool)
+	// SinceConnect is how long ago the agent's own connection began, and
+	// whether it has begun at all. It stands in for the arrival of everyone
+	// in the opening roster snapshot, who may have reconnected moments
+	// before the agent did and be loading still.
+	SinceConnect() (time.Duration, bool)
+}
+
 // Permissions resolves a player's current permission level, as a plain
 // string rather than the plugin package's enum — again so this package
 // doesn't have to import plugin just to describe what it needs from it.
@@ -60,12 +76,64 @@ type Deliverer struct {
 	// different plugins reaching this one store for the same player -- a
 	// guard placed in either plugin cannot see the other's call.
 	xuidLocks sync.Map // xuid string -> *sync.Mutex
+	// joins and joinGrace defer delivery to a player who has only just
+	// arrived. Both zero unless WithFreshJoinGrace is passed, which keeps
+	// every existing caller and test on the old behaviour.
+	joins     JoinClock
+	joinGrace time.Duration
+}
+
+// Option configures a Deliverer at construction.
+type Option func(*Deliverer)
+
+// WithFreshJoinGrace makes SendNow leave a just-joined player's copy pending
+// instead of recording it as delivered.
+//
+// A whisper or broadcast that lands within grace of an arrival reaches a
+// client that is still loading: the server accepts it, the player never sees
+// it, and a delivery row would stop anything from ever retrying it. Leaving
+// the row pending hands the message to that player's own join drain, which
+// defers on the same grace when it wakes -- so grace must be shorter than
+// the drain's wait, or a drain would never deliver anything.
+func WithFreshJoinGrace(j JoinClock, grace time.Duration) Option {
+	return func(d *Deliverer) { d.joins, d.joinGrace = j, grace }
 }
 
 // NewDeliverer builds a Deliverer over the given Store, Voice, Roster and
 // Permissions.
-func NewDeliverer(s Store, v Voice, r Roster, p Permissions, log *logging.Logger) *Deliverer {
-	return &Deliverer{store: s, voice: v, roster: r, perms: p, log: log}
+func NewDeliverer(s Store, v Voice, r Roster, p Permissions, log *logging.Logger, opts ...Option) *Deliverer {
+	d := &Deliverer{store: s, voice: v, roster: r, perms: p, log: log}
+	for _, opt := range opts {
+		opt(d)
+	}
+	return d
+}
+
+// stillLoading reports whether xuid's client may be too freshly loaded to
+// see a message sent right now: their own arrival if one was seen, and
+// otherwise the agent's connection, since the opening snapshot cannot tell
+// an hour-old builder from a player who reconnected a second earlier.
+func (d *Deliverer) stillLoading(xuid string) bool {
+	if d.joins == nil || d.joinGrace <= 0 {
+		return false
+	}
+	if since, ok := d.joins.SinceJoin(xuid); ok {
+		return since < d.joinGrace
+	}
+	since, ok := d.joins.SinceConnect()
+	return ok && since < d.joinGrace
+}
+
+// justArrived reports whether xuid made an arrival of their own too recently
+// to be served. Only an arrival counts: the connection standing in for one
+// is a guess about who might be loading, fine for withholding a delivery row
+// but not for cancelling a drain that a real join scheduled.
+func (d *Deliverer) justArrived(xuid string) bool {
+	if d.joins == nil || d.joinGrace <= 0 {
+		return false
+	}
+	since, ok := d.joins.SinceJoin(xuid)
+	return ok && since < d.joinGrace
 }
 
 // recipients resolves which currently-online XUIDs a should reach. everyone
@@ -138,11 +206,29 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 		// anyone online right now sees the same announcement again on
 		// their next join.
 		delivered := 0
+		deferred := 0
+		heard := 0
 		for _, xuid := range targets {
 			if ctx.Err() != nil {
 				// Cancelled: stop rather than attempt (and log) a store
 				// write for every remaining recipient that would fail anyway.
 				break
+			}
+			if d.stillLoading(xuid) {
+				// Heard by everyone whose client is up, but not by this one:
+				// recording it would be the same permanent loss a whisper to
+				// a loading client used to be. Left pending, so their own
+				// drain owes it to them -- unless the target is one that
+				// never queues, in which case they have simply missed it.
+				deferred++
+				if !d.justArrived(xuid) {
+					// Withheld on a guess, not on an arrival: nothing says
+					// this player is loading beyond the agent having only
+					// just connected, and one Say reaches every client that
+					// is up. They heard it; only their row was skipped.
+					heard++
+				}
+				continue
 			}
 			if err := d.store.MarkDelivered(ctx, id, xuid, now); err != nil {
 				d.log.Error("announce_mark_delivered_failed", logging.Fields{"announcement_id": id, "xuid": xuid, "error": err.Error()})
@@ -150,7 +236,14 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 			}
 			delivered++
 		}
-		return delivered, nil
+		if deferred > 0 {
+			d.log.Info("announce_deferred_for_joining", logging.Fields{"announcement_id": id, "players": deferred})
+		}
+		// Counted as reached: everyone recorded, plus everyone withheld on
+		// nothing worse than a guess. A player who demonstrably just
+		// arrived is not counted -- their client rendered nothing, and
+		// their own drain still owes them the same text.
+		return delivered + heard, nil
 	}
 
 	// Whisper: each recipient gets their own Tell, and only a recipient
@@ -159,11 +252,19 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 	// recorded as delivered, which would lose the message for good since
 	// nothing else retries it.
 	delivered := 0
+	deferred := 0
 	for _, xuid := range targets {
 		if ctx.Err() != nil {
 			// Cancelled: stop rather than run up a failed bridge attempt
 			// (and an error line) for every recipient still left to try.
 			break
+		}
+		if d.stillLoading(xuid) {
+			// Their client is not rendering chat yet, so this Tell would be
+			// accepted by the server and seen by nobody. Not sent and not
+			// recorded: their own join drain owes it to them.
+			deferred++
+			continue
 		}
 		err := d.voice.Tell(ctx, xuid, a.Body)
 		metrics.AnnounceDelivery(metrics.DeliveryWhisper, err)
@@ -176,6 +277,9 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 			continue
 		}
 		delivered++
+	}
+	if deferred > 0 {
+		d.log.Info("announce_deferred_for_joining", logging.Fields{"announcement_id": id, "players": deferred})
 	}
 	return delivered, nil
 }
@@ -278,6 +382,16 @@ func (d *Deliverer) DrainForJoin(ctx context.Context, xuid string, now time.Time
 	defer mu.Unlock()
 
 	if !d.store.Enabled() {
+		return 0, 0, nil
+	}
+	if d.justArrived(xuid) {
+		// This drain belongs to an arrival the player has already replaced:
+		// they dropped and rejoined inside its wait. Whispering the backlog
+		// now would hand it to a loading client and record it, which is the
+		// permanent loss the wait exists to prevent. Nothing delivered and
+		// nothing owed to report, so no summary line is spoken either --
+		// the newer arrival's own drain, a full wait behind it, owes them
+		// everything.
 		return 0, 0, nil
 	}
 	permission := d.perms.Resolve(ctx, xuid)

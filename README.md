@@ -86,9 +86,11 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   `add_player` proximity packet) and the name source `Voice.Tell` resolves
   a reply target from
 - `internal/bus` - typed pub/sub event bus; every answerable chat message
-  (`chat.MessageEvent`) and every genuinely new arrival
-  (`roster.JoinEvent`) is published here, so event-driven plugins subscribe
-  instead of touching the connection
+  (`chat.MessageEvent`), every genuinely new arrival (`roster.JoinEvent`)
+  and every player a session's opening snapshot finds already online
+  (`roster.PresentEvent`, never greeted - see "Announcements and the command
+  audit trail") is published here, so event-driven plugins subscribe instead
+  of touching the connection
 - `internal/plugin` - the `Plugin`/`Context`/`Registry` extension surface
 - `internal/plugins` - concrete plugins: `core` (`!help`/`!ping`), `stats`
   (`!players`, `!online`, `!version`, `!backup`), `welcome` (event-driven, no
@@ -376,6 +378,60 @@ message was written for. `!now` never queues in the first place, so it has
 no expiry to speak of. Expiry is what keeps this a queue instead of a nag:
 without it, a message would eventually reach whoever logs in next no matter
 how stale it had gone.
+
+Join delivery waits for the greeting before it starts. A whisper sent the
+instant the roster reports a join is accepted by the server and displayed to
+nobody, because the joining client is not rendering chat yet - and the
+delivery is recorded, so nothing ever retries it. Two announcements were
+lost exactly that way on 2026-09-11, 0.8s after the join. The wait sits past
+the welcome's own, so the greeting owns the join moment and the backlog
+follows it.
+
+A delivery belongs to the connection that scheduled it, and that connection
+is over the moment it drops - not when the next one opens. A drain whose
+wait outlives its connection abandons itself without a word, because the
+bridge is a separate process that stays up: a whisper sent into the gap is
+accepted by the server and recorded against players who are mid-reconnect,
+which is the loss all of this exists to prevent. The next connection
+re-reports everyone still online and gives them a delivery of their own -
+the same wait, from the connection that found them there - so a backlog is
+never stranded by a reconnect and never whispered twice. They are not
+greeted for it; they did not arrive.
+
+A delivery already under way stops the same moment, between one message and
+the next. The connection ending cancels the drain where it stands, so the
+rest of the backlog is left pending rather than whispered and recorded
+against someone who is no longer on the server, and the `!inbox` trailer
+that would have followed it is not spoken either - a player mid-reconnect
+is owed no pointer at a list they are not there to read. Whatever is still
+owed is summarised by the delivery the next connection schedules for them.
+
+Those snapshot deliveries would otherwise all come due in the same
+millisecond, so each is spread by a random fraction of the wait, never more
+than the wait itself. Five deliver at a time; the rest wait their turn
+rather than being dropped, up to a bound, because the cap is there to limit
+how many are served at once and not how many are served at all. A player
+actually shed past that bound is logged.
+
+An announcement published in that same window - a schedule firing, an event
+source, `!announce` - reaches everyone else as usual, but a player who has
+only just arrived is not recorded as having heard it. A broadcast still goes
+out, since it is heard by every client that is up; a whisper to a loading
+client is not even sent. For every target that queues the row stays pending
+and that player's own drain owes it to them, which is the only thing that
+retries; `!now` queues for nobody, so a player who arrives into one has
+simply missed it. The drain defers on the same grace when it wakes, so the
+grace is shorter than its wait - otherwise a drain would defer itself
+forever.
+
+For the first seconds after the agent itself connects it cannot tell a
+builder of an hour from someone who reconnected a second earlier, so it
+records a delivery against neither. That is a guess rather than a fact, and
+the two are counted differently: the reported reach of a broadcast includes
+a player withheld on the guess, since one `say` is heard by every client
+that is up, and excludes a player whose arrival was actually seen inside the
+grace, whose client rendered nothing and whose own drain still owes them the
+text.
 
 Join delivery sends every expedited message first, uncapped, then up to
 three ordinary ones, oldest first, then - only if something is still left -

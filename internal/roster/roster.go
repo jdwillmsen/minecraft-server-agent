@@ -29,10 +29,35 @@ const JoinKind = "roster.join"
 // roster, and not part of the session's opening snapshot.
 type JoinEvent struct {
 	Entry
+	// Generation is which of the agent's connections was live when this was
+	// published. A handler that waits before acting compares it against the
+	// current one: a connection that has since been replaced no longer
+	// speaks for this player, and the new one has reported them again.
+	Generation uint64
 }
 
 // Kind satisfies the bus's Event interface.
 func (JoinEvent) Kind() string { return JoinKind }
+
+// PresentKind is the bus event kind published for a player the opening
+// snapshot reports as already online.
+const PresentKind = "roster.present"
+
+// PresentEvent is published once per player in a session's opening
+// snapshot. Deliberately not a JoinEvent: these players did not just
+// arrive and must never be greeted for reappearing. What they may be is
+// mid-load — the agent cannot tell a builder of an hour from someone who
+// reconnected a second before it did — so a handler that owes them
+// something delayed has to hear about them.
+type PresentEvent struct {
+	Entry
+	// Generation is the connection whose snapshot reported them, read the
+	// same way JoinEvent's is.
+	Generation uint64
+}
+
+// Kind satisfies the bus's Event interface.
+func (PresentEvent) Kind() string { return PresentKind }
 
 // LeaveKind is the bus event kind published when a known player departs.
 const LeaveKind = "roster.leave"
