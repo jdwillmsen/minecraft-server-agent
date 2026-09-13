@@ -121,10 +121,7 @@ func (r *Roster) BeginSession(at time.Time, agentXUID string) {
 	defer r.mu.Unlock()
 	r.since = at
 	r.agentXUID = agentXUID
-	r.players = make(map[string]string)
-	r.xuidByUUID = make(map[string]string)
-	r.snapshotStarted = false
-	r.snapshotEnded = false
+	r.forget()
 }
 
 // EndSession empties the Roster because the connection carrying it is
@@ -138,6 +135,14 @@ func (r *Roster) BeginSession(at time.Time, agentXUID string) {
 func (r *Roster) EndSession() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.forget()
+}
+
+// forget drops everything a connection taught this Roster, leaving it
+// pre-snapshot. Shared by the two ends of a session so that a field added to
+// the Roster cannot be reset at one of them and retained at the other, which
+// is the stale-state class both calls exist to prevent. Callers hold r.mu.
+func (r *Roster) forget() {
 	r.players = make(map[string]string)
 	r.xuidByUUID = make(map[string]string)
 	r.snapshotStarted = false

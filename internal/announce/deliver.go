@@ -175,13 +175,6 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 		return 0, nil
 	}
 	targets := d.recipients(ctx, a)
-	if len(targets) == 0 {
-		// Nobody to tell right now and nothing to record; the announcement
-		// stays pending in the store (if it queues at all) for whoever
-		// joins later. Calling Say to an empty audience would broadcast
-		// into the void with no delivery row to show for it.
-		return 0, nil
-	}
 	now := time.Now()
 
 	// Delivery is derived from the target, never trusted off the row: this
@@ -191,6 +184,14 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 	// TargetPlayer row that happened to carry DeliveryBroadcast must still
 	// whisper, not broadcast a private message to the whole server.
 	if DeliveryFor(a.TargetKind) == DeliveryBroadcast {
+		// Said even when the roster names nobody, which is what a
+		// disconnect gap looks like from here. The console bridge is a
+		// separate process that stays up, so the server can still speak to
+		// whoever is on it; what the gap makes unknowable is who that was.
+		// Nothing is recorded, because there is no roster snapshot to
+		// record from -- a target that queues stays pending and may be
+		// whispered on a later join, and online-only never queues, so this
+		// is its only chance to be heard at all.
 		err := d.voice.Say(ctx, a.Body)
 		metrics.AnnounceDelivery(metrics.DeliveryBroadcast, err)
 		if err != nil {
@@ -244,6 +245,14 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 		// arrived is not counted -- their client rendered nothing, and
 		// their own drain still owes them the same text.
 		return delivered + heard, nil
+	}
+
+	if len(targets) == 0 {
+		// Nobody to whisper to and nothing to record; the announcement
+		// stays pending in the store (if it queues at all) for whoever
+		// joins later. Unlike a broadcast, a whisper needs an XUID to go
+		// to, so there is nothing to send into the gap.
+		return 0, nil
 	}
 
 	// Whisper: each recipient gets their own Tell, and only a recipient

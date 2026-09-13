@@ -817,3 +817,53 @@ func TestSendNowCountsOnlyGuessedDeferralsAsReached(t *testing.T) {
 		t.Errorf("recorded %v, want nothing: neither copy may be marked", store.delivered)
 	}
 }
+
+func TestSendNowBroadcastsWithNobodyOnTheRoster(t *testing.T) {
+	// An announcement published while the agent is between connections has
+	// no roster to aim at, but the console bridge is a separate process that
+	// stays up, so the server can still speak to whoever is on it. Online-
+	// only never queues, so suppressing Say here would not delay the message
+	// -- it would lose it.
+	a := Announcement{Body: "server restarting in 5 minutes", TargetKind: TargetOnlineOnly}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 7)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 || voice.says[0] != a.Body {
+		t.Errorf("Say calls = %v, want exactly one carrying %q — an online-only broadcast has no second chance", voice.says, a.Body)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing: there is no roster snapshot to record from, and a row for a player who may have left loses the message for good", store.delivered)
+	}
+	if sent != 0 {
+		t.Errorf("sent = %d, want 0 — it was said, but nobody is known to have heard it", sent)
+	}
+}
+
+func TestSendNowStaysSilentForAWhisperWithNobodyOnTheRoster(t *testing.T) {
+	// The other half of the asymmetry: a whisper needs an XUID to go to, so
+	// an empty roster leaves it with nothing to send. It stays pending for
+	// the player's own join instead.
+	a := Announcement{Body: "your waypoint is at 100 64 -200", TargetKind: TargetPlayer, TargetValue: "xuid-1"}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 8)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.tells) != 0 || len(voice.says) != 0 {
+		t.Errorf("Tell = %v and Say = %v, want both empty — a private message must not be broadcast just because its recipient is unreachable", voice.tells, voice.says)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing", store.delivered)
+	}
+	if sent != 0 {
+		t.Errorf("sent = %d, want 0", sent)
+	}
+}

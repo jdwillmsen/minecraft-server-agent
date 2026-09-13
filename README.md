@@ -470,10 +470,18 @@ greeted for it; they did not arrive.
 The roster empties the moment the connection dies rather than when the next
 one opens. Between the two, nobody is being watched: an announcement
 published in that gap by a schedule, an event source or the HTTP API finds
-no recipients and stays pending for the join that follows. Held onto, the
-roster would name whoever was online when the connection died, and one of
-them may already have left - recording a delivery against them loses that
-message for good.
+no recipients to record. Held onto, the roster would name whoever was online
+when the connection died, and one of them may already have left - recording
+a delivery against them loses that message for good.
+
+What the gap makes unknowable is who was online, not whether the server can
+speak: the console bridge is a separate process that stays up. So an
+announcement to everyone or to whoever is online is still broadcast in the
+gap and heard by whoever is there - it simply records nothing, which leaves
+a queued one pending for the join that follows and gives an online-only one
+its only chance to be heard at all. An announcement addressed to a player
+or to a permission is whispered, and a whisper needs someone to send it to,
+so that one stays silent and stays pending.
 
 A delivery already under way stops the same moment, between one message and
 the next. The connection ending cancels the drain where it stands, so the

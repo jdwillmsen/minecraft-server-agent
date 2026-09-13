@@ -400,6 +400,26 @@ func sampleOnce(ctx context.Context, pinger *adapters.ServerPinger, link func() 
 	}
 }
 
+// connectionEnded retires the session state a dead Bedrock connection left
+// behind, in the one place both halves of it are reset together.
+//
+// The connection is dead here, not merely about to be replaced, and the
+// console bridge is a separate process that still answers -- so anything
+// reading this state in the gap would speak into a server whose players are
+// reconnecting. Anything scheduled under the dead connection must abandon
+// rather than whisper to a client that is mid-load, which is what ending the
+// join clock's connection says. And nobody is being watched: held onto, the
+// roster would answer Online() with whoever was here when the connection
+// died, and an announcement published in the gap would be recorded as
+// delivered to players who may already have left, which nothing retries.
+//
+// A function rather than two statements inline so the gap is a state a test
+// can reach the way runConnectLoop reaches it.
+func connectionEnded(playerRoster *roster.Roster, joinClock *joinTimes) {
+	joinClock.disconnected()
+	playerRoster.EndSession()
+}
+
 // runConnectLoop owns the reconnect/backoff policy. Each iteration runs one
 // session to completion (or failure), then waits before trying again.
 func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store, link *linkMeter, joinClock *joinTimes) {
@@ -427,17 +447,7 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblingXUIDs, permResolver, ans, playerStore, auditor, link, joinClock)
 		lasted := time.Since(started)
 		httpServer.SetReady(false)
-		// The connection is dead here, not merely about to be replaced.
-		// Anything scheduled under it must abandon rather than speak into
-		// the gap: the bridge is a separate process and still answers, so a
-		// whisper sent now is accepted by a server whose players are
-		// reconnecting, and recorded against clients that are mid-load.
-		joinClock.disconnected()
-		// Nobody is being watched now. Held onto, the roster would answer
-		// Online() with whoever was here when the connection died, and an
-		// announcement published in the gap would be recorded as delivered
-		// to players who may already have left.
-		playerRoster.EndSession()
+		connectionEnded(playerRoster, joinClock)
 
 		if ctx.Err() != nil {
 			return
