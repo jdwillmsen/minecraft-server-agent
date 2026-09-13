@@ -1534,6 +1534,7 @@ git commit -m "feat(census): group entities into located clusters"
 package census
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -1672,12 +1673,81 @@ func TestAggregateCarriesProvenance(t *testing.T) {
 		t.Errorf("provenance = %v/%q/%+v, want it carried through unchanged", c.TakenAt, c.SourceKind, c.Stats)
 	}
 }
+
+func TestAggregateIsDeterministicOverTiedRows(t *testing.T) {
+	// Build input that ties on the old comparator keys:
+	// - Same identifier and same count in different dimensions (ties Totals and Regions)
+	// - Concentrations of equal size in well-separated locations in different dimensions
+	var entities []Entity
+
+	// 5 zombies in Overworld, all in region (0, 0)
+	for i := 0; i < 5; i++ {
+		entities = append(entities, Entity{Identifier: "zombie", Dimension: Overworld, X: float64(i), Z: 0})
+	}
+
+	// 5 zombies in Nether, all in region (0, 0) [also ties Regions]
+	for i := 0; i < 5; i++ {
+		entities = append(entities, Entity{Identifier: "zombie", Dimension: Nether, X: float64(i), Z: 0})
+	}
+
+	// 25 items in Overworld at one location (concentration cluster 1)
+	for i := 0; i < 25; i++ {
+		entities = append(entities, Entity{Identifier: "item", Dimension: Overworld, X: 100 + float64(i%3), Z: 100 + float64(i%3)})
+	}
+
+	// 25 items in Nether at a different location (concentration cluster 2, same count as cluster 1)
+	for i := 0; i < 25; i++ {
+		entities = append(entities, Entity{Identifier: "item", Dimension: Nether, X: 5000 + float64(i%3), Z: 5000 + float64(i%3)})
+	}
+
+	// Fingerprint a census by converting its structured output to a string
+	fingerprint := func(c Census) string {
+		var fp string
+		for _, tot := range c.Totals {
+			fp += fmt.Sprintf("T:%d:%s:%d:%d,", tot.Dimension, tot.Identifier, tot.Category, tot.Count)
+		}
+		for _, reg := range c.Regions {
+			fp += fmt.Sprintf("R:%d:%d:%d:%d:%d,", reg.Key.Dimension, reg.Key.X, reg.Key.Z, reg.Category, reg.Count)
+		}
+		for _, nam := range c.Named {
+			fp += fmt.Sprintf("N:%s:%s:%d,", nam.Name, nam.Identifier, nam.Dimension)
+		}
+		for _, con := range c.Concentrations {
+			fp += fmt.Sprintf("C:%d:%s:%d,", con.Dimension, con.Identifier, con.Cluster.Count)
+		}
+		return fp
+	}
+
+	// Run Aggregate 50 times and collect fingerprints
+	var firstFP string
+	var diffSection string
+	for run := 0; run < 50; run++ {
+		c := Aggregate(entities, ScanStats{}, time.Unix(0, 0), "archive")
+		fp := fingerprint(c)
+		if run == 0 {
+			firstFP = fp
+		} else if fp != firstFP {
+			// Find which section differed
+			if len(c.Totals) != len(c.Totals) {
+				diffSection = "Totals"
+			} else if len(c.Regions) != len(c.Regions) {
+				diffSection = "Regions"
+			} else if len(c.Concentrations) != len(c.Concentrations) {
+				diffSection = "Concentrations"
+			}
+			if diffSection == "" {
+				diffSection = "ordering within a section"
+			}
+			t.Fatalf("run %d produced different output than run 0 (differed in %s): %q vs %q", run, diffSection, fp, firstFP)
+		}
+	}
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `go test ./internal/census/ -run TestAggregate -v`
-Expected: FAIL, `undefined: Aggregate`.
+Expected: FAIL, `undefined: Aggregate` (before implementation); once implemented, TestAggregateIsDeterministicOverTiedRows must FAIL on the old comparators.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -1819,7 +1889,10 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 		if c.Totals[i].Count != c.Totals[j].Count {
 			return c.Totals[i].Count > c.Totals[j].Count
 		}
-		return c.Totals[i].Identifier < c.Totals[j].Identifier
+		if c.Totals[i].Identifier != c.Totals[j].Identifier {
+			return c.Totals[i].Identifier < c.Totals[j].Identifier
+		}
+		return c.Totals[i].Dimension < c.Totals[j].Dimension
 	})
 
 	for k, count := range regions {
@@ -1834,10 +1907,16 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 		if c.Regions[i].Count != c.Regions[j].Count {
 			return c.Regions[i].Count > c.Regions[j].Count
 		}
+		if c.Regions[i].Key.Dimension != c.Regions[j].Key.Dimension {
+			return c.Regions[i].Key.Dimension < c.Regions[j].Key.Dimension
+		}
 		if c.Regions[i].Key.X != c.Regions[j].Key.X {
 			return c.Regions[i].Key.X < c.Regions[j].Key.X
 		}
-		return c.Regions[i].Key.Z < c.Regions[j].Key.Z
+		if c.Regions[i].Key.Z != c.Regions[j].Key.Z {
+			return c.Regions[i].Key.Z < c.Regions[j].Key.Z
+		}
+		return c.Regions[i].Category < c.Regions[j].Category
 	})
 
 	for key, group := range byType {
@@ -1861,10 +1940,36 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 		if c.Concentrations[i].Cluster.Count != c.Concentrations[j].Cluster.Count {
 			return c.Concentrations[i].Cluster.Count > c.Concentrations[j].Cluster.Count
 		}
-		return c.Concentrations[i].Identifier < c.Concentrations[j].Identifier
+		if c.Concentrations[i].Identifier != c.Concentrations[j].Identifier {
+			return c.Concentrations[i].Identifier < c.Concentrations[j].Identifier
+		}
+		if c.Concentrations[i].Dimension != c.Concentrations[j].Dimension {
+			return c.Concentrations[i].Dimension < c.Concentrations[j].Dimension
+		}
+		if c.Concentrations[i].Cluster.CentreX != c.Concentrations[j].Cluster.CentreX {
+			return c.Concentrations[i].Cluster.CentreX < c.Concentrations[j].Cluster.CentreX
+		}
+		return c.Concentrations[i].Cluster.CentreZ < c.Concentrations[j].Cluster.CentreZ
 	})
 
-	sort.Slice(c.Named, func(i, j int) bool { return c.Named[i].Name < c.Named[j].Name })
+	sort.Slice(c.Named, func(i, j int) bool {
+		if c.Named[i].Name != c.Named[j].Name {
+			return c.Named[i].Name < c.Named[j].Name
+		}
+		if c.Named[i].Identifier != c.Named[j].Identifier {
+			return c.Named[i].Identifier < c.Named[j].Identifier
+		}
+		if c.Named[i].Dimension != c.Named[j].Dimension {
+			return c.Named[i].Dimension < c.Named[j].Dimension
+		}
+		if c.Named[i].X != c.Named[j].X {
+			return c.Named[i].X < c.Named[j].X
+		}
+		if c.Named[i].Y != c.Named[j].Y {
+			return c.Named[i].Y < c.Named[j].Y
+		}
+		return c.Named[i].Z < c.Named[j].Z
+	})
 	return c
 }
 ```
@@ -1872,7 +1977,7 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/census/ -run TestAggregate -v`
-Expected: PASS, seven tests.
+Expected: PASS, eight tests (seven original aggregate tests plus TestAggregateIsDeterministicOverTiedRows).
 
 - [ ] **Step 5: Commit**
 

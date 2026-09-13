@@ -1,6 +1,7 @@
 package census
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -137,5 +138,74 @@ func TestAggregateCarriesProvenance(t *testing.T) {
 	c := Aggregate(nil, ScanStats{Records: 7}, when, "archive")
 	if !c.TakenAt.Equal(when) || c.SourceKind != "archive" || c.Stats.Records != 7 {
 		t.Errorf("provenance = %v/%q/%+v, want it carried through unchanged", c.TakenAt, c.SourceKind, c.Stats)
+	}
+}
+
+func TestAggregateIsDeterministicOverTiedRows(t *testing.T) {
+	// Build input that ties on the old comparator keys:
+	// - Same identifier and same count in different dimensions (ties Totals and Regions)
+	// - Concentrations of equal size in well-separated locations in different dimensions
+	var entities []Entity
+
+	// 5 zombies in Overworld, all in region (0, 0)
+	for i := 0; i < 5; i++ {
+		entities = append(entities, Entity{Identifier: "zombie", Dimension: Overworld, X: float64(i), Z: 0})
+	}
+
+	// 5 zombies in Nether, all in region (0, 0) [also ties Regions]
+	for i := 0; i < 5; i++ {
+		entities = append(entities, Entity{Identifier: "zombie", Dimension: Nether, X: float64(i), Z: 0})
+	}
+
+	// 25 items in Overworld at one location (concentration cluster 1)
+	for i := 0; i < 25; i++ {
+		entities = append(entities, Entity{Identifier: "item", Dimension: Overworld, X: 100 + float64(i%3), Z: 100 + float64(i%3)})
+	}
+
+	// 25 items in Nether at a different location (concentration cluster 2, same count as cluster 1)
+	for i := 0; i < 25; i++ {
+		entities = append(entities, Entity{Identifier: "item", Dimension: Nether, X: 5000 + float64(i%3), Z: 5000 + float64(i%3)})
+	}
+
+	// Fingerprint a census by converting its structured output to a string
+	fingerprint := func(c Census) string {
+		var fp string
+		for _, tot := range c.Totals {
+			fp += fmt.Sprintf("T:%d:%s:%d:%d,", tot.Dimension, tot.Identifier, tot.Category, tot.Count)
+		}
+		for _, reg := range c.Regions {
+			fp += fmt.Sprintf("R:%d:%d:%d:%d:%d,", reg.Key.Dimension, reg.Key.X, reg.Key.Z, reg.Category, reg.Count)
+		}
+		for _, nam := range c.Named {
+			fp += fmt.Sprintf("N:%s:%s:%d,", nam.Name, nam.Identifier, nam.Dimension)
+		}
+		for _, con := range c.Concentrations {
+			fp += fmt.Sprintf("C:%d:%s:%d,", con.Dimension, con.Identifier, con.Cluster.Count)
+		}
+		return fp
+	}
+
+	// Run Aggregate 50 times and collect fingerprints
+	var firstFP string
+	var diffSection string
+	for run := 0; run < 50; run++ {
+		c := Aggregate(entities, ScanStats{}, time.Unix(0, 0), "archive")
+		fp := fingerprint(c)
+		if run == 0 {
+			firstFP = fp
+		} else if fp != firstFP {
+			// Find which section differed
+			if len(c.Totals) != len(c.Totals) {
+				diffSection = "Totals"
+			} else if len(c.Regions) != len(c.Regions) {
+				diffSection = "Regions"
+			} else if len(c.Concentrations) != len(c.Concentrations) {
+				diffSection = "Concentrations"
+			}
+			if diffSection == "" {
+				diffSection = "ordering within a section"
+			}
+			t.Fatalf("run %d produced different output than run 0 (differed in %s): %q vs %q", run, diffSection, fp, firstFP)
+		}
 	}
 }

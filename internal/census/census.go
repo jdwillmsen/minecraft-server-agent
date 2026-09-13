@@ -135,7 +135,10 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 		if c.Totals[i].Count != c.Totals[j].Count {
 			return c.Totals[i].Count > c.Totals[j].Count
 		}
-		return c.Totals[i].Identifier < c.Totals[j].Identifier
+		if c.Totals[i].Identifier != c.Totals[j].Identifier {
+			return c.Totals[i].Identifier < c.Totals[j].Identifier
+		}
+		return c.Totals[i].Dimension < c.Totals[j].Dimension
 	})
 
 	for k, count := range regions {
@@ -150,10 +153,16 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 		if c.Regions[i].Count != c.Regions[j].Count {
 			return c.Regions[i].Count > c.Regions[j].Count
 		}
+		if c.Regions[i].Key.Dimension != c.Regions[j].Key.Dimension {
+			return c.Regions[i].Key.Dimension < c.Regions[j].Key.Dimension
+		}
 		if c.Regions[i].Key.X != c.Regions[j].Key.X {
 			return c.Regions[i].Key.X < c.Regions[j].Key.X
 		}
-		return c.Regions[i].Key.Z < c.Regions[j].Key.Z
+		if c.Regions[i].Key.Z != c.Regions[j].Key.Z {
+			return c.Regions[i].Key.Z < c.Regions[j].Key.Z
+		}
+		return c.Regions[i].Category < c.Regions[j].Category
 	})
 
 	for key, group := range byType {
@@ -177,9 +186,35 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 		if c.Concentrations[i].Cluster.Count != c.Concentrations[j].Cluster.Count {
 			return c.Concentrations[i].Cluster.Count > c.Concentrations[j].Cluster.Count
 		}
-		return c.Concentrations[i].Identifier < c.Concentrations[j].Identifier
+		if c.Concentrations[i].Identifier != c.Concentrations[j].Identifier {
+			return c.Concentrations[i].Identifier < c.Concentrations[j].Identifier
+		}
+		if c.Concentrations[i].Dimension != c.Concentrations[j].Dimension {
+			return c.Concentrations[i].Dimension < c.Concentrations[j].Dimension
+		}
+		if c.Concentrations[i].Cluster.CentreX != c.Concentrations[j].Cluster.CentreX {
+			return c.Concentrations[i].Cluster.CentreX < c.Concentrations[j].Cluster.CentreX
+		}
+		return c.Concentrations[i].Cluster.CentreZ < c.Concentrations[j].Cluster.CentreZ
 	})
 
-	sort.Slice(c.Named, func(i, j int) bool { return c.Named[i].Name < c.Named[j].Name })
+	sort.Slice(c.Named, func(i, j int) bool {
+		if c.Named[i].Name != c.Named[j].Name {
+			return c.Named[i].Name < c.Named[j].Name
+		}
+		if c.Named[i].Identifier != c.Named[j].Identifier {
+			return c.Named[i].Identifier < c.Named[j].Identifier
+		}
+		if c.Named[i].Dimension != c.Named[j].Dimension {
+			return c.Named[i].Dimension < c.Named[j].Dimension
+		}
+		if c.Named[i].X != c.Named[j].X {
+			return c.Named[i].X < c.Named[j].X
+		}
+		if c.Named[i].Y != c.Named[j].Y {
+			return c.Named[i].Y < c.Named[j].Y
+		}
+		return c.Named[i].Z < c.Named[j].Z
+	})
 	return c
 }
