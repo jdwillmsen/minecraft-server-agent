@@ -763,3 +763,60 @@ func TestAnnounceDrain_ConnectionEndingMidSendStopsTheBacklog(t *testing.T) {
 		t.Fatal("the send was never cancelled: the rest of the backlog would reach a player this connection no longer watches")
 	}
 }
+
+// stoppedDeliverer parks inside DrainForJoin until its context ends, then
+// reports what a real one does when a send is cancelled part-way: the
+// messages it managed, the rest still owed, and no error -- sendPending
+// treats cancellation as a clean stop.
+type stoppedDeliverer struct {
+	inside    chan struct{}
+	returned  chan struct{}
+	remaining int
+}
+
+var _ AnnounceDeliverer = (*stoppedDeliverer)(nil)
+
+func (s *stoppedDeliverer) DrainForJoin(ctx context.Context, _ string, _ time.Time) (int, int, error) {
+	select {
+	case s.inside <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	defer close(s.returned)
+	return 1, s.remaining, nil
+}
+
+// The summary line has to stop with the backlog it summarises. A cancelled
+// send returns no error, so nothing downstream of the deliverer can tell
+// this apart from a capped drain unless the connection is consulted again:
+// what this catches is a trailer whispered on a context the connection-end
+// cancel cannot reach, pointing a player who is mid-reconnect at an !inbox
+// they are not there to read.
+func TestAnnounceDrain_ConnectionEndingMidSendSendsNoSummary(t *testing.T) {
+	deliverer := &stoppedDeliverer{inside: make(chan struct{}, 1), returned: make(chan struct{}), remaining: 4}
+	conns := &fakeConnections{gen: 1}
+	voice := newRecordingTellVoice()
+	d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("error"), WithConnections(conns))
+
+	if err := d.HandleEvent(t.Context(), &plugin.Context{Voice: voice}, joinEventAt("111", 1)); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	select {
+	case <-deliverer.inside:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the drain never reached the deliverer")
+	}
+
+	conns.end()
+
+	select {
+	case <-deliverer.returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the send was never cancelled by the connection ending")
+	}
+	select {
+	case msg := <-voice.told:
+		t.Fatalf("summary %q was whispered after the connection ended: its player may be mid-reconnect", msg)
+	case <-time.After(250 * time.Millisecond):
+	}
+}

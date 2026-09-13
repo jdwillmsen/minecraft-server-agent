@@ -319,10 +319,12 @@ func TestALeaveAfterFailedReconnectWritesCarriesTheConnectionStart(t *testing.T)
 	}
 }
 
-// One PlayerList may carry a removal and a re-add for the same player. The
-// departure has to be applied before the arrival, or it erases the arrival
-// the same packet just reported -- and the deliverer then reads a client
-// that is mid-load as settled, which is the loss the join clock exists for.
+// One PlayerList may carry a removal and a re-add for the same player.
+// Arrivals are applied first and the departure is then skipped, because the
+// roster shows the player back at the end of the packet -- applying it would
+// erase the arrival the same packet just reported, and the deliverer would
+// read a client that is mid-load as settled, which is the loss the join
+// clock exists for.
 func TestSamePacketRejoinKeepsTheArrival(t *testing.T) {
 	log := logging.New("info")
 	siblings := map[string]struct{}{siblingBot: {}}

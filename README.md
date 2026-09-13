@@ -398,6 +398,14 @@ the same wait, from the connection that found them there - so a backlog is
 never stranded by a reconnect and never whispered twice. They are not
 greeted for it; they did not arrive.
 
+A delivery already under way stops the same moment, between one message and
+the next. The connection ending cancels the drain where it stands, so the
+rest of the backlog is left pending rather than whispered and recorded
+against someone who is no longer on the server, and the `!inbox` trailer
+that would have followed it is not spoken either - a player mid-reconnect
+is owed no pointer at a list they are not there to read. Whatever is still
+owed is summarised by the delivery the next connection schedules for them.
+
 Those snapshot deliveries would otherwise all come due in the same
 millisecond, so each is spread by a random fraction of the wait, never more
 than the wait itself. Five deliver at a time; the rest wait their turn

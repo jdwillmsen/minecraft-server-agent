@@ -270,24 +270,27 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 // summary is never added when remaining is 0: the welcome message already
 // owns this moment, and an empty inbox has nothing to add to it.
 func (a *AnnounceDrain) drain(voice plugin.Voice, xuid string, ended <-chan struct{}) {
-	drainCtx, cancel := context.WithTimeout(a.rootCtx, drainTimeout)
-	defer cancel()
-
-	// Cancelled the moment the connection ends, so a backlog stops between
+	// Cancelled the moment the connection ends, and every context this
+	// delivery speaks through descends from it: a backlog stops between
 	// messages instead of whispering the rest of itself at a player this
 	// agent is no longer watching -- and recording each one as delivered.
 	// The bridge is a separate process and stays up, so nothing else fails.
+	connCtx, endConn := context.WithCancel(a.rootCtx)
+	defer endConn()
 	if ended != nil {
 		stop := make(chan struct{})
 		defer close(stop)
 		go func() {
 			select {
 			case <-ended:
-				cancel()
+				endConn()
 			case <-stop:
 			}
 		}()
 	}
+
+	drainCtx, cancel := context.WithTimeout(connCtx, drainTimeout)
+	defer cancel()
 
 	_, remaining, err := a.deliverer.DrainForJoin(drainCtx, xuid, time.Now())
 	if pgerr.Unready(err) {
@@ -303,15 +306,25 @@ func (a *AnnounceDrain) drain(voice plugin.Voice, xuid string, ended <-chan stru
 	if remaining == 0 {
 		return
 	}
+	if connCtx.Err() != nil {
+		// The backlog stopped because the connection did, and a cancelled
+		// send is a clean stop that leaves everything it did not reach
+		// still owed. A player mid-reconnect is owed no trailer either:
+		// the next connection re-reports them and its own delivery
+		// summarises whatever is still left by then.
+		return
+	}
 	if voice == nil {
 		a.log.Error("announce_drain_summary_undeliverable", logging.Fields{"xuid": xuid})
 		return
 	}
 
-	// A fresh bound rather than whatever's left of drainCtx: the summary is
-	// one short whisper, no reason for it to inherit a budget that a long
-	// backlog may have already spent down to nothing.
-	tellCtx, tellCancel := context.WithTimeout(a.rootCtx, plugin.DefaultDispatchTimeout)
+	// A fresh bound rather than whatever's left of drainCtx, since the
+	// summary is one short whisper and has no reason to inherit a budget a
+	// long backlog may have already spent down to nothing -- but still
+	// under connCtx, so a connection ending while it is in flight stops it
+	// like it stops everything else this delivery says.
+	tellCtx, tellCancel := context.WithTimeout(connCtx, plugin.DefaultDispatchTimeout)
 	defer tellCancel()
 	err = voice.Tell(tellCtx, xuid, drainSummary(remaining))
 	metrics.AnnounceDelivery(metrics.DeliverySummary, err)
