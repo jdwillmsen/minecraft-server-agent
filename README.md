@@ -177,7 +177,8 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   other out of the game during a release - see "Handing over to a standby"
   below
 - `internal/httpapi` - `/healthz`, `/readyz` (the live agent's real Bedrock
-  session state, or a warm standby's deliberate wait - both are ready),
+  session state, or a standby's wait - both are ready), the role that says
+  which of the two this process is,
   `/metrics`, and `POST /announcements` when `ANNOUNCE_API_TOKEN` is set
 - `internal/metrics` - every series the agent exports beyond the session
   gauge and reconnect counter; callers record through small functions and
@@ -483,6 +484,13 @@ at - so an `@server` answer that outlives its connection still reaches the
 player who asked for it. The next connection replaces those names as it
 reports them.
 
+A resolvable name is never taken as proof that a player is still here. Every
+announcement whisper checks the roster's online list first, so a backlog
+whose drain was scheduled by an arrival is not sent to someone who quit
+during its wait: the console accepts a `tellraw` matching nobody and reports
+success, which would record the whole backlog as delivered and never offer
+it again. What they are owed survives for their next join instead.
+
 What the gap makes unknowable is who was online, not whether the server can
 speak. So an announcement to everyone or to whoever is online is still
 broadcast in the gap and heard by whoever is there - it simply records
@@ -492,12 +500,16 @@ announcement addressed to a player or to a permission is whispered, and a
 whisper needs someone to send it to, so that one stays silent and stays
 pending.
 
-Only the live agent broadcasts blind like that. The announcement API is
-served by every pod, including a warm standby, whose roster is empty for its
-whole life rather than for a backoff - and whose console bridge is up like
-any other. A publish that reaches a standby and names nobody is not spoken:
-the server belongs to whichever process holds the lock. See "Handing over to
-a standby".
+Only the gap earns that, and only for the live agent. An empty roster on a
+server the agent *is* connected to means what it says - nobody is on -
+and nothing is spoken, exactly as before. The announcement API is served by
+every pod, including a warm standby, whose roster is empty for its whole
+life rather than for a backoff and whose console bridge is up like any
+other; a publish that reaches one and names nobody is not spoken, because
+the server belongs to whichever process holds the lock. A process counts as
+a standby from startup until it actually takes the lock, and again the
+moment it loses one, so neither window can broadcast into a game it is not
+in. See "Handing over to a standby".
 
 A delivery already under way stops the same moment, between one message and
 the next. The connection ending cancels the drain where it stands, so the
@@ -829,7 +841,14 @@ soon as the server notices the socket is gone.
 | Live agent with a Bedrock session | `200` | `ready` |
 | Live agent with no session, or dead on a respawn screen | `503` | `not ready` |
 | Warm standby waiting for the lock | `200` | `standby` |
-| Starting up, before either | `503` | `not ready` |
+| Starting up, before the lock | `200` | `standby` |
+
+A process is a standby from the moment it starts until it actually holds the
+lock, and again from the moment it loses one. That is what the role means -
+"not playing" - and it is read by more than `/readyz`: the announcement API
+is served for the whole process, so a role that claimed otherwise during
+startup would let a pod broadcast into a game it is not in. An agent running
+without a database has no lock to wait for and goes live immediately.
 
 A waiting standby is **ready**, which is deliberate twice over: it is a
 healthy pod doing exactly what it should, and a rolling update that waits for

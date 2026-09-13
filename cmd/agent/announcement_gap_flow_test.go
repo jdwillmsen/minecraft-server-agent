@@ -10,6 +10,7 @@ import (
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/httpapi"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
@@ -115,6 +116,13 @@ func (g *connectionGap) apply(t *testing.T, entries ...protocol.PlayerListEntry)
 	handlePlayerList(context.Background(), wire(t, entries...), selfXUID, siblingBotXUIDs(), g.log, g.bus, g.roster, store.Nop{}, g.joins)
 }
 
+// quit is the player leaving: one removal record, the shape the live server
+// sends.
+func (g *connectionGap) quit(t *testing.T) {
+	t.Helper()
+	g.apply(t, removeEntry(playerXUID))
+}
+
 // publish sends the queued announcement the way a schedule, an event source
 // or the HTTP API does: straight through the deliverer, now. Those three run
 // for the process rather than for a session, which is how a publish reaches
@@ -205,5 +213,100 @@ func TestAPublishInTheConnectionGapIsNotRecordedAgainstWhoWasThere(t *testing.T)
 	}
 	if owed := g.stillOwed(t); len(owed) != 0 {
 		t.Errorf("still owed = %v after the replacement delivery, want nothing", owed)
+	}
+}
+
+// TestADrainForAPlayerWhoQuitIsNotWhisperedOrRecorded is the other end of
+// the same permanent loss, inside a live session rather than across a gap. A
+// drain is scheduled by an arrival and fires seconds later; a player who
+// quits inside that wait is gone, and mc-console-bridge answers a tellraw
+// that matches nobody with success, so the backlog would be recorded as
+// delivered and never offered again.
+//
+// It fails if the announcement whisper paths take a resolvable gamertag as
+// evidence of presence. Names are deliberately kept after a player leaves so
+// a reply already in flight can still be addressed -- which the second half
+// of this test holds to -- and that is exactly why presence has to be asked
+// of the roster's online list instead.
+func TestADrainForAPlayerWhoQuitIsNotWhisperedOrRecorded(t *testing.T) {
+	at := time.Date(2026, 9, 13, 9, 0, 0, 0, time.UTC)
+	g := newConnectionGap(t, at)
+
+	g.arrive(t, "LightKing0221")
+	// Their drain is scheduled here, a full wait ahead of now.
+	g.quit(t)
+	g.clock.advance(announceDrainDelay + time.Second)
+
+	delivered, remaining, err := g.drainer.DrainForJoin(context.Background(), playerXUID, g.clock.now())
+	if err != nil {
+		t.Fatalf("DrainForJoin: %v", err)
+	}
+	if lines := g.voice.spoken(); len(lines) != 0 {
+		t.Errorf("whispered to a player who has quit:%s", formatTimeline(lines, at))
+	}
+	if rows := g.backlog.deliveryRows(); len(rows) != 0 {
+		t.Errorf("delivery rows = %+v, want none — a recorded delivery is never offered again", rows)
+	}
+	if delivered != 0 || remaining != 1 {
+		t.Errorf("DrainForJoin = (%d, %d), want (0, 1) — the announcement is still owed", delivered, remaining)
+	}
+	if owed := g.stillOwed(t); len(owed) != 1 || owed[0] != gapAnnouncementID {
+		t.Fatalf("still owed = %v, want announcement %d kept for their next join", owed, gapAnnouncementID)
+	}
+
+	// The half that has to keep working: the same player is still nameable,
+	// so an @server answer that was still being written when they left is
+	// addressed rather than thrown away.
+	if name, ok := g.roster.NameFor(playerXUID); !ok || name != "LightKing0221" {
+		t.Errorf("NameFor after they quit = (%q, %v), want (LightKing0221, true)", name, ok)
+	}
+	if g.roster.IsOnline(playerXUID) {
+		t.Error("IsOnline after they quit = true, want false")
+	}
+}
+
+// TestAProcessThatHasNotTakenTheLockDoesNotBroadcast wires the Deliverer's
+// leadership signal to a real HTTP server the way main does, and publishes
+// before any role has been assigned -- the window between the announcement
+// API being mounted and the campaign for the lock finishing, during which a
+// pod that is in no game answers requests.
+func TestAProcessThatHasNotTakenTheLockDoesNotBroadcast(t *testing.T) {
+	srv, err := httpapi.New("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("httpapi.New: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	at := time.Date(2026, 9, 13, 9, 0, 0, 0, time.UTC)
+	voice := newTimelineVoice(newScaledClock(at))
+	backlog := &backlogStore{}
+	playerRoster := roster.New()
+	joins := newJoinTimes()
+	d := announce.NewDeliverer(backlog, voice,
+		newDeliveryAudience(playerRoster, siblingBotXUIDs()),
+		announcePermissions{resolver: fakePermResolver(t, nil)}, logging.New("info"),
+		announce.WithFreshJoinGrace(joins, freshJoinGrace),
+		announce.WithLeadership(srv),
+		announce.WithSession(joins))
+
+	a := announce.Announcement{ID: 1, Body: "server restarting in 5 minutes", TargetKind: announce.TargetOnlineOnly}
+	if _, err := d.SendNow(context.Background(), a, a.ID); err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if lines := voice.spoken(); len(lines) != 0 {
+		t.Errorf("spoke before holding the lock, want silence:%s", formatTimeline(lines, at))
+	}
+
+	// Once it is the live agent, the same publish in the same gap is heard.
+	srv.SetRole(httpapi.RoleLive)
+	if _, err := d.SendNow(context.Background(), a, a.ID); err != nil {
+		t.Fatalf("SendNow after taking the lock: %v", err)
+	}
+	if lines := voice.spoken(); len(lines) != 1 {
+		t.Errorf("lines = %+v, want exactly one once this process holds the lock", lines)
 	}
 }

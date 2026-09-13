@@ -36,6 +36,10 @@ func TestServer_Readyz_NotReadyUntilSetReady(t *testing.T) {
 	}
 	defer srv.ln.Close()
 
+	// Readiness is a question about a live agent's session. A process that
+	// has not taken the lock is a standby and answers as one.
+	srv.SetRole(RoleLive)
+
 	get := func() *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		srv.httpServer.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
@@ -200,4 +204,34 @@ func readyz(srv *Server) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	srv.httpServer.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	return rec
+}
+
+// A process is a standby until it takes the lock, not from the moment
+// something remembers to say so. The announcement API is mounted for the
+// whole process and answers long before leadership is settled, so a role
+// that read live by default would let a pod that is in no game act as though
+// it were the one playing.
+func TestServer_IsAStandbyUntilItTakesTheLock(t *testing.T) {
+	srv, err := New("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = srv.ln.Close() }()
+
+	if srv.Live() {
+		t.Error("Live() = true before any role was assigned, want false")
+	}
+	if rec := readyz(srv); rec.Code != http.StatusOK || rec.Body.String() != "standby" {
+		t.Errorf("readyz before leadership = (%d, %q), want (200, standby)", rec.Code, rec.Body.String())
+	}
+
+	srv.SetRole(RoleLive)
+	if !srv.Live() {
+		t.Error("Live() = false after taking the lock, want true")
+	}
+
+	srv.SetRole(RoleStandby)
+	if srv.Live() {
+		t.Error("Live() = true after standing down, want false")
+	}
 }

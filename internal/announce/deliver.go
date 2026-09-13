@@ -59,6 +59,18 @@ type Leadership interface {
 	Live() bool
 }
 
+// Session reports whether the agent currently has a live Bedrock connection.
+// It is what tells an empty roster's two meanings apart: connected with
+// nobody online is an idle server, where a broadcast would be a console line
+// nobody could hear, while disconnected is the gap, where the roster cannot
+// answer who is there but the console bridge still can. Narrowed to the one
+// question rather than folded into Roster, which answers who is reachable
+// and has no notion of the connection behind it.
+type Session interface {
+	// Connected reports whether a Bedrock session is live right now.
+	Connected() bool
+}
+
 // Permissions resolves a player's current permission level, as a plain
 // string rather than the plugin package's enum — again so this package
 // doesn't have to import plugin just to describe what it needs from it.
@@ -98,6 +110,10 @@ type Deliverer struct {
 	// WithLeadership is passed, which reads as live: a deployment with no
 	// lock to wait for has always been the live agent.
 	leader Leadership
+	// session says whether that same broadcast would be going into a gap or
+	// into an idle server. Nil unless WithSession is passed, which reads as
+	// disconnected: nothing has claimed a session is up.
+	session Session
 }
 
 // Option configures a Deliverer at construction.
@@ -128,6 +144,14 @@ func WithLeadership(l Leadership) Option {
 	return func(d *Deliverer) { d.leader = l }
 }
 
+// WithSession lets a Deliverer tell an idle server from a connection gap.
+//
+// Without it an empty roster is read as a gap, because that is the only
+// state a Deliverer with no session source can be sure it cannot see into.
+func WithSession(s Session) Option {
+	return func(d *Deliverer) { d.session = s }
+}
+
 // NewDeliverer builds a Deliverer over the given Store, Voice, Roster and
 // Permissions.
 func NewDeliverer(s Store, v Voice, r Roster, p Permissions, log *logging.Logger, opts ...Option) *Deliverer {
@@ -143,6 +167,39 @@ func NewDeliverer(s Store, v Voice, r Roster, p Permissions, log *logging.Logger
 // lock to wait for and is the live agent by default.
 func (d *Deliverer) live() bool {
 	return d.leader == nil || d.leader.Live()
+}
+
+// connected reports whether the agent is in the game right now. False when
+// no Session was wired: a Deliverer that was never given one cannot claim a
+// connection it has no way to observe.
+func (d *Deliverer) connected() bool {
+	return d.session != nil && d.session.Connected()
+}
+
+// inTheGap reports whether an empty roster means "who is here is unknowable"
+// rather than "nobody is here". Only the live agent between connections is
+// in that state: a standby is in no game at all, and a connected agent with
+// an empty roster is simply on an idle server, where a broadcast would be a
+// console line no player could hear.
+func (d *Deliverer) inTheGap() bool {
+	return d.live() && !d.connected()
+}
+
+// departed reports whether xuid has left since the roster named them.
+//
+// Deliberately asked of the roster's online list rather than of whether a
+// gamertag resolves: a name outlives the session that taught it, because a
+// reply already in flight still has to be addressable, so name resolution is
+// no evidence at all that the player is still there. A whisper recorded
+// against someone who has gone is the permanent loss this package exists to
+// avoid -- nothing retries a delivery that has a row.
+func (d *Deliverer) departed(xuid string) bool {
+	for _, online := range d.roster.Online() {
+		if online == xuid {
+			return false
+		}
+	}
+	return true
 }
 
 // stillLoading reports whether xuid's client may be too freshly loaded to
@@ -229,12 +286,13 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 		// whispered on a later join, and online-only never queues, so this
 		// is its only chance to be heard at all.
 		//
-		// A standby looks identical from the roster alone and must stay
-		// silent: it is in no game, its roster is empty for its whole life
-		// rather than for a backoff, and the server it would speak into
-		// belongs to the process that holds the lock.
-		if len(targets) == 0 && !d.live() {
-			d.log.Info("announce_say_skipped_standby", logging.Fields{"announcement_id": id})
+		// Only the gap earns that. A standby is in no game and its roster
+		// is empty for its whole life rather than for a backoff, so the
+		// server it would speak into belongs to the process holding the
+		// lock; a connected agent with an empty roster is on an idle
+		// server, where the roster is right and there is nobody to hear.
+		if len(targets) == 0 && !d.inTheGap() {
+			d.log.Info("announce_say_skipped_no_audience", logging.Fields{"announcement_id": id, "connected": d.connected(), "live": d.live()})
 			return 0, nil
 		}
 		err := d.voice.Say(ctx, a.Body)
@@ -313,6 +371,12 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 			// (and an error line) for every recipient still left to try.
 			break
 		}
+		if d.departed(xuid) {
+			// Left between the roster naming them and their turn in this
+			// loop. Nothing is sent and nothing recorded, so what they are
+			// owed survives for their next join.
+			continue
+		}
 		if d.stillLoading(xuid) {
 			// Their client is not rendering chat yet, so this Tell would be
 			// accepted by the server and seen by nobody. Not sent and not
@@ -370,12 +434,22 @@ func (d *Deliverer) Publish(ctx context.Context, a Announcement) (id int64, sent
 // successful send delivered. A send or a mark that fails is logged and
 // simply not counted: the announcement is left pending in the store, so it
 // is retried on this player's next join or !inbox rather than lost.
+//
+// A player who is no longer online is not whispered to at all. This drain
+// was scheduled seconds ago by their arrival, and a player who quits inside
+// that wait would otherwise be sent their whole backlog and have every
+// message of it recorded -- the console accepts a tellraw that matches
+// nobody, so the send reports success and the backlog is gone for good.
 func (d *Deliverer) sendPending(ctx context.Context, xuid string, now time.Time, msgs []Announcement) int {
 	delivered := 0
 	for _, a := range msgs {
 		if ctx.Err() != nil {
 			// Cancelled: stop here rather than turn the rest of a backlog
 			// into that many more failed bridge attempts and error lines.
+			break
+		}
+		if d.departed(xuid) {
+			d.log.Info("announce_drain_stopped_player_left", logging.Fields{"announcement_id": a.ID, "xuid": xuid})
 			break
 		}
 		err := d.voice.Tell(ctx, xuid, a.Body)

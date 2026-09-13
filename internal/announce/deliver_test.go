@@ -116,7 +116,7 @@ func TestDrainForJoinCapsNormalButNotExpedited(t *testing.T) {
 	}
 	store := &fakeStore{enabled: true, pending: pending}
 	voice := &fakeVoice{}
-	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"xuid-1"}}, fakePermissions{}, testLogger())
 
 	delivered, remaining, err := d.DrainForJoin(context.Background(), "xuid-1", time.Now())
 	if err != nil {
@@ -154,7 +154,7 @@ func TestAFailedSendIsNotRecordedAsDelivered(t *testing.T) {
 	}
 	store := &fakeStore{enabled: true, pending: pending}
 	voice := &fakeVoice{tellErr: map[string]error{"xuid-1": errors.New("bridge unreachable")}}
-	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"xuid-1"}}, fakePermissions{}, testLogger())
 
 	delivered, remaining, err := d.DrainForJoin(context.Background(), "xuid-1", time.Now())
 	if err != nil {
@@ -326,7 +326,7 @@ func TestDrainForJoinStopsWhenContextAlreadyCancelled(t *testing.T) {
 	}
 	store := &fakeStore{enabled: true, pending: pending}
 	voice := &fakeVoice{}
-	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"xuid-1"}}, fakePermissions{}, testLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -451,7 +451,7 @@ func TestConcurrentDrainForJoinCallsForSameXUIDEachSendOnlyOnce(t *testing.T) {
 	}
 	store := newRaceStore(pending)
 	voice := &fakeVoice{}
-	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"xuid-1"}}, fakePermissions{}, testLogger())
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -483,7 +483,7 @@ func TestConcurrentDrainForJoinAndDrainAllForSameXUIDEachSendOnlyOnce(t *testing
 	}
 	store := newRaceStore(pending)
 	voice := &fakeVoice{}
-	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"xuid-1"}}, fakePermissions{}, testLogger())
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -523,7 +523,7 @@ func TestDrainAllCapsOneInboxAndReportsTheRest(t *testing.T) {
 	}
 	store := &fakeStore{enabled: true, pending: pending}
 	voice := &fakeVoice{}
-	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"xuid-1"}}, fakePermissions{}, testLogger())
 
 	delivered, remaining, err := d.DrainAll(context.Background(), "xuid-1", time.Now())
 	if err != nil {
@@ -546,7 +546,7 @@ func TestDrainAllUnderTheCapLeavesNothingOwed(t *testing.T) {
 		{ID: 1, Body: "one", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
 		{ID: 2, Body: "two", Priority: PriorityNormal, TargetKind: TargetPlayer, Delivery: DeliveryWhisper},
 	}}
-	d := NewDeliverer(store, &fakeVoice{}, fakeRoster{}, fakePermissions{}, testLogger())
+	d := NewDeliverer(store, &fakeVoice{}, fakeRoster{online: []string{"xuid-1"}}, fakePermissions{}, testLogger())
 
 	delivered, remaining, err := d.DrainAll(context.Background(), "xuid-1", time.Now())
 	if err != nil {
@@ -947,5 +947,148 @@ func TestSendNowWhispersOnAStandbyIsAlreadyNothing(t *testing.T) {
 	}
 	if len(store.delivered) != 0 {
 		t.Errorf("store recorded %v, want nothing", store.delivered)
+	}
+}
+
+// fadingRoster answers with online until it has been read once, then with
+// nobody: a player who quits between the roster naming them and their turn
+// in a send loop.
+type fadingRoster struct {
+	mu     sync.Mutex
+	online []string
+	reads  int
+}
+
+var _ Roster = (*fadingRoster)(nil)
+
+func (r *fadingRoster) Online() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reads++
+	if r.reads > 1 {
+		return nil
+	}
+	return r.online
+}
+
+// fakeSession is a Session whose answer the test fixes.
+type fakeSession struct{ connected bool }
+
+var _ Session = fakeSession{}
+
+func (s fakeSession) Connected() bool { return s.connected }
+
+// A drain is scheduled by an arrival and fires seconds later. A player who
+// quits inside that wait is gone, but the console accepts a tellraw that
+// matches nobody and reports success — so whispering their backlog anyway
+// would record every message of it and lose the lot, which is the permanent
+// loss this package exists to avoid.
+func TestDrainForJoinSendsNothingToAPlayerWhoLeftBeforeItFired(t *testing.T) {
+	pending := []Announcement{
+		{ID: 1, Body: "one", Priority: PriorityNormal, TargetKind: TargetPlayer},
+		{ID: 2, Body: "two", Priority: PriorityExpedited, TargetKind: TargetPlayer},
+	}
+	store := &fakeStore{enabled: true, pending: pending}
+	voice := &fakeVoice{}
+	// Nobody on the roster: the player this drain belongs to has quit.
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+
+	delivered, remaining, err := d.DrainForJoin(context.Background(), "xuid-1", time.Now())
+	if err != nil {
+		t.Fatalf("DrainForJoin: %v", err)
+	}
+	if len(voice.tells) != 0 {
+		t.Errorf("whispered %v to a player who is not on the server", voice.tells)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing — a recorded delivery is never retried", store.delivered)
+	}
+	if delivered != 0 || remaining != len(pending) {
+		t.Errorf("DrainForJoin = (%d, %d), want (0, %d) — the whole backlog is still owed", delivered, remaining, len(pending))
+	}
+}
+
+func TestDrainAllSendsNothingToAPlayerWhoLeft(t *testing.T) {
+	// The !inbox path reaches the same sender, and a player can quit between
+	// typing it and the store answering.
+	store := &fakeStore{enabled: true, pending: []Announcement{{ID: 1, Body: "one", TargetKind: TargetPlayer}}}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+
+	delivered, remaining, err := d.DrainAll(context.Background(), "xuid-1", time.Now())
+	if err != nil {
+		t.Fatalf("DrainAll: %v", err)
+	}
+	if len(voice.tells) != 0 || len(store.delivered) != 0 {
+		t.Errorf("tells = %v, rows = %v, want both empty", voice.tells, store.delivered)
+	}
+	if delivered != 0 || remaining != 1 {
+		t.Errorf("DrainAll = (%d, %d), want (0, 1)", delivered, remaining)
+	}
+}
+
+func TestSendNowSkipsAWhisperRecipientWhoLeftMidLoop(t *testing.T) {
+	// recipients() reads the roster once. A permission-targeted send then
+	// whispers one player at a time, and the last of them may have quit
+	// while the first was still being told.
+	a := Announcement{Body: "the nether hub is open", TargetKind: TargetPermission, TargetValue: "operator"}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice,
+		&fadingRoster{online: []string{"op-1", "op-2"}},
+		fakePermissions{levels: map[string]string{"op-1": "operator", "op-2": "operator"}},
+		testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 21)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if sent != 0 || len(voice.tells) != 0 || len(store.delivered) != 0 {
+		t.Errorf("sent = %d, tells = %v, rows = %v; want nothing sent or recorded once the roster no longer names them", sent, voice.tells, store.delivered)
+	}
+}
+
+func TestSendNowStaysSilentOnAnIdleConnectedServer(t *testing.T) {
+	// Connected with nobody online is not a gap: the roster is right, there
+	// is genuinely nobody to hear it, and a console line sent anyway is
+	// noise counted as a broadcast.
+	a := Announcement{Body: "server restarting in 5 minutes", TargetKind: TargetOnlineOnly}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: true}),
+		WithSession(fakeSession{connected: true}))
+
+	sent, err := d.SendNow(context.Background(), a, 22)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 0 {
+		t.Errorf("Say calls = %v, want none on an idle server the agent is connected to", voice.says)
+	}
+	if sent != 0 || len(store.delivered) != 0 {
+		t.Errorf("sent = %d, rows = %v, want nothing", sent, store.delivered)
+	}
+}
+
+func TestSendNowBroadcastsWhenTheSameRosterMeansAGap(t *testing.T) {
+	// The identical empty roster, from a leader whose connection is down:
+	// the console bridge is a separate process and still reaches whoever is
+	// on the server, and online-only never queues, so this is its one chance.
+	a := Announcement{Body: "server restarting in 5 minutes", TargetKind: TargetOnlineOnly}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: true}),
+		WithSession(fakeSession{connected: false}))
+
+	if _, err := d.SendNow(context.Background(), a, 23); err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 || voice.says[0] != a.Body {
+		t.Errorf("Say calls = %v, want exactly one carrying %q", voice.says, a.Body)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing — there is no roster snapshot to record from", store.delivered)
 	}
 }

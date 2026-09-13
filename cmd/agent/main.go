@@ -198,8 +198,11 @@ func main() {
 		announce.WithFreshJoinGrace(joins, freshJoinGrace),
 		// A publish can reach any replica, because the announcement API is
 		// mounted for the process; only the one holding the lock is playing
-		// on the server a broadcast would be heard on.
+		// on the server a broadcast would be heard on, and only while it is
+		// between connections is its empty roster a gap rather than an idle
+		// server.
 		announce.WithLeadership(httpServer),
+		announce.WithSession(joins),
 	)
 	// Wrapped only now: the stores above type-assert the concrete Postgres
 	// to borrow its pool, which the wrapper would hide from them.
@@ -277,7 +280,15 @@ func main() {
 		// Ends with this turn, not with the process: the connect loop and
 		// every live-only writer below run under it, so losing the lock takes
 		// the agent out of the game without taking the process down.
-		liveCtx, endTurn := context.WithCancel(ctx)
+		//
+		// Standing down demotes the role first, so nothing that reads it acts
+		// on a game this process no longer has a claim to while the connect
+		// loop is still unwinding.
+		liveCtx, cancelTurn := context.WithCancel(ctx)
+		endTurn := func() {
+			httpServer.SetRole(httpapi.RoleStandby)
+			cancelTurn()
+		}
 		go endTermOnLockLoss(liveCtx, term, endTurn, log)
 		// A turn that began without the lock -- because whoever holds it is
 		// gone without having released it -- is a turn worth flagging for as

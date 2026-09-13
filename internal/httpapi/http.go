@@ -17,14 +17,17 @@ import (
 type Role int32
 
 const (
-	// RoleLive is the process that holds the agent lock and the login. It is
-	// the zero value because it is what a process with no standby to hand
-	// over to has always been, and what an agent running without a database
-	// -- and so without a lock to wait for -- still is.
-	RoleLive Role = iota
-	// RoleStandby is a process that has finished every part of its startup
-	// that does not need the login, and is waiting for the lock.
-	RoleStandby
+	// RoleStandby is a process that is not playing: one still starting up,
+	// one waiting for the lock, or one that has just lost it. It is the zero
+	// value because a process becomes live by taking the lock, and until it
+	// has, claiming otherwise would let it act on a game it is not in --
+	// the announcement API is served for the whole process, including the
+	// startup before leadership is settled and the moment after it is gone.
+	// A deployment with no database has no lock to wait for and is set live
+	// explicitly instead -- see awaitLeadership.
+	RoleStandby Role = iota
+	// RoleLive is the process that holds the agent lock and the login.
+	RoleLive
 )
 
 // Server is the agent's HTTP server.
