@@ -86,6 +86,7 @@ func newElection(cfg config.Config, pool *pgxpool.Pool, log *logging.Logger) cam
 		leader.PoolDial(pool, cfg.MCUsername),
 		leader.WithPoll(time.Duration(cfg.LeaderPollMs)*time.Millisecond),
 		leader.WithMaxWait(time.Duration(cfg.LeaderMaxWaitMs)*time.Millisecond),
+		leader.WithHeartbeat(time.Duration(cfg.LeaderHeartbeatMs)*time.Millisecond),
 		leader.WithLogger(log),
 	)}
 }

@@ -296,3 +296,134 @@ func TestAnAbandonedLockIsOutwaitedAndThenAdopted(t *testing.T) {
 		t.Error("the term adopted the lock and still reports it holds none")
 	}
 }
+
+func TestAStandbyWaitsOutTheBoundWhileTheHolderAnnouncesItself(t *testing.T) {
+	// The failure the heartbeat exists for, against a real server. Two pods
+	// coexisting for longer than the bound -- a rolling update, a paused
+	// rollout, an old pod hanging past its termination grace -- used to end
+	// with the standby forcing itself live and kicking an agent that was
+	// perfectly healthy, which its connect loop answers by kicking back. Here
+	// the standby hears the holder and stays out of the game instead, however
+	// long the bound says it has waited.
+	leading := livePool(t, "beating-holder")
+	standby := livePool(t, "beating-standby")
+	acct := account(t)
+	beat := 25 * time.Millisecond
+
+	held, err := campaignWithin(t,
+		New(PoolDial(leading, acct), WithHeartbeat(beat), WithProbe(50*time.Millisecond)),
+		5*time.Second)
+	if err != nil {
+		t.Fatalf("the holder never took a free lock: %v", err)
+	}
+	if !held.Held() {
+		t.Fatal("the holder does not hold the lock it was given")
+	}
+
+	// A bound of 100ms against a staleness window of 75ms: a standby acting on
+	// the clock alone would be live almost at once.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	waiting := New(PoolDial(standby, acct),
+		WithPoll(20*time.Millisecond),
+		WithMaxWait(100*time.Millisecond),
+		WithHeartbeat(beat))
+	done := make(chan *Term, 1)
+	go func() {
+		term, err := waiting.Campaign(ctx)
+		if err != nil {
+			t.Errorf("standby campaign: %v", err)
+		}
+		done <- term
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("the standby went live while the holder was still announcing itself")
+	case <-time.After(2 * time.Second):
+	}
+
+	// An ordinary handover from here, which also says something the unit tests
+	// cannot: that connection has had its read time out on every one of those
+	// hundred polls and is still the connection that takes the lock.
+	if err := held.Release(t.Context()); err != nil {
+		t.Fatalf("release the held lock: %v", err)
+	}
+	select {
+	case term := <-done:
+		defer func() { _ = term.Release(t.Context()) }()
+		if !term.Held() {
+			t.Error("the standby went live without the lock although the holder released it")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the standby never took the lock the holder gave up")
+	}
+}
+
+func TestAHolderThatStopsAnnouncingItselfIsOutwaitedAndTakenOver(t *testing.T) {
+	// The other half of the same mechanism: waiting on a live holder must not
+	// become waiting forever. This lock is held by a connection that announces
+	// itself and then stops, which is what a pod killed between two
+	// announcements leaves behind -- the backend, and the lock, still there for
+	// as long as TCP keepalive takes to notice.
+	holding := livePool(t, "stopped-holder")
+	standby := livePool(t, "stopped-standby")
+	acct := account(t)
+	beat := 25 * time.Millisecond
+	announceFor := 500 * time.Millisecond
+
+	dead, err := holding.Acquire(t.Context())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer dead.Release()
+	var taken bool
+	if err := dead.QueryRow(t.Context(), tryLockSQL, acct).Scan(&taken); err != nil {
+		t.Fatalf("take lock: %v", err)
+	}
+	if !taken {
+		t.Fatal("the lock was not free at the start of the test")
+	}
+
+	// Joined before the connection is handed back, because it is the same
+	// connection: a pgx connection used from two goroutines at once is a data
+	// race, and this test would be reporting one of its own making.
+	announcing, stopAnnouncing := context.WithTimeout(t.Context(), announceFor)
+	announced := make(chan struct{})
+	defer func() {
+		stopAnnouncing()
+		<-announced
+	}()
+	go func() {
+		defer close(announced)
+		for announcing.Err() == nil {
+			if _, err := dead.Exec(announcing, heartbeatSQL, heartbeatChannel, acct); err != nil && announcing.Err() == nil {
+				t.Errorf("announce: %v", err)
+			}
+			select {
+			case <-announcing.Done():
+			case <-time.After(beat):
+			}
+		}
+	}()
+
+	started := time.Now()
+	term, err := campaignWithin(t,
+		New(PoolDial(standby, acct),
+			WithPoll(20*time.Millisecond),
+			WithMaxWait(100*time.Millisecond),
+			WithHeartbeat(beat),
+			WithProbe(50*time.Millisecond)),
+		30*time.Second)
+	if err != nil {
+		t.Fatalf("the standby never gave up on a holder that had gone quiet: %v", err)
+	}
+	defer func() { _ = term.Release(t.Context()) }()
+
+	if took := time.Since(started); took < announceFor {
+		t.Errorf("the standby went live after %v, before the holder stopped announcing itself at %v", took, announceFor)
+	}
+	if term.Held() {
+		t.Error("the term claims a lock the quiet connection is still holding")
+	}
+}

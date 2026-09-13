@@ -13,7 +13,7 @@ func clearEnv(t *testing.T) {
 		"COMMAND_RATE_LIMIT_PER_MINUTE", "LOG_LEVEL",
 		"CONSOLE_BRIDGE_URL", "CONSOLE_BRIDGE_TOKEN", "CONSOLE_BRIDGE_TIMEOUT_MS",
 		"LLM_MAX_TOKENS", "LLM_TIMEOUT_MS", "LLM_TOTAL_TIMEOUT_MS",
-		"LEADER_POLL_MS", "LEADER_MAX_WAIT_MS",
+		"LEADER_POLL_MS", "LEADER_MAX_WAIT_MS", "LEADER_HEARTBEAT_MS",
 	} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
@@ -171,6 +171,34 @@ func TestLoad_LeaderPollZeroFails(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error when LEADER_POLL_MS is 0")
+	}
+}
+
+func TestLoad_LeaderHeartbeatOverride(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("LEADER_HEARTBEAT_MS", "4000")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.LeaderHeartbeatMs != 4000 {
+		t.Errorf("LeaderHeartbeatMs = %d, want 4000", cfg.LeaderHeartbeatMs)
+	}
+}
+
+// An agent that announces itself less often than a standby is willing to wait
+// is an agent no standby ever hears in time: it would go live on a silence
+// that only meant the holder had not got round to speaking yet.
+func TestLoad_LeaderHeartbeatAboveTheBoundFails(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("LEADER_MAX_WAIT_MS", "10000")
+	t.Setenv("LEADER_HEARTBEAT_MS", "10000")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error when LEADER_HEARTBEAT_MS is not below LEADER_MAX_WAIT_MS")
 	}
 }
 

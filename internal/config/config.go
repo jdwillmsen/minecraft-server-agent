@@ -92,7 +92,21 @@ type Config struct {
 	// Must stay comfortably above LeaderPollMs and above the few seconds a
 	// departing agent spends leaving the game and settling its database, so no
 	// ordinary release ever reaches it.
+	//
+	// It is a floor rather than a deadline: a standby that can still hear the
+	// holder announcing itself keeps waiting past it, since the point of the
+	// bound is a lock nobody will release, not a lock somebody is using.
 	LeaderMaxWaitMs int
+	// LeaderHeartbeatMs is how often the live agent announces that it is still
+	// there, which is the only thing that tells a standby a slow holder from a
+	// dead one.
+	//
+	// Must be under LeaderMaxWaitMs or a standby goes live without ever having
+	// had the chance to hear one, and is worth keeping under a third of it: a
+	// standby waits three intervals of silence before it stops believing in the
+	// holder, and while that is shorter than the bound, a holder that really is
+	// gone costs a standby the bound and nothing more.
+	LeaderHeartbeatMs int
 
 	// The LLM backend behind @server answering. An empty LLMBaseURL disables
 	// answering entirely -- the mention is logged and nothing else happens,
@@ -192,6 +206,16 @@ func Load() (Config, error) {
 		// tuning.
 		return Config{}, fmt.Errorf("LEADER_MAX_WAIT_MS (%d) must be >= LEADER_POLL_MS (%d)", leaderMaxWait, leaderPoll)
 	}
+	leaderHeartbeat, err := positiveInt("LEADER_HEARTBEAT_MS", 10000)
+	if err != nil {
+		return Config{}, err
+	}
+	if leaderHeartbeat >= leaderMaxWait {
+		// An announcement that comes round less often than the bound is one no
+		// standby ever hears in time: it would go live on a silence that meant
+		// only that the holder had not got round to speaking yet.
+		return Config{}, fmt.Errorf("LEADER_HEARTBEAT_MS (%d) must be < LEADER_MAX_WAIT_MS (%d)", leaderHeartbeat, leaderMaxWait)
+	}
 	llmMaxTokens, err := positiveInt("LLM_MAX_TOKENS", 192)
 	if err != nil {
 		return Config{}, err
@@ -242,6 +266,7 @@ func Load() (Config, error) {
 		PGConnectTimeoutMs:        pgConnectTimeout,
 		LeaderPollMs:              leaderPoll,
 		LeaderMaxWaitMs:           leaderMaxWait,
+		LeaderHeartbeatMs:         leaderHeartbeat,
 		LLMBaseURL:                stringDefault("LLM_BASE_URL", ""),
 		LLMModel:                  stringDefault("LLM_MODEL", ""),
 		LLMAPIKey:                 stringDefault("LLM_API_KEY", ""),

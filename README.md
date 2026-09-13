@@ -202,7 +202,8 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 | `PG_PASSWORD` | *(empty)* | Database password |
 | `PG_CONNECT_TIMEOUT_MS` | `5000` | Bounds the startup connection check, so a slow database costs persistence, not the ability to start |
 | `LEADER_POLL_MS` | `500` | How often a warm standby asks whether the agent lock has come free. The dominant term in how long a release leaves the server without an agent; only meaningful with a database configured, since without one there is no lock and no standby |
-| `LEADER_MAX_WAIT_MS` | `60000` | How long a standby waits for the lock before going live without it, because a lock nobody will release would otherwise cost hours - see "When nobody releases the lock" below. Must be at least `LEADER_POLL_MS`, and is deliberately far above the few seconds an ordinary handover takes, so a release never reaches it |
+| `LEADER_MAX_WAIT_MS` | `60000` | The floor under a standby's wait, not a deadline: once it has elapsed the standby may go live without the lock, but only if the holder has gone quiet - see "When nobody releases the lock" below. Must be at least `LEADER_POLL_MS`, and is deliberately far above the few seconds an ordinary handover takes, so a release never reaches it |
+| `LEADER_HEARTBEAT_MS` | `10000` | How often the live agent announces that it is still there, which is what lets a standby tell a slow holder from a dead one. A standby gives up on three intervals of silence, so keep this under a third of `LEADER_MAX_WAIT_MS`; it must be under `LEADER_MAX_WAIT_MS` or a standby goes live having never had the chance to hear one |
 | `LLM_BASE_URL` | *(empty disables answering)* | Base URL of the OpenAI-compatible backend behind `@server` |
 | `LLM_MODEL` | *(empty)* | Model name sent with each request |
 | `LLM_API_KEY` | *(empty)* | Bearer token for the LLM backend, if it requires one |
@@ -801,13 +802,53 @@ settings are all zero (`idle_session_timeout`, `tcp_keepalives_idle`,
 node's `7200 / 75 / 9` - so worst case the lock stays taken for about 2h11m.
 
 Waiting that out would trade a 29-second planned gap for a multi-hour
-unplanned one, so the wait is bounded by `LEADER_MAX_WAIT_MS`. At the end of
-it the agent goes live **without** the lock and lets the Xbox Live kick evict
-whatever is still logged in - which is exactly how every release worked before
-any of this existed, so the worst case is no worse than it used to be. That
-decision is logged at ERROR (`leading_without_the_lock`), because it is the
-process knowingly giving up the guarantee the lock provides, and it shows up
-in `mc_agent_leader_unlocked` for as long as it lasts.
+unplanned one, so `LEADER_MAX_WAIT_MS` puts a floor under the wait: once it has
+elapsed the standby is entitled to go live **without** the lock and let the
+Xbox Live kick evict whatever is still logged in - which is exactly how every
+release worked before any of this existed, so the worst case is no worse than
+it used to be.
+
+**The bound is the fallback, not the rule.** A clock cannot tell a holder that
+is gone from one that is merely still there: it only says how long this process
+has waited. So the live agent announces itself every `LEADER_HEARTBEAT_MS`
+(10s by default) for as long as it leads, and a standby that can still hear
+those announcements keeps waiting, however long the bound says it has been.
+Taking the login off a healthy agent would not end that conflict anyway - the
+second login kicks the first, and the evicted agent's connect loop kicks
+straight back, the two flapping with `mc_agent_leader_unlocked` pinned at 1.
+
+A standby gives up on silence, not on time: three missed announcements - 30s at
+the default interval - and only once the bound has elapsed as well. Three
+because one missed write is not a death, since a statement can lose its turn to
+a checkpoint, a failover or a descheduled process. 30s because it is half the
+bound, which keeps the silence already conclusive by the time the bound is up:
+a holder that really is gone still costs a standby the bound and nothing more.
+A holder that announces nothing at all - a dead backend, or an agent from the
+release before this shipped - is outwaited exactly as it was before, which is
+what makes this safe to deploy over a version that cannot announce itself.
+
+The announcement is a PostgreSQL `NOTIFY` on the connection the standby is
+already polling on, not a row in a table. That is a trade: a row would be
+readable after the fact and would tell a standby the holder's age the instant
+it started, instead of after the first announcement it hears. It would also
+need a table, and this agent's schema lives in `jdwlabs/platform` - so it would
+make the agent wait on a migration there and on the grants the runtime role
+would need on it, which is exactly the failure described under "Testing the
+store against a real database" below. `NOTIFY` needs neither, and nothing for
+two deployments to do in the wrong order.
+
+`pg_stat_activity` looks like it could answer the same question for free, and
+cannot: the holder's connection is legitimately idle between its five-second
+probes, so a healthy holder and a dead pod's abandoned backend look identical
+there.
+
+A failed announcement is not standing down. A holder that cannot write one is
+still logged in and still holds the lock, so it logs `leader_heartbeat_failed`
+at WARN and carries on - only the lock ending ends a term. Going live without
+the lock is still logged at ERROR (`leading_without_the_lock`), because it is
+the process knowingly giving up the guarantee the lock provides, and it still
+shows up in `mc_agent_leader_unlocked` for as long as it lasts. What changed is
+when that happens, not what it means.
 
 Such a process keeps chasing the lock in the background and adopts it the
 moment it frees. That is not tidiness: an agent with no lock has no connection
@@ -818,7 +859,10 @@ survivable, is dead for the rest of the process's life. Adoption logs
 connection under the same probe a lock held from the start gets.
 
 **What the chart still has to do.** The agent side of this is only half the
-fix. Until the Helm chart moves from `Recreate` to `RollingUpdate` with
+fix, and the heartbeat above is what makes the other half safe: with
+`Recreate`, two agent pods never coexist and nothing can reach the bound, while
+a rolling update makes coexisting pods the normal case. Until the Helm chart
+moves from `Recreate` to `RollingUpdate` with
 `maxSurge: 1` and `maxUnavailable: 0`, the old pod is still stopped before
 the new one starts and there is never a standby to hand over to - so the
 lock is always free when the new pod asks for it, and a release costs what it
@@ -911,11 +955,14 @@ from `V6__minecraft_moderation.sql`: `go test -tags livedb
 disposable database built from the migrations, never at production.
 
 `internal/leader` has one as well, and it needs no table at all - advisory
-locks are server state, not schema - so the same `MC_TEST_DSN` works:
+locks and `LISTEN`/`NOTIFY` are both server state, not schema - so the same
+`MC_TEST_DSN` works:
 `go test -tags livedb ./internal/leader/`. It is worth more than its size
 suggests: it asserts that two processes never hold the lock at once, that a
 terminated connection releases it, that a lock nobody releases is outwaited
-and then adopted once it frees, and that a lock taken on a *pooled*
+and then adopted once it frees, that a standby stays out of the game while the
+holder is still announcing itself and takes over once it stops, and that a lock
+taken on a *pooled*
 connection is silently lost when the pool retires it - the bug the dedicated
 connection exists to avoid, written down so nobody optimises it back in. One
 of its cases terminates connections by `application_name`, so it can run

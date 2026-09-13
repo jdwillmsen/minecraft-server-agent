@@ -31,6 +31,17 @@
 // what every release did before this package existed. The guarantee is given
 // up loudly and only after the bound -- see Campaign.
 //
+// A bound on its own cannot tell a holder that is gone from one that is merely
+// still there, because it only ever asks how long this process has waited. So
+// the holder announces itself while it leads, and a standby that can still
+// hear those announcements keeps waiting rather than taking the login off a
+// live agent -- which, since the second login kicks the first, would not end
+// the conflict but start a flap, the evicted agent's connect loop taking the
+// login straight back. The bound stays as the floor underneath that: a holder
+// which announces nothing is outwaited exactly as it was before, whether it is
+// a dead backend PostgreSQL has not reaped or an agent from the release before
+// this was written. See Term.beat and pursue.
+//
 // The hazard that shape brings is the one this package is built around: a
 // session-scoped advisory lock belongs to one connection. Taking it on a
 // pooled connection that is later recycled releases it silently, leaving an
@@ -80,6 +91,39 @@ const DefaultProbe = 5 * time.Second
 // dead backend holding the lock.
 const DefaultMaxWait = 60 * time.Second
 
+// DefaultHeartbeat is how often the holder announces that it is still there.
+//
+// Far inside DefaultMaxWait, so a standby hears the holder several times over
+// before the bound it would otherwise act on: the announcement is the only
+// thing that distinguishes a slow holder from a gone one, and a standby has to
+// have had the chance to hear one while it still had time to believe it.
+const DefaultHeartbeat = 10 * time.Second
+
+// heartbeatStale is how many announcements a standby lets the holder miss
+// before it stops believing in it.
+//
+// Three, because one missed write is not a death: a statement can lose its
+// turn to a checkpoint, a failover or a descheduled process, and a standby
+// that took the login away over one slow write would be the flap this is here
+// to avoid. Three of the default interval is 30s, half of DefaultMaxWait,
+// which keeps a property worth keeping -- the silence is already conclusive by
+// the time the bound elapses, so a holder that really is gone costs a standby
+// the bound and nothing more. An interval set above a third of the bound gives
+// that up: takeover then costs the bound plus however much of the staleness
+// window is left, which is slower but never wrong.
+const heartbeatStale = 3
+
+// heartbeatWrite bounds one announcement.
+//
+// Short because the write shares the leading connection -- and so the mutex
+// guarding it -- with the liveness probe and with Release. An announcement
+// still outstanding when the process is shutting down would spend the budget
+// the departing agent needs to hand the lock back, and its successor would
+// then have to outwait a lock that nobody released. One statement on an open
+// connection that takes longer than this has already failed at the only thing
+// an announcement is for.
+const heartbeatWrite = time.Second
+
 // Session is one dedicated database connection an Election runs on, and the
 // lock it holds.
 //
@@ -100,6 +144,15 @@ type Session interface {
 	Unlock(ctx context.Context) error
 	// Alive reports whether the connection is still usable.
 	Alive(ctx context.Context) error
+	// Heartbeat announces, to any standby listening, that the process holding
+	// this lock is still here. Its failure says nothing about leadership: the
+	// holder is still in the game and still holds the lock.
+	Heartbeat(ctx context.Context) error
+	// AwaitHeartbeat waits for an announcement from whoever holds this lock,
+	// reporting whether one arrived before ctx ended. A ctx that ends first is
+	// silence rather than an error, which is what almost every poll hears: the
+	// holder announces itself far less often than a standby asks for the lock.
+	AwaitHeartbeat(ctx context.Context) (bool, error)
 	// Close hands the connection back. Idempotent: the lost-connection path
 	// and the release path both end here.
 	Close()
@@ -111,11 +164,12 @@ type Dial func(ctx context.Context) (Session, error)
 
 // Election waits for the agent lock and reports when it is held.
 type Election struct {
-	dial    Dial
-	poll    time.Duration
-	probe   time.Duration
-	maxWait time.Duration
-	log     *logging.Logger
+	dial      Dial
+	poll      time.Duration
+	probe     time.Duration
+	maxWait   time.Duration
+	heartbeat time.Duration
+	log       *logging.Logger
 }
 
 // Option configures an Election.
@@ -139,6 +193,18 @@ func WithProbe(d time.Duration) Option {
 	}
 }
 
+// WithHeartbeat overrides DefaultHeartbeat. It sets both how often the holder
+// announces itself and, as a multiple of that, how long a silence has to last
+// before a standby stops believing in it -- one interval, because the two are
+// only meaningful against each other (see heartbeatStale).
+func WithHeartbeat(d time.Duration) Option {
+	return func(e *Election) {
+		if d > 0 {
+			e.heartbeat = d
+		}
+	}
+}
+
 // WithMaxWait overrides DefaultMaxWait. A value of zero or less waits
 // forever, which no production path asks for and which only a test that wants
 // to prove the waiting itself should.
@@ -155,7 +221,13 @@ func WithLogger(l *logging.Logger) Option {
 
 // New builds an Election over dial.
 func New(dial Dial, opts ...Option) *Election {
-	e := &Election{dial: dial, poll: DefaultPoll, probe: DefaultProbe, maxWait: DefaultMaxWait}
+	e := &Election{
+		dial:      dial,
+		poll:      DefaultPoll,
+		probe:     DefaultProbe,
+		maxWait:   DefaultMaxWait,
+		heartbeat: DefaultHeartbeat,
+	}
 	for _, opt := range opts {
 		opt(e)
 	}
@@ -169,10 +241,13 @@ func New(dial Dial, opts ...Option) *Election {
 // situation from here -- not yet -- and the standby's job in all three is to
 // keep waiting while the live agent carries on playing.
 //
-// The wait is bounded (see DefaultMaxWait). When the bound is reached the
-// returned Term does not hold the lock -- Held reports false -- and the caller
-// is expected to go live anyway: the only thing that can hold a lock nobody
-// releases is a process that is already gone, and the Xbox Live login kicks
+// The wait is bounded (see DefaultMaxWait), and the bound is a floor rather
+// than a deadline: once it has elapsed this process is entitled to go live, but
+// not while the lock's holder is still announcing itself. When the bound has
+// elapsed and the holder has gone quiet, the returned Term does not hold the
+// lock -- Held reports false -- and the caller is expected to go live anyway:
+// the only thing that can hold a lock nobody releases, and say nothing while it
+// does, is a process that is already gone, and the Xbox Live login kicks
 // whatever is still connected as the account. That is precisely how every
 // release worked before this package existed, so the worst case is no worse
 // than it used to be, and the best case is the handover this is all for.
@@ -187,7 +262,7 @@ func (e *Election) Campaign(ctx context.Context) (*Term, error) {
 		return nil, err
 	}
 	if sess != nil {
-		return newTerm(sess, e.probe, e.log), nil
+		return newTerm(sess, e.probe, e.heartbeat, e.log), nil
 	}
 
 	// Error, not warning: the process is knowingly giving up the one
@@ -210,14 +285,19 @@ func (e *Election) Campaign(ctx context.Context) (*Term, error) {
 	return term, nil
 }
 
-// pursue polls for the lock until it has it, until limit elapses, or until ctx
-// ends. It returns the locked session, which the caller then owns; (nil, nil)
-// means limit elapsed with the lock still held elsewhere.
+// pursue polls for the lock until it has it, until limit elapses with the
+// holder gone quiet, or until ctx ends. It returns the locked session, which
+// the caller then owns; (nil, nil) means the wait was given up on.
 //
-// A limit of zero or less never elapses. The session is this function's own
-// until it hands one back: a poll that finds the lock taken keeps it for the
-// next attempt, a failed attempt discards it, and a wait that gives up returns
-// it to the pool rather than leaving a connection checked out for nothing.
+// A limit of zero or less never elapses, and with no limit there is nothing for
+// the holder's announcements to change, so they are not listened for: the only
+// caller that waits without a limit is a process that is already live and
+// chasing the lock from inside the game.
+//
+// The session is this function's own until it hands one back: a poll that finds
+// the lock taken keeps it for the next attempt, a failed attempt discards it,
+// and a wait that gives up returns it to the pool rather than leaving a
+// connection checked out for nothing.
 func (e *Election) pursue(ctx context.Context, limit time.Duration) (Session, error) {
 	var sess Session
 	defer func() {
@@ -226,14 +306,18 @@ func (e *Election) pursue(ctx context.Context, limit time.Duration) (Session, er
 		}
 	}()
 
-	var giveUp <-chan time.Time
-	if limit > 0 {
-		timer := time.NewTimer(limit)
-		defer timer.Stop()
-		giveUp = timer.C
-	}
-
+	started := time.Now()
 	waiting := false
+	// Zero until the holder has been heard from. A standby that never hears
+	// anything acts on the bound exactly as it did before any of this existed,
+	// which is what makes this safe to deploy over a release that announces
+	// nothing.
+	var heard time.Time
+	// Set once listening itself fails. A heartbeat this process cannot hear has
+	// to read as silence: a standby kept out of the game indefinitely by a
+	// broken query would be worse than the bound it replaced.
+	deaf := false
+	extended := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -270,14 +354,73 @@ func (e *Election) pursue(ctx context.Context, limit time.Duration) (Session, er
 			}
 		}
 
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-giveUp:
-			return nil, nil
-		case <-time.After(e.poll):
+		if limit > 0 && time.Since(started) >= limit {
+			if !e.holderAlive(heard) {
+				return nil, nil
+			}
+			if !extended {
+				// Once: the holder may go on being alive for hours, and this
+				// line is worth nothing repeated every poll for all of them.
+				extended = true
+				e.note("leader_holder_alive", logging.Fields{
+					"waited_ms": time.Since(started).Milliseconds(),
+					"stale_ms":  e.staleAfter().Milliseconds(),
+					"reason":    "the lock's holder is still announcing itself; waiting past the maximum wait rather than taking the login from a live agent",
+				})
+			}
+		}
+
+		announced, err := e.waitOut(ctx, sess, limit > 0 && !deaf)
+		switch {
+		case err != nil:
+			deaf = true
+			e.note("leader_heartbeat_unheard", logging.Fields{
+				"error":  err.Error(),
+				"reason": "cannot listen for the holder; the maximum wait decides this campaign on its own from here",
+			})
+		case announced:
+			heard = time.Now()
 		}
 	}
+}
+
+// holderAlive reports whether the lock's holder has announced itself recently
+// enough to be believed. A holder never heard from is not believed at all --
+// see heartbeatStale.
+func (e *Election) holderAlive(heard time.Time) bool {
+	return !heard.IsZero() && time.Since(heard) < e.staleAfter()
+}
+
+// staleAfter is how long the holder's silence has to last before a standby
+// treats the lock as abandoned.
+func (e *Election) staleAfter() time.Duration {
+	return heartbeatStale * e.heartbeat
+}
+
+// waitOut spends one poll interval, listening for the holder's announcement
+// while it does when there is a connection to listen on and a bound for the
+// answer to matter to.
+//
+// It spends the whole interval either way, including when it hears something
+// early. How often a standby asks for the lock is what decides how long an
+// ordinary handover takes, and tying that rate to how often the holder happens
+// to announce itself would couple two intervals that are set for unrelated
+// reasons.
+func (e *Election) waitOut(ctx context.Context, sess Session, listen bool) (bool, error) {
+	wait, cancel := context.WithTimeout(ctx, e.poll)
+	defer cancel()
+	if sess == nil || !listen {
+		<-wait.Done()
+		return false, nil
+	}
+	heard, err := sess.AwaitHeartbeat(wait)
+	// The rest of the interval is spent either way, so that a listen failing
+	// instantly does not turn the poll loop into a spin.
+	<-wait.Done()
+	if err != nil {
+		return false, err
+	}
+	return heard, nil
 }
 
 func (e *Election) note(event string, fields logging.Fields) {
@@ -314,7 +457,7 @@ type Term struct {
 	log *logging.Logger
 }
 
-func newTerm(sess Session, probe time.Duration, log *logging.Logger) *Term {
+func newTerm(sess Session, probe, beat time.Duration, log *logging.Logger) *Term {
 	t := &Term{
 		sess:    sess,
 		lost:    make(chan struct{}),
@@ -328,6 +471,7 @@ func newTerm(sess Session, probe time.Duration, log *logging.Logger) *Term {
 	// term that already holds the lock must not wait forever.
 	t.markAdopted()
 	go t.watch(probe)
+	go t.beat(beat)
 	if log != nil {
 		log.Info("leader_acquired", nil)
 	}
@@ -336,6 +480,13 @@ func newTerm(sess Session, probe time.Duration, log *logging.Logger) *Term {
 
 // newUnlockedTerm is the term a caller leads under when the bounded wait
 // expired: live, and honest about holding no lock.
+//
+// It announces nothing, for want of anything to announce on -- the heartbeat
+// rides the connection carrying the lock, and this term has none. That is less
+// a gap than the shape of the situation: a process here is already logging
+// leading_without_the_lock, and once every process in a deployment announces
+// itself none of them reaches this state while another is alive, so there is no
+// unlocked term for a third process to have to wait on.
 func newUnlockedTerm(log *logging.Logger) *Term {
 	return &Term{
 		lost:    make(chan struct{}),
@@ -379,7 +530,7 @@ func (t *Term) adopt(ctx context.Context, e *Election) {
 	if err != nil || sess == nil {
 		return
 	}
-	if t.install(sess, e.probe) {
+	if t.install(sess, e.probe, e.heartbeat) {
 		if t.log != nil {
 			t.log.Info("leader_lock_adopted", nil)
 		}
@@ -395,7 +546,7 @@ func (t *Term) adopt(ctx context.Context, e *Election) {
 
 // install makes a late-acquired lock this term's own, reporting false if the
 // term has already been released.
-func (t *Term) install(sess Session, probe time.Duration) bool {
+func (t *Term) install(sess Session, probe, beat time.Duration) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	select {
@@ -407,6 +558,7 @@ func (t *Term) install(sess Session, probe time.Duration) bool {
 	t.held.Store(true)
 	t.markAdopted()
 	go t.watch(probe)
+	go t.beat(beat)
 	return true
 }
 
@@ -504,6 +656,53 @@ func (t *Term) check(ctx context.Context) error {
 	return t.sess.Alive(ctx)
 }
 
+// beat announces, for as long as this term lasts, that the process holding the
+// lock is still here -- which is what lets a standby tell this process from a
+// pod whose backend PostgreSQL has not yet reaped.
+//
+// A failed announcement is logged and nothing more. The holder still holds the
+// lock and is still logged in, and only the lock ending may end a term: a
+// process that stood down over a database hiccup would leave the server with no
+// agent while remaining in the game, which is every cost of a conflict and none
+// of its point. Whether the connection is still there is the probe's question,
+// asked separately and answered on its own evidence.
+func (t *Term) beat(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		// Before the first tick, not after it: a standby may already be
+		// waiting with the bound running against it, and an announcement is
+		// worth nothing to it until one arrives.
+		ctx, cancel := context.WithTimeout(context.Background(), heartbeatWrite)
+		err := t.heartbeat(ctx)
+		cancel()
+		if err != nil && t.log != nil {
+			t.log.Warn("leader_heartbeat_failed", logging.Fields{
+				"error":  err.Error(),
+				"reason": "the holder could not announce itself; it still holds the lock and is still in the game",
+			})
+		}
+
+		select {
+		case <-t.stop:
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// heartbeat announces on the connection carrying the lock, or does nothing once
+// the term has ended: a process that went on announcing itself after standing
+// down would hold its own successor's standby out of the game.
+func (t *Term) heartbeat(ctx context.Context) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.sess == nil {
+		return nil
+	}
+	return t.sess.Heartbeat(ctx)
+}
+
 // drop abandons a connection that has stopped answering. The lock went with
 // it, so there is nothing to unlock.
 func (t *Term) drop() {
@@ -552,11 +751,43 @@ type poolSession struct {
 	conn    *pgxpool.Conn
 	account string
 	once    sync.Once
+	// listening is set by the first AwaitHeartbeat. Touched only from the
+	// campaign that owns this session before it is handed over, and never
+	// again once it is: nothing else on this connection listens.
+	listening bool
 }
 
 const (
 	tryLockSQL = `SELECT pg_try_advisory_lock(hashtext('minecraft.agent'), hashtext($1))`
 	unlockSQL  = `SELECT pg_advisory_unlock(hashtext('minecraft.agent'), hashtext($1))`
+)
+
+// The heartbeat is a LISTEN/NOTIFY announcement rather than a row somebody
+// writes and somebody else reads, and that is a trade worth stating. A row
+// would be readable after the fact, and would let a standby learn the holder's
+// age the instant it started rather than having to hear one announcement
+// first. It would also need a table, and this agent's schema lives in another
+// repository -- so a row would make this change wait on a migration there, and
+// on the grants the runtime role would need on it, which is precisely the
+// failure that went unnoticed the last time this schema gained something.
+// NOTIFY needs neither: no DDL, no grants, nothing for two deployments to do in
+// the wrong order. What it costs is that a standby knows nothing until the next
+// announcement arrives, which the interval keeps far inside the bound.
+//
+// pg_stat_activity and pg_locks look like they could answer the same question
+// with no announcement at all, and cannot: the holder's connection is
+// legitimately idle between probes, so "a backend holding the lock and doing
+// nothing" is what a healthy holder and a dead pod both look like.
+const (
+	// heartbeatChannel is shared by every account, with the account in the
+	// payload: a channel name is an identifier, which PostgreSQL truncates past
+	// 63 bytes, and a truncated channel would have two accounts waiting on each
+	// other's announcements. Filtering on the payload cannot truncate.
+	heartbeatChannel = "minecraft_agent_heartbeat"
+	heartbeatSQL     = `SELECT pg_notify($1, $2)`
+	// LISTEN takes an identifier rather than a parameter, so the channel is
+	// interpolated -- safe because it is the constant above and never input.
+	listenSQL = `LISTEN ` + heartbeatChannel
 )
 
 func (s *poolSession) TryLock(ctx context.Context) (bool, error) {
@@ -595,6 +826,55 @@ func (s *poolSession) Alive(ctx context.Context) error {
 		return fmt.Errorf("leader: ping: %w", err)
 	}
 	return nil
+}
+
+// Heartbeat says, to anyone listening, that this account's lock is held by a
+// process that is still here. Cheap by design: one statement, no table, no row
+// to clean up, and nothing recorded if nobody is listening.
+func (s *poolSession) Heartbeat(ctx context.Context) error {
+	if _, err := s.conn.Exec(ctx, heartbeatSQL, heartbeatChannel, s.account); err != nil {
+		return fmt.Errorf("leader: announce heartbeat: %w", err)
+	}
+	return nil
+}
+
+// AwaitHeartbeat waits for the holder to announce itself on the connection this
+// standby is already polling on.
+//
+// The LISTEN is taken once, lazily: only a standby acting on the bound needs
+// it, and a connection that is about to become the holder's would pay for it
+// for nothing. It is deliberately not undone when the connection goes back to
+// the pool -- Close has to stay instantaneous, since it runs on the paths where
+// leadership is being handed over or has just been lost, and a connection left
+// listening costs at most the handful of announcements that queue on it before
+// the pool retires it for being idle.
+func (s *poolSession) AwaitHeartbeat(ctx context.Context) (bool, error) {
+	if !s.listening {
+		if _, err := s.conn.Exec(ctx, listenSQL); err != nil {
+			return false, fmt.Errorf("leader: listen for heartbeats: %w", err)
+		}
+		s.listening = true
+	}
+
+	for {
+		note, err := s.conn.Conn().WaitForNotification(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				// The ordinary case, hit on most polls: the caller's wait ran
+				// out before the holder had anything to say. pgx reaches that
+				// by letting the read time out, which leaves the connection
+				// usable -- it closes one only on errors that are not
+				// timeouts -- so the next poll goes on using this one.
+				return false, nil
+			}
+			return false, fmt.Errorf("leader: wait for heartbeat: %w", err)
+		}
+		if note.Payload == s.account {
+			return true, nil
+		}
+		// Another account's agent announcing itself on the shared channel.
+		// A different login, so not a holder this process is waiting on.
+	}
 }
 
 func (s *poolSession) Close() {
