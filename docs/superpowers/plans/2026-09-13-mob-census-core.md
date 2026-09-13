@@ -2700,7 +2700,7 @@ Expected: a report naming the nether regions saturated with piglins and brutes, 
 
 This whole plan was executed once against the live FWB world before being written, so these are observed outputs rather than predictions. Two things to expect:
 
-- **Entity totals will differ from the hand-run Python audit by a handful of records** — 22,622 against 22,616 on the same archive. The two readers disagree slightly over write-ahead-log and superseded entries, and the Python run opened the database read-write while this opens it read-only. A difference of this order is the readers disagreeing; a difference of hundreds is a bug.
+- **The entity total depends on whether the write-ahead log has been replayed, not on which reader you use.** A world extracted fresh from an archive reports 22,622 records; the same world after any process opens it read-write reports 22,616, because a read-write open replays and compacts the WAL. This was confirmed by running this very `Scan` over both states of the same world: the reader is identical, the directory is not. Always read a freshly extracted archive, read-only, or the number is not reproducible — which is the entire point of this tool. A difference of hundreds is a bug; a difference of single digits between a pristine and a previously-opened copy is this effect.
 - **The report is only useful if it agrees with a careful manual count.** If the nether piglin regions, the overworld animal saturation, or the item concentration are absent or wildly different, stop and investigate rather than committing — reproducing that audit is the entire point of the tool.
 
 - [ ] **Step 7: Commit**
