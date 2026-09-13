@@ -188,15 +188,16 @@ func recordedIDs(rows []deliveryRow) []int64 {
 	return ids
 }
 
-// TestABacklogInterruptedByADroppedConnectionIsNotLost is the last path of
-// JDWLABS-541 end to end. The connection is dropped between one whispered
-// announcement and the next: the rest must not be spoken, must not be
-// recorded, and must not be summarised at a player who is mid-reconnect --
-// the bridge is a separate process and stays up, so nothing about the drop
-// stops them on its own. What makes this the same permanent loss as the
-// original incident is the delivery row: written for a message the player
-// never saw, it suppresses that message for good. The second half is the
-// point of stopping: the very next connection pays what was left owed.
+// TestABacklogInterruptedByADroppedConnectionIsNotLost is the last path by
+// which a join backlog could still be lost, end to end. The connection is
+// dropped between one whispered announcement and the next: the rest must
+// not be spoken, must not be recorded, and must not be summarised at a
+// player who is mid-reconnect -- the bridge is a separate process and stays
+// up, so nothing about the drop stops them on its own. What makes this the
+// same permanent loss as the original incident is the delivery row: written
+// for a message the player never saw, it suppresses that message for good.
+// The second half is the point of stopping: the very next connection pays
+// what was left owed.
 func TestABacklogInterruptedByADroppedConnectionIsNotLost(t *testing.T) {
 	joinedAt := time.Date(2026, 9, 11, 22, 42, 0, 0, time.UTC)
 	ctx, cancel := context.WithCancel(context.Background())
