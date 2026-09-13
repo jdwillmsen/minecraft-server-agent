@@ -351,6 +351,94 @@ func TestAnswerWithToolsMessageHistoryIsWellFormed(t *testing.T) {
 	}
 }
 
+// toolCallReplyWithText is a turn where the model both wrote to the player
+// and asked for a tool, which is the turn a refusal arrives in.
+func toolCallReplyWithText(text, name, args string) string {
+	return `{"choices":[{"message":{"content":` + strconv.Quote(text) +
+		`,"tool_calls":[{"id":"c1","type":"function","function":{"name":"` + name +
+		`","arguments":` + strconv.Quote(args) + `}}]},"finish_reason":"tool_calls"}]}`
+}
+
+// assistantTurnOf runs one tool round against a backend scripted with first
+// and returns the assistant turn the follow-up request carried.
+func assistantTurnOf(t *testing.T, first string) chatMessage {
+	t.Helper()
+	var bodies [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, body)
+		reply := textReply
+		if len(bodies) == 1 {
+			reply = first
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(reply))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
+	registry := tools.NewRegistry(tools.Tool{
+		Name:   "server_status",
+		Schema: json.RawMessage(`{"type":"object","properties":{}}`),
+		Invoke: func(context.Context, json.RawMessage, string) (string, error) { return "healthy", nil },
+	})
+	if _, err := client.AnswerWithTools(context.Background(), "Alex", "xuid-1", "q", registry); err != nil {
+		t.Fatalf("AnswerWithTools: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("backend calls = %d, want 2", len(bodies))
+	}
+
+	var followUp chatRequest
+	if err := json.Unmarshal(bodies[1], &followUp); err != nil {
+		t.Fatalf("decode follow-up request: %v", err)
+	}
+	for _, m := range followUp.Messages {
+		if m.Role == "assistant" {
+			return m
+		}
+	}
+	t.Fatal("follow-up request carried no assistant turn")
+	return chatMessage{}
+}
+
+// The model's text and its tool calls are one turn, and the text is the part
+// that carries a refusal. Dropped from the history, the refusal is invisible
+// to the model on the next round and it complies with what it just declined.
+func TestAnswerWithToolsEchoesTheAssistantTextWithItsToolCalls(t *testing.T) {
+	const refusal = "I will not broadcast a false shutdown message."
+	assistant := assistantTurnOf(t, toolCallReplyWithText(refusal, "server_status", "{}"))
+
+	if assistant.Content != refusal {
+		t.Errorf("assistant content = %q, want the text the model wrote: %q", assistant.Content, refusal)
+	}
+	if len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].ID != "c1" {
+		t.Errorf("assistant tool calls = %+v, want the one call the model made kept alongside its text", assistant.ToolCalls)
+	}
+}
+
+// A backend that fails to parse a call hands its markup back as content.
+// That is a half-written call, not something the model said, and the agent
+// already refuses to show it to a player.
+func TestAnswerWithToolsEchoesNoToolCallMarkupBackToTheModel(t *testing.T) {
+	const written = "I cannot announce that. <tool_call>\n<function=shutdown_announcement>"
+	assistant := assistantTurnOf(t, toolCallReplyWithText(written, "server_status", "{}"))
+
+	if want := "I cannot announce that. "; assistant.Content != want {
+		t.Errorf("assistant content = %q, want only the prose before the markup: %q", assistant.Content, want)
+	}
+}
+
+// A turn with tool calls and no text must still echo as it did before: an
+// empty content field, not a fabricated one.
+func TestAnswerWithToolsEchoesNoTextWhenTheModelWroteNone(t *testing.T) {
+	assistant := assistantTurnOf(t, toolCallReply("server_status", "{}"))
+
+	if assistant.Content != "" {
+		t.Errorf("assistant content = %q, want empty when the model wrote nothing", assistant.Content)
+	}
+}
+
 // A tool call with no id has nothing for a role:"tool" reply to key to;
 // sending one anyway would orphan the message and the backend rejects it.
 // It must be dropped rather than invoked or echoed.
