@@ -63,7 +63,7 @@ func New(addr string) (*Server, error) {
 	// healthy pod and stall the rolling update that only removes the old pod
 	// once the new one is ready -- the update the standby exists to serve.
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		if Role(s.role.Load()) == RoleStandby {
+		if !s.Live() {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("standby"))
 			return
@@ -113,6 +113,19 @@ func (s *Server) SetReady(ready bool) {
 func (s *Server) SetRole(role Role) {
 	s.role.Store(int32(role))
 	setLeader(role == RoleLive)
+}
+
+// Live reports whether this process is the one currently holding the agent
+// lock, as last recorded by SetRole.
+//
+// Read by anything in the process that may only act once, not once per
+// replica: the announcement API is mounted for the process rather than for a
+// turn as the live agent, so a request landing on a standby reaches code that
+// would otherwise speak into the server the live agent is playing on. This
+// answers from the same atomic /readyz and mc_agent_leader answer from, so
+// there is no second place for "which pod is live" to be decided.
+func (s *Server) Live() bool {
+	return Role(s.role.Load()) == RoleLive
 }
 
 // ListenAndServe blocks serving HTTP on the listener bound by New, until the

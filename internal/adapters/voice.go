@@ -45,10 +45,12 @@ func (v NoopVoice) Say(ctx context.Context, message string) error {
 // is defeated if a display name it never checked can steer where a reply
 // goes.
 type NameResolver interface {
-	// NameFor returns the gamertag currently on record for xuid. ok is
-	// false if xuid isn't in the live roster (never seen this session, or
-	// already left) — Tell must not guess or fall back to xuid itself,
-	// since that is never a valid tellraw target.
+	// NameFor returns the last gamertag recorded for xuid. ok is false only
+	// when nothing has ever named this xuid — Tell must not guess or fall
+	// back to xuid itself, since that is never a valid tellraw target. A
+	// player who has since left, or whose session ended with the agent's
+	// connection, still resolves: the tellraw then reaches nobody, which
+	// costs less than a reply this process can no longer address at all.
 	NameFor(xuid string) (name string, ok bool)
 }
 
@@ -82,7 +84,7 @@ type tellrawRun struct {
 }
 
 // Tell whispers message to the player identified by xuid, by resolving
-// their current gamertag from the live roster and targeting them with a
+// their last recorded gamertag from the roster and targeting them with a
 // Bedrock name-selector (`@a[name="..."]`), not a bare name token. Bedrock
 // gamertags may contain spaces, which a bare name token cannot represent in
 // mc-console-bridge's allowlist grammar (a bare token is deliberately
@@ -92,7 +94,7 @@ type tellrawRun struct {
 func (v *BridgeVoice) Tell(ctx context.Context, xuid, message string) error {
 	name, ok := v.names.NameFor(xuid)
 	if !ok {
-		return fmt.Errorf("bridge voice: no known gamertag for xuid %q (not in the live roster), cannot target a tellraw reply", xuid)
+		return fmt.Errorf("bridge voice: no known gamertag for xuid %q (never named on any roster), cannot target a tellraw reply", xuid)
 	}
 	if strings.Contains(name, `"`) {
 		// A real Xbox gamertag cannot contain a double quote, but this

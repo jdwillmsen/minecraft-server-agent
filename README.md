@@ -467,21 +467,37 @@ the same wait, from the connection that found them there - so a backlog is
 never stranded by a reconnect and never whispered twice. They are not
 greeted for it; they did not arrive.
 
-The roster empties the moment the connection dies rather than when the next
-one opens. Between the two, nobody is being watched: an announcement
-published in that gap by a schedule, an event source or the HTTP API finds
-no recipients to record. Held onto, the roster would name whoever was online
-when the connection died, and one of them may already have left - recording
-a delivery against them loses that message for good.
+The roster stops holding anyone as present the moment the connection dies
+rather than when the next one opens. Between the two, nobody is being
+watched: an announcement published in that gap by a schedule, an event
+source or the HTTP API finds no recipients to record. Held onto, the roster
+would name whoever was online when the connection died, and one of them may
+already have left - recording a delivery against them loses that message
+for good.
+
+Gamertags are kept across the gap even though presence is not, because the
+two stop being true at different moments. A reply the model was still
+writing when the connection dropped goes out over the console bridge, which
+is a separate process and still answers, and a whisper needs a name to aim
+at - so an `@server` answer that outlives its connection still reaches the
+player who asked for it. The next connection replaces those names as it
+reports them.
 
 What the gap makes unknowable is who was online, not whether the server can
-speak: the console bridge is a separate process that stays up. So an
-announcement to everyone or to whoever is online is still broadcast in the
-gap and heard by whoever is there - it simply records nothing, which leaves
-a queued one pending for the join that follows and gives an online-only one
-its only chance to be heard at all. An announcement addressed to a player
-or to a permission is whispered, and a whisper needs someone to send it to,
-so that one stays silent and stays pending.
+speak. So an announcement to everyone or to whoever is online is still
+broadcast in the gap and heard by whoever is there - it simply records
+nothing, which leaves a queued one pending for the join that follows and
+gives an online-only one its only chance to be heard at all. An
+announcement addressed to a player or to a permission is whispered, and a
+whisper needs someone to send it to, so that one stays silent and stays
+pending.
+
+Only the live agent broadcasts blind like that. The announcement API is
+served by every pod, including a warm standby, whose roster is empty for its
+whole life rather than for a backoff - and whose console bridge is up like
+any other. A publish that reaches a standby and names nobody is not spoken:
+the server belongs to whichever process holds the lock. See "Handing over to
+a standby".
 
 A delivery already under way stops the same moment, between one message and
 the next. The connection ending cancels the drain where it stands, so the

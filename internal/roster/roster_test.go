@@ -64,7 +64,7 @@ func TestApply_RemovalCarryingOnlyAUUIDIsALeave(t *testing.T) {
 	if len(leaves) != 1 || leaves[0].XUID != "111" || leaves[0].Username != "Steve" {
 		t.Fatalf("leaves = %+v, want Steve (111)", leaves)
 	}
-	if _, ok := r.NameFor("111"); ok {
+	if r.IsOnline("111") {
 		t.Error("Steve still on the roster after a UUID-only removal")
 	}
 
@@ -81,7 +81,7 @@ func TestApply_RemovalOfAnUnknownUUIDIsIgnored(t *testing.T) {
 	if _, leaves, _ := r.Apply([]PlayerListEntry{{UUID: "u-unknown", Remove: true}}); len(leaves) != 0 {
 		t.Errorf("leaves = %+v for a UUID nobody was recorded under, want none", leaves)
 	}
-	if _, ok := r.NameFor("111"); !ok {
+	if !r.IsOnline("111") {
 		t.Error("an unrelated removal took Steve off the roster")
 	}
 }
@@ -172,8 +172,8 @@ func TestBeginSession_ForgetsThePreviousSessionsPlayers(t *testing.T) {
 
 	r.BeginSession(time.Now(), agentEntry.XUID)
 
-	if _, ok := r.NameFor("111"); ok {
-		t.Error("NameFor after BeginSession = ok, want not-ok — a player who may have left while disconnected must not still resolve")
+	if r.IsOnline("111") {
+		t.Error("IsOnline after BeginSession = true, want false — a player who may have left while disconnected must not still count as present")
 	}
 }
 
@@ -222,13 +222,19 @@ func TestNameFor_UnknownXUID(t *testing.T) {
 	}
 }
 
-func TestNameFor_KnownXUIDAfterRemove(t *testing.T) {
+// Presence and identity stop being true at different moments: a departure
+// ends the first and leaves the second alone, because a tellraw goes out over
+// the console bridge and still needs a gamertag to aim at.
+func TestNameForOutlivesPresenceAfterRemove(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
 	r.Apply([]PlayerListEntry{{XUID: "111", Remove: true}})
 
-	if _, ok := r.NameFor("111"); ok {
-		t.Error("NameFor after removal = ok, want not-ok")
+	if r.IsOnline("111") {
+		t.Error("IsOnline after removal = true, want false")
+	}
+	if name, ok := r.NameFor("111"); !ok || name != "Steve" {
+		t.Errorf("NameFor after removal = (%q, %v), want (Steve, true)", name, ok)
 	}
 }
 
@@ -390,8 +396,42 @@ func TestEndSessionEmptiesTheRoster(t *testing.T) {
 	if online := r.Online(); len(online) != 0 {
 		t.Errorf("Online() = %v after the connection ended, want nobody", online)
 	}
-	if _, ok := r.NameFor("111"); ok {
-		t.Error("still naming a player the ended connection was watching")
+	if r.IsOnline("111") {
+		t.Error("IsOnline = true after the connection ended, want false")
+	}
+}
+
+// The other half of EndSession: presence is what the gap makes unknowable,
+// not who an XUID belongs to. An @server answer whose model call outlives the
+// connection is still whispered over the console bridge, which is a separate
+// process, and a tellraw needs a gamertag to target -- so a name the dead
+// connection taught must still resolve.
+func TestEndSessionKeepsNamesSoALateReplyCanStillBeAddressed(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve", UUID: "u-111"})
+
+	r.EndSession()
+
+	name, ok := r.NameFor("111")
+	if !ok || name != "Steve" {
+		t.Errorf("NameFor(111) = (%q, %v) after the connection ended, want (Steve, true) — the answer would be logged and thrown away", name, ok)
+	}
+	if r.IsOnline("111") {
+		t.Error("IsOnline(111) = true after the connection ended, want false — nobody is being watched in the gap")
+	}
+}
+
+// A name is the last one seen, not the first: the next session teaches it
+// whatever the server reports now, so a rename between connections wins.
+func TestNameForTakesTheNextSessionsName(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "OldName"})
+	r.EndSession()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "NewName"})
+
+	if name, _ := r.NameFor("111"); name != "NewName" {
+		t.Errorf("NameFor(111) = %q, want NewName", name)
 	}
 }
 

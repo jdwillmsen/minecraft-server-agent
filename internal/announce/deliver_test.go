@@ -867,3 +867,85 @@ func TestSendNowStaysSilentForAWhisperWithNobodyOnTheRoster(t *testing.T) {
 		t.Errorf("sent = %d, want 0", sent)
 	}
 }
+
+// fakeLeadership is a Leadership whose answer the test fixes.
+type fakeLeadership struct{ live bool }
+
+var _ Leadership = fakeLeadership{}
+
+func (l fakeLeadership) Live() bool { return l.live }
+
+func TestSendNowStaysSilentOnAStandby(t *testing.T) {
+	// A standby's roster is empty for its whole life, which from the roster
+	// alone is indistinguishable from the live agent's reconnect gap. The
+	// announcement API is mounted for the process, so a publish can land
+	// here; the console bridge this process holds is up regardless, so Say
+	// would be heard by every player on the server the other process is
+	// playing on.
+	a := Announcement{Body: "server restarting in 5 minutes", TargetKind: TargetEveryone}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: false}))
+
+	sent, err := d.SendNow(context.Background(), a, 11)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 0 {
+		t.Errorf("Say calls = %v, want none — a process that is in no game must not speak into the one the leader is playing", voice.says)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing", store.delivered)
+	}
+	if sent != 0 {
+		t.Errorf("sent = %d, want 0", sent)
+	}
+}
+
+func TestSendNowBroadcastsFromTheLeaderInTheGap(t *testing.T) {
+	// The same empty roster, from the process that holds the lock: it is
+	// between connections, the bridge is still up, and online-only never
+	// queues, so suppressing this would lose the message rather than delay
+	// it. Nothing is recorded either way — there is no roster to record from.
+	a := Announcement{Body: "server restarting in 5 minutes", TargetKind: TargetOnlineOnly}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: true}))
+
+	sent, err := d.SendNow(context.Background(), a, 12)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 || voice.says[0] != a.Body {
+		t.Errorf("Say calls = %v, want exactly one carrying %q", voice.says, a.Body)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing", store.delivered)
+	}
+	if sent != 0 {
+		t.Errorf("sent = %d, want 0 — it was said, but nobody is known to have heard it", sent)
+	}
+}
+
+func TestSendNowWhispersOnAStandbyIsAlreadyNothing(t *testing.T) {
+	// Leadership gates only the broadcast a roster cannot back. A whisper on
+	// a standby was already silent, because it has nobody to whisper to, and
+	// must stay pending rather than be recorded.
+	a := Announcement{Body: "your waypoint is at 100 64 -200", TargetKind: TargetPlayer, TargetValue: "xuid-1"}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: false}))
+
+	if _, err := d.SendNow(context.Background(), a, 13); err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.tells) != 0 || len(voice.says) != 0 {
+		t.Errorf("Tell = %v and Say = %v, want both empty", voice.tells, voice.says)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing", store.delivered)
+	}
+}

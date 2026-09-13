@@ -167,6 +167,18 @@ func main() {
 	voice := adapters.NewBridgeVoice(bridgeClient, playerRoster)
 	audience := newDeliveryAudience(playerRoster, siblings)
 
+	// Built here rather than beside the routes it serves: it is where this
+	// process's role is recorded, and the Deliverer below has to read that to
+	// know whether it may speak into the game at all.
+	httpServer, err := httpapi.New(cfg.HTTPAddr)
+	if err != nil {
+		// A bind failure here (bad address, port already in use) means the
+		// agent would run with no /healthz, /readyz, or /metrics at all -
+		// worse than not starting, since nothing external would notice.
+		log.Error("http_bind_failed", logging.Fields{"error": err.Error()})
+		os.Exit(1)
+	}
+
 	// One Deliverer for the process, reached two ways: plugin.Context narrows
 	// it to what !announce and !inbox need, while the drain plugin needs
 	// DrainForJoin, which that interface deliberately does not carry. Two
@@ -184,6 +196,10 @@ func main() {
 		announcePermissions{resolver: permResolver},
 		log,
 		announce.WithFreshJoinGrace(joins, freshJoinGrace),
+		// A publish can reach any replica, because the announcement API is
+		// mounted for the process; only the one holding the lock is playing
+		// on the server a broadcast would be heard on.
+		announce.WithLeadership(httpServer),
 	)
 	// Wrapped only now: the stores above type-assert the concrete Postgres
 	// to borrow its pool, which the wrapper would hide from them.
@@ -214,14 +230,6 @@ func main() {
 	// leadership instead -- see startLiveWork.
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
 
-	httpServer, err := httpapi.New(cfg.HTTPAddr)
-	if err != nil {
-		// A bind failure here (bad address, port already in use) means the
-		// agent would run with no /healthz, /readyz, or /metrics at all -
-		// worse than not starting, since nothing external would notice.
-		log.Error("http_bind_failed", logging.Fields{"error": err.Error()})
-		os.Exit(1)
-	}
 	// Same two-tier lookup !announce @player uses, so a name the API and the
 	// command resolve can never mean two different players.
 	apiOn := httpServer.MountAnnouncements(cfg.AnnounceAPIToken, deliverer, playerLookup{live: playerRoster, archive: playerStore}, log)
@@ -1083,7 +1091,7 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 		if chat.IsSelfOrSibling(p.XUID, selfXUID, siblingXUIDs) {
 			continue
 		}
-		if _, stillHere := playerRoster.NameFor(p.XUID); !stillHere {
+		if !playerRoster.IsOnline(p.XUID) {
 			continue
 		}
 		if _, err := playerStore.ResumeSession(ctx, p.XUID, p.Username, time.Now()); err != nil {
@@ -1104,7 +1112,7 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 		if chat.IsSelfOrSibling(join.XUID, selfXUID, siblingXUIDs) {
 			continue
 		}
-		if _, stillHere := playerRoster.NameFor(join.XUID); !stillHere {
+		if !playerRoster.IsOnline(join.XUID) {
 			continue
 		}
 		log.Info("player_joined", logging.Fields{"xuid": join.XUID, "username": join.Username})
@@ -1121,7 +1129,7 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 			continue
 		}
 		log.Info("player_left", logging.Fields{"xuid": leave.XUID, "username": leave.Username})
-		if _, backAlready := playerRoster.NameFor(leave.XUID); !backAlready {
+		if !playerRoster.IsOnline(leave.XUID) {
 			// Still gone at the end of the packet, so this departure is the
 			// last word on them. When it isn't -- a removal and a re-add in
 			// one packet -- the arrival above is newer than this and must

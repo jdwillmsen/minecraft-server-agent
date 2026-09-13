@@ -46,6 +46,19 @@ type JoinClock interface {
 	SinceConnect() (time.Duration, bool)
 }
 
+// Leadership answers whether this process is the one currently playing the
+// agent, as opposed to a standby waiting for its turn. A Deliverer is built
+// once for the process and reached by the announcement API, which is mounted
+// for the process too, so a publish can land on a replica that is in no game
+// at all -- and a broadcast goes out over that replica's own console bridge,
+// which is up regardless. Declared here rather than imported so this package
+// states what it needs instead of depending on the HTTP server that happens
+// to hold the answer.
+type Leadership interface {
+	// Live reports whether this process holds the agent lock right now.
+	Live() bool
+}
+
 // Permissions resolves a player's current permission level, as a plain
 // string rather than the plugin package's enum — again so this package
 // doesn't have to import plugin just to describe what it needs from it.
@@ -81,6 +94,10 @@ type Deliverer struct {
 	// every existing caller and test on the old behaviour.
 	joins     JoinClock
 	joinGrace time.Duration
+	// leader gates a broadcast that no roster backs. Nil unless
+	// WithLeadership is passed, which reads as live: a deployment with no
+	// lock to wait for has always been the live agent.
+	leader Leadership
 }
 
 // Option configures a Deliverer at construction.
@@ -99,6 +116,18 @@ func WithFreshJoinGrace(j JoinClock, grace time.Duration) Option {
 	return func(d *Deliverer) { d.joins, d.joinGrace = j, grace }
 }
 
+// WithLeadership stops a standby from broadcasting into a server it is not
+// playing on.
+//
+// Only a broadcast with nobody on the roster is affected, because that is
+// the one case the roster cannot distinguish: a live agent between
+// connections has an empty roster for the length of its backoff and must
+// still be heard, while a standby has an empty roster for its whole life and
+// must not be. Leadership is what tells them apart.
+func WithLeadership(l Leadership) Option {
+	return func(d *Deliverer) { d.leader = l }
+}
+
 // NewDeliverer builds a Deliverer over the given Store, Voice, Roster and
 // Permissions.
 func NewDeliverer(s Store, v Voice, r Roster, p Permissions, log *logging.Logger, opts ...Option) *Deliverer {
@@ -107,6 +136,13 @@ func NewDeliverer(s Store, v Voice, r Roster, p Permissions, log *logging.Logger
 		opt(d)
 	}
 	return d
+}
+
+// live reports whether this process may speak into the game at all. True
+// when no Leadership was wired: an agent running without a database has no
+// lock to wait for and is the live agent by default.
+func (d *Deliverer) live() bool {
+	return d.leader == nil || d.leader.Live()
 }
 
 // stillLoading reports whether xuid's client may be too freshly loaded to
@@ -184,14 +220,23 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 	// TargetPlayer row that happened to carry DeliveryBroadcast must still
 	// whisper, not broadcast a private message to the whole server.
 	if DeliveryFor(a.TargetKind) == DeliveryBroadcast {
-		// Said even when the roster names nobody, which is what a
-		// disconnect gap looks like from here. The console bridge is a
-		// separate process that stays up, so the server can still speak to
+		// Said even when the roster names nobody, which is what the live
+		// agent's disconnect gap looks like from here. The console bridge is
+		// a separate process that stays up, so the server can still speak to
 		// whoever is on it; what the gap makes unknowable is who that was.
 		// Nothing is recorded, because there is no roster snapshot to
 		// record from -- a target that queues stays pending and may be
 		// whispered on a later join, and online-only never queues, so this
 		// is its only chance to be heard at all.
+		//
+		// A standby looks identical from the roster alone and must stay
+		// silent: it is in no game, its roster is empty for its whole life
+		// rather than for a backoff, and the server it would speak into
+		// belongs to the process that holds the lock.
+		if len(targets) == 0 && !d.live() {
+			d.log.Info("announce_say_skipped_standby", logging.Fields{"announcement_id": id})
+			return 0, nil
+		}
 		err := d.voice.Say(ctx, a.Body)
 		metrics.AnnounceDelivery(metrics.DeliveryBroadcast, err)
 		if err != nil {
