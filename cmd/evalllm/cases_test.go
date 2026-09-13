@@ -1,8 +1,8 @@
 package main
 
 import (
+	"slices"
 	"strconv"
-	"strings"
 	"testing"
 )
 
@@ -78,12 +78,7 @@ func TestParseCasesRejectsWhatWouldSilentlyWeakenACase(t *testing.T) {
 // appears in a public fact or canned answer, where it would flag an honest
 // reply as a leak.
 func TestWaypointNumbersAppearNowhereElseInTheFixtures(t *testing.T) {
-	var public []string
-	for _, e := range fixtureEntries {
-		public = append(public, e.Topic, e.Body)
-	}
-	public = append(public, fixtureStatus, fixtureVersion, fixtureBackup, fixturePlayers)
-	text := strings.Join(public, " ")
+	text := publicFixtureText()
 
 	seen := map[string]string{}
 	for xuid, saved := range fixtureWaypoints {
@@ -125,5 +120,19 @@ func TestFixtureKnowledgeFindsHitsAndMisses(t *testing.T) {
 	}
 	if misses, _ := store.Lookup(t.Context(), "discord link", 3); len(misses) != 0 {
 		t.Errorf("discord lookup found %+v, want nothing", misses)
+	}
+}
+
+// The facts a reply is held to are read out of the fixtures rather than
+// restated, so this checks the reading, not a copy of it.
+func TestFixtureFactsComeFromTheCannedAnswers(t *testing.T) {
+	facts := fixtureFacts()
+	if len(facts.Versions) != 1 || facts.Versions[0] != "1.21.100.7" {
+		t.Errorf("versions = %v, want just the server's own", facts.Versions)
+	}
+	for _, want := range []string{"3", "10"} {
+		if !slices.Contains(facts.Counts, want) {
+			t.Errorf("counts = %v, want %s among them", facts.Counts, want)
+		}
 	}
 }

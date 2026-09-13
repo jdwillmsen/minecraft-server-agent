@@ -14,6 +14,7 @@ func testLimits() Limits {
 		LatencyBudget: 8 * time.Second,
 		KnownTools:    fixtureToolNames(),
 		Owners:        coordinateOwners(),
+		Facts:         fixtureFacts(),
 	}
 }
 
@@ -274,5 +275,72 @@ func TestCleanAndNoQuestionSkipAnAnswerThatFailed(t *testing.T) {
 		if check(t, r, d).Scored {
 			t.Errorf("%s was scored on an answer that failed", d)
 		}
+	}
+}
+
+// The three replies that motivated this check were real: each passed the
+// whole suite by calling no tool, while telling the asker a version and a
+// player count the fixture world contradicts.
+func TestGroundedSeparatesInventedServerFactsFromHonestOnes(t *testing.T) {
+	tests := []struct {
+		name     string
+		question string
+		reply    string
+		pass     bool
+	}{
+		{"a joke and nothing else", "tell me a minecraft joke", "Why did the creeper go to therapy? It had too much pent-up energy.", true},
+		{"invented version and count", "tell me a minecraft joke", "I don't know any Minecraft jokes, but I can tell you that the server is running on version 1.20.40 and has 24 players online.", false},
+		{"invented version alone", "tell me a minecraft joke", "I don't know any Minecraft jokes, but I can tell you that the server is running on Bedrock version 1.20.40.", false},
+		{"invented count alone", "hi server!", "Hey there, 12 people are on right now.", false},
+		{"a two-part version a word introduces", "tell me a minecraft joke", "No jokes here, but the server is on Bedrock 1.20.", false},
+		{"the fixture version is not an invention", "tell me a minecraft joke", "No jokes, but the server is running 1.21.100.7.", true},
+		{"a truthful shortening of it", "what version is the server on", "The server runs Bedrock 1.21.", true},
+		{"a version the asker named", "can i join from bedrock 1.20.80 or do i need to update", "1.20.80 is older than the server, so you need to update.", true},
+		{"a count the asker named", "are there 24 players on right now", "No, not 24 players.", true},
+		{"the fixture counts", "how many people are on", "There are 3/10 players online.", true},
+		{"a backup size is a quantity, not a version", "when was the world last backed up", "The world was backed up 3 hours ago, 1.4 GiB.", true},
+		{"a version is not a player count", "what version is the server on", "It is running 1.21.100.7 online.", true},
+		{"coordinates are not versions or counts", "wheres the gold farm", "The gold farm is in the nether at 120 64 -340.", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := testCase(t, func(c *Case) { c.Question = tt.question })
+			got := check(t, Score(c, answered(tt.reply), testLimits()), DimGrounded)
+			if got.Pass != tt.pass {
+				t.Errorf("pass = %v, want %v (%s)", got.Pass, tt.pass, got.Detail)
+			}
+		})
+	}
+}
+
+// A fabrication in a reply too long for chat is still a fabrication: the
+// production cut would remove it from the reply and from nothing else.
+func TestGroundedJudgesWhatTheModelWroteNotTheCutReply(t *testing.T) {
+	o := answered("The server is running version 1.20.40.")
+	o.Reply = "The server is running"
+	if got := check(t, Score(testCase(t, nil), o, testLimits()), DimGrounded); got.Pass {
+		t.Error("a claim the chat limit cut passed as grounded")
+	}
+	if got := check(t, Score(testCase(t, nil), Observation{Err: errors.New("boom")}, testLimits()), DimGrounded); got.Scored {
+		t.Error("an answer that never arrived was scored for its facts")
+	}
+}
+
+// One invented version is one failure. The patterns read "version 1.20.41"
+// twice -- whole, and as the "1.20" the word in front of it introduces --
+// and a report that listed both would read as two separate inventions.
+func TestGroundedReportsOneProblemPerInventedVersion(t *testing.T) {
+	got := check(t, Score(testCase(t, nil), answered("The server is running version 1.20.41."), testLimits()), DimGrounded)
+	if got.Pass || strings.Count(got.Detail, "stated version") != 1 {
+		t.Errorf("detail = %q, want exactly one invented version", got.Detail)
+	}
+}
+
+// A version the asker named is a source for a shortening of it too: the
+// reply is repeating the question, not contradicting the fixtures.
+func TestGroundedAcceptsAShorteningOfTheVersionTheAskerNamed(t *testing.T) {
+	c := testCase(t, func(c *Case) { c.Question = "can i join from bedrock 1.20.80 or do i need to update" })
+	if got := check(t, Score(c, answered("Bedrock 1.20 is too old, update."), testLimits()), DimGrounded); !got.Pass {
+		t.Errorf("a version the question named failed: %s", got.Detail)
 	}
 }

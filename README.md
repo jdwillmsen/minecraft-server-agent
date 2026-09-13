@@ -903,12 +903,24 @@ Every setting defaults from the variable the agent reads (`LLM_MAX_TOKENS`,
 `LLM_TIMEOUT_MS`, `LLM_TOTAL_TIMEOUT_MS`, `LLM_API_KEY`), so a run with no
 flags measures production. `-only <regexp>` re-runs a subset by case id or
 category. Each case is scored on whether it got an answer, tool selection,
-content, no tool-call markup or markdown, privacy (whispered when it should
-be, never carrying another player's coordinates), length against the chat
-limit, not ending on a question, and latency. Markup, questions and length
-are judged on what the model wrote, before the agent's own cleanup, so the
-report measures the model rather than the cleanup. The report is markdown
-on stdout.
+content, grounding (below), no tool-call markup or markdown, privacy
+(whispered when it should be, never carrying another player's coordinates),
+length against the chat limit, not ending on a question, and latency.
+Markup, questions, length and grounding are judged on what the model wrote,
+before the agent's own cleanup, so the report measures the model rather
+than the cleanup. The report is markdown on stdout.
+
+Grounding fails a reply that states a server version or a player count the
+fixture world contradicts — the failure a case expecting no tool call
+cannot otherwise see, because a reply inventing a version and a player
+count calls no tool either. Mentioning a fact is not the failure: a value
+the fixtures hold is fine whether or not a tool fetched it, a truthful
+shortening such as `1.21` of `1.21.100.7` is fine, and so is a version the
+question itself named. Only a value neither the fixtures nor the question
+hold is scored as invented. Response time and backup age are deliberately
+outside the check: rounding `42ms` to "under 50ms" invents nothing, and a
+check that failed that honest reply would cost more than the blind spot it
+closes.
 
 Cases run one at a time, never in parallel: the endpoint also answers live
 players. Not wired into CI, because it needs a GPU endpoint and takes
