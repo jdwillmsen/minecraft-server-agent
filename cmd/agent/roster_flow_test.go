@@ -183,7 +183,7 @@ func TestPlayerListFlow(t *testing.T) {
 			addEntry(playerXUID, "Steve"),
 		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, newJoinTimes())
 
-		playerRoster.BeginSession(time.Now())
+		playerRoster.BeginSession(time.Now(), selfXUID)
 		handlePlayerList(context.Background(), wire(t,
 			addEntry(selfXUID, "Agent"),
 			addEntry("2535411111111111", "Alex"),
@@ -248,7 +248,7 @@ func TestReconnectRestartsTheSessionsOfPlayersStillOnline(t *testing.T) {
 	playerRoster := roster.New()
 	profiles := &sessionCalls{}
 
-	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), log)
+	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), selfXUID, log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
@@ -259,7 +259,7 @@ func TestReconnectRestartsTheSessionsOfPlayersStillOnline(t *testing.T) {
 		t.Fatalf("got %d joins before the disconnect, want Steve's", len(joins))
 	}
 
-	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), log)
+	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), selfXUID, log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 		addEntry(siblingBot, "AfkBot"),
@@ -294,14 +294,14 @@ func TestALeaveAfterFailedReconnectWritesCarriesTheConnectionStart(t *testing.T)
 	playerRoster := roster.New()
 	profiles := &sessionCalls{}
 
-	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), log)
+	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), selfXUID, log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 		addEntry(playerXUID, "Steve"),
 	), selfXUID, siblings, log, eventBus, playerRoster, profiles, newJoinTimes())
 
 	profiles.failOpening = true
-	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), log)
+	beginWatching(context.Background(), playerRoster, profiles, newJoinTimes(), selfXUID, log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 		addEntry(playerXUID, "Steve"),
@@ -333,7 +333,7 @@ func TestSamePacketRejoinKeepsTheArrival(t *testing.T) {
 	playerRoster := roster.New()
 	joinClock := newJoinTimes()
 
-	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, selfXUID, log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 		addEntry(playerXUID, "Steve"),
@@ -387,7 +387,7 @@ func TestOpeningSnapshotReportsPlayersPresentWithTheirConnection(t *testing.T) {
 	playerRoster := roster.New()
 	joinClock := newJoinTimes()
 
-	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, selfXUID, log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 		addEntry(siblingBot, "AfkBot"),
@@ -406,7 +406,7 @@ func TestOpeningSnapshotReportsPlayersPresentWithTheirConnection(t *testing.T) {
 		t.Error("the snapshot recorded an arrival: the clock must keep answering that honestly")
 	}
 
-	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, selfXUID, log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 		addEntry(playerXUID, "Steve"),
@@ -431,7 +431,7 @@ func TestAJoinCarriesItsConnection(t *testing.T) {
 	playerRoster := roster.New()
 	joinClock := newJoinTimes()
 
-	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, selfXUID, log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
@@ -461,7 +461,7 @@ func TestSamePacketJoinAndLeaveGreetsNobody(t *testing.T) {
 	playerRoster := roster.New()
 	joinClock := newJoinTimes()
 
-	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, log)
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, selfXUID, log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
@@ -491,7 +491,7 @@ func TestSnapshotAddAndRemoveLeavesNobodyPresent(t *testing.T) {
 	profiles := &sessionCalls{}
 	joinClock := newJoinTimes()
 
-	beginWatching(context.Background(), playerRoster, profiles, joinClock, log)
+	beginWatching(context.Background(), playerRoster, profiles, joinClock, selfXUID, log)
 	handlePlayerList(context.Background(), wire(t,
 		addEntry(selfXUID, "Agent"),
 		addEntry(playerXUID, "Steve"),
@@ -505,5 +505,89 @@ func TestSnapshotAddAndRemoveLeavesNobodyPresent(t *testing.T) {
 		if call == "resume:"+playerXUID {
 			t.Errorf("session writes = %v, want no resume for a player the snapshot removed", profiles.calls)
 		}
+	}
+}
+
+// The packet sequence a Bedrock server actually sends the agent when it
+// connects to a populated server, captured off the wire: the agent's own
+// entry alone, then the whole roster with that entry at its head. Every
+// player already online arrives in that second packet, and each one of them
+// was greeted and had their join counted on every connect -- the welcome
+// storm this test exists to keep shut.
+func TestOpeningBurstBehindTheAgentsOwnEntryGreetsNobody(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	presentEvents, _ := eventBus.Subscribe(roster.PresentKind, 8)
+	joinEvents, _ := eventBus.Subscribe(roster.JoinKind, 8)
+	playerRoster := roster.New()
+	joinClock := newJoinTimes()
+	const alexXUID = "2535411111111111"
+
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, selfXUID, log)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(selfXUID, "Agent"),
+		addEntry(playerXUID, "Steve"),
+		addEntry(alexXUID, "Alex"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	if joins := drainJoins(t, joinEvents); len(joins) != 0 {
+		t.Fatalf("got %d joins from the roster behind the agent's own entry, want 0 — nobody in it arrived: %+v", len(joins), joins)
+	}
+	present := drainPresent(t, presentEvents)
+	if len(present) != 2 || present[0].XUID != playerXUID || present[1].XUID != alexXUID {
+		t.Fatalf("present events = %+v, want Steve and Alex", present)
+	}
+	for _, p := range present {
+		if _, ok := joinClock.SinceJoin(p.XUID); ok {
+			t.Errorf("recorded an arrival for %s, who was already online", p.XUID)
+		}
+	}
+
+	// The arrival behind the burst is still a join: the greeting has to
+	// survive the fix that silences it for everyone else.
+	handlePlayerList(context.Background(), wire(t,
+		addEntry("2535422222222222", "Notch"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	joins := drainJoins(t, joinEvents)
+	if len(joins) != 1 || joins[0].Username != "Notch" {
+		t.Fatalf("joins after the burst = %+v, want Notch's arrival", joins)
+	}
+	if present := drainPresent(t, presentEvents); len(present) != 0 {
+		t.Errorf("present events after the burst = %+v, want none", present)
+	}
+}
+
+// Connecting to an empty server: the burst is the agent's own entry twice
+// and nothing else, and the first player of the day still gets greeted.
+func TestFirstArrivalOnAnEmptyServerIsStillGreeted(t *testing.T) {
+	log := logging.New("info")
+	siblings := map[string]struct{}{siblingBot: {}}
+	eventBus := bus.New()
+	presentEvents, _ := eventBus.Subscribe(roster.PresentKind, 8)
+	joinEvents, _ := eventBus.Subscribe(roster.JoinKind, 8)
+	playerRoster := roster.New()
+	joinClock := newJoinTimes()
+
+	beginWatching(context.Background(), playerRoster, store.Nop{}, joinClock, selfXUID, log)
+	for range 2 {
+		handlePlayerList(context.Background(), wire(t,
+			addEntry(selfXUID, "Agent"),
+		), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+	}
+	handlePlayerList(context.Background(), wire(t,
+		addEntry(playerXUID, "Steve"),
+	), selfXUID, siblings, log, eventBus, playerRoster, store.Nop{}, joinClock)
+
+	joins := drainJoins(t, joinEvents)
+	if len(joins) != 1 || joins[0].XUID != playerXUID {
+		t.Fatalf("joins = %+v, want Steve greeted as the arrival he is", joins)
+	}
+	if present := drainPresent(t, presentEvents); len(present) != 0 {
+		t.Errorf("present events = %+v, want none: Steve was not already online", present)
 	}
 }

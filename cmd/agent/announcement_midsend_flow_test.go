@@ -147,7 +147,7 @@ func (i *interruption) reconnectFinding(t *testing.T, gamertag string) {
 }
 
 func (i *interruption) beginWatching() {
-	i.roster.BeginSession(time.Now())
+	i.roster.BeginSession(time.Now(), selfXUID)
 	i.joins.connected()
 }
 
