@@ -264,9 +264,9 @@ func (i *incident) publishBacklog(t *testing.T) {
 	}
 }
 
-// TestAFreshArrivalsBacklogSurvivesTheJoinMoment is JDWLABS-541 end to end:
-// the announcements that were lost are instead held back while the client
-// loads, and reach the player after the greeting, still recorded exactly
+// TestAFreshArrivalsBacklogSurvivesTheJoinMoment is the reported loss end to
+// end: the announcements that went missing are instead held back while the
+// client loads, and reach the player after the greeting, still recorded exactly
 // once. The second case is the incident as reported, reproduced by taking
 // the join clock away -- the whisper goes out into a loading client and the
 // row is written, so the message is gone for good.

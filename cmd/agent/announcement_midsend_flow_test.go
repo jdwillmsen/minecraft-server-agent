@@ -188,8 +188,9 @@ func recordedIDs(rows []deliveryRow) []int64 {
 	return ids
 }
 
-// TestABacklogInterruptedByADroppedConnectionIsNotLost is the last path of
-// JDWLABS-541 end to end. The connection is dropped between one whispered
+// TestABacklogInterruptedByADroppedConnectionIsNotLost is the last path by
+// which a join backlog could still be lost, end to end. The connection is
+// dropped between one whispered
 // announcement and the next: the rest must not be spoken, must not be
 // recorded, and must not be summarised at a player who is mid-reconnect --
 // the bridge is a separate process and stays up, so nothing about the drop
