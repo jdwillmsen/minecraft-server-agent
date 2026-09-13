@@ -72,6 +72,13 @@ type Config struct {
 	// answers commands and greets players without persistence.
 	PGConnectTimeoutMs int
 
+	// LeaderPollMs is how often a standby asks whether the agent lock has come
+	// free. It is the dominant term in how long a release leaves the server
+	// without an agent: the departing process releases the lock as it goes,
+	// and nobody plays again until a standby notices. Only meaningful with a
+	// database configured -- without one there is no lock and no standby.
+	LeaderPollMs int
+
 	// The LLM backend behind @server answering. An empty LLMBaseURL disables
 	// answering entirely -- the mention is logged and nothing else happens,
 	// which is the Stage 1-3 behaviour.
@@ -155,6 +162,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	leaderPoll, err := positiveInt("LEADER_POLL_MS", 500)
+	if err != nil {
+		return Config{}, err
+	}
 	llmMaxTokens, err := positiveInt("LLM_MAX_TOKENS", 192)
 	if err != nil {
 		return Config{}, err
@@ -203,6 +214,7 @@ func Load() (Config, error) {
 		PGUser:                    stringDefault("PG_USERNAME", ""),
 		PGPassword:                stringDefault("PG_PASSWORD", ""),
 		PGConnectTimeoutMs:        pgConnectTimeout,
+		LeaderPollMs:              leaderPoll,
 		LLMBaseURL:                stringDefault("LLM_BASE_URL", ""),
 		LLMModel:                  stringDefault("LLM_MODEL", ""),
 		LLMAPIKey:                 stringDefault("LLM_API_KEY", ""),

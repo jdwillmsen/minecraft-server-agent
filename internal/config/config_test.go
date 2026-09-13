@@ -13,6 +13,7 @@ func clearEnv(t *testing.T) {
 		"COMMAND_RATE_LIMIT_PER_MINUTE", "LOG_LEVEL",
 		"CONSOLE_BRIDGE_URL", "CONSOLE_BRIDGE_TOKEN", "CONSOLE_BRIDGE_TIMEOUT_MS",
 		"LLM_MAX_TOKENS", "LLM_TIMEOUT_MS", "LLM_TOTAL_TIMEOUT_MS",
+		"LEADER_POLL_MS",
 	} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
@@ -109,6 +110,36 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.ConsoleBridgeTimeoutMs != 5000 {
 		t.Errorf("ConsoleBridgeTimeoutMs = %d, want 5000", cfg.ConsoleBridgeTimeoutMs)
+	}
+	if cfg.LeaderPollMs != 500 {
+		t.Errorf("LeaderPollMs = %d, want 500", cfg.LeaderPollMs)
+	}
+}
+
+// The standby's poll interval is most of the gap a release leaves, so it is
+// worth being able to tune without a rebuild -- and worth refusing outright
+// when it is set to something that would mean never asking.
+func TestLoad_LeaderPollOverride(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("LEADER_POLL_MS", "250")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.LeaderPollMs != 250 {
+		t.Errorf("LeaderPollMs = %d, want 250", cfg.LeaderPollMs)
+	}
+}
+
+func TestLoad_LeaderPollZeroFails(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("LEADER_POLL_MS", "0")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error when LEADER_POLL_MS is 0")
 	}
 }
 

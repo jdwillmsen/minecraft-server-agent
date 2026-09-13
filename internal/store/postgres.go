@@ -33,7 +33,12 @@ func Open(ctx context.Context, dsn string, connectTimeout time.Duration) (*Postg
 	}
 	// Small on purpose. This workload writes two rows per player visit; a
 	// large pool would reserve connections on a shared cluster to sit idle.
-	cfg.MaxConns = 4
+	//
+	// One more than the work needs, because one is not available to it: the
+	// leader lock holds a connection of its own for as long as the process
+	// leads (see internal/leader), and a pool sized for the work alone would
+	// be a pool the agent is permanently one connection short of.
+	cfg.MaxConns = 5
 	cfg.MinConns = 0
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
@@ -71,6 +76,13 @@ func (p *Postgres) Pool() *pgxpool.Pool {
 
 // RecordJoin reads the prior profile and opens a session in one transaction.
 //
+// TotalSeconds counts the two endings the agent watched through: a departure
+// it saw ('left') and a session it closed itself while handing the game over
+// to a successor ('agent_restart'). A handover splits one visit into two
+// rows, and leaving its first half out would mean a release silently deleting
+// playtime from every profile that was online for it. 'unknown' stays
+// excluded: those are the visits nobody watched end.
+//
 // One transaction because the two halves contradict each other otherwise: the
 // upsert advances last_seen_at and join_count, so a read afterwards would
 // report the player as having just been seen, and every greeting would say
@@ -88,7 +100,7 @@ func (p *Postgres) RecordJoin(ctx context.Context, xuid, gamertag string, at tim
 	prior := Profile{XUID: xuid, Gamertag: gamertag}
 	err = tx.QueryRow(ctx, `
 		SELECT p.first_seen_at, p.last_seen_at, p.join_count,
-		       COALESCE(SUM(s.duration_seconds) FILTER (WHERE s.ended_reason = 'left'), 0)::BIGINT,
+		       COALESCE(SUM(s.duration_seconds) FILTER (WHERE s.ended_reason IN ('left', 'agent_restart')), 0)::BIGINT,
 		       COUNT(s.session_id) FILTER (WHERE s.ended_reason = 'unknown'),
 		       COUNT(s.session_id)
 		FROM minecraft.players p
@@ -285,13 +297,14 @@ func (p *Postgres) XUIDForName(ctx context.Context, gamertag string) (string, bo
 // returns the duration the UPDATE just gave it. After is their sum, not a
 // second read that a concurrent join could have moved.
 //
-// prior counts only 'left' sessions, the ones whose end was watched, the
-// same rule RecordJoin's TotalSeconds uses so a greeting and a milestone
-// never disagree. An 'unknown' session's duration is a guess: this agent
-// now closes one at zero length, but rows written before that carry the
-// player's entire absence, and a milestone read off them would announce
-// hours nobody played. closed needs no filter; everything it returns has
-// just been set to 'left'.
+// prior counts the sessions whose end was watched -- a departure ('left') or
+// a handover this agent made itself ('agent_restart') -- the same rule
+// RecordJoin's TotalSeconds uses so a greeting and a milestone never
+// disagree. An 'unknown' session's duration is a guess: this agent now
+// closes one at zero length, but rows written before that carry the player's
+// entire absence, and a milestone read off them would announce hours nobody
+// played. closed needs no filter; everything it returns has just been set to
+// 'left'.
 //
 // Only a session that began at or after since is closed as 'left'. One
 // older than that was open when the current connection began, which means
@@ -315,7 +328,7 @@ func (p *Postgres) RecordLeave(ctx context.Context, xuid string, since, at time.
 		    WHERE xuid = $1 AND ended_reason = 'open' AND joined_at >= $3
 		    RETURNING gamertag, duration_seconds
 		), prior AS (
-		    SELECT COALESCE(SUM(duration_seconds) FILTER (WHERE ended_reason = 'left'), 0)::BIGINT AS total
+		    SELECT COALESCE(SUM(duration_seconds) FILTER (WHERE ended_reason IN ('left', 'agent_restart')), 0)::BIGINT AS total
 		    FROM minecraft.sessions
 		    WHERE xuid = $1
 		)
@@ -333,6 +346,44 @@ func (p *Postgres) RecordLeave(ctx context.Context, xuid string, since, at time.
 		Before:   time.Duration(before) * time.Second,
 		After:    time.Duration(after) * time.Second,
 	}, nil
+}
+
+// CloseForHandover closes what this agent was watching, at the moment it
+// stopped watching, so a release costs nobody their playtime.
+//
+// One statement, two readings of "open", exactly as RecordLeave draws them. A
+// session that began at or after the current connection was watched through
+// to here, so it is closed at `at` and counted: the successor finds the
+// player in its own opening roster snapshot and resumes watching them, and
+// the two halves sum to the visit. One that began earlier survived a close
+// this connection already attempted, which means the agent was away while it
+// was open, so it is closed at its own joined_at and credits nothing -- the
+// same honesty CloseOrphans applies, for the same reason.
+//
+// Only the rows this call credits are counted in the return value. The stale
+// ones are a fault being cleaned up, not playtime being handed over, and
+// reporting them together would make the log line say a release preserved
+// time it actually discarded.
+func (p *Postgres) CloseForHandover(ctx context.Context, since, at time.Time) (int, error) {
+	var closed int
+	err := p.pool.QueryRow(ctx, `
+		WITH stale AS (
+		    UPDATE minecraft.sessions
+		    SET left_at = joined_at, ended_reason = 'unknown'
+		    WHERE ended_reason = 'open' AND joined_at < $2
+		), handed_over AS (
+		    UPDATE minecraft.sessions
+		    SET left_at = $1, ended_reason = 'agent_restart'
+		    WHERE ended_reason = 'open' AND joined_at >= $2
+		    RETURNING session_id
+		)
+		SELECT COUNT(*)::INT FROM handed_over`,
+		at, since,
+	).Scan(&closed)
+	if err != nil {
+		return 0, fmt.Errorf("store: close sessions for handover: %w", err)
+	}
+	return closed, nil
 }
 
 // CloseOrphans ends sessions left open by a previous run or a previous

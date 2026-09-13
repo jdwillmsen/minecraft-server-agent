@@ -25,14 +25,17 @@ type Profile struct {
 	// JoinCount includes the join being recorded, so a first-ever arrival
 	// reads as 1 rather than 0.
 	JoinCount int
-	// TotalSeconds sums only sessions whose departure the agent observed
-	// (ended_reason 'left'). A session it never saw end contributes nothing,
-	// whatever duration its row carries, so this is a lower bound -- see
-	// UncleanSessions.
+	// TotalSeconds sums only sessions whose end the agent observed: a
+	// departure it watched ('left'), or a session it closed itself as it
+	// handed the game over to a successor ('agent_restart'). A session it
+	// never saw end contributes nothing, whatever duration its row carries,
+	// so this is a lower bound -- see UncleanSessions.
 	TotalSeconds int64
 	// UncleanSessions counts visits the agent never saw end, because a server
-	// restart, an agent restart or a crash ended them instead. A profile with
-	// many of these has playtime that is a floor, not a measurement.
+	// restart, a crash, or an agent that died without handing over ended them
+	// instead. A profile with many of these has playtime that is a floor, not
+	// a measurement. A planned handover is not one of them: it closes what it
+	// was watching at the moment it stopped watching, which is a measurement.
 	UncleanSessions int
 	// Sessions counts every visit recorded before this one, watched
 	// arrivals and presences resumed from a roster snapshot alike. Zero
@@ -130,6 +133,26 @@ type Store interface {
 	// "offline", and the only one that justifies refusing to store a
 	// message.
 	XUIDForName(ctx context.Context, gamertag string) (xuid string, ok bool, err error)
+	// CloseForHandover closes the sessions this agent is watching because it
+	// is about to stop watching them: it is leaving the game so another
+	// process can take the login over, and a successor cannot close what it
+	// never saw open.
+	//
+	// Separate from CloseOrphans, which is the same statement's opposite
+	// reading. An orphan is a session whose end nobody saw and whose
+	// duration is therefore a guess, closed at zero length; these are
+	// sessions whose end is known to the second, closed at `at` and counted
+	// toward the player's playtime. Recording both the same way would mean
+	// either discarding watched time on every release or crediting unwatched
+	// time on every crash.
+	//
+	// since is when the current connection began watching, and carries the
+	// same meaning it has in RecordLeave: a session older than it was open
+	// across a gap the agent never saw, so it is closed as unobserved and
+	// credits nothing.
+	//
+	// Returns how many sessions were credited.
+	CloseForHandover(ctx context.Context, since, at time.Time) (int, error)
 	// CloseOrphans marks every open session as ended without observation.
 	// Called at the start of every connection: the agent learns of a
 	// departure by being connected, so anything still open when it
@@ -160,5 +183,8 @@ func (Nop) ResumeSession(context.Context, string, string, time.Time) (bool, erro
 }
 func (Nop) XUIDForName(context.Context, string) (string, bool, error) { return "", false, nil }
 func (Nop) CloseOrphans(context.Context, time.Time) (int, error)      { return 0, nil }
-func (Nop) Close()                                                    {}
-func (Nop) Enabled() bool                                             { return false }
+func (Nop) CloseForHandover(context.Context, time.Time, time.Time) (int, error) {
+	return 0, nil
+}
+func (Nop) Close()        {}
+func (Nop) Enabled() bool { return false }

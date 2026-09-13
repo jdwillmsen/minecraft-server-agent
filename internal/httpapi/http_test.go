@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestServer_Healthz(t *testing.T) {
@@ -109,4 +111,93 @@ func TestServer_ShutdownIsClean(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("ListenAndServe did not return after Shutdown")
 	}
+}
+
+// A standby has done everything a pod can do without the game login: it has
+// refreshed its Xbox token, opened its database, loaded its knowledge and
+// bound this very server. Reporting it unready would make Kubernetes treat a
+// correctly waiting pod as a broken one -- and, with a rolling update that
+// will not remove the old pod until the new one is ready, would deadlock the
+// rollout the standby exists to make fast.
+func TestServer_Readyz_AStandbyIsReadyWithoutASession(t *testing.T) {
+	srv, err := New("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.ln.Close()
+
+	srv.SetRole(RoleStandby)
+	rec := readyz(srv)
+	if rec.Code != http.StatusOK {
+		t.Errorf("a standby's status = %d, want 200", rec.Code)
+	}
+	// Distinguishable from a live agent, because the two states call for
+	// different reactions from whoever is reading: one is serving players,
+	// the other is waiting for its turn.
+	if rec.Body.String() != "standby" {
+		t.Errorf("a standby's body = %q, want standby", rec.Body.String())
+	}
+}
+
+func TestServer_Readyz_TheLiveAgentStillAnswersForItsSession(t *testing.T) {
+	srv, err := New("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.ln.Close()
+
+	srv.SetRole(RoleLive)
+	if rec := readyz(srv); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("live with no session: status = %d, want 503", rec.Code)
+	}
+	srv.SetReady(true)
+	if rec := readyz(srv); rec.Code != http.StatusOK || rec.Body.String() != "ready" {
+		t.Errorf("live with a session: (%d, %q), want (200, ready)", rec.Code, rec.Body.String())
+	}
+}
+
+// Handing the lock on is not a failure, and the moment after it the process
+// is a standby again: it has no session, and it must not report the 503 that
+// would say it is broken.
+func TestServer_Readyz_AnAgentThatGaveUpTheLockIsAStandbyAgain(t *testing.T) {
+	srv, err := New("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.ln.Close()
+
+	srv.SetRole(RoleLive)
+	srv.SetReady(true)
+	srv.SetReady(false)
+	srv.SetRole(RoleStandby)
+
+	if rec := readyz(srv); rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 for a demoted agent waiting again", rec.Code)
+	}
+}
+
+// The gauge exists so "exactly one agent is live" is answerable from
+// outside: two of these at 1 is the two-logins-one-account failure, and zero
+// of them is nobody playing.
+func TestSetRoleMovesTheLeaderGauge(t *testing.T) {
+	srv, err := New("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.ln.Close()
+
+	srv.SetRole(RoleLive)
+	if got := testutil.ToFloat64(leaderGauge); got != 1 {
+		t.Errorf("mc_agent_leader = %v while live, want 1", got)
+	}
+	srv.SetRole(RoleStandby)
+	if got := testutil.ToFloat64(leaderGauge); got != 0 {
+		t.Errorf("mc_agent_leader = %v while standby, want 0", got)
+	}
+}
+
+func readyz(srv *Server) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	return rec
 }
