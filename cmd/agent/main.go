@@ -433,6 +433,11 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		// whisper sent now is accepted by a server whose players are
 		// reconnecting, and recorded against clients that are mid-load.
 		joinClock.disconnected()
+		// Nobody is being watched now. Held onto, the roster would answer
+		// Online() with whoever was here when the connection died, and an
+		// announcement published in the gap would be recorded as delivered
+		// to players who may already have left.
+		playerRoster.EndSession()
 
 		if ctx.Err() != nil {
 			return

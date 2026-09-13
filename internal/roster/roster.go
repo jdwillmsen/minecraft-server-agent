@@ -127,6 +127,23 @@ func (r *Roster) BeginSession(at time.Time, agentXUID string) {
 	r.snapshotEnded = false
 }
 
+// EndSession empties the Roster because the connection carrying it is
+// gone. Everything BeginSession says about a retained map being wrong
+// applies from the moment the connection dies, not from the moment the next
+// one opens: in between, anyone reading Online() -- an announcement
+// published by a schedule, an event source or the HTTP API -- would be
+// handed players who may already have left, and recording a delivery
+// against one of them loses that message for good. The next session's
+// BeginSession still runs and still sets when it began watching.
+func (r *Roster) EndSession() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.players = make(map[string]string)
+	r.xuidByUUID = make(map[string]string)
+	r.snapshotStarted = false
+	r.snapshotEnded = false
+}
+
 // Since reports when the current session began watching, as given to
 // BeginSession. A presence that started before it was not watched through:
 // whatever happened across the gap -- a departure, a return -- was never

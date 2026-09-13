@@ -373,3 +373,40 @@ func TestApply_DepartureDoesNotEndTheOpeningSnapshot(t *testing.T) {
 		t.Errorf("present = %+v, want Alex: a removal must not end the burst behind it", present)
 	}
 }
+
+// A connection that dies takes the roster's knowledge with it. Kept, it
+// would answer Online() with whoever was here when the connection died, and
+// an announcement published in the gap would be recorded as delivered to a
+// player who may already have left -- which nothing retries.
+func TestEndSessionEmptiesTheRoster(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve", UUID: "u-111"})
+	if len(r.Online()) == 0 {
+		t.Fatal("nobody online after the snapshot, so this test proves nothing")
+	}
+
+	r.EndSession()
+
+	if online := r.Online(); len(online) != 0 {
+		t.Errorf("Online() = %v after the connection ended, want nobody", online)
+	}
+	if _, ok := r.NameFor("111"); ok {
+		t.Error("still naming a player the ended connection was watching")
+	}
+}
+
+// The next connection's snapshot is still a snapshot: those players were
+// already here, so none of them is an arrival.
+func TestEndSessionThenSnapshotReportsNobodyAsJoining(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve", UUID: "u-111"})
+	r.EndSession()
+
+	joins, _, present := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve", UUID: "u-111"}})
+	if len(joins) != 0 {
+		t.Errorf("joins = %+v after reconnecting, want none: the snapshot is not a burst of arrivals", joins)
+	}
+	if len(present) == 0 {
+		t.Error("nobody reported as present, so their backlog would never be scheduled")
+	}
+}

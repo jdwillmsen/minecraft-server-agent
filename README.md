@@ -467,6 +467,14 @@ the same wait, from the connection that found them there - so a backlog is
 never stranded by a reconnect and never whispered twice. They are not
 greeted for it; they did not arrive.
 
+The roster empties the moment the connection dies rather than when the next
+one opens. Between the two, nobody is being watched: an announcement
+published in that gap by a schedule, an event source or the HTTP API finds
+no recipients and stays pending for the join that follows. Held onto, the
+roster would name whoever was online when the connection died, and one of
+them may already have left - recording a delivery against them loses that
+message for good.
+
 A delivery already under way stops the same moment, between one message and
 the next. The connection ending cancels the drain where it stands, so the
 rest of the backlog is left pending rather than whispered and recorded
