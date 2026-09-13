@@ -68,6 +68,12 @@ backup), operator-set schedules (`!schedule`), and an optional HTTP API
 announcements", "Scheduled announcements" and "The announcement HTTP API"
 below.
 
+Releases no longer take the agent out of the game for half a minute. A new
+pod starts as a warm standby - fully started, deliberately out of the game -
+and joins only when the pod it is replacing releases the lock it leaves with.
+See "Handing over to a standby" below, including the part of that fix which
+lives in the Helm chart rather than here.
+
 ## Architecture
 
 ```
@@ -105,7 +111,10 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 - `internal/store` - Postgres-backed player profiles and playtime, behind a
   `store.Nop` no-op so an unset `PG_HOST` is a supported state rather than a
   crash; a plugin only ever sees the narrow `PlayerStore` read-and-record
-  slice (`RecordJoin`, `Enabled`), never the connection pool itself
+  slice (`RecordJoin`, `Enabled`), never the connection pool itself. It draws
+  three different endings for a visit and never confuses them: a departure
+  the agent watched, a handover it made itself, and a session whose end
+  nobody saw
 - `internal/knowledge` - the curated fact store behind `!kb`. Kept separate
   from `internal/store`, which owns presence, so the code path the LLM reads
   from can never also reach a player's session; a `Nop` implementation makes
@@ -157,9 +166,14 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   800ms window, so that number would be the same every time
 - `internal/mcauth` - Xbox Live device-code login with on-disk token
   caching, so a restart doesn't require a fresh interactive login
-- `internal/httpapi` - `/healthz`, `/readyz` (reflects real Bedrock session
-  state), `/metrics`, and `POST /announcements` when `ANNOUNCE_API_TOKEN`
-  is set
+- `internal/leader` - the lock that makes exactly one process the live
+  agent, and the warm standby that waits for it. One Xbox Live account holds
+  one connection, so this is what stops two pods taking turns kicking each
+  other out of the game during a release - see "Handing over to a standby"
+  below
+- `internal/httpapi` - `/healthz`, `/readyz` (the live agent's real Bedrock
+  session state, or a warm standby's deliberate wait - both are ready),
+  `/metrics`, and `POST /announcements` when `ANNOUNCE_API_TOKEN` is set
 - `internal/metrics` - every series the agent exports beyond the session
   gauge and reconnect counter; callers record through small functions and
   never touch a Prometheus type - see "Metrics" below
@@ -187,6 +201,8 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 | `PG_USERNAME` | *(empty)* | Database role |
 | `PG_PASSWORD` | *(empty)* | Database password |
 | `PG_CONNECT_TIMEOUT_MS` | `5000` | Bounds the startup connection check, so a slow database costs persistence, not the ability to start |
+| `LEADER_POLL_MS` | `500` | How often a warm standby asks whether the agent lock has come free. The dominant term in how long a release leaves the server without an agent; only meaningful with a database configured, since without one there is no lock and no standby |
+| `LEADER_MAX_WAIT_MS` | `60000` | How long a standby waits for the lock before going live without it, because a lock nobody will release would otherwise cost hours - see "When nobody releases the lock" below. Must be at least `LEADER_POLL_MS`, and is deliberately far above the few seconds an ordinary handover takes, so a release never reaches it |
 | `LLM_BASE_URL` | *(empty disables answering)* | Base URL of the OpenAI-compatible backend behind `@server` |
 | `LLM_MODEL` | *(empty)* | Model name sent with each request |
 | `LLM_API_KEY` | *(empty)* | Bearer token for the LLM backend, if it requires one |
@@ -209,6 +225,8 @@ breaking change.
 | Name | Type | Labels | Recorded |
 |---|---|---|---|
 | `mc_agent_connected` | gauge | none | 1 while a Bedrock session is up |
+| `mc_agent_leader` | gauge | none | 1 while this process is the live agent, 0 while it is a warm standby |
+| `mc_agent_leader_unlocked` | gauge | none | 1 while this process is the live agent *without* holding the lock |
 | `mc_agent_reconnects_total` | counter | none | per reconnect attempt |
 | `mc_agent_commands_total` | counter | `command`, `outcome` | once per dispatch, beside the audit write |
 | `mc_agent_mentions_total` | counter | `outcome` | once per `@server` mention |
@@ -246,6 +264,19 @@ the audit, auth and death counters, start at zero: `increase()` over a
 series that first appears at 1 reads as 0, and an alert on the first failure
 after a restart would never fire. A missing or ungranted audit table counts
 as a write failure on every command, though it is logged only once.
+
+`mc_agent_leader` is worth alerting on in both directions, summed across
+pods: two agents reporting 1 are two processes kicking each other out of one
+Xbox Live account, and none reporting 1 is a server with nobody answering
+it. Mid-rollout it is briefly 0 everywhere - that gap is the handover, and
+it is the number "Handing over to a standby" below exists to keep small.
+
+`mc_agent_leader_unlocked` is the other half of that question and a separate
+series on purpose: a pod leading without the lock **is** the live agent and
+reports 1 in `mc_agent_leader` like any other, so the thing worth alerting on
+- that nothing is currently stopping a second agent joining - is invisible
+there. It is a gauge rather than a counter because it stops being true: the
+agent adopts the lock if it ever frees, and the series clears when it does.
 
 `mc_agent_server_tps` and `mc_agent_link_rtt_seconds` do not exist until
 first measured, and a failed measurement never resets them: a zero would
@@ -683,6 +714,113 @@ a container would otherwise block on a device code nobody is watching for:
   connect loop retries with backoff indefinitely; no login prompt is ever
   printed. Recover the same way: delete the cache file and restart.
 
+## Handing over to a standby
+
+A release used to cost the server its agent for about half a minute. The old
+pod was stopped before the new one started, the new pod then did all of its
+startup - Xbox token refresh, database, knowledge, HTTP - before dialling,
+and the server was still holding the old login when it got there, so its
+first connect attempt was refused and it waited out a reconnect delay too.
+Measured on one rollout: pod started at 21:43:02Z, in the game at 21:43:31Z.
+
+The constraint that makes this awkward is outside the agent: **one Xbox Live
+account holds one connection, and a second login kicks the first.** Two
+agents cannot overlap in the game even for a moment. So the handover is
+arranged the other way round - a second pod starts, pays every startup cost
+it can, and waits *out* of the game until the old one leaves.
+
+**The lock.** A process joins only while it holds a PostgreSQL session-scoped
+advisory lock keyed on `MC_USERNAME`, taken on a connection of its own that it
+holds for as long as it leads (`internal/leader`). The holder is the only
+process that joins the game, and the only one that runs the announcement
+sources, the schedule loop, the TPS sampling and the moderation record's
+pruning - a standby doing any of those would announce everything twice and
+speak on the console as a second agent.
+
+The connection is dedicated on purpose. An advisory lock belongs to the
+connection that took it, so taking one on a pooled connection means the lock
+is released the moment the pool retires that connection - silently, while the
+process still believes it leads. Holding the connection is therefore the same
+act as holding the lock, and giving it back is the same act as standing down.
+The holder pings it every few seconds, because a connection that has gone
+away has taken the lock with it and another process may already have both.
+
+A Kubernetes Lease was the alternative and was not chosen: the agent has no
+ServiceAccount, Role or RoleBinding today, and a lease is held for its full
+duration after a pod dies, where a lock on a dead connection is released as
+soon as the server notices the socket is gone.
+
+**Readiness tells the two apart.** `/readyz` answers:
+
+| State | Status | Body |
+|---|---|---|
+| Live agent with a Bedrock session | `200` | `ready` |
+| Live agent with no session, or dead on a respawn screen | `503` | `not ready` |
+| Warm standby waiting for the lock | `200` | `standby` |
+| Starting up, before either | `503` | `not ready` |
+
+A waiting standby is **ready**, which is deliberate twice over: it is a
+healthy pod doing exactly what it should, and a rolling update that waits for
+the new pod to be ready before removing the old one would otherwise deadlock -
+the new pod waiting for a lock the old pod will not release until Kubernetes
+removes it. `mc_agent_leader` is how a reader tells live from standby;
+`/healthz` is unconditional, so a standby is never restarted for waiting.
+
+**Shutdown, in order.** On `SIGTERM` the live agent:
+
+1. closes its Bedrock connection and waits ~2s for the disconnect to actually
+   reach the server. Closing the socket is not leaving the game: the RakNet
+   layer sends the disconnect notice from its own tick, and a process that
+   exits first leaves the server to time the session out - the ten seconds the
+   old rollout spent with the login held by a pod that was already gone,
+2. closes every session it was watching as `ended_reason = 'agent_restart'`,
+   at the moment it stopped watching, so a release no longer discards watched
+   playtime,
+3. releases the lock, last. A standby joins the instant it sees the lock free,
+   so anything done after this point would be done with two agents live.
+
+A session closed that way counts toward a player's playtime exactly like one
+closed by a departure the agent watched: the visit is split across two rows
+and both halves count. `'unknown'` - the session nobody watched end - still
+counts for nothing, and a clean handover is never recorded as one. No schema
+change was needed for any of this; `'agent_restart'` has been a permitted
+`ended_reason` since the first migration and nothing had ever written it.
+
+**When nobody releases the lock.** An advisory lock is released when the
+connection holding it ends, which is immediate for a process that exits and
+slow for a pod that dies without closing its socket - a `SIGKILL`, an OOM
+kill, a node losing power. PostgreSQL keeps that backend, and its lock, until
+TCP keepalive reaps it. On `platform-postgresql-cluster-prd` the server-side
+settings are all zero (`idle_session_timeout`, `tcp_keepalives_idle`,
+`tcp_keepalives_interval`, `tcp_keepalives_count`), meaning they inherit the
+node's `7200 / 75 / 9` - so worst case the lock stays taken for about 2h11m.
+
+Waiting that out would trade a 29-second planned gap for a multi-hour
+unplanned one, so the wait is bounded by `LEADER_MAX_WAIT_MS`. At the end of
+it the agent goes live **without** the lock and lets the Xbox Live kick evict
+whatever is still logged in - which is exactly how every release worked before
+any of this existed, so the worst case is no worse than it used to be. That
+decision is logged at ERROR (`leading_without_the_lock`), because it is the
+process knowingly giving up the guarantee the lock provides, and it shows up
+in `mc_agent_leader_unlocked` for as long as it lasts.
+
+Such a process keeps chasing the lock in the background and adopts it the
+moment it frees. That is not tidiness: an agent with no lock has no connection
+to watch, so until it adopts one nothing can tell it that another agent has
+taken the login - and `Lost()` detection, the thing that makes a conflict
+survivable, is dead for the rest of the process's life. Adoption logs
+`leader_lock_adopted`, clears `mc_agent_leader_unlocked`, and puts the
+connection under the same probe a lock held from the start gets.
+
+**What the chart still has to do.** The agent side of this is only half the
+fix. Until the Helm chart moves from `Recreate` to `RollingUpdate` with
+`maxSurge: 1` and `maxUnavailable: 0`, the old pod is still stopped before
+the new one starts and there is never a standby to hand over to - so the
+lock is always free when the new pod asks for it, and a release costs what it
+costs today minus the ten seconds step 1 above removes. With the chart
+change, the gap is the disconnect plus one poll interval
+(`LEADER_POLL_MS`) plus the time to dial and spawn.
+
 ## Development
 
 ```sh
@@ -766,6 +904,17 @@ never production: these tests write rows.
 from `V6__minecraft_moderation.sql`: `go test -tags livedb
 ./internal/moderation/`. It inserts and deletes rows, so point it at a
 disposable database built from the migrations, never at production.
+
+`internal/leader` has one as well, and it needs no table at all - advisory
+locks are server state, not schema - so the same `MC_TEST_DSN` works:
+`go test -tags livedb ./internal/leader/`. It is worth more than its size
+suggests: it asserts that two processes never hold the lock at once, that a
+terminated connection releases it, that a lock nobody releases is outwaited
+and then adopted once it frees, and that a lock taken on a *pooled*
+connection is silently lost when the pool retires it - the bug the dedicated
+connection exists to avoid, written down so nobody optimises it back in. One
+of its cases terminates connections by `application_name`, so it can run
+alongside the other live suites against one database without killing them.
 
 ## Releases
 

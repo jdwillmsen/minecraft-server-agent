@@ -145,7 +145,12 @@ func main() {
 	var scheduleStore announce.ScheduleStore = announce.Nop{}
 	var auditor audit.Store = audit.Nop{}
 	var moderationStore moderation.Store = moderation.Nop{}
+	// The lock that makes exactly one of these processes the live agent. It
+	// lives on the profile store's pool, so it exists exactly when
+	// persistence does -- see newElection and awaitLeadership.
+	var election campaigner
 	if pg, ok := playerStore.(*store.Postgres); ok && pg.Pool() != nil {
+		election = newElection(cfg, pg.Pool(), log)
 		knowledgeStore = knowledge.NewPostgres(pg.Pool())
 		moderationStore = newModerationLog(moderation.NewPostgres(pg.Pool()), log)
 		waypointStore = waypoints.NewPostgres(pg.Pool())
@@ -202,11 +207,12 @@ func main() {
 		time.Duration(cfg.LLMTotalTimeoutMs)*time.Millisecond,
 		bridgeTimeout,
 	)
+	// Started for the process rather than for a turn as the live agent: the
+	// subscriptions are the registry's, which never changes, and a standby
+	// that is in no game has nothing to dispatch anyway. Everything that
+	// writes somewhere a second process would also write starts with
+	// leadership instead -- see startLiveWork.
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
-	go sampleGameClock(ctx, pinger, link.roundTrip, bridgeTimeout, log)
-	go pruneModerationLog(ctx, moderationStore, moderationPruneInterval, log)
-	go runServerWatcher(ctx, cfg, bridgeTimeout, announceStore, deliverer, log)
-	go runScheduler(ctx, scheduleStore, deliverer, log)
 
 	httpServer, err := httpapi.New(cfg.HTTPAddr)
 	if err != nil {
@@ -242,8 +248,44 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Refreshed here, before the wait below rather than after it: every cost
+	// paid while this process is still a standby is a cost the handover does
+	// not pay.
+	warmXboxToken(ts, log)
+
 	log.Info("starting", logging.Fields{"mc_host": cfg.MCHost, "mc_port": cfg.MCPort})
-	runConnectLoop(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblings, permResolver, ans, playerStore, auditor, link, joins)
+
+	// One pass of this loop is one turn as the live agent: wait for the lock,
+	// play until the process is shutting down or the lock is gone, then hand
+	// over. A process that loses the lock becomes a standby again rather than
+	// exiting -- the database blinking must not cost the server its agent,
+	// which is exactly what it cost before there was a lock at all.
+	for ctx.Err() == nil {
+		term, live := awaitLeadership(ctx, election, httpServer.SetRole, log)
+		if !live {
+			break
+		}
+
+		// Ends with this turn, not with the process: the connect loop and
+		// every live-only writer below run under it, so losing the lock takes
+		// the agent out of the game without taking the process down.
+		liveCtx, endTurn := context.WithCancel(ctx)
+		go endTermOnLockLoss(liveCtx, term, endTurn, log)
+		// A turn that began without the lock -- because whoever holds it is
+		// gone without having released it -- is a turn worth flagging for as
+		// long as it lasts.
+		go watchForcedLeadership(liveCtx, term, log)
+		startLiveWork(liveCtx, cfg, bridgeTimeout, pinger, link, announceStore, deliverer, scheduleStore, moderationStore, log)
+
+		runConnectLoop(liveCtx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblings, permResolver, ans, playerStore, auditor, link, joins)
+
+		endTurn()
+		// The agent is out of the game by now -- the connect loop waits for
+		// its own disconnect to reach the server -- so the sessions it was
+		// watching can be closed at the moment it stopped watching, and only
+		// then is the lock passed on.
+		handover(ctx, term, playerStore, playerRoster.Since(), log)
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
@@ -602,7 +644,11 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
-	defer conn.Close()
+	// Not a bare Close: when this session is ending because the process is
+	// handing the agent over, the server has to be told before the process
+	// stops existing, or it holds the login until it times the session out --
+	// see leaveGame.
+	defer leaveGame(ctx, conn, leaveGrace, log)
 
 	// conn.ReadPacket below only unblocks on the connection's own context,
 	// which gophertunnel derives from the RakNet link rather than from the

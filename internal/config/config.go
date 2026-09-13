@@ -72,6 +72,28 @@ type Config struct {
 	// answers commands and greets players without persistence.
 	PGConnectTimeoutMs int
 
+	// LeaderPollMs is how often a standby asks whether the agent lock has come
+	// free. It is the dominant term in how long a release leaves the server
+	// without an agent: the departing process releases the lock as it goes,
+	// and nobody plays again until a standby notices. Only meaningful with a
+	// database configured -- without one there is no lock and no standby.
+	LeaderPollMs int
+	// LeaderMaxWaitMs bounds that wait, after which the agent goes live
+	// without the lock.
+	//
+	// The lock is released by the connection holding it ending, which is
+	// instant for a process that exits and hours for a pod that died without
+	// closing its socket: PostgreSQL keeps that backend, and its lock, until
+	// TCP keepalive reaps it. Waiting that out would cost the server its agent
+	// for far longer than the gap this whole mechanism exists to shorten, so
+	// the wait ends here and the Xbox Live kick evicts whatever is still
+	// logged in -- exactly what a restart did before there was a lock.
+	//
+	// Must stay comfortably above LeaderPollMs and above the few seconds a
+	// departing agent spends leaving the game and settling its database, so no
+	// ordinary release ever reaches it.
+	LeaderMaxWaitMs int
+
 	// The LLM backend behind @server answering. An empty LLMBaseURL disables
 	// answering entirely -- the mention is logged and nothing else happens,
 	// which is the Stage 1-3 behaviour.
@@ -155,6 +177,21 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	leaderPoll, err := positiveInt("LEADER_POLL_MS", 500)
+	if err != nil {
+		return Config{}, err
+	}
+	leaderMaxWait, err := positiveInt("LEADER_MAX_WAIT_MS", 60000)
+	if err != nil {
+		return Config{}, err
+	}
+	if leaderMaxWait < leaderPoll {
+		// A bound below one poll interval is a bound that gives up before it
+		// has asked twice, which is not a fallback for a lock nobody will
+		// release -- it is the lock turned off, by a value that looks like
+		// tuning.
+		return Config{}, fmt.Errorf("LEADER_MAX_WAIT_MS (%d) must be >= LEADER_POLL_MS (%d)", leaderMaxWait, leaderPoll)
+	}
 	llmMaxTokens, err := positiveInt("LLM_MAX_TOKENS", 192)
 	if err != nil {
 		return Config{}, err
@@ -203,6 +240,8 @@ func Load() (Config, error) {
 		PGUser:                    stringDefault("PG_USERNAME", ""),
 		PGPassword:                stringDefault("PG_PASSWORD", ""),
 		PGConnectTimeoutMs:        pgConnectTimeout,
+		LeaderPollMs:              leaderPoll,
+		LeaderMaxWaitMs:           leaderMaxWait,
 		LLMBaseURL:                stringDefault("LLM_BASE_URL", ""),
 		LLMModel:                  stringDefault("LLM_MODEL", ""),
 		LLMAPIKey:                 stringDefault("LLM_API_KEY", ""),

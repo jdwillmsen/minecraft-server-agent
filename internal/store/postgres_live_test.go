@@ -574,3 +574,135 @@ func TestEnsurePlayerLeavesAnExistingProfileAlone(t *testing.T) {
 		t.Errorf("player is (%q, %d) after an ensure, want (\"Regular\", 1)", gamertag, joins)
 	}
 }
+
+// A release hands the agent over from one process to another, and the
+// departing one is the only thing that knows who it was watching. Closing
+// those sessions as it goes is what keeps a deploy from costing every player
+// online the time they had already played.
+func TestHandoverClosesWatchedSessionsAndCreditsThem(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := freshXUID()
+	connected := time.Now().UTC().Add(-time.Hour)
+
+	if _, err := pg.RecordJoin(ctx, xuid, "Handover", connected); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+
+	closed, err := pg.CloseForHandover(ctx, connected, connected.Add(30*time.Minute))
+	if err != nil {
+		t.Fatalf("handover: %v", err)
+	}
+	// At least, rather than exactly: the handover closes every session this
+	// agent was watching, and a shared test database holds other players'
+	// rows from other tests. What must be exact is this player's own row.
+	if closed < 1 {
+		t.Errorf("closed %d sessions, want at least the one being watched", closed)
+	}
+
+	reason, duration := sessionEnd(t, pg, xuid)
+	if reason != "agent_restart" {
+		t.Errorf("ended_reason = %q, want agent_restart", reason)
+	}
+	if duration != 1800 {
+		t.Errorf("duration_seconds = %d, want 1800: the handover credits the time actually watched", duration)
+	}
+
+	// And the player is credited: a handover is a split session, not a lost
+	// one, so the next greeting reads the same total it would have read had
+	// nobody deployed anything.
+	profile, err := pg.RecordJoin(ctx, xuid, "Handover", connected.Add(30*time.Minute))
+	if err != nil {
+		t.Fatalf("rejoin: %v", err)
+	}
+	if profile.TotalSeconds != 1800 {
+		t.Errorf("TotalSeconds = %d, want 1800: a handover's half of a session must still count", profile.TotalSeconds)
+	}
+	// The distinction the schema draws, and the one an operator reads: an
+	// unclean session is time nobody watched. This was watched, to the
+	// second.
+	if profile.UncleanSessions != 0 {
+		t.Errorf("UncleanSessions = %d, want 0: a clean handover is not an unwatched session", profile.UncleanSessions)
+	}
+}
+
+// The same rule RecordLeave applies: a session older than the current
+// connection was open across a gap the agent never saw, so the handover
+// cannot honestly credit it either.
+func TestHandoverLeavesASessionFromBeforeTheConnectionUnobserved(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := freshXUID()
+	old := time.Now().UTC().Add(-48 * time.Hour)
+
+	if _, err := pg.RecordJoin(ctx, xuid, "LongGone", old); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+
+	connected := time.Now().UTC()
+	if _, err := pg.CloseForHandover(ctx, connected, connected.Add(time.Minute)); err != nil {
+		t.Fatalf("handover: %v", err)
+	}
+
+	reason, duration := sessionEnd(t, pg, xuid)
+	if reason != "unknown" {
+		t.Errorf("ended_reason = %q, want unknown for a session open across a gap", reason)
+	}
+	if duration != 0 {
+		t.Errorf("duration_seconds = %d, want 0: two days of absence is not playtime", duration)
+	}
+}
+
+// The handover's whole point, end to end: a player online across a release
+// keeps the time they played on both sides of it.
+func TestPlaytimeSurvivesAHandoverMidSession(t *testing.T) {
+	pg := liveStore(t)
+	ctx := t.Context()
+	xuid := freshXUID()
+	joined := time.Now().UTC().Add(-2 * time.Hour)
+	handover := joined.Add(30 * time.Minute)
+
+	if _, err := pg.RecordJoin(ctx, xuid, "StayedOnline", joined); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if _, err := pg.CloseForHandover(ctx, joined, handover); err != nil {
+		t.Fatalf("handover: %v", err)
+	}
+	// The successor finds them in its opening roster snapshot and resumes
+	// watching, exactly as it does after any reconnect.
+	if _, err := pg.ResumeSession(ctx, xuid, "StayedOnline", handover); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+
+	playtime, err := pg.RecordLeave(ctx, xuid, handover, handover.Add(20*time.Minute))
+	if err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	if playtime.Before != 30*time.Minute {
+		t.Errorf("playtime before the leave = %v, want 30m (the half the handover closed)", playtime.Before)
+	}
+	if playtime.After != 50*time.Minute {
+		t.Errorf("playtime after the leave = %v, want 50m: both halves of one visit", playtime.After)
+	}
+}
+
+// sessionEnd reads how the player's most recent session ended.
+func sessionEnd(t *testing.T, pg *Postgres, xuid string) (reason string, duration int) {
+	t.Helper()
+	err := pg.pool.QueryRow(t.Context(), `
+		SELECT ended_reason, COALESCE(duration_seconds, -1)
+		FROM minecraft.sessions WHERE xuid = $1
+		ORDER BY session_id DESC LIMIT 1`, xuid,
+	).Scan(&reason, &duration)
+	if err != nil {
+		t.Fatalf("read session: %v", err)
+	}
+	return reason, duration
+}
+
+// freshXUID keeps these tests independent of each other and of every
+// previous run: the totals they assert are sums over one player's whole
+// history, so a fixed id would accumulate.
+func freshXUID() string {
+	return fmt.Sprintf("25356%011d", time.Now().UnixNano()%1e11)
+}
