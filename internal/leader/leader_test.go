@@ -28,10 +28,18 @@ type fakeSession struct {
 	// can let a term settle before the connection dies under it.
 	aliveAfter int
 
+	// beating is whether the process that holds this lock is announcing
+	// itself, as a standby listening on this connection would hear it.
+	beating  atomic.Bool
+	beatErr  error
+	awaitErr error
+
 	tries    int
 	probes   int
 	unlocked int
 	closed   int
+	beats    int
+	awaits   int
 
 	busy       atomic.Bool
 	concurrent atomic.Bool
@@ -78,6 +86,33 @@ func (s *fakeSession) Alive(context.Context) error {
 	return nil
 }
 
+func (s *fakeSession) Heartbeat(context.Context) error {
+	defer s.enter()()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.beats++
+	return s.beatErr
+}
+
+func (s *fakeSession) AwaitHeartbeat(ctx context.Context) (bool, error) {
+	defer s.enter()()
+	s.mu.Lock()
+	s.awaits++
+	err := s.awaitErr
+	s.mu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	if s.beating.Load() {
+		return true, nil
+	}
+	// Silence until the caller stops waiting, which is what a standby hears
+	// on almost every poll: the holder announces itself far less often than a
+	// standby asks for the lock.
+	<-ctx.Done()
+	return false, nil
+}
+
 func (s *fakeSession) Close() {
 	defer s.enter()()
 	s.mu.Lock()
@@ -89,6 +124,18 @@ func (s *fakeSession) counts() (tries, unlocked, closed int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.tries, s.unlocked, s.closed
+}
+
+func (s *fakeSession) beatCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.beats
+}
+
+func (s *fakeSession) awaitCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.awaits
 }
 
 // dialing hands out the given sessions in order, reporting err for as many
@@ -483,4 +530,171 @@ func TestReleasingAnUnlockedTermStopsItChasingTheLock(t *testing.T) {
 		tries, unlocked, closed := later.counts()
 		return tries == 0 || (unlocked == 1 && closed == 1)
 	}, "the lock was left taken on a connection the released term abandoned")
+}
+
+func TestAStandbyKeepsWaitingWhileTheHolderIsStillAnnouncingItself(t *testing.T) {
+	// The bound on its own cannot tell a holder that is gone from one that is
+	// merely still there: it asks how long this process has waited, never
+	// whether anybody is on the other end. Going live anyway would put two
+	// processes in the game, and since the second login kicks the first, the
+	// evicted agent's connect loop takes the login straight back -- the flap
+	// the lock exists to prevent rather than cause.
+	sess := &fakeSession{heldElsewhere: 1 << 30}
+	sess.beating.Store(true)
+	spare := &fakeSession{heldElsewhere: 1 << 30}
+	d := &dialing{sessions: []*fakeSession{sess, spare}}
+	bound := 20 * time.Millisecond
+
+	e := New(d.dial, WithPoll(time.Millisecond), WithMaxWait(bound), WithHeartbeat(10*time.Millisecond))
+	done := make(chan *Term, 1)
+	go func() {
+		term, err := e.Campaign(t.Context())
+		if err != nil {
+			t.Errorf("Campaign: %v", err)
+		}
+		done <- term
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("the standby went live although the holder was still announcing itself")
+	case <-time.After(20 * bound):
+	}
+
+	// And the holder dies. The announcements stop, the silence outlasts what a
+	// slow write could explain, and the standby takes over rather than waiting
+	// on a lock that nobody is left to release.
+	sess.beating.Store(false)
+	select {
+	case term := <-done:
+		defer func() { _ = term.Release(t.Context()) }()
+		if term.Held() {
+			t.Error("the term claims a lock the other connection is still holding")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the standby never went live after the holder stopped announcing itself")
+	}
+}
+
+func TestAHolderThatAnnouncesNothingIsStillOutwaitedAtTheBound(t *testing.T) {
+	// Two situations look identical from here and must behave the same: a pod
+	// that died without closing its socket, whose backend and lock PostgreSQL
+	// keeps for hours, and -- for exactly one release -- an agent from the
+	// version before any of this was written, which announces nothing because
+	// it cannot. Waiting on that silence forever would make deploying the
+	// heartbeat the deadlock the heartbeat is meant to remove.
+	sess := &fakeSession{heldElsewhere: 1 << 30}
+	spare := &fakeSession{heldElsewhere: 1 << 30}
+	d := &dialing{sessions: []*fakeSession{sess, spare}}
+	bound := 20 * time.Millisecond
+
+	started := time.Now()
+	term, err := New(d.dial,
+		WithPoll(time.Millisecond),
+		WithMaxWait(bound),
+		WithHeartbeat(5*time.Millisecond),
+	).Campaign(t.Context())
+	if err != nil {
+		t.Fatalf("Campaign: %v", err)
+	}
+	defer func() { _ = term.Release(t.Context()) }()
+
+	if took := time.Since(started); took > 2*time.Second {
+		t.Errorf("the campaign waited %v on a holder that announced nothing, want about %v", took, bound)
+	}
+	if term.Held() {
+		t.Error("the term reports it holds a lock another connection is holding")
+	}
+	if sess.awaitCount() == 0 {
+		t.Error("the standby never listened for the holder at all")
+	}
+}
+
+func TestAStandbyThatCannotListenFallsBackToTheBound(t *testing.T) {
+	// A heartbeat this process cannot hear has to read as silence. The
+	// alternative -- treating a broken listen as "cannot rule out a live
+	// holder" -- is a standby held out of the game indefinitely by a failing
+	// query, which is strictly worse than the bound it replaced.
+	sess := &fakeSession{heldElsewhere: 1 << 30, awaitErr: errors.New("listen failed")}
+	spare := &fakeSession{heldElsewhere: 1 << 30}
+	d := &dialing{sessions: []*fakeSession{sess, spare}}
+
+	term, err := New(d.dial,
+		WithPoll(time.Millisecond),
+		WithMaxWait(20*time.Millisecond),
+		WithHeartbeat(5*time.Millisecond),
+	).Campaign(t.Context())
+	if err != nil {
+		t.Fatalf("Campaign: %v", err)
+	}
+	defer func() { _ = term.Release(t.Context()) }()
+
+	if term.Held() {
+		t.Error("the term reports it holds a lock another connection is holding")
+	}
+	// Once, not once per poll: a listen that is broken stays broken, and a
+	// standby that retried it every poll would spend the whole wait logging.
+	if got := sess.awaitCount(); got != 1 {
+		t.Errorf("listen attempts = %d after the first failure, want 1", got)
+	}
+}
+
+func TestTheHolderAnnouncesItselfWhileItLeadsAndStopsWhenItStandsDown(t *testing.T) {
+	// What every standby's wait depends on. The first announcement goes out at
+	// once rather than after an interval, because a standby already waiting
+	// has the bound running against it from before this term began.
+	sess := &fakeSession{}
+	d := &dialing{sessions: []*fakeSession{sess}}
+
+	term, err := New(d.dial,
+		WithPoll(time.Millisecond),
+		WithProbe(time.Millisecond),
+		WithHeartbeat(time.Millisecond),
+	).Campaign(t.Context())
+	if err != nil {
+		t.Fatalf("Campaign: %v", err)
+	}
+	waitFor(t, func() bool { return sess.beatCount() >= 3 }, "the holder never announced itself while leading")
+
+	if err := term.Release(t.Context()); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	// Silence from the moment it stands down, on the connection it has already
+	// handed back: a process that kept announcing itself after releasing the
+	// lock would hold its successor's standby out of the game.
+	settled := sess.beatCount()
+	time.Sleep(20 * time.Millisecond)
+	if got := sess.beatCount(); got != settled {
+		t.Errorf("announcements went on after the term ended: %d then %d", settled, got)
+	}
+}
+
+func TestAHolderThatCannotAnnounceItselfIsStillTheHolder(t *testing.T) {
+	// The heartbeat is advice to a standby, not a claim to leadership. A
+	// holder whose writes are failing is still logged in and still holds the
+	// lock, and a process that stood down over a database hiccup would leave
+	// the server agentless while remaining in the game -- so only the lock
+	// ending a term may end one.
+	sess := &fakeSession{beatErr: errors.New("write failed")}
+	d := &dialing{sessions: []*fakeSession{sess}}
+
+	term, err := New(d.dial,
+		WithPoll(time.Millisecond),
+		WithProbe(time.Millisecond),
+		WithHeartbeat(time.Millisecond),
+	).Campaign(t.Context())
+	if err != nil {
+		t.Fatalf("Campaign: %v", err)
+	}
+	defer func() { _ = term.Release(t.Context()) }()
+
+	waitFor(t, func() bool { return sess.beatCount() >= 3 }, "the holder gave up announcing itself after the first failure")
+	select {
+	case <-term.Lost():
+		t.Error("the term ended because its announcements were failing")
+	default:
+	}
+	if !term.Held() {
+		t.Error("a holder whose announcements fail reports that it holds no lock")
+	}
 }
