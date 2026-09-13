@@ -77,3 +77,22 @@ func TestStatusOfIsUnknownForUncountedCategories(t *testing.T) {
 		t.Errorf("StatusOf(ignored) = %v, want StatusUnknown", got)
 	}
 }
+
+func TestStatusOfGradesTheEndsInvertedCaps(t *testing.T) {
+	// The End's monster caps are 10 surface / 8 cave - inverted relative to
+	// every other dimension in the table - so this is the one boundary
+	// where getting Range() backwards would actually change the answer.
+	for _, tc := range []struct {
+		count int
+		want  Status
+	}{
+		{8, Headroom},
+		{9, AtRisk},
+		{10, AtRisk},
+		{11, Capped},
+	} {
+		if got := StatusOf(End, Monster, tc.count); got != tc.want {
+			t.Errorf("StatusOf(end,monster,%d) = %v, want %v", tc.count, got, tc.want)
+		}
+	}
+}

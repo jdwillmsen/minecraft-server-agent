@@ -61,6 +61,9 @@ func TestArchiveSourceExtractsTheNewestArchive(t *testing.T) {
 	if world.Kind != "archive" {
 		t.Errorf("Kind = %q, want %q", world.Kind, "archive")
 	}
+	if world.Archive != "fwb-20260913T000000Z.tar.gz" {
+		t.Errorf("Archive = %q, want the newest archive's filename", world.Archive)
+	}
 	want := time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC)
 	if !world.TakenAt.Equal(want) {
 		t.Errorf("TakenAt = %v, want %v parsed from the archive name", world.TakenAt, want)

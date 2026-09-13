@@ -83,7 +83,9 @@ func TestScanCapturesFirstUnparsableError(t *testing.T) {
 		}},
 	})
 
-	// Add a corrupt actorprefix record
+	// Bytes that are not valid NBT at all stand in for a torn write during
+	// a backup snapshot - the kind of corruption FirstUnparsableErr exists
+	// to let an operator diagnose.
 	db, err := leveldb.OpenFile(path, nil)
 	if err != nil {
 		t.Fatalf("open db: %v", err)

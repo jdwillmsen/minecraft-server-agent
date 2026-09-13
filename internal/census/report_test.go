@@ -54,6 +54,23 @@ func TestRenderReportsUnreadableRecordsRatherThanHidingThem(t *testing.T) {
 	}
 }
 
+func TestRenderStatesTheFirstDecodeFailureWhenPresent(t *testing.T) {
+	c := sampleCensus()
+	c.Stats.Unparsable = 1
+	c.Stats.FirstUnparsableErr = "unmarshal actorprefix 0102030405060708: unexpected EOF"
+	out := Render(c, DefaultReportOptions())
+	if !strings.Contains(out, "first decode failure: unmarshal actorprefix 0102030405060708: unexpected EOF") {
+		t.Errorf("report does not state the first decode failure\n---\n%s", out)
+	}
+}
+
+func TestRenderOmitsTheFirstDecodeFailureLineWhenThereIsNone(t *testing.T) {
+	out := Render(sampleCensus(), DefaultReportOptions())
+	if strings.Contains(out, "first decode failure") {
+		t.Errorf("report states a decode failure that never happened\n---\n%s", out)
+	}
+}
+
 func TestRenderHonoursTopLimits(t *testing.T) {
 	var entities []Entity
 	for i := 0; i < 40; i++ {
@@ -64,8 +81,11 @@ func TestRenderHonoursTopLimits(t *testing.T) {
 	}
 	c := Aggregate(entities, ScanStats{}, time.Unix(0, 0).UTC(), "archive")
 	out := Render(c, ReportOptions{TopRegions: 5, TopTypes: 5})
-	if got := strings.Count(out, "x "); got > 6 {
-		t.Errorf("report rendered %d region rows, want at most 5 plus a header", got)
+	// Each region row contributes exactly one "x " (from "x %6d..."); the
+	// dimension header line does not. 40 single-zombie regions exist, so
+	// only TopRegions honouring the limit gives exactly 5.
+	if got := strings.Count(out, "x "); got != 5 {
+		t.Errorf("report rendered %d region rows, want exactly 5", got)
 	}
 }
 

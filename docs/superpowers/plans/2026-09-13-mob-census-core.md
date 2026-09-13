@@ -1789,19 +1789,21 @@ func TestAggregateIsDeterministicOverTiedRows(t *testing.T) {
 
 	// Run Aggregate 50 times and collect fingerprints
 	var firstFP string
+	var firstTotals, firstRegions, firstConcentrations int
 	var diffSection string
 	for run := 0; run < 50; run++ {
 		c := Aggregate(entities, ScanStats{}, time.Unix(0, 0), "archive")
 		fp := fingerprint(c)
 		if run == 0 {
 			firstFP = fp
+			firstTotals, firstRegions, firstConcentrations = len(c.Totals), len(c.Regions), len(c.Concentrations)
 		} else if fp != firstFP {
 			// Find which section differed
-			if len(c.Totals) != len(c.Totals) {
+			if len(c.Totals) != firstTotals {
 				diffSection = "Totals"
-			} else if len(c.Regions) != len(c.Regions) {
+			} else if len(c.Regions) != firstRegions {
 				diffSection = "Regions"
-			} else if len(c.Concentrations) != len(c.Concentrations) {
+			} else if len(c.Concentrations) != firstConcentrations {
 				diffSection = "Concentrations"
 			}
 			if diffSection == "" {
@@ -1811,12 +1813,62 @@ func TestAggregateIsDeterministicOverTiedRows(t *testing.T) {
 		}
 	}
 }
+
+func TestAggregateOrdersConcentrationsTiedOnEverythingButY(t *testing.T) {
+	// Two clusters of the same identifier, dimension, size and X/Z, but at
+	// clearly different Y - a two-storey mob farm, or stacked item piles.
+	// The old comparator stopped at CentreZ, so nothing distinguished these
+	// two clusters. sort.Slice's instability on a fully-tied pair only
+	// surfaces once the slice is long enough to leave the small-n insertion
+	// path, so a spread of unrelated concentration types rides along
+	// purely to grow c.Concentrations past that threshold.
+	var entities []Entity
+	for n := 0; n < 12; n++ {
+		id := fmt.Sprintf("noise%02d", n)
+		x := float64(n) * 5000
+		for i := 0; i < ConcentrationThreshold; i++ {
+			entities = append(entities, Entity{Identifier: id, Dimension: Overworld, X: x, Y: 0, Z: 0})
+		}
+	}
+	for _, y := range []float64{0, 1000} {
+		for i := 0; i < ConcentrationThreshold; i++ {
+			entities = append(entities, Entity{Identifier: "creaking", Dimension: Overworld, X: 99999, Y: y, Z: 0})
+		}
+	}
+
+	var firstOrder [2]float64
+	for run := 0; run < 100; run++ {
+		c := Aggregate(entities, ScanStats{}, time.Unix(0, 0), "archive")
+		var order [2]float64
+		found := 0
+		for _, con := range c.Concentrations {
+			if con.Identifier != "creaking" {
+				continue
+			}
+			if found >= 2 {
+				t.Fatalf("run %d: more than 2 creaking concentrations", run)
+			}
+			order[found] = con.Cluster.CentreY
+			found++
+		}
+		if found != 2 {
+			t.Fatalf("run %d: found %d creaking concentrations, want 2", run, found)
+		}
+		if run == 0 {
+			firstOrder = order
+			continue
+		}
+		if order != firstOrder {
+			t.Fatalf("run %d produced a different concentration order than run 0: %v vs %v", run, order, firstOrder)
+		}
+	}
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `go test ./internal/census/ -run TestAggregate -v`
-Expected: FAIL, `undefined: Aggregate` (before implementation); once implemented, TestAggregateIsDeterministicOverTiedRows must FAIL on the old comparators.
+Expected: FAIL, `undefined: Aggregate` (before implementation); once implemented, TestAggregateIsDeterministicOverTiedRows and TestAggregateOrdersConcentrationsTiedOnEverythingButY must FAIL on a comparator that stops at CentreZ.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -2018,7 +2070,28 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 		if c.Concentrations[i].Cluster.CentreX != c.Concentrations[j].Cluster.CentreX {
 			return c.Concentrations[i].Cluster.CentreX < c.Concentrations[j].Cluster.CentreX
 		}
-		return c.Concentrations[i].Cluster.CentreZ < c.Concentrations[j].Cluster.CentreZ
+		if c.Concentrations[i].Cluster.CentreZ != c.Concentrations[j].Cluster.CentreZ {
+			return c.Concentrations[i].Cluster.CentreZ < c.Concentrations[j].Cluster.CentreZ
+		}
+		if c.Concentrations[i].Cluster.CentreY != c.Concentrations[j].Cluster.CentreY {
+			return c.Concentrations[i].Cluster.CentreY < c.Concentrations[j].Cluster.CentreY
+		}
+		if c.Concentrations[i].Cluster.MinX != c.Concentrations[j].Cluster.MinX {
+			return c.Concentrations[i].Cluster.MinX < c.Concentrations[j].Cluster.MinX
+		}
+		if c.Concentrations[i].Cluster.MinY != c.Concentrations[j].Cluster.MinY {
+			return c.Concentrations[i].Cluster.MinY < c.Concentrations[j].Cluster.MinY
+		}
+		if c.Concentrations[i].Cluster.MinZ != c.Concentrations[j].Cluster.MinZ {
+			return c.Concentrations[i].Cluster.MinZ < c.Concentrations[j].Cluster.MinZ
+		}
+		if c.Concentrations[i].Cluster.MaxX != c.Concentrations[j].Cluster.MaxX {
+			return c.Concentrations[i].Cluster.MaxX < c.Concentrations[j].Cluster.MaxX
+		}
+		if c.Concentrations[i].Cluster.MaxY != c.Concentrations[j].Cluster.MaxY {
+			return c.Concentrations[i].Cluster.MaxY < c.Concentrations[j].Cluster.MaxY
+		}
+		return c.Concentrations[i].Cluster.MaxZ < c.Concentrations[j].Cluster.MaxZ
 	})
 
 	sort.Slice(c.Named, func(i, j int) bool {
@@ -2043,10 +2116,21 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 }
 ```
 
+Concentrations must be a total order down to the cluster bounds, not just
+down to CentreZ: two clusters of the same type, same dimension, equal size,
+tied on X and Z but differing only in Y (a two-storey mob farm, stacked item
+piles) would otherwise permute between runs whenever `sort.Slice`'s
+instability on a fully-tied pair happens to surface. A test written against
+the original (short) comparator -
+`TestAggregateOrdersConcentrationsTiedOnEverythingButY` - fails intermittently
+without the CentreY/Min/Max tiebreakers and passes reliably with them.
+
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/census/ -run TestAggregate -v`
-Expected: PASS, eight tests (seven original aggregate tests plus TestAggregateIsDeterministicOverTiedRows).
+Expected: PASS, nine tests (seven original aggregate tests, plus
+TestAggregateIsDeterministicOverTiedRows, plus
+TestAggregateOrdersConcentrationsTiedOnEverythingButY).
 
 - [ ] **Step 5: Commit**
 
@@ -2067,7 +2151,7 @@ git commit -m "feat(census): aggregate entities into totals, graded regions and 
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `type World struct { DBPath string; TakenAt time.Time; Kind string }`; `type Source interface { Open(ctx context.Context) (World, func() error, error) }`; `type ArchiveSource struct { Dir string }`; `func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error)`.
+- Produces: `type World struct { DBPath string; TakenAt time.Time; Kind string; Archive string }`; `type Source interface { Open(ctx context.Context) (World, func() error, error) }`; `type ArchiveSource struct { Dir string }`; `func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error)`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2134,6 +2218,9 @@ func TestArchiveSourceExtractsTheNewestArchive(t *testing.T) {
 	}
 	if world.Kind != "archive" {
 		t.Errorf("Kind = %q, want %q", world.Kind, "archive")
+	}
+	if world.Archive != "fwb-20260913T000000Z.tar.gz" {
+		t.Errorf("Archive = %q, want the newest archive's filename", world.Archive)
 	}
 	want := time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC)
 	if !world.TakenAt.Equal(want) {
@@ -2241,6 +2328,10 @@ type World struct {
 	TakenAt time.Time
 	// Kind names the source, for the report's provenance line.
 	Kind string
+	// Archive names the backup file the world came from, so an operator
+	// looking at a Scan failure over an extracted temp path can tell which
+	// fwb-<stamp>.tar.gz to go pull apart by hand.
+	Archive string
 }
 
 // Source supplies world bytes. The engine above never learns which
@@ -2306,7 +2397,7 @@ func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
 		_ = cleanup()
 		return World{}, nil, err
 	}
-	return World{DBPath: dbPath, TakenAt: stamp, Kind: "archive"}, cleanup, nil
+	return World{DBPath: dbPath, TakenAt: stamp, Kind: "archive", Archive: newest}, cleanup, nil
 }
 
 func extract(ctx context.Context, archive, root string) error {
@@ -2348,6 +2439,10 @@ func extract(ctx context.Context, archive, root string) error {
 			return fmt.Errorf("archive %s contains an entry escaping the extraction root: %q", archive, header.Name)
 		}
 
+		// Only regular files and directories are extracted; symlink and
+		// hardlink entries are skipped deliberately rather than by
+		// oversight. A LevelDB archive contains none, and following one
+		// would reintroduce the escape the traversal check above refuses.
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, 0o755); err != nil {
@@ -2481,6 +2576,23 @@ func TestRenderReportsUnreadableRecordsRatherThanHidingThem(t *testing.T) {
 	}
 }
 
+func TestRenderStatesTheFirstDecodeFailureWhenPresent(t *testing.T) {
+	c := sampleCensus()
+	c.Stats.Unparsable = 1
+	c.Stats.FirstUnparsableErr = "unmarshal actorprefix 0102030405060708: unexpected EOF"
+	out := Render(c, DefaultReportOptions())
+	if !strings.Contains(out, "first decode failure: unmarshal actorprefix 0102030405060708: unexpected EOF") {
+		t.Errorf("report does not state the first decode failure\n---\n%s", out)
+	}
+}
+
+func TestRenderOmitsTheFirstDecodeFailureLineWhenThereIsNone(t *testing.T) {
+	out := Render(sampleCensus(), DefaultReportOptions())
+	if strings.Contains(out, "first decode failure") {
+		t.Errorf("report states a decode failure that never happened\n---\n%s", out)
+	}
+}
+
 func TestRenderHonoursTopLimits(t *testing.T) {
 	var entities []Entity
 	for i := 0; i < 40; i++ {
@@ -2491,8 +2603,11 @@ func TestRenderHonoursTopLimits(t *testing.T) {
 	}
 	c := Aggregate(entities, ScanStats{}, time.Unix(0, 0).UTC(), "archive")
 	out := Render(c, ReportOptions{TopRegions: 5, TopTypes: 5})
-	if got := strings.Count(out, "x "); got > 6 {
-		t.Errorf("report rendered %d region rows, want at most 5 plus a header", got)
+	// Each region row contributes exactly one "x " (from "x %6d..."); the
+	// dimension header line does not. 40 single-zombie regions exist, so
+	// only TopRegions honouring the limit gives exactly 5.
+	if got := strings.Count(out, "x "); got != 5 {
+		t.Errorf("report rendered %d region rows, want exactly 5", got)
 	}
 }
 
@@ -2562,8 +2677,12 @@ func Render(c Census, opts ReportOptions) string {
 	}
 	fmt.Fprintf(&b, "FWB mob census\n")
 	fmt.Fprintf(&b, "world taken at %s via %s\n", taken, sourceKindOrUnknown(c.SourceKind))
-	fmt.Fprintf(&b, "records %d, decoded %d, unparsable %d, unplaced %d\n\n",
+	fmt.Fprintf(&b, "records %d, decoded %d, unparsable %d, unplaced %d\n",
 		c.Stats.Records, c.Stats.Decoded, c.Stats.Unparsable, c.Stats.Unplaced)
+	if c.Stats.FirstUnparsableErr != "" {
+		fmt.Fprintf(&b, "first decode failure: %s\n", c.Stats.FirstUnparsableErr)
+	}
+	fmt.Fprintf(&b, "\n")
 
 	byDimension := map[Dimension]int{}
 	for _, t := range c.Totals {
@@ -2605,10 +2724,7 @@ func Render(c Census, opts ReportOptions) string {
 			}
 			minX, maxX, minZ, maxZ := r.Key.Bounds()
 			caps, _ := CapsFor(r.Key.Dimension, r.Category)
-			lower, upper := caps.Surface, caps.Cave
-			if lower > upper {
-				lower, upper = upper, lower
-			}
+			lower, upper := caps.Range()
 			fmt.Fprintf(&b, "    x %6d..%-6d z %6d..%-6d %-12s %4d / %d..%d  %s\n",
 				minX, maxX, minZ, maxZ, r.Category, r.Count, lower, upper, r.Status)
 			shown++
@@ -2671,7 +2787,9 @@ func sourceKindOrUnknown(kind string) string {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/census/ -run TestRender -v`
-Expected: PASS, seven tests.
+Expected: PASS, nine tests (the original seven, plus
+TestRenderStatesTheFirstDecodeFailureWhenPresent and
+TestRenderOmitsTheFirstDecodeFailureLineWhenThereIsNone).
 
 - [ ] **Step 5: Commit**
 
@@ -2835,6 +2953,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -2853,14 +2972,21 @@ func main() {
 // run is the testable body. It writes nothing to stdout unless it produced a
 // whole report: a truncated report is worse than none, because it looks like
 // an answer.
-func run(ctx context.Context, args []string, stdout io.Writer) error {
+func run(ctx context.Context, args []string, stdout io.Writer) (err error) {
 	fs := flag.NewFlagSet("census", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	backupDir := fs.String("backup-dir", "/backup", "directory holding fwb-<stamp>.tar.gz backup archives")
 	topRegions := fs.Int("top-regions", census.DefaultReportOptions().TopRegions, "how many regions to list")
 	topTypes := fs.Int("top-types", census.DefaultReportOptions().TopTypes, "how many entity types to list")
-	if err := fs.Parse(args); err != nil {
-		return fmt.Errorf("parse flags: %w", err)
+	if parseErr := fs.Parse(args); parseErr != nil {
+		if errors.Is(parseErr, flag.ErrHelp) {
+			// -h/-help is a request for usage, not a failure: it should
+			// print to stdout and exit 0 like any other well-behaved CLI.
+			fs.SetOutput(stdout)
+			fs.PrintDefaults()
+			return nil
+		}
+		return fmt.Errorf("parse flags: %w", parseErr)
 	}
 
 	source := census.ArchiveSource{Dir: *backupDir}
@@ -2868,11 +2994,19 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer cleanup()
+	defer func() {
+		// A silent RemoveAll failure here repeats every scheduled run and
+		// slowly fills the volume with ~570MB extractions, so surface it -
+		// but never let a cleanup failure mask a scan or render error that
+		// already explains why the run failed.
+		if cleanupErr := cleanup(); cleanupErr != nil && err == nil {
+			err = fmt.Errorf("clean up extracted world %s: %w", world.Archive, cleanupErr)
+		}
+	}()
 
-	entities, stats, err := census.Scan(world.DBPath)
-	if err != nil {
-		return err
+	entities, stats, scanErr := census.Scan(world.DBPath)
+	if scanErr != nil {
+		return fmt.Errorf("scan archive %s: %w", world.Archive, scanErr)
 	}
 
 	report := census.Render(
@@ -2889,7 +3023,9 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./cmd/census/ -v`
-Expected: PASS, three tests.
+Expected: PASS, three tests (unchanged in count - the help-flag and
+cleanup-error-capture behaviour added in review is exercised by hand, not by
+new named tests here).
 
 - [ ] **Step 5: Run the whole suite and build**
 

@@ -28,8 +28,12 @@ func Render(c Census, opts ReportOptions) string {
 	}
 	fmt.Fprintf(&b, "FWB mob census\n")
 	fmt.Fprintf(&b, "world taken at %s via %s\n", taken, sourceKindOrUnknown(c.SourceKind))
-	fmt.Fprintf(&b, "records %d, decoded %d, unparsable %d, unplaced %d\n\n",
+	fmt.Fprintf(&b, "records %d, decoded %d, unparsable %d, unplaced %d\n",
 		c.Stats.Records, c.Stats.Decoded, c.Stats.Unparsable, c.Stats.Unplaced)
+	if c.Stats.FirstUnparsableErr != "" {
+		fmt.Fprintf(&b, "first decode failure: %s\n", c.Stats.FirstUnparsableErr)
+	}
+	fmt.Fprintf(&b, "\n")
 
 	byDimension := map[Dimension]int{}
 	for _, t := range c.Totals {
@@ -71,10 +75,7 @@ func Render(c Census, opts ReportOptions) string {
 			}
 			minX, maxX, minZ, maxZ := r.Key.Bounds()
 			caps, _ := CapsFor(r.Key.Dimension, r.Category)
-			lower, upper := caps.Surface, caps.Cave
-			if lower > upper {
-				lower, upper = upper, lower
-			}
+			lower, upper := caps.Range()
 			fmt.Fprintf(&b, "    x %6d..%-6d z %6d..%-6d %-12s %4d / %d..%d  %s\n",
 				minX, maxX, minZ, maxZ, r.Category, r.Count, lower, upper, r.Status)
 			shown++

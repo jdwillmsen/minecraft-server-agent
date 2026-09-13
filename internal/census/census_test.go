@@ -187,25 +187,77 @@ func TestAggregateIsDeterministicOverTiedRows(t *testing.T) {
 
 	// Run Aggregate 50 times and collect fingerprints
 	var firstFP string
+	var firstTotals, firstRegions, firstConcentrations int
 	var diffSection string
 	for run := 0; run < 50; run++ {
 		c := Aggregate(entities, ScanStats{}, time.Unix(0, 0), "archive")
 		fp := fingerprint(c)
 		if run == 0 {
 			firstFP = fp
+			firstTotals, firstRegions, firstConcentrations = len(c.Totals), len(c.Regions), len(c.Concentrations)
 		} else if fp != firstFP {
 			// Find which section differed
-			if len(c.Totals) != len(c.Totals) {
+			if len(c.Totals) != firstTotals {
 				diffSection = "Totals"
-			} else if len(c.Regions) != len(c.Regions) {
+			} else if len(c.Regions) != firstRegions {
 				diffSection = "Regions"
-			} else if len(c.Concentrations) != len(c.Concentrations) {
+			} else if len(c.Concentrations) != firstConcentrations {
 				diffSection = "Concentrations"
 			}
 			if diffSection == "" {
 				diffSection = "ordering within a section"
 			}
 			t.Fatalf("run %d produced different output than run 0 (differed in %s): %q vs %q", run, diffSection, fp, firstFP)
+		}
+	}
+}
+
+func TestAggregateOrdersConcentrationsTiedOnEverythingButY(t *testing.T) {
+	// Two clusters of the same identifier, dimension, size and X/Z, but at
+	// clearly different Y - a two-storey mob farm, or stacked item piles.
+	// The old comparator stopped at CentreZ, so nothing distinguished these
+	// two clusters. sort.Slice's instability on a fully-tied pair only
+	// surfaces once the slice is long enough to leave the small-n insertion
+	// path, so a spread of unrelated concentration types rides along
+	// purely to grow c.Concentrations past that threshold.
+	var entities []Entity
+	for n := 0; n < 12; n++ {
+		id := fmt.Sprintf("noise%02d", n)
+		x := float64(n) * 5000
+		for i := 0; i < ConcentrationThreshold; i++ {
+			entities = append(entities, Entity{Identifier: id, Dimension: Overworld, X: x, Y: 0, Z: 0})
+		}
+	}
+	for _, y := range []float64{0, 1000} {
+		for i := 0; i < ConcentrationThreshold; i++ {
+			entities = append(entities, Entity{Identifier: "creaking", Dimension: Overworld, X: 99999, Y: y, Z: 0})
+		}
+	}
+
+	var firstOrder [2]float64
+	for run := 0; run < 100; run++ {
+		c := Aggregate(entities, ScanStats{}, time.Unix(0, 0), "archive")
+		var order [2]float64
+		found := 0
+		for _, con := range c.Concentrations {
+			if con.Identifier != "creaking" {
+				continue
+			}
+			if found >= 2 {
+				t.Fatalf("run %d: more than 2 creaking concentrations", run)
+			}
+			order[found] = con.Cluster.CentreY
+			found++
+		}
+		if found != 2 {
+			t.Fatalf("run %d: found %d creaking concentrations, want 2", run, found)
+		}
+		if run == 0 {
+			firstOrder = order
+			continue
+		}
+		if order != firstOrder {
+			t.Fatalf("run %d produced a different concentration order than run 0: %v vs %v", run, order, firstOrder)
 		}
 	}
 }

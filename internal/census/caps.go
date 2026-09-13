@@ -12,6 +12,16 @@ type Caps struct {
 	Surface, Cave int
 }
 
+// Range returns the caps as an ordered pair. The End inverts the usual
+// relationship — its monster caps are 10 surface and 8 cave — so callers
+// must never assume Surface is the lower bound.
+func (c Caps) Range() (lower, upper int) {
+	if c.Surface > c.Cave {
+		return c.Cave, c.Surface
+	}
+	return c.Surface, c.Cave
+}
+
 var capTable = map[Dimension]map[Category]Caps{
 	Overworld: {
 		Monster:     {Surface: 8, Cave: 16},
@@ -85,10 +95,7 @@ func StatusOf(d Dimension, c Category, count int) Status {
 	if !ok {
 		return StatusUnknown
 	}
-	lower, upper := caps.Surface, caps.Cave
-	if lower > upper {
-		lower, upper = upper, lower
-	}
+	lower, upper := caps.Range()
 	switch {
 	case count > upper:
 		return Capped

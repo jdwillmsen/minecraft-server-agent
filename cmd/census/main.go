@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -25,14 +26,21 @@ func main() {
 // run is the testable body. It writes nothing to stdout unless it produced a
 // whole report: a truncated report is worse than none, because it looks like
 // an answer.
-func run(ctx context.Context, args []string, stdout io.Writer) error {
+func run(ctx context.Context, args []string, stdout io.Writer) (err error) {
 	fs := flag.NewFlagSet("census", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	backupDir := fs.String("backup-dir", "/backup", "directory holding fwb-<stamp>.tar.gz backup archives")
 	topRegions := fs.Int("top-regions", census.DefaultReportOptions().TopRegions, "how many regions to list")
 	topTypes := fs.Int("top-types", census.DefaultReportOptions().TopTypes, "how many entity types to list")
-	if err := fs.Parse(args); err != nil {
-		return fmt.Errorf("parse flags: %w", err)
+	if parseErr := fs.Parse(args); parseErr != nil {
+		if errors.Is(parseErr, flag.ErrHelp) {
+			// -h/-help is a request for usage, not a failure: it should
+			// print to stdout and exit 0 like any other well-behaved CLI.
+			fs.SetOutput(stdout)
+			fs.PrintDefaults()
+			return nil
+		}
+		return fmt.Errorf("parse flags: %w", parseErr)
 	}
 
 	source := census.ArchiveSource{Dir: *backupDir}
@@ -40,11 +48,19 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer cleanup()
+	defer func() {
+		// A silent RemoveAll failure here repeats every scheduled run and
+		// slowly fills the volume with ~570MB extractions, so surface it -
+		// but never let a cleanup failure mask a scan or render error that
+		// already explains why the run failed.
+		if cleanupErr := cleanup(); cleanupErr != nil && err == nil {
+			err = fmt.Errorf("clean up extracted world %s: %w", world.Archive, cleanupErr)
+		}
+	}()
 
-	entities, stats, err := census.Scan(world.DBPath)
-	if err != nil {
-		return err
+	entities, stats, scanErr := census.Scan(world.DBPath)
+	if scanErr != nil {
+		return fmt.Errorf("scan archive %s: %w", world.Archive, scanErr)
 	}
 
 	report := census.Render(

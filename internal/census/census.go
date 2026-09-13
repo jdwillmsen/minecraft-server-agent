@@ -195,7 +195,28 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 		if c.Concentrations[i].Cluster.CentreX != c.Concentrations[j].Cluster.CentreX {
 			return c.Concentrations[i].Cluster.CentreX < c.Concentrations[j].Cluster.CentreX
 		}
-		return c.Concentrations[i].Cluster.CentreZ < c.Concentrations[j].Cluster.CentreZ
+		if c.Concentrations[i].Cluster.CentreZ != c.Concentrations[j].Cluster.CentreZ {
+			return c.Concentrations[i].Cluster.CentreZ < c.Concentrations[j].Cluster.CentreZ
+		}
+		if c.Concentrations[i].Cluster.CentreY != c.Concentrations[j].Cluster.CentreY {
+			return c.Concentrations[i].Cluster.CentreY < c.Concentrations[j].Cluster.CentreY
+		}
+		if c.Concentrations[i].Cluster.MinX != c.Concentrations[j].Cluster.MinX {
+			return c.Concentrations[i].Cluster.MinX < c.Concentrations[j].Cluster.MinX
+		}
+		if c.Concentrations[i].Cluster.MinY != c.Concentrations[j].Cluster.MinY {
+			return c.Concentrations[i].Cluster.MinY < c.Concentrations[j].Cluster.MinY
+		}
+		if c.Concentrations[i].Cluster.MinZ != c.Concentrations[j].Cluster.MinZ {
+			return c.Concentrations[i].Cluster.MinZ < c.Concentrations[j].Cluster.MinZ
+		}
+		if c.Concentrations[i].Cluster.MaxX != c.Concentrations[j].Cluster.MaxX {
+			return c.Concentrations[i].Cluster.MaxX < c.Concentrations[j].Cluster.MaxX
+		}
+		if c.Concentrations[i].Cluster.MaxY != c.Concentrations[j].Cluster.MaxY {
+			return c.Concentrations[i].Cluster.MaxY < c.Concentrations[j].Cluster.MaxY
+		}
+		return c.Concentrations[i].Cluster.MaxZ < c.Concentrations[j].Cluster.MaxZ
 	})
 
 	sort.Slice(c.Named, func(i, j int) bool {

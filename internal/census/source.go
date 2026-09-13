@@ -22,6 +22,10 @@ type World struct {
 	TakenAt time.Time
 	// Kind names the source, for the report's provenance line.
 	Kind string
+	// Archive names the backup file the world came from, so an operator
+	// looking at a Scan failure over an extracted temp path can tell which
+	// fwb-<stamp>.tar.gz to go pull apart by hand.
+	Archive string
 }
 
 // Source supplies world bytes. The engine above never learns which
@@ -87,7 +91,7 @@ func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
 		_ = cleanup()
 		return World{}, nil, err
 	}
-	return World{DBPath: dbPath, TakenAt: stamp, Kind: "archive"}, cleanup, nil
+	return World{DBPath: dbPath, TakenAt: stamp, Kind: "archive", Archive: newest}, cleanup, nil
 }
 
 func extract(ctx context.Context, archive, root string) error {
@@ -129,6 +133,10 @@ func extract(ctx context.Context, archive, root string) error {
 			return fmt.Errorf("archive %s contains an entry escaping the extraction root: %q", archive, header.Name)
 		}
 
+		// Only regular files and directories are extracted; symlink and
+		// hardlink entries are skipped deliberately rather than by
+		// oversight. A LevelDB archive contains none, and following one
+		// would reintroduce the escape the traversal check above refuses.
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, 0o755); err != nil {

@@ -183,6 +183,15 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   gauge and reconnect counter; callers record through small functions and
   never touch a Prometheus type - see "Metrics" below
 - `internal/ratelimit` - per-actor sliding-window command rate limiting
+- `internal/census` - reads a Bedrock world save from a backup archive and
+  produces a reproducible population report: entity totals, 144-block
+  regions graded against Bedrock's spawn caps, name-tagged mobs, and located
+  entity concentrations. Reproducibility is the point, not a nicety - every
+  ordering the report depends on is a total order over ties, down to the
+  cluster bounds, so the same world bytes always produce the same report
+- `cmd/census` - the binary; runs as a Kubernetes CronJob beside the server
+  rather than inside the agent, since the scan is a batch job over hundreds
+  of megabytes and the agent's own pod is the one answering players in chat
 
 ## Environment variables
 
