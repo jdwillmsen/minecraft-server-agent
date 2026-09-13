@@ -1,6 +1,9 @@
 package census
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func entityAt(x, y, z float64) Entity {
 	return Entity{Identifier: "item", Dimension: Overworld, X: x, Y: y, Z: z}
@@ -74,5 +77,40 @@ func TestClusterEntitiesGroupsAcrossTheOriginOnNegativeCoordinates(t *testing.T)
 func TestClusterEntitiesOnAnEmptyInput(t *testing.T) {
 	if got := ClusterEntities(nil, 16); len(got) != 0 {
 		t.Errorf("got %d clusters for no entities, want 0", len(got))
+	}
+}
+
+func TestClusterEntitiesOrderIsDeterministic(t *testing.T) {
+	// Create several hundred entities arranged as well-separated pairs.
+	// Each pair is a cluster of exactly 2 entities; pairs are far enough apart
+	// that they don't merge. This produces many equal-sized clusters, exercising
+	// the tie-breaking logic that must be deterministic.
+	const pairs = 300
+	const spacing = 1000.0
+	var entities []Entity
+	for i := 0; i < pairs; i++ {
+		x := float64(i) * spacing
+		entities = append(entities, entityAt(x, 0, 0))
+		entities = append(entities, entityAt(x+1, 0, 0))
+	}
+
+	// Call ClusterEntities multiple times on the same slice.
+	const runs = 50
+	var fingerprints [runs]string
+	for run := 0; run < runs; run++ {
+		result := ClusterEntities(entities, 8)
+		var fp string
+		for _, c := range result {
+			fp += fmt.Sprintf("(%d,%.1f,%.1f,%.1f);", c.Count, c.CentreX, c.CentreY, c.CentreZ)
+		}
+		fingerprints[run] = fp
+	}
+
+	// All fingerprints must be identical.
+	for run := 1; run < runs; run++ {
+		if fingerprints[run] != fingerprints[0] {
+			t.Errorf("run %d fingerprint differs from run 0: %s != %s",
+				run, fingerprints[run], fingerprints[0])
+		}
 	}
 }

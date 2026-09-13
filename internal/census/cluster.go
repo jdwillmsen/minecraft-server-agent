@@ -17,7 +17,9 @@ type Cluster struct {
 }
 
 // ClusterEntities groups entities by proximity and returns the groups
-// largest first.
+// largest first. The returned order is deterministic for a given input,
+// sorted by Count (descending), then by CentreX, CentreY, CentreZ, MinX,
+// MinY, MinZ, MaxX, MaxY, MaxZ (all ascending).
 //
 // Grouping is transitive: two entities further apart than the radius still
 // share a cluster if a chain of neighbours links them. A spatial hash keeps
@@ -120,6 +122,35 @@ func ClusterEntities(entities []Entity, radius float64) []Cluster {
 		c.CentreX, c.CentreY, c.CentreZ = sx/count, sy/count, sz/count
 		out = append(out, c)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Count > out[j].Count })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		if out[i].CentreX != out[j].CentreX {
+			return out[i].CentreX < out[j].CentreX
+		}
+		if out[i].CentreY != out[j].CentreY {
+			return out[i].CentreY < out[j].CentreY
+		}
+		if out[i].CentreZ != out[j].CentreZ {
+			return out[i].CentreZ < out[j].CentreZ
+		}
+		if out[i].MinX != out[j].MinX {
+			return out[i].MinX < out[j].MinX
+		}
+		if out[i].MinY != out[j].MinY {
+			return out[i].MinY < out[j].MinY
+		}
+		if out[i].MinZ != out[j].MinZ {
+			return out[i].MinZ < out[j].MinZ
+		}
+		if out[i].MaxX != out[j].MaxX {
+			return out[i].MaxX < out[j].MaxX
+		}
+		if out[i].MaxY != out[j].MaxY {
+			return out[i].MaxY < out[j].MaxY
+		}
+		return out[i].MaxZ < out[j].MaxZ
+	})
 	return out
 }

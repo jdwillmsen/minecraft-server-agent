@@ -1275,14 +1275,17 @@ git commit -m "feat(census): scan a Bedrock world save into placed entities"
 
 **Interfaces:**
 - Consumes: `Entity` from Task 1.
-- Produces: `type Cluster struct { Count int; CentreX, CentreY, CentreZ float64; MinX, MaxX, MinY, MaxY, MinZ, MaxZ float64 }`; `func ClusterEntities(entities []Entity, radius float64) []Cluster` returning clusters sorted by descending `Count`.
+- Produces: `type Cluster struct { Count int; CentreX, CentreY, CentreZ float64; MinX, MaxX, MinY, MaxY, MinZ, MaxZ float64 }`; `func ClusterEntities(entities []Entity, radius float64) []Cluster` returning clusters in deterministic order (sorted by Count descending, then by CentreX, CentreY, CentreZ, MinX, MinY, MinZ, MaxX, MaxY, MaxZ ascending).
 
 - [ ] **Step 1: Write the failing test**
 
 ```go
 package census
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func entityAt(x, y, z float64) Entity {
 	return Entity{Identifier: "item", Dimension: Overworld, X: x, Y: y, Z: z}
@@ -1358,6 +1361,41 @@ func TestClusterEntitiesOnAnEmptyInput(t *testing.T) {
 		t.Errorf("got %d clusters for no entities, want 0", len(got))
 	}
 }
+
+func TestClusterEntitiesOrderIsDeterministic(t *testing.T) {
+	// Create several hundred entities arranged as well-separated pairs.
+	// Each pair is a cluster of exactly 2 entities; pairs are far enough apart
+	// that they don't merge. This produces many equal-sized clusters, exercising
+	// the tie-breaking logic that must be deterministic.
+	const pairs = 300
+	const spacing = 1000.0
+	var entities []Entity
+	for i := 0; i < pairs; i++ {
+		x := float64(i) * spacing
+		entities = append(entities, entityAt(x, 0, 0))
+		entities = append(entities, entityAt(x+1, 0, 0))
+	}
+
+	// Call ClusterEntities multiple times on the same slice.
+	const runs = 50
+	var fingerprints [runs]string
+	for run := 0; run < runs; run++ {
+		result := ClusterEntities(entities, 8)
+		var fp string
+		for _, c := range result {
+			fp += fmt.Sprintf("(%d,%.1f,%.1f,%.1f);", c.Count, c.CentreX, c.CentreY, c.CentreZ)
+		}
+		fingerprints[run] = fp
+	}
+
+	// All fingerprints must be identical.
+	for run := 1; run < runs; run++ {
+		if fingerprints[run] != fingerprints[0] {
+			t.Errorf("run %d fingerprint differs from run 0: %s != %s",
+				run, fingerprints[run], fingerprints[0])
+		}
+	}
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1387,7 +1425,9 @@ type Cluster struct {
 }
 
 // ClusterEntities groups entities by proximity and returns the groups
-// largest first.
+// largest first. The returned order is deterministic for a given input,
+// sorted by Count (descending), then by CentreX, CentreY, CentreZ, MinX,
+// MinY, MinZ, MaxX, MaxY, MaxZ (all ascending).
 //
 // Grouping is transitive: two entities further apart than the radius still
 // share a cluster if a chain of neighbours links them. A spatial hash keeps
@@ -1490,7 +1530,36 @@ func ClusterEntities(entities []Entity, radius float64) []Cluster {
 		c.CentreX, c.CentreY, c.CentreZ = sx/count, sy/count, sz/count
 		out = append(out, c)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Count > out[j].Count })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		if out[i].CentreX != out[j].CentreX {
+			return out[i].CentreX < out[j].CentreX
+		}
+		if out[i].CentreY != out[j].CentreY {
+			return out[i].CentreY < out[j].CentreY
+		}
+		if out[i].CentreZ != out[j].CentreZ {
+			return out[i].CentreZ < out[j].CentreZ
+		}
+		if out[i].MinX != out[j].MinX {
+			return out[i].MinX < out[j].MinX
+		}
+		if out[i].MinY != out[j].MinY {
+			return out[i].MinY < out[j].MinY
+		}
+		if out[i].MinZ != out[j].MinZ {
+			return out[i].MinZ < out[j].MinZ
+		}
+		if out[i].MaxX != out[j].MaxX {
+			return out[i].MaxX < out[j].MaxX
+		}
+		if out[i].MaxY != out[j].MaxY {
+			return out[i].MaxY < out[j].MaxY
+		}
+		return out[i].MaxZ < out[j].MaxZ
+	})
 	return out
 }
 ```
@@ -1498,7 +1567,7 @@ func ClusterEntities(entities []Entity, radius float64) []Cluster {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/census/ -run TestCluster -v`
-Expected: PASS, five tests.
+Expected: PASS, six tests.
 
 - [ ] **Step 5: Commit**
 
