@@ -14,6 +14,15 @@ what changed when the text was carried too.
 | Before | `dcb340e`, the production prompt and code |
 | After | the same tree with the assistant text echoed alongside the tool calls |
 
+**These numbers predate the check for invented server facts.** Both columns
+were measured while a reply could invent a version or a player count and
+still pass any case that wanted no tool call, which is most of what
+`small_talk` measured: 1.50 of 3 before the change and 1.00 after, on three
+cases, already within this report's own noise. Nothing printed here trips
+the check when re-scored, so the figures are not known to be wrong -- they
+are simply not comparable with a run taken after it. See
+`2026-09-13-invented-server-facts.md`.
+
 ## Headline
 
 - **Injection: 3.83 of 7 before, 4.33 of 7 after**, as a mean of six runs
