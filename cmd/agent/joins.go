@@ -30,7 +30,11 @@ const staleJoin = time.Hour
 // time in the type that decides joins and leaves, where a wrong answer is
 // worse than this.
 type joinTimes struct {
-	mu    sync.Mutex
+	mu sync.Mutex
+	// ended is closed when the live connection ends, so a delivery already
+	// under way stops rather than finishing against a connection that is
+	// gone. A generation read once, before the send, cannot see that.
+	ended chan struct{}
 	at    map[string]time.Time
 	since time.Time
 	// gen counts connections. It is what tells a delivery scheduled before
@@ -42,7 +46,7 @@ type joinTimes struct {
 }
 
 func newJoinTimes() *joinTimes {
-	return &joinTimes{at: make(map[string]time.Time), now: time.Now}
+	return &joinTimes{at: make(map[string]time.Time), ended: make(chan struct{}), now: time.Now}
 }
 
 // joined records an arrival, and drops anything long enough past to be a
@@ -75,6 +79,8 @@ func (j *joinTimes) connected() {
 	j.at = make(map[string]time.Time)
 	j.since = j.now()
 	j.gen++
+	j.endCurrent()
+	j.ended = make(chan struct{})
 }
 
 // disconnected ends the current connection. Arrivals are kept: a player who
@@ -86,6 +92,31 @@ func (j *joinTimes) disconnected() {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.gen++
+	j.endCurrent()
+}
+
+// endCurrent closes the live connection's channel once. Callers hold the
+// lock.
+func (j *joinTimes) endCurrent() {
+	select {
+	case <-j.ended:
+		// Already closed: two ends for one connection, which a drop
+		// followed by the next connect produces.
+	default:
+		close(j.ended)
+	}
+}
+
+// Ended implements plugins.Connections: a channel closed when the
+// connection live at the time of the call ends. A delivery captures it
+// before it waits, so a send already under way stops mid-backlog rather
+// than whispering the rest at a player who is no longer being watched by
+// this connection -- a generation read once, before the send, cannot see
+// that happen.
+func (j *joinTimes) Ended() <-chan struct{} {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.ended
 }
 
 // Generation implements plugins.Connections.

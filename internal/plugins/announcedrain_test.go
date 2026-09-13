@@ -89,6 +89,8 @@ type fakeConnections struct {
 	// the drain goroutine instead of guessing how far along it is. Nil
 	// unless a test wants it; the send never blocks either way.
 	reads chan struct{}
+	// ended stands in for the live connection's channel, closed by end().
+	ended chan struct{}
 }
 
 var _ Connections = (*fakeConnections)(nil)
@@ -103,9 +105,42 @@ func (c *fakeConnections) Generation() uint64 {
 	return c.gen
 }
 
+func (c *fakeConnections) Ended() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ended == nil {
+		c.ended = make(chan struct{})
+	}
+	return c.ended
+}
+
+// end drops the live connection without opening another, the shape of a
+// connection lost mid-delivery.
+func (c *fakeConnections) end() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ended == nil {
+		c.ended = make(chan struct{})
+	}
+	select {
+	case <-c.ended:
+	default:
+		close(c.ended)
+	}
+	c.gen++
+}
+
 func (c *fakeConnections) reconnect() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.ended != nil {
+		select {
+		case <-c.ended:
+		default:
+			close(c.ended)
+		}
+	}
+	c.ended = make(chan struct{})
 	c.gen++
 }
 
@@ -677,5 +712,54 @@ func TestDrainHoldingForASlotAbandonsWhenItsConnectionEnds(t *testing.T) {
 	case <-deliverer.calls:
 		t.Fatal("a drain that queued for a slot across a disconnect delivered: its player may be mid-reconnect")
 	case <-time.After(250 * time.Millisecond):
+	}
+}
+
+// blockingDeliverer parks inside DrainForJoin until its context ends, the
+// shape of a backlog part-way through its per-message bridge calls.
+type blockingDeliverer struct {
+	inside chan struct{}
+	err    chan error
+}
+
+var _ AnnounceDeliverer = (*blockingDeliverer)(nil)
+
+func (b *blockingDeliverer) DrainForJoin(ctx context.Context, _ string, _ time.Time) (int, int, error) {
+	select {
+	case b.inside <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	b.err <- ctx.Err()
+	return 0, 0, ctx.Err()
+}
+
+// A connection that dies part-way through a backlog must stop it. The
+// bridge is a separate process and stays up, so every remaining message
+// would otherwise be whispered and recorded against a player this agent is
+// no longer watching -- the same permanent loss, one message later.
+func TestAnnounceDrain_ConnectionEndingMidSendStopsTheBacklog(t *testing.T) {
+	deliverer := &blockingDeliverer{inside: make(chan struct{}, 1), err: make(chan error, 1)}
+	conns := &fakeConnections{gen: 1}
+	d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("error"), WithConnections(conns))
+
+	if err := d.HandleEvent(t.Context(), &plugin.Context{Voice: newRecordingTellVoice()}, joinEventAt("111", 1)); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	select {
+	case <-deliverer.inside:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the drain never reached the deliverer")
+	}
+
+	conns.end()
+
+	select {
+	case err := <-deliverer.err:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("send ended with %v, want it cancelled when the connection did", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the send was never cancelled: the rest of the backlog would reach a player this connection no longer watches")
 	}
 }

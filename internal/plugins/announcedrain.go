@@ -31,6 +31,11 @@ type AnnounceDeliverer interface {
 // duplicate whose player may by then be loading a fresh client.
 type Connections interface {
 	Generation() uint64
+	// Ended is closed when the connection live at the time of the call
+	// ends. Captured before a delivery starts, it is what stops a backlog
+	// mid-send: the generation is read once and cannot report a drop that
+	// happens between one whispered message and the next.
+	Ended() <-chan struct{}
 }
 
 // drainTimeout bounds one join's delivery. A backlog can be several
@@ -211,6 +216,13 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 	}
 
 	voice := pctx.Voice
+	// Captured now, with the generation: both describe the connection this
+	// delivery belongs to, and the channel is what a send already in
+	// progress watches.
+	var ended <-chan struct{}
+	if a.conns != nil {
+		ended = a.conns.Ended()
+	}
 	go func() {
 		if wait := a.wait(); wait > 0 {
 			select {
@@ -248,7 +260,7 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 		if a.stale(generation) {
 			return
 		}
-		a.drain(voice, xuid)
+		a.drain(voice, xuid, ended)
 	}()
 	return nil
 }
@@ -257,9 +269,25 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 // something was left behind — whispers one line pointing at !inbox. A
 // summary is never added when remaining is 0: the welcome message already
 // owns this moment, and an empty inbox has nothing to add to it.
-func (a *AnnounceDrain) drain(voice plugin.Voice, xuid string) {
+func (a *AnnounceDrain) drain(voice plugin.Voice, xuid string, ended <-chan struct{}) {
 	drainCtx, cancel := context.WithTimeout(a.rootCtx, drainTimeout)
 	defer cancel()
+
+	// Cancelled the moment the connection ends, so a backlog stops between
+	// messages instead of whispering the rest of itself at a player this
+	// agent is no longer watching -- and recording each one as delivered.
+	// The bridge is a separate process and stays up, so nothing else fails.
+	if ended != nil {
+		stop := make(chan struct{})
+		defer close(stop)
+		go func() {
+			select {
+			case <-ended:
+				cancel()
+			case <-stop:
+			}
+		}()
+	}
 
 	_, remaining, err := a.deliverer.DrainForJoin(drainCtx, xuid, time.Now())
 	if pgerr.Unready(err) {
