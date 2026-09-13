@@ -276,7 +276,7 @@ func nbtPos(m map[string]any) (x, y, z float64, ok bool) {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/census/ -run 'TestEntity|TestDimension' -v`
-Expected: PASS, six tests.
+Expected: PASS, five tests.
 
 - [ ] **Step 5: Commit**
 
