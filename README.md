@@ -309,8 +309,13 @@ granted more trust than a stranger, and a bridge outage fails closed.
 An `@server` question is not a single completion: the model may call tools
 from `internal/tools` for up to two rounds before the next request
 withholds tools entirely, which is what forces text out of a model that
-would otherwise keep calling them instead of answering. The full surface,
-as wired in `internal/toolset/toolset.go`:
+would otherwise keep calling them instead of answering. Each round is
+carried into the next as the standard message shape has it: the assistant
+turn keeps both what the model wrote and the calls it asked for, so a
+refusal it made while calling a tool is still in front of it on the round
+that answers. Only a player hears less than the model does - the reply is
+the final round's text. The full surface, as wired in
+`internal/toolset/toolset.go`:
 
 - `knowledge_lookup` - look up a recorded topic
 - `waypoint_lookup` - the asker's own coordinates saved under a name

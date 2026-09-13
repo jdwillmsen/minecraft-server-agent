@@ -502,7 +502,22 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 			return ExtractText(payload), nil
 		}
 
-		messages = append(messages, chatMessage{Role: "assistant", ToolCalls: calls})
+		// The text the model wrote in the same turn as its tool calls belongs
+		// to that turn. It is regularly the turn where it refuses something
+		// the question demanded, and a refusal it cannot see is one it does
+		// not hold to: measured, the model declined to announce a false
+		// shutdown, called a tool, and then announced it anyway on the round
+		// that followed. Kept as the model wrote it rather than as cleanReply
+		// leaves it, since that cleanup enforces a chat line's budget and the
+		// no-question rule for players, and trimming the history would leave
+		// the model remembering words it never wrote. Only unparsed call
+		// markup goes: that is a half-written call the backend handed back as
+		// text, not prose, and showing one back invites another.
+		messages = append(messages, chatMessage{
+			Role:      "assistant",
+			Content:   cutToolMarkup(messageContent(payload)),
+			ToolCalls: calls,
+		})
 		for _, call := range calls {
 			result, err := registry.Invoke(ctx, call.Function.Name, json.RawMessage(call.Function.Arguments), callerXUID)
 			metrics.ToolCall(toolLabel(registry, call.Function.Name), err)
