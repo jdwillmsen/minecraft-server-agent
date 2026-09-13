@@ -82,7 +82,7 @@ func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
 		return World{}, nil, err
 	}
 
-	dbPath, err := findDB(root)
+	dbPath, err := findDB(root, newest)
 	if err != nil {
 		_ = cleanup()
 		return World{}, nil, err
@@ -105,7 +105,7 @@ func extract(ctx context.Context, archive, root string) error {
 	tr := tar.NewReader(gz)
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return fmt.Errorf("extract %s: %w", archive, err)
 		}
 		header, err := tr.Next()
 		if err == io.EOF {
@@ -115,11 +115,16 @@ func extract(ctx context.Context, archive, root string) error {
 			return fmt.Errorf("read %s: %w", archive, err)
 		}
 
-		// Refuse any entry that would land outside the extraction root
-		// rather than sanitising it. A traversal entry means the archive is
-		// not what it claims to be, and continuing past that is how a
-		// surprise becomes a write to somebody's home directory.
-		target := filepath.Join(root, filepath.Clean("/"+header.Name))
+		// A tar entry that names an absolute path or climbs out of the archive
+		// root means the archive is not what it claims to be. Refuse the whole
+		// extraction rather than quietly rewriting the path to something safe:
+		// continuing past that is how a surprise becomes a write nobody
+		// reviewed.
+		cleaned := filepath.Clean(header.Name)
+		if filepath.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(os.PathSeparator)) {
+			return fmt.Errorf("archive %s contains an entry escaping the extraction root: %q", archive, header.Name)
+		}
+		target := filepath.Join(root, cleaned)
 		if !strings.HasPrefix(target, filepath.Clean(root)+string(os.PathSeparator)) {
 			return fmt.Errorf("archive %s contains an entry escaping the extraction root: %q", archive, header.Name)
 		}
@@ -151,7 +156,7 @@ func extract(ctx context.Context, archive, root string) error {
 // findDB locates the LevelDB directory inside an extracted archive. The
 // archive's internal layout has changed before, so this searches rather than
 // assuming a fixed path.
-func findDB(root string) (string, error) {
+func findDB(root string, archive string) (string, error) {
 	var found string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -166,7 +171,7 @@ func findDB(root string) (string, error) {
 		return "", fmt.Errorf("search extracted archive: %w", err)
 	}
 	if found == "" {
-		return "", fmt.Errorf("no db directory inside the extracted archive at %s", root)
+		return "", fmt.Errorf("no db directory inside archive %s", archive)
 	}
 	return found, nil
 }

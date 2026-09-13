@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -91,12 +92,44 @@ func TestArchiveSourceRefusesPathsEscapingTheExtractionRoot(t *testing.T) {
 	// A tar entry naming ../ must never be written outside the temporary
 	// directory. The archive is trusted today, but a path-traversal write
 	// running as the census would be a real foothold.
-	dir := t.TempDir()
-	writeArchive(t, dir, "fwb-20260913T000000Z.tar.gz", map[string]string{"../escaped": "x"})
-	if _, _, err := (ArchiveSource{Dir: dir}).Open(context.Background()); err == nil {
-		t.Error("Open accepted an archive containing a ../ path")
+	testCases := []string{
+		"../escaped",
+		"../../etc/passwd",
+		"/etc/passwd",
 	}
-	if _, err := os.Stat(filepath.Join(dir, "..", "escaped")); err == nil {
-		t.Error("a ../ tar entry was written outside the extraction root")
+
+	for _, payload := range testCases {
+		t.Run(payload, func(t *testing.T) {
+			dir := t.TempDir()
+			// Include a valid world so findDB succeeds; the ONLY reason
+			// Open should fail is the traversal check.
+			writeArchive(t, dir, "fwb-20260913T000000Z.tar.gz", map[string]string{
+				"FWB/db/CURRENT": "valid",
+				payload:          "x",
+			})
+			_, cleanup, err := (ArchiveSource{Dir: dir}).Open(context.Background())
+			if err == nil {
+				cleanup()
+				t.Errorf("Open accepted an archive containing %q", payload)
+			}
+			if !strings.Contains(err.Error(), "escaping the extraction root") {
+				t.Errorf("error did not mention escaping: %v", err)
+			}
+		})
+	}
+}
+
+func TestArchiveSourceAcceptsBenignArchives(t *testing.T) {
+	// Prove that valid archives pass the traversal check.
+	dir := t.TempDir()
+	writeArchive(t, dir, "fwb-20260913T000000Z.tar.gz", map[string]string{
+		"FWB/db/CURRENT": "valid",
+	})
+	_, cleanup, err := (ArchiveSource{Dir: dir}).Open(context.Background())
+	if err != nil {
+		t.Fatalf("Open of benign archive failed: %v", err)
+	}
+	if err := cleanup(); err != nil {
+		t.Fatalf("cleanup: %v", err)
 	}
 }
