@@ -76,9 +76,8 @@ func Render(c Census, opts ReportOptions) string {
 				fmt.Fprintf(&b, "  %s\n", d)
 			}
 			minX, maxX, minZ, maxZ := r.Key.Bounds()
-			caps, _ := CapsFor(r.Key.Dimension, r.Category)
 			fmt.Fprintf(&b, "    x %6d..%-6d z %6d..%-6d %-12s %4d / %-6s %s\n",
-				minX, maxX, minZ, maxZ, r.Category, r.Count, capBounds(caps), r.Status)
+				minX, maxX, minZ, maxZ, r.Category, r.Count, capBounds(r.Caps), r.Status)
 			shown++
 		}
 	}

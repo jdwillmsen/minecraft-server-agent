@@ -285,3 +285,30 @@ func TestAggregateDoesNotGradeACategoryThatCannotSpawnInTheDimension(t *testing.
 		t.Errorf("got %d named entities, want the five name tags still listed", len(c.Named))
 	}
 }
+
+func TestAggregateGivesEveryRegionTheCapsItWasGradedAgainst(t *testing.T) {
+	// The report prints the cap beside the count. Looking it up a second
+	// time at render lets a lookup that fails print a ceiling nobody read
+	// out of the table, so the region carries the caps it was graded with.
+	c := Aggregate([]Entity{
+		{Identifier: "zombie", Dimension: Overworld, X: 0, Y: 64, Z: 0},
+		{Identifier: "cow", Dimension: Overworld, X: 0, Y: 64, Z: 0},
+		{Identifier: "bat", Dimension: Overworld, X: 0, Y: 64, Z: 0},
+		{Identifier: "zombie_pigman", Dimension: Nether, X: 0, Y: 64, Z: 0},
+		{Identifier: "enderman", Dimension: End, X: 0, Y: 64, Z: 0},
+	}, ScanStats{Records: 5, Decoded: 5}, time.Unix(0, 0), "archive")
+
+	if len(c.Regions) == 0 {
+		t.Fatal("Aggregate graded no regions")
+	}
+	for _, r := range c.Regions {
+		want, ok := CapsFor(r.Key.Dimension, r.Category)
+		if !ok {
+			t.Errorf("region %+v was graded against caps that do not exist", r)
+			continue
+		}
+		if r.Caps != want {
+			t.Errorf("region %+v carries caps %+v, want %+v", r, r.Caps, want)
+		}
+	}
+}

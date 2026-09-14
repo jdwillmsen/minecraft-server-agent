@@ -14,10 +14,12 @@ type Total struct {
 }
 
 // Region is one population-control region's occupancy for one category,
-// graded against that category's cap range.
+// graded against that category's cap range. Caps travels with the region so
+// that reporting a count never has to look up a cap that might not be there.
 type Region struct {
 	Key      RegionKey
 	Category Category
+	Caps     Caps
 	Count    int
 	Status   Status
 }
@@ -91,6 +93,7 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 	type regionCategory struct {
 		key      RegionKey
 		category Category
+		caps     Caps
 	}
 	regions := map[regionCategory]int{}
 
@@ -118,8 +121,8 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 				Persistent: e.Persistent,
 			})
 		}
-		if _, counted := CapsFor(e.Dimension, category); counted {
-			regions[regionCategory{RegionOf(e.Dimension, e.X, e.Z), category}]++
+		if caps, counted := CapsFor(e.Dimension, category); counted {
+			regions[regionCategory{RegionOf(e.Dimension, e.X, e.Z), category, caps}]++
 		}
 	}
 
@@ -145,8 +148,9 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 		c.Regions = append(c.Regions, Region{
 			Key:      k.key,
 			Category: k.category,
+			Caps:     k.caps,
 			Count:    count,
-			Status:   StatusOf(k.key.Dimension, k.category, count),
+			Status:   k.caps.Status(count),
 		})
 	}
 	sort.Slice(c.Regions, func(i, j int) bool {
