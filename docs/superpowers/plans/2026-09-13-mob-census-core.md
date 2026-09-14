@@ -614,7 +614,7 @@ git commit -m "feat(census): bucket entities into 144-block population regions"
 
 **Interfaces:**
 - Consumes: `Dimension`, `Category` from Tasks 1 and 2.
-- Produces: `const NoSpawn = -1`; `type Caps struct { Surface, Cave int }`; `func (c Caps) Range() (lower, upper int)`; `func CapsFor(d Dimension, c Category) (Caps, bool)`; `type Status int` with `Headroom`, `AtRisk`, `Capped`, `StatusUnknown`; `func (s Status) String() string`; `func StatusOf(d Dimension, c Category, count int) Status`; `const GlobalCap = 200`.
+- Produces: `const NoSpawn = -1`; `type Caps struct { Surface, Cave int }`; `func (c Caps) Range() (lower, upper int)`; `func (c Caps) Status(count int) Status`; `func CapsFor(d Dimension, c Category) (Caps, bool)`; `type Status int` with `Headroom`, `AtRisk`, `Capped`, `StatusUnknown`; `func (s Status) String() string`; `func StatusOf(d Dimension, c Category, count int) Status`; `const GlobalCap = 200`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -663,17 +663,19 @@ func TestCapsForHasNoEntryForUncountedCategories(t *testing.T) {
 func TestStatusOfReportsARangeNotAFalsePrecision(t *testing.T) {
 	// Surface-versus-cave is fixed when a mob spawns and is not written to
 	// the save, so the exact cap is unknowable. Overworld monsters are
-	// capped somewhere in 8..16: at or below 8 there is headroom for
-	// certain, above 16 the region is saturated for certain, between the
-	// two it depends on how those mobs spawned.
+	// capped somewhere in 8..16: below 8 there is headroom for certain, at
+	// 16 the region is saturated for certain, between the two it depends on
+	// how those mobs spawned.
 	for _, tc := range []struct {
 		count int
 		want  Status
 	}{
 		{0, Headroom},
-		{8, Headroom},
+		{7, Headroom},
+		{8, AtRisk},
 		{9, AtRisk},
-		{16, AtRisk},
+		{15, AtRisk},
+		{16, Capped},
 		{17, Capped},
 	} {
 		if got := StatusOf(Overworld, Monster, tc.count); got != tc.want {
@@ -694,14 +696,13 @@ func TestStatusOfGradesOnlyTheEnvironmentsACategorySpawnsIn(t *testing.T) {
 		want  Status
 	}{
 		{Overworld, Animal, 1, Headroom},
-		{Overworld, Animal, 4, Headroom},
-		{Overworld, Animal, 5, Capped},
+		{Overworld, Animal, 3, Headroom},
+		{Overworld, Animal, 4, Capped},
 		{Overworld, Ambient, 1, Headroom},
-		{Overworld, Ambient, 2, Headroom},
-		{Overworld, Ambient, 3, Capped},
+		{Overworld, Ambient, 2, Capped},
 		{Nether, Monster, 1, Headroom},
-		{Nether, Monster, 16, Headroom},
-		{Nether, Monster, 17, Capped},
+		{Nether, Monster, 15, Headroom},
+		{Nether, Monster, 16, Capped},
 	} {
 		if got := StatusOf(tc.d, tc.c, tc.count); got != tc.want {
 			t.Errorf("StatusOf(%v,%v,%d) = %v, want %v", tc.d, tc.c, tc.count, got, tc.want)
@@ -746,10 +747,10 @@ func TestStatusOfGradesTheEndsInvertedCaps(t *testing.T) {
 		count int
 		want  Status
 	}{
-		{8, Headroom},
+		{7, Headroom},
+		{8, AtRisk},
 		{9, AtRisk},
-		{10, AtRisk},
-		{11, Capped},
+		{10, Capped},
 	} {
 		if got := StatusOf(End, Monster, tc.count); got != tc.want {
 			t.Errorf("StatusOf(end,monster,%d) = %v, want %v", tc.count, got, tc.want)
@@ -765,6 +766,65 @@ func TestCapsForHasNoEntryForCategoriesThatCannotSpawnInTheEnd(t *testing.T) {
 	for _, c := range []Category{Animal, WaterAnimal, Ambient, Pillager} {
 		if caps, ok := CapsFor(End, c); ok {
 			t.Errorf("CapsFor(end,%v) = %+v, want no entry", c, caps)
+		}
+	}
+}
+
+func TestStatusOfTreatsACountOnItsCapAsCapped(t *testing.T) {
+	// Bedrock stops spawning once the count reaches the ceiling, not once
+	// it passes it, so a region sitting exactly on its cap has no room
+	// left. "16 / 16 headroom" is precisely the line an operator would read
+	// as room to spare.
+	for _, tc := range []struct {
+		d     Dimension
+		c     Category
+		count int
+		want  Status
+	}{
+		{Nether, Monster, 16, Capped},
+		{Overworld, Animal, 4, Capped},
+		{Overworld, Ambient, 2, Capped},
+		{Overworld, WaterAnimal, 36, Capped},
+		{Overworld, Pillager, 8, Capped},
+	} {
+		if got := StatusOf(tc.d, tc.c, tc.count); got != tc.want {
+			t.Errorf("StatusOf(%v,%v,%d) = %v, want %v", tc.d, tc.c, tc.count, got, tc.want)
+		}
+	}
+}
+
+func TestStatusOfTreatsACountOnTheLowerBoundAsAtRisk(t *testing.T) {
+	// Where the two environments carry different ceilings, reaching the
+	// lower one is already enough to stop spawning if that is the ceiling
+	// that applies - which the save cannot say.
+	for _, tc := range []struct {
+		d     Dimension
+		c     Category
+		count int
+		want  Status
+	}{
+		{Overworld, Monster, 8, AtRisk},
+		{End, Monster, 8, AtRisk},
+	} {
+		if got := StatusOf(tc.d, tc.c, tc.count); got != tc.want {
+			t.Errorf("StatusOf(%v,%v,%d) = %v, want %v", tc.d, tc.c, tc.count, got, tc.want)
+		}
+	}
+}
+
+func TestCapsWithNoSpawnableEnvironmentHaveNoRangeToGradeAgainst(t *testing.T) {
+	// Caps and its methods are exported, so a caller can hand in a cell the
+	// table would never hold. Falling through to the first arm returned a
+	// range of -1..-1, which graded a count of zero as capped and printed a
+	// ceiling of -1.
+	none := Caps{Surface: NoSpawn, Cave: NoSpawn}
+	lower, upper := none.Range()
+	if lower != NoSpawn || upper != NoSpawn {
+		t.Errorf("Range() = (%d,%d), want (%d,%d)", lower, upper, NoSpawn, NoSpawn)
+	}
+	for _, count := range []int{0, 1, 100} {
+		if got := none.Status(count); got != StatusUnknown {
+			t.Errorf("Status(%d) = %v, want StatusUnknown", count, got)
 		}
 	}
 }
@@ -791,9 +851,12 @@ const GlobalCap = 200
 //
 // It is deliberately not zero. A ceiling of zero and an environment with no
 // ceiling behave identically for spawning - nothing spawns either way - but
-// they differ entirely when grading mobs that are already there, because
-// those mobs spawned under the other environment's ceiling, or were bred or
-// name-tagged and never counted against a spawn cap at all.
+// they differ entirely when grading mobs that are already there. Every mob
+// present occupies its category's density regardless of how it got there, so
+// the count is real; what is absent is a ceiling of this environment's to
+// measure it against, because those mobs arrived under the other
+// environment's ceiling, or were bred, spawned from an egg or led in. Zero
+// would grade every one of them as over cap.
 const NoSpawn = -1
 
 // Caps is one cell of the population-control table. Surface and Cave are
@@ -811,6 +874,10 @@ type Caps struct {
 // graded exactly.
 func (c Caps) Range() (lower, upper int) {
 	switch {
+	// Neither environment spawns the category, so there are no bounds to
+	// grade against - which is not the same as bounds of zero.
+	case c.Surface == NoSpawn && c.Cave == NoSpawn:
+		return NoSpawn, NoSpawn
 	case c.Surface == NoSpawn:
 		return c.Cave, c.Cave
 	case c.Cave == NoSpawn:
@@ -885,20 +952,28 @@ func (s Status) String() string {
 // Bedrock fixes whether a mob counts as a surface or a cave spawn at spawn
 // time and does not write that to the save, so the exact applicable cap
 // cannot be recovered. Rather than invent a single number, the count is
-// graded against both bounds: at or below the lower bound there is headroom
-// whichever way the mobs spawned, above the upper bound the region is
-// saturated whichever way, and between them it depends on facts the save
-// does not carry.
+// graded against both bounds. Bedrock refuses a spawn once the count reaches
+// the ceiling, so below the lower bound there is headroom whichever way the
+// mobs spawned, at or above the upper bound the region is saturated whichever
+// way, and between them it depends on facts the save does not carry.
 func StatusOf(d Dimension, c Category, count int) Status {
 	caps, ok := CapsFor(d, c)
 	if !ok {
 		return StatusUnknown
 	}
-	lower, upper := caps.Range()
+	return caps.Status(count)
+}
+
+// Status grades a count against this cell's caps.
+func (c Caps) Status(count int) Status {
+	lower, upper := c.Range()
+	if upper == NoSpawn {
+		return StatusUnknown
+	}
 	switch {
-	case count > upper:
+	case count >= upper:
 		return Capped
-	case count > lower:
+	case count >= lower:
 		return AtRisk
 	default:
 		return Headroom
@@ -909,13 +984,18 @@ func StatusOf(d Dimension, c Category, count int) Status {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/census/ -run 'TestCap|TestStatus' -v`
-Expected: PASS, nine tests. TestStatusOfHandlesAZeroSurfaceCap is gone - it
-asserted the defect, that a nether region holding one mob is at risk - and
+Expected: PASS, thirteen tests. TestStatusOfHandlesAZeroSurfaceCap is gone -
+it asserted the defect, that a nether region holding one mob is at risk - and
 four tests replace it with what an environment a category cannot spawn in
 actually means: TestStatusOfGradesOnlyTheEnvironmentsACategorySpawnsIn,
 TestCapTableHasNoCellWithoutAnApplicableCap,
 TestCapsForHasNoEntryWhereACategoryCannotSpawn and
-TestCapsForHasNoEntryForCategoriesThatCannotSpawnInTheEnd.
+TestCapsForHasNoEntryForCategoriesThatCannotSpawnInTheEnd. Three more pin
+where the boundary sits and what happens without one:
+TestStatusOfTreatsACountOnItsCapAsCapped,
+TestStatusOfTreatsACountOnTheLowerBoundAsAtRisk and
+TestCapsWithNoSpawnableEnvironmentHaveNoRangeToGradeAgainst. The pattern also
+catches TestCapBoundsPrintsNoCeilingRatherThanMinusOne from the report task.
 
 - [ ] **Step 5: Commit**
 
@@ -1149,7 +1229,7 @@ git commit -m "feat(census): resolve actor dimensions from digp chunk records"
 
 **Interfaces:**
 - Consumes: `Entity`, `EntityFromNBT`, `dimensionIndex` from Tasks 1 and 5.
-- Produces: `func Scan(ctx context.Context, dbPath string) ([]Entity, ScanStats, error)`; `type ScanStats struct { Records, Decoded, Unparsable, Unplaced int; FirstUnparsableErr string }`; `const MaxUnparsableRatio = 0.05`; `func (s ScanStats) Unreadable() bool`. Test helper: `func writeFixtureWorld(t *testing.T, actors []fixtureActor) string` and `type fixtureActor struct { ID uint64; Dimension *int32; NBT map[string]any }`.
+- Produces: `func Scan(ctx context.Context, dbPath string) ([]Entity, ScanStats, error)`; `type ScanStats struct { Records, Decoded, Unparsable, Unplaced, Unidentified int; FirstUnparsableErr string }`; `const MaxUnusableRatio = 0.05`; `func (s ScanStats) Unusable() int`; `func (s ScanStats) Unreadable() bool`. Test helper: `func writeFixtureWorld(t *testing.T, actors []fixtureActor) string` and `type fixtureActor struct { ID uint64; Dimension *int32; NBT map[string]any }`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1304,6 +1384,49 @@ func TestScanCountsUnplacedEntities(t *testing.T) {
 	}
 }
 
+func TestScanCountsRecordsThatNameNoEntity(t *testing.T) {
+	// A record that decodes and places but carries no identifier cannot be
+	// categorised, so it presses against no cap and appears in the report
+	// as a blank line. Counting it is what lets the run refuse a world
+	// whose identifier tag has moved.
+	path := writeFixtureWorld(t, []fixtureActor{
+		{ID: 4, NBT: map[string]any{"Pos": pos(1, 64, 2), "UniqueID": int64(4)}},
+	})
+	entities, stats, err := Scan(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(entities) != 0 {
+		t.Errorf("got %d entities, want 0", len(entities))
+	}
+	if stats.Unidentified != 1 || stats.Decoded != 0 {
+		t.Errorf("stats = %+v, want 1 unidentified and 0 decoded", stats)
+	}
+	if stats.Records != 1 {
+		t.Errorf("Records = %d, want 1", stats.Records)
+	}
+}
+
+func TestScanStatsAccountForEveryRecordItSaw(t *testing.T) {
+	// Records is the denominator of the unreadable ratio, so every record
+	// must land in exactly one of the outcomes that make up its numerator
+	// or in Decoded. A record that lands in none is a failure mode the
+	// threshold cannot see.
+	nether := int32(1)
+	path := writeFixtureWorld(t, []fixtureActor{
+		{ID: 1, NBT: map[string]any{"identifier": "minecraft:zombie", "Pos": pos(1, 64, 2)}},
+		{ID: 2, Dimension: &nether, NBT: map[string]any{"identifier": "minecraft:ghast"}},
+		{ID: 3, NBT: map[string]any{"Pos": pos(3, 64, 4)}},
+	})
+	_, stats, err := Scan(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if got := stats.Decoded + stats.Unusable(); got != stats.Records {
+		t.Errorf("decoded %d plus unusable %d = %d, want records %d", stats.Decoded, stats.Unusable(), got, stats.Records)
+	}
+}
+
 func TestScanRejectsAMissingWorld(t *testing.T) {
 	if _, _, err := Scan(context.Background(), t.TempDir()+"/does-not-exist"); err == nil {
 		t.Error("Scan of a missing world returned nil error")
@@ -1361,6 +1484,13 @@ func TestScanStatsSeparatesTornRecordsFromAWholesaleDecodeFailure(t *testing.T) 
 		{"a few torn records", ScanStats{Records: 1000, Decoded: 950, Unparsable: 50}, false},
 		{"past the limit", ScanStats{Records: 1000, Decoded: 949, Unparsable: 51}, true},
 		{"the layout moved", ScanStats{Records: 412000, Unparsable: 412000}, true},
+		// NBT that decodes is not NBT the census can use: a renamed or
+		// retyped Pos leaves every record decoding and none of them
+		// placeable, and a moved identifier leaves every record placed
+		// and nothing named. Both render an empty report.
+		{"Pos moved", ScanStats{Records: 412000, Unplaced: 412000}, true},
+		{"identifier moved", ScanStats{Records: 412000, Unidentified: 412000}, true},
+		{"failures spread across reasons", ScanStats{Records: 1000, Decoded: 940, Unparsable: 20, Unplaced: 20, Unidentified: 20}, true},
 	} {
 		if got := tc.stats.Unreadable(); got != tc.want {
 			t.Errorf("%s: Unreadable() = %v, want %v", tc.name, got, tc.want)
@@ -1419,14 +1549,15 @@ const actorPrefix = "actorprefix"
 // world it failed to read instead of quietly reporting a short count.
 type ScanStats struct {
 	Records            int    // actorprefix keys seen
-	Decoded            int    // records that became entities
+	Decoded            int    // records that became usable entities
 	Unparsable         int    // records whose NBT would not decode
 	Unplaced           int    // records decoded but carrying no usable position
+	Unidentified       int    // records placed but naming no entity
 	FirstUnparsableErr string // first decode failure seen, or empty if none
 }
 
-// MaxUnparsableRatio is how much of a world may fail to decode before the
-// records that did survive stop being a census.
+// MaxUnusableRatio is how much of a world may fail to yield an entity before
+// the records that did survive stop being a census.
 //
 // A backup is taken while the server runs, so a few torn records are normal
 // and failing the nightly job over them would only teach operators to
@@ -1435,14 +1566,23 @@ type ScanStats struct {
 // line matters far less than drawing one: 5% of a 400,000-record world is
 // 20,000 records, far past torn-write noise and far short of a layout
 // change.
-const MaxUnparsableRatio = 0.05
+const MaxUnusableRatio = 0.05
 
-// Unreadable reports whether so much of the world failed to decode that the
+// Unusable counts the records that produced no entity. Decoding is only the
+// first of the ways a layout change breaks a record: well-formed NBT decodes
+// into a map whatever the game renamed, and the census then loses the record
+// on a position it cannot read or an entity it cannot name. Counting only
+// the decode failures would leave both of those looking like a quiet world.
+func (s ScanStats) Unusable() int {
+	return s.Unparsable + s.Unplaced + s.Unidentified
+}
+
+// Unreadable reports whether so much of the world yielded nothing that the
 // rest cannot be reported as a census. A world with no actor records at all
 // is not unreadable: an empty world is a fact about the world, and a report
 // saying so must stay distinguishable from one built out of nothing.
 func (s ScanStats) Unreadable() bool {
-	return s.Records > 0 && float64(s.Unparsable) > MaxUnparsableRatio*float64(s.Records)
+	return s.Records > 0 && float64(s.Unusable()) > MaxUnusableRatio*float64(s.Records)
 }
 
 // Scan reads every entity out of a Bedrock world's LevelDB.
@@ -1490,6 +1630,13 @@ func Scan(ctx context.Context, dbPath string) ([]Entity, ScanStats, error) {
 			stats.Unplaced++
 			return
 		}
+		// An entity with no identifier can be neither categorised nor
+		// graded, and renders as a blank line in every section that would
+		// name it, so it is not an entity the census can report on.
+		if e.Identifier == "" {
+			stats.Unidentified++
+			return
+		}
 		e.Dimension = index.lookup(k[len(actorPrefix):])
 		stats.Decoded++
 		entities = append(entities, e)
@@ -1520,9 +1667,10 @@ func iterate(ctx context.Context, db *leveldb.DB, prefix []byte, fn func(k, v []
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/census/ -run TestScan -v`
-Expected: PASS, six tests (the original four, plus
-TestScanStatsSeparatesTornRecordsFromAWholesaleDecodeFailure and
-TestScanStopsOnACancelledContext).
+Expected: PASS, eight tests (the original four, plus
+TestScanStatsSeparatesTornRecordsFromAWholesaleDecodeFailure,
+TestScanStopsOnACancelledContext, TestScanCountsRecordsThatNameNoEntity and
+TestScanStatsAccountForEveryRecordItSaw).
 
 - [ ] **Step 5: Commit**
 
@@ -1859,7 +2007,7 @@ git commit -m "feat(census): group entities into located clusters"
 - Produces:
   - `type Census struct { TakenAt time.Time; SourceKind string; Stats ScanStats; Totals []Total; Regions []Region; Named []Named; PersistentByIdentifier map[string]int; Concentrations []Concentration }`
   - `type Total struct { Dimension Dimension; Identifier string; Category Category; Count int }`
-  - `type Region struct { Key RegionKey; Category Category; Count int; Status Status }`
+  - `type Region struct { Key RegionKey; Category Category; Caps Caps; Count int; Status Status }`
   - `type Named struct { Name string; Identifier string; Dimension Dimension; X, Y, Z float64; Persistent bool }`
   - `type Concentration struct { Dimension Dimension; Identifier string; Cluster Cluster }`
   - `const ConcentrationThreshold = 25`, `const ConcentrationRadius = 24.0`
@@ -2155,6 +2303,33 @@ func TestAggregateDoesNotGradeACategoryThatCannotSpawnInTheDimension(t *testing.
 		t.Errorf("got %d named entities, want the five name tags still listed", len(c.Named))
 	}
 }
+
+func TestAggregateGivesEveryRegionTheCapsItWasGradedAgainst(t *testing.T) {
+	// The report prints the cap beside the count. Looking it up a second
+	// time at render lets a lookup that fails print a ceiling nobody read
+	// out of the table, so the region carries the caps it was graded with.
+	c := Aggregate([]Entity{
+		{Identifier: "zombie", Dimension: Overworld, X: 0, Y: 64, Z: 0},
+		{Identifier: "cow", Dimension: Overworld, X: 0, Y: 64, Z: 0},
+		{Identifier: "bat", Dimension: Overworld, X: 0, Y: 64, Z: 0},
+		{Identifier: "zombie_pigman", Dimension: Nether, X: 0, Y: 64, Z: 0},
+		{Identifier: "enderman", Dimension: End, X: 0, Y: 64, Z: 0},
+	}, ScanStats{Records: 5, Decoded: 5}, time.Unix(0, 0), "archive")
+
+	if len(c.Regions) == 0 {
+		t.Fatal("Aggregate graded no regions")
+	}
+	for _, r := range c.Regions {
+		want, ok := CapsFor(r.Key.Dimension, r.Category)
+		if !ok {
+			t.Errorf("region %+v was graded against caps that do not exist", r)
+			continue
+		}
+		if r.Caps != want {
+			t.Errorf("region %+v carries caps %+v, want %+v", r, r.Caps, want)
+		}
+	}
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -2181,10 +2356,12 @@ type Total struct {
 }
 
 // Region is one population-control region's occupancy for one category,
-// graded against that category's cap range.
+// graded against that category's cap range. Caps travels with the region so
+// that reporting a count never has to look up a cap that might not be there.
 type Region struct {
 	Key      RegionKey
 	Category Category
+	Caps     Caps
 	Count    int
 	Status   Status
 }
@@ -2258,6 +2435,7 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 	type regionCategory struct {
 		key      RegionKey
 		category Category
+		caps     Caps
 	}
 	regions := map[regionCategory]int{}
 
@@ -2285,8 +2463,8 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 				Persistent: e.Persistent,
 			})
 		}
-		if _, counted := CapsFor(e.Dimension, category); counted {
-			regions[regionCategory{RegionOf(e.Dimension, e.X, e.Z), category}]++
+		if caps, counted := CapsFor(e.Dimension, category); counted {
+			regions[regionCategory{RegionOf(e.Dimension, e.X, e.Z), category, caps}]++
 		}
 	}
 
@@ -2312,8 +2490,9 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 		c.Regions = append(c.Regions, Region{
 			Key:      k.key,
 			Category: k.category,
+			Caps:     k.caps,
 			Count:    count,
-			Status:   StatusOf(k.key.Dimension, k.category, count),
+			Status:   k.caps.Status(count),
 		})
 	}
 	sort.Slice(c.Regions, func(i, j int) bool {
@@ -2420,10 +2599,11 @@ without the CentreY/Min/Max tiebreakers and passes reliably with them.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/census/ -run TestAggregate -v`
-Expected: PASS, ten tests (seven original aggregate tests, plus
+Expected: PASS, eleven tests (seven original aggregate tests, plus
 TestAggregateIsDeterministicOverTiedRows, plus
 TestAggregateOrdersConcentrationsTiedOnEverythingButY, plus
-TestAggregateDoesNotGradeACategoryThatCannotSpawnInTheDimension).
+TestAggregateDoesNotGradeACategoryThatCannotSpawnInTheDimension, plus
+TestAggregateGivesEveryRegionTheCapsItWasGradedAgainst).
 
 - [ ] **Step 5: Commit**
 
@@ -2945,12 +3125,16 @@ func TestRenderReportsUnreadableRecordsRatherThanHidingThem(t *testing.T) {
 	c := sampleCensus()
 	c.Stats.Unparsable = 3
 	c.Stats.Unplaced = 2
+	c.Stats.Unidentified = 1
 	out := Render(c, DefaultReportOptions())
 	if !strings.Contains(out, "3") || !strings.Contains(out, "unparsable") {
 		t.Error("report does not surface unparsable records")
 	}
 	if !strings.Contains(out, "unplaced") {
 		t.Error("report does not surface unplaced records")
+	}
+	if !strings.Contains(out, "unidentified 1") {
+		t.Errorf("report does not surface records that named no entity\n---\n%s", out)
 	}
 }
 
@@ -3064,11 +3248,20 @@ func TestRenderAccountsForEveryDecodedEntityByDimension(t *testing.T) {
 		t.Errorf("dimension breakdown sums to %d, want %d\n---\n%s", sum, len(entities), out)
 	}
 }
+
+func TestCapBoundsPrintsNoCeilingRatherThanMinusOne(t *testing.T) {
+	// Caps is exported and NoSpawn is -1, so a cell nothing spawns in must
+	// not render as a ceiling of "-1" in the one column an operator reads
+	// the count against.
+	if got := capBounds(Caps{Surface: NoSpawn, Cave: NoSpawn}); got != "none" {
+		t.Errorf("capBounds(no spawnable environment) = %q, want %q", got, "none")
+	}
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test ./internal/census/ -run TestRender -v`
+Run: `go test ./internal/census/ -run 'TestRender|TestCapBounds' -v`
 Expected: FAIL, `undefined: Render`.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -3105,8 +3298,8 @@ func Render(c Census, opts ReportOptions) string {
 	}
 	fmt.Fprintf(&b, "FWB mob census\n")
 	fmt.Fprintf(&b, "world taken at %s via %s\n", taken, sourceKindOrUnknown(c.SourceKind))
-	fmt.Fprintf(&b, "records %d, decoded %d, unparsable %d, unplaced %d\n",
-		c.Stats.Records, c.Stats.Decoded, c.Stats.Unparsable, c.Stats.Unplaced)
+	fmt.Fprintf(&b, "records %d, decoded %d, unparsable %d, unplaced %d, unidentified %d\n",
+		c.Stats.Records, c.Stats.Decoded, c.Stats.Unparsable, c.Stats.Unplaced, c.Stats.Unidentified)
 	if c.Stats.FirstUnparsableErr != "" {
 		fmt.Fprintf(&b, "first decode failure: %s\n", c.Stats.FirstUnparsableErr)
 	}
@@ -3152,9 +3345,8 @@ func Render(c Census, opts ReportOptions) string {
 				fmt.Fprintf(&b, "  %s\n", d)
 			}
 			minX, maxX, minZ, maxZ := r.Key.Bounds()
-			caps, _ := CapsFor(r.Key.Dimension, r.Category)
 			fmt.Fprintf(&b, "    x %6d..%-6d z %6d..%-6d %-12s %4d / %-6s %s\n",
-				minX, maxX, minZ, maxZ, r.Category, r.Count, capBounds(caps), r.Status)
+				minX, maxX, minZ, maxZ, r.Category, r.Count, capBounds(r.Caps), r.Status)
 			shown++
 		}
 	}
@@ -3209,6 +3401,9 @@ func Render(c Census, opts ReportOptions) string {
 // advertise an ambiguity the save does not leave open.
 func capBounds(c Caps) string {
 	lower, upper := c.Range()
+	if upper == NoSpawn {
+		return "none"
+	}
 	if lower == upper {
 		return strconv.Itoa(upper)
 	}
@@ -3225,12 +3420,13 @@ func sourceKindOrUnknown(kind string) string {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test ./internal/census/ -run TestRender -v`
-Expected: PASS, eleven tests (the original seven, plus
+Run: `go test ./internal/census/ -run 'TestRender|TestCapBounds' -v`
+Expected: PASS, twelve tests (the original seven, plus
 TestRenderStatesTheFirstDecodeFailureWhenPresent,
 TestRenderOmitsTheFirstDecodeFailureLineWhenThereIsNone,
-TestRenderStatesOneNumberWhereOnlyOneEnvironmentSpawnsTheCategory and
-TestRenderAccountsForEveryDecodedEntityByDimension).
+TestRenderStatesOneNumberWhereOnlyOneEnvironmentSpawnsTheCategory,
+TestRenderAccountsForEveryDecodedEntityByDimension and
+TestCapBoundsPrintsNoCeilingRatherThanMinusOne).
 
 - [ ] **Step 5: Commit**
 
@@ -3251,7 +3447,7 @@ git commit -m "feat(census): render the census as an operator report"
 
 **Interfaces:**
 - Consumes: `ArchiveSource`, `Scan`, `Aggregate`, `Render` from Tasks 6 and 8-10.
-- Produces: `func run(ctx context.Context, args []string, stdout io.Writer) error` — the testable body, with `main` a thin wrapper that derives the context from SIGINT and SIGTERM so a terminating pod still runs the extraction cleanup.
+- Produces: `func run(ctx context.Context, args []string, stdout io.Writer) error` — the testable body, with `main` a thin wrapper that derives the context from SIGINT and SIGTERM so a terminating pod still runs the extraction cleanup; and `func reportFrom(ctx context.Context, source census.Source, opts census.ReportOptions, stdout io.Writer) error`, which takes the census from an already-chosen source so a test can supply one whose cleanup fails.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3271,14 +3467,12 @@ import (
 	"testing"
 
 	"github.com/df-mc/goleveldb/leveldb"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/census"
 	"github.com/sandertv/gophertunnel/minecraft/nbt"
 )
 
-// buildArchive writes a one-zombie world and tars it the way the backup job
-// does - `tar czf "$ARCHIVE_TMP" -C "$STAGE" .`, so "./" is member 0 and
-// every directory gets an entry ahead of its files - so the binary is
-// exercised end to end against the archive shape it actually receives.
-func buildArchive(t *testing.T, dir string) {
+// zombieRecord is the actorprefix value of a single placed, named mob.
+func zombieRecord(t *testing.T) []byte {
 	t.Helper()
 	payload, err := nbt.MarshalEncoding(map[string]any{
 		"identifier": "minecraft:zombie",
@@ -3288,18 +3482,42 @@ func buildArchive(t *testing.T, dir string) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	buildArchiveFromRecord(t, dir, payload)
+	return payload
+}
+
+// stageWorld writes a world holding one actor record and returns the
+// directory an archive of it would extract to.
+func stageWorld(t *testing.T, actorRecord []byte) string {
+	t.Helper()
+	stage := t.TempDir()
+	if err := os.MkdirAll(worldDB(stage), 0o755); err != nil {
+		t.Fatalf("stage world: %v", err)
+	}
+	writeWorld(t, worldDB(stage), actorRecord)
+	return stage
+}
+
+func worldDB(stage string) string { return filepath.Join(stage, "FWB", "db") }
+
+// buildArchive writes a one-zombie world and tars it the way the backup job
+// does - `tar czf "$ARCHIVE_TMP" -C "$STAGE" .`, so "./" is member 0 and
+// every directory gets an entry ahead of its files - so the binary is
+// exercised end to end against the archive shape it actually receives.
+func buildArchive(t *testing.T, dir string) {
+	t.Helper()
+	buildArchiveFromRecord(t, dir, zombieRecord(t))
 }
 
 // buildArchiveFromRecord builds that archive around a caller-supplied
 // actorprefix value, so a test can stand in bytes the decoder will refuse.
 func buildArchiveFromRecord(t *testing.T, dir string, actorRecord []byte) {
 	t.Helper()
-	stage := t.TempDir()
-	dbPath := filepath.Join(stage, "FWB", "db")
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
-		t.Fatalf("stage world: %v", err)
-	}
+	stage := stageWorld(t, actorRecord)
+	tarWorld(t, stage, dir)
+}
+
+func writeWorld(t *testing.T, dbPath string, actorRecord []byte) {
+	t.Helper()
 	db, err := leveldb.OpenFile(dbPath, nil)
 	if err != nil {
 		t.Fatalf("open world: %v", err)
@@ -3316,7 +3534,10 @@ func buildArchiveFromRecord(t *testing.T, dir string, actorRecord []byte) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("close world: %v", err)
 	}
+}
 
+func tarWorld(t *testing.T, stage, dir string) {
+	t.Helper()
 	out, err := os.Create(filepath.Join(dir, "fwb-20260913T203100Z.tar.gz"))
 	if err != nil {
 		t.Fatalf("create archive: %v", err)
@@ -3416,6 +3637,54 @@ func TestRunRefusesToReportAWorldItCouldNotDecode(t *testing.T) {
 	}
 }
 
+func TestRunRefusesToReportAWorldWhosePositionsMoved(t *testing.T) {
+	// The failure a Bedrock layout change actually produces: the NBT still
+	// decodes, so nothing is unparsable, but Pos is no longer three
+	// float32s and not one record can be placed in a region. Every section
+	// of the report renders empty and the job would otherwise exit 0.
+	payload, err := nbt.MarshalEncoding(map[string]any{
+		"identifier": "minecraft:zombie",
+		"Pos":        []any{float64(1), float64(64), float64(2)},
+		"UniqueID":   int64(1),
+	}, nbt.LittleEndian)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	dir := t.TempDir()
+	buildArchiveFromRecord(t, dir, payload)
+
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"-backup-dir", dir}, &out); err == nil {
+		t.Fatal("run returned nil error for a world where no record could be placed")
+	}
+	if out.Len() != 0 {
+		t.Errorf("run wrote %q to stdout, want no report at all", out.String())
+	}
+}
+
+func TestRunRefusesToReportAWorldWhoseRecordsNameNothing(t *testing.T) {
+	// The variant that escapes a placement check entirely: every record
+	// decodes and places, and the report lists entities with a blank
+	// identifier, no graded regions and an exit code of 0.
+	payload, err := nbt.MarshalEncoding(map[string]any{
+		"Pos":      []any{float32(1), float32(64), float32(2)},
+		"UniqueID": int64(1),
+	}, nbt.LittleEndian)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	dir := t.TempDir()
+	buildArchiveFromRecord(t, dir, payload)
+
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"-backup-dir", dir}, &out); err == nil {
+		t.Fatal("run returned nil error for a world where no record named an entity")
+	}
+	if out.Len() != 0 {
+		t.Errorf("run wrote %q to stdout, want no report at all", out.String())
+	}
+}
+
 func TestRunRemovesTheExtractionWhenItIsCancelled(t *testing.T) {
 	// The pod can be terminated part way through a multi-minute extraction,
 	// and what must not survive it is the ~570MB tree on the backup volume.
@@ -3440,6 +3709,57 @@ func TestRunRemovesTheExtractionWhenItIsCancelled(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Errorf("run wrote %q to stdout, want no report at all", out.String())
+	}
+}
+
+// stubSource stands in for the archive source so a test can control what the
+// cleanup it hands back does.
+type stubSource struct {
+	world   census.World
+	cleanup func() error
+}
+
+func (s stubSource) Open(context.Context) (census.World, func() error, error) {
+	return s.world, s.cleanup, nil
+}
+
+func TestReportFromSurfacesACleanupFailureThatCancellationWouldHide(t *testing.T) {
+	// Cancellation is the case the cleanup exists for: the pod is going
+	// away and the ~570MB extraction has to go with it. Reporting the
+	// cleanup failure only when everything else succeeded stayed silent in
+	// exactly the run where it mattered.
+	stage := stageWorld(t, zombieRecord(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var out bytes.Buffer
+	err := reportFrom(ctx, stubSource{
+		world:   census.World{DBPath: worldDB(stage), Kind: "archive", Archive: "fwb-20260913T203100Z.tar.gz"},
+		cleanup: func() error { return errors.New("device or resource busy") },
+	}, census.DefaultReportOptions(), &out)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("reportFrom of a cancelled context returned %v, want it to still wrap context.Canceled", err)
+	}
+	if !strings.Contains(err.Error(), "device or resource busy") {
+		t.Errorf("error hides the cleanup failure: %v", err)
+	}
+	if !strings.Contains(err.Error(), "fwb-20260913T203100Z.tar.gz") {
+		t.Errorf("error does not name the archive left extracted: %v", err)
+	}
+}
+
+func TestReportFromSurfacesACleanupFailureAfterASuccessfulRun(t *testing.T) {
+	stage := stageWorld(t, zombieRecord(t))
+
+	var out bytes.Buffer
+	err := reportFrom(context.Background(), stubSource{
+		world:   census.World{DBPath: worldDB(stage), Kind: "archive", Archive: "fwb-20260913T203100Z.tar.gz"},
+		cleanup: func() error { return errors.New("device or resource busy") },
+	}, census.DefaultReportOptions(), &out)
+
+	if err == nil || !strings.Contains(err.Error(), "device or resource busy") {
+		t.Errorf("reportFrom returned %v, want the cleanup failure", err)
 	}
 }
 ```
@@ -3489,7 +3809,7 @@ func main() {
 // run is the testable body. It writes nothing to stdout unless it produced a
 // whole report: a truncated report is worse than none, because it looks like
 // an answer.
-func run(ctx context.Context, args []string, stdout io.Writer) (err error) {
+func run(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("census", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	backupDir := fs.String("backup-dir", "/backup", "directory holding fwb-<stamp>.tar.gz backup archives")
@@ -3506,7 +3826,13 @@ func run(ctx context.Context, args []string, stdout io.Writer) (err error) {
 		return fmt.Errorf("parse flags: %w", parseErr)
 	}
 
-	source := census.ArchiveSource{Dir: *backupDir}
+	return reportFrom(ctx, census.ArchiveSource{Dir: *backupDir},
+		census.ReportOptions{TopRegions: *topRegions, TopTypes: *topTypes}, stdout)
+}
+
+// reportFrom takes the census from an opened source. Splitting it from flag
+// parsing is what lets a test supply a source whose cleanup fails.
+func reportFrom(ctx context.Context, source census.Source, opts census.ReportOptions, stdout io.Writer) (err error) {
 	world, cleanup, err := source.Open(ctx)
 	if err != nil {
 		return err
@@ -3514,10 +3840,11 @@ func run(ctx context.Context, args []string, stdout io.Writer) (err error) {
 	defer func() {
 		// A silent RemoveAll failure here repeats every scheduled run and
 		// slowly fills the volume with ~570MB extractions, so surface it -
-		// but never let a cleanup failure mask a scan or render error that
-		// already explains why the run failed.
-		if cleanupErr := cleanup(); cleanupErr != nil && err == nil {
-			err = fmt.Errorf("clean up extracted world %s: %w", world.Archive, cleanupErr)
+		// joined to whatever the run already failed with rather than
+		// replacing it, because cancellation is both the likeliest reason
+		// the run failed and the case the cleanup exists for.
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("clean up extracted world %s: %w", world.Archive, cleanupErr))
 		}
 	}()
 
@@ -3526,19 +3853,21 @@ func run(ctx context.Context, args []string, stdout io.Writer) (err error) {
 		return fmt.Errorf("scan archive %s: %w", world.Archive, scanErr)
 	}
 
-	// Every section of a report built from records that would not decode
+	// Every section of a report built from records that yielded no entity
 	// renders empty, and an empty report reads exactly like a quiet world.
 	// Exit non-zero with the counts instead, so the CronJob goes red rather
 	// than publishing a world with no mobs in it.
 	if stats.Unreadable() {
-		return fmt.Errorf("archive %s: %d of %d actor records failed to decode, over the %.0f%% limit; first failure: %s",
-			world.Archive, stats.Unparsable, stats.Records, census.MaxUnparsableRatio*100, stats.FirstUnparsableErr)
+		unusable := fmt.Errorf("archive %s: %d of %d actor records did not decode into a usable entity (%d unparsable, %d unplaced, %d unidentified), over the %.0f%% limit",
+			world.Archive, stats.Unusable(), stats.Records,
+			stats.Unparsable, stats.Unplaced, stats.Unidentified, census.MaxUnusableRatio*100)
+		if stats.FirstUnparsableErr == "" {
+			return unusable
+		}
+		return fmt.Errorf("%w; first decode failure: %s", unusable, stats.FirstUnparsableErr)
 	}
 
-	report := census.Render(
-		census.Aggregate(entities, stats, world.TakenAt, world.Kind),
-		census.ReportOptions{TopRegions: *topRegions, TopTypes: *topTypes},
-	)
+	report := census.Render(census.Aggregate(entities, stats, world.TakenAt, world.Kind), opts)
 	if _, err := io.WriteString(stdout, report); err != nil {
 		return fmt.Errorf("write report: %w", err)
 	}
@@ -3549,10 +3878,14 @@ func run(ctx context.Context, args []string, stdout io.Writer) (err error) {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./cmd/census/ -v`
-Expected: PASS, five tests (the original three - the help-flag and
-cleanup-error-capture behaviour added in review is still exercised by hand -
-plus TestRunRefusesToReportAWorldItCouldNotDecode and
-TestRunRemovesTheExtractionWhenItIsCancelled).
+Expected: PASS, nine tests (the original three - the help-flag behaviour
+added in review is still exercised by hand - plus
+TestRunRefusesToReportAWorldItCouldNotDecode,
+TestRunRefusesToReportAWorldWhosePositionsMoved,
+TestRunRefusesToReportAWorldWhoseRecordsNameNothing,
+TestRunRemovesTheExtractionWhenItIsCancelled,
+TestReportFromSurfacesACleanupFailureThatCancellationWouldHide and
+TestReportFromSurfacesACleanupFailureAfterASuccessfulRun).
 
 - [ ] **Step 5: Run the whole suite and build**
 
