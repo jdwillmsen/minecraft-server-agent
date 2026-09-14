@@ -302,7 +302,7 @@ func TestAnnounceNowSaysSoWhenItCannotSeeWhoHeardIt(t *testing.T) {
 	if strings.Contains(strings.ToLower(reply), "nobody") {
 		t.Errorf("reply %q claims nobody heard it, but it was broadcast to a server the agent cannot see", reply)
 	}
-	if !strings.Contains(strings.ToLower(reply), "can't see who is online") {
+	if !strings.Contains(strings.ToLower(reply), "couldn't account for who heard it") {
 		t.Errorf("reply %q should say the audience could not be counted", reply)
 	}
 }

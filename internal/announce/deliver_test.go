@@ -1283,6 +1283,32 @@ func TestSendNowReportsAStandbysPublishAsQueued(t *testing.T) {
 	}
 }
 
+// Queued is a promise somebody owes. Online-only queues for nobody --
+// PendingFor excludes it -- so a standby reporting one would tell a caller
+// the live agent will deliver a row nothing will ever pick up. The zero is
+// the honest answer: nothing was spoken here, and nothing will be.
+func TestSendNowDoesNotReportAnOnlineOnlyPublishOffTheLeaderAsQueued(t *testing.T) {
+	a := Announcement{Body: "restarting in five", TargetKind: TargetOnlineOnly}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: false}))
+
+	sent, err := d.SendNow(context.Background(), a, 55)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 0 {
+		t.Errorf("Say calls = %v, want none from a process that is in no game", voice.says)
+	}
+	if sent.Queued {
+		t.Errorf("sent = %+v, want it not reported as queued: an online-only row is delivered by nobody", sent)
+	}
+	if !sent.Counted || sent.Players != 0 {
+		t.Errorf("sent = %+v, want a counted zero", sent)
+	}
+}
+
 // The live agent watching an empty server is the zero this one must stay
 // distinct from: nothing queued on anyone else's behalf, and nobody heard it
 // because nobody was there.

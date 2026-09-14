@@ -241,10 +241,13 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 	// in any of those cases is a report of a delivery that did not occur.
 	switch {
 	case !sent.Counted && announce.DeliveryFor(target) == announce.DeliveryBroadcast:
-		// Broadcast while the roster could not say who is here, so it went
-		// out and nobody can be named. Claiming a number would be a count
-		// this agent did not have.
-		return "Announced, but I can't see who is online right now.", nil
+		// The line is in chat and the audience could not be accounted for,
+		// which happens for reasons this reply cannot tell apart -- no
+		// roster to name them, a delivery row that would not write, a loop
+		// the connection cut short. Claiming a number would be a count this
+		// agent did not have, and naming one of the three as the cause would
+		// send the operator after a fault that may not exist.
+		return "Announced, but I couldn't account for who heard it.", nil
 	case !sent.Counted:
 		// A whisper that reached someone and whose record did not survive.
 		// The roster was never in doubt here, so blaming it would be a

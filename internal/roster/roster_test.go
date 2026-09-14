@@ -451,6 +451,33 @@ func TestEndSessionThenSnapshotReportsNobodyAsJoining(t *testing.T) {
 	}
 }
 
+// An add with no XUID carries no identity this Roster can key on, so it is
+// ignored outright -- and an ignored entry cannot be the server's answer to
+// who is here either. Reading one as "told, and the answer is nobody"
+// suppresses a broadcast published in that window, and an online-only one
+// never queues, so it would be gone.
+func TestABlankXUIDOpeningPacketLeavesTheRosterUntold(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+
+	r.Apply([]PlayerListEntry{{UUID: "u-111", Username: "Steve"}})
+
+	if r.Knows() {
+		t.Error("Knows() after a blank-XUID add = true, want false — nothing usable has said who is on the server")
+	}
+	if len(r.Online()) != 0 {
+		t.Errorf("Online() = %+v, want nobody: a blank-XUID add is ignored outright", r.Online())
+	}
+
+	joins, _, present := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
+	if !r.Knows() {
+		t.Error("Knows() after the opening list = false, want true")
+	}
+	if len(joins) != 0 || len(present) != 2 {
+		t.Errorf("joins = %+v, present = %+v; want nobody joining and both present", joins, present)
+	}
+}
+
 // A removal says who left, not who is here. If the first packet of a session
 // carries only one -- a player who quit in that instant -- the roster is as
 // unanswered as it was before, and the server behind it may be full. Reading

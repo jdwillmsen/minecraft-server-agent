@@ -258,11 +258,17 @@ var uncounted = Reach{}
 var queued = Reach{Counted: true, Queued: true}
 
 // nothingSent is what an immediate send that spoke to nobody achieved. On a
-// process that is not the one that speaks it is queued, whatever the target:
-// the row is stored and the live agent owes the delivery, which a caller must
-// be able to tell from the zero a watched, empty server gives.
-func (d *Deliverer) nothingSent() Reach {
-	if !d.live() {
+// process that is not the one that speaks it is queued for any target that
+// queues: the row is stored and the live agent owes the delivery, which a
+// caller must be able to tell from the zero a watched, empty server gives.
+//
+// Online-only is the exception, because nothing will ever pick its row up --
+// PendingFor excludes it by construction. The HTTP API refuses one off the
+// leader before it gets here, but that check is read-then-act and the role
+// can change under it, so the honest answer for a target with no queue
+// behind it is the zero, never a queued promise nobody owes.
+func (d *Deliverer) nothingSent(t Target) Reach {
+	if !d.live() && Queues(t) {
 		return queued
 	}
 	return reached(0)
@@ -292,7 +298,7 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		// role rather than the roster.
 		if !d.live() {
 			d.log.Info("announce_say_skipped_not_live", logging.Fields{"announcement_id": id, "recipients": len(targets)})
-			return d.nothingSent(), nil
+			return d.nothingSent(a.TargetKind), nil
 		}
 		// Said even when the roster names nobody, which is what the live
 		// agent's disconnect gap looks like from here. The console bridge is
@@ -396,7 +402,7 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		// stays pending in the store (if it queues at all) for whoever
 		// joins later. Unlike a broadcast, a whisper needs an XUID to go
 		// to, so there is nothing to send into the gap.
-		return d.nothingSent(), nil
+		return d.nothingSent(a.TargetKind), nil
 	}
 
 	// Whisper: each recipient gets their own Tell, and only a recipient
