@@ -117,8 +117,8 @@ func (s *Server) SetReady(ready bool) {
 	s.ready.Store(ready)
 }
 
-// SetRole records whether this process is the live agent or a standby waiting
-// for the lock.
+// SetRole records which of the three roles this process is in: still
+// starting, a standby waiting for the lock, or the live agent holding it.
 //
 // It also moves mc_agent_leader, rather than leaving that to a second call
 // from the same place: "which pod is live" is read from the metric by alerts

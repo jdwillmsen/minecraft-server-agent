@@ -241,7 +241,7 @@ breaking change.
 | Name | Type | Labels | Recorded |
 |---|---|---|---|
 | `mc_agent_connected` | gauge | none | 1 while a Bedrock session is up |
-| `mc_agent_leader` | gauge | none | 1 while this process is the live agent, 0 while it is a warm standby |
+| `mc_agent_leader` | gauge | none | 1 while this process is the live agent, 0 while it is anything else - a warm standby, or a process still starting |
 | `mc_agent_leader_unlocked` | gauge | none | 1 while this process is the live agent *without* holding the lock |
 | `mc_agent_reconnects_total` | counter | none | per reconnect attempt |
 | `mc_agent_commands_total` | counter | `command`, `outcome` | once per dispatch, beside the audit write |
@@ -467,6 +467,12 @@ re-reports everyone still online and gives them a delivery of their own -
 the same wait, from the connection that found them there - so a backlog is
 never stranded by a reconnect and never whispered twice. They are not
 greeted for it; they did not arrive.
+
+The welcome greeting waits out a delay of its own and belongs to its
+connection the same way. One whose connection ended before it was spoken is
+dropped rather than said into a game this process may no longer be playing
+in - either because the session dropped or because the lock passed to
+another pod, which owns the greetings in that game from then on.
 
 The roster stops holding anyone as present the moment the connection dies
 rather than when the next one opens. Between the two, nobody is being
