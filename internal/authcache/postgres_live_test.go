@@ -21,6 +21,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/oauth2"
@@ -245,5 +246,97 @@ func TestAMissingTableReportsItselfUnavailableNotEmpty(t *testing.T) {
 	err = missing.Save(ctx, &oauth2.Token{AccessToken: "a", RefreshToken: "r"})
 	if !errors.Is(err, mcauth.ErrStoreUnavailable) {
 		t.Fatalf("Save against a missing table = %v, want ErrStoreUnavailable", err)
+	}
+}
+
+// Nothing in the schema stopped an older token replacing a newer one, and two
+// processes writing this row is a designed state rather than a Kubernetes
+// fault: leadership can be forced when the lock holder is gone without having
+// released it. A write that would replace a row this process never read is
+// refused, so the writer can take what is there instead of retiring the
+// credential the other process is playing on.
+func TestSaveRefusesToReplaceARowThisProcessNeverRead(t *testing.T) {
+	ctx := context.Background()
+	pool := livePool(t)
+	account := testAccount(t)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM `+Table+` WHERE account = $1`, account)
+	})
+
+	leader := NewPostgres(pool, account)
+	forced := NewPostgres(pool, account)
+
+	if err := leader.Save(ctx, liveToken("r1")); err != nil {
+		t.Fatalf("leader Save: %v", err)
+	}
+	if _, err := forced.Load(ctx); err != nil {
+		t.Fatalf("forced Load: %v", err)
+	}
+	if err := leader.Save(ctx, liveToken("r2")); err != nil {
+		t.Fatalf("leader rotation: %v", err)
+	}
+
+	if err := forced.Save(ctx, liveToken("r3")); !errors.Is(err, mcauth.ErrStoreConflict) {
+		t.Fatalf("Save over a row written since = %v, want ErrStoreConflict", err)
+	}
+	got, err := leader.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.RefreshToken != "r2" {
+		t.Errorf("the row holds %q, want the newer r2 left alone", got.RefreshToken)
+	}
+
+	// And re-reading is what entitles it to write: the writer reacts rather
+	// than being locked out of its own store.
+	if _, err := forced.Load(ctx); err != nil {
+		t.Fatalf("forced reload: %v", err)
+	}
+	if err := forced.Save(ctx, liveToken("r3")); err != nil {
+		t.Fatalf("Save after re-reading: %v", err)
+	}
+}
+
+// The same guard on the row that is not there yet: a process whose load
+// answered "nothing stored" -- the cold start, and the migration window --
+// must not overwrite a row that appeared since.
+func TestSaveIntoARowAnotherProcessCreatedIsAConflict(t *testing.T) {
+	ctx := context.Background()
+	pool := livePool(t)
+	account := testAccount(t)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM `+Table+` WHERE account = $1`, account)
+	})
+
+	first := NewPostgres(pool, account)
+	second := NewPostgres(pool, account)
+	if _, err := second.Load(ctx); !errors.Is(err, mcauth.ErrNoToken) {
+		t.Fatalf("Load of an empty row = %v, want ErrNoToken", err)
+	}
+
+	if err := first.Save(ctx, liveToken("r1")); err != nil {
+		t.Fatalf("first Save: %v", err)
+	}
+	if err := second.Save(ctx, liveToken("r2")); !errors.Is(err, mcauth.ErrStoreConflict) {
+		t.Fatalf("Save into a row created since = %v, want ErrStoreConflict", err)
+	}
+	got, err := first.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.RefreshToken != "r1" {
+		t.Errorf("the row holds %q, want the first writer's r1", got.RefreshToken)
+	}
+}
+
+// liveToken is a token with the fields this store round-trips and an access
+// half that is still good, since a stored token with no expiry would never be
+// refreshed by either role.
+func liveToken(refresh string) *oauth2.Token {
+	return &oauth2.Token{
+		AccessToken:  "access",
+		RefreshToken: refresh,
+		TokenType:    "Bearer",
+		Expiry:       time.Now().Add(time.Hour),
 	}
 }

@@ -34,6 +34,15 @@ var ErrNoToken = errors.New("mcauth: no cached token")
 // read is a reason to stop and say so.
 var ErrStoreUnavailable = errors.New("mcauth: token store unavailable")
 
+// ErrStoreConflict means the store holds a token this writer never read: a
+// second process wrote the account's row between this one's last read and
+// this write, so the write was refused rather than applied. Last-writer-wins
+// on a rotating credential is how a retired token becomes the only stored
+// one, and two processes writing is a designed state -- leadership can be
+// forced when the lock holder is gone without having released it. A writer
+// that sees this is expected to re-read the store and take what it finds.
+var ErrStoreConflict = errors.New("mcauth: token store changed under this writer")
+
 // ErrSavedToFallback means a Save reached the secondary store because the
 // primary could not take it. The rotation is durable -- which is what the
 // account's login depends on -- but not where the next load prefers to look,
@@ -56,7 +65,10 @@ type Store interface {
 	// Load returns the cached token, ErrNoToken if the store holds none for
 	// this account, or ErrStoreUnavailable if it cannot say either way.
 	Load(ctx context.Context) (*oauth2.Token, error)
-	// Save replaces whatever the store holds for this account.
+	// Save replaces whatever the store holds for this account, or reports
+	// ErrStoreConflict if that is something this store has not read: a
+	// second writer got there first, and overwriting it would retire the
+	// credential the other process is playing on.
 	Save(ctx context.Context, tok *oauth2.Token) error
 }
 

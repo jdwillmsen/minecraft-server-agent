@@ -217,6 +217,14 @@ func (c *cachingTokenSource) Token() (*oauth2.Token, error) {
 			c.note(func() { c.log.Info("auth_token_written_to_fallback", nil) })
 			return tok, nil
 		}
+		if errors.Is(err, ErrStoreConflict) {
+			// Another process wrote the account's row, so it holds the
+			// login this one was rotating. Taking its token back is the
+			// next call's job -- see reload.
+			c.mustReload = true
+			c.note(func() { c.log.Info("auth_token_write_superseded", nil) })
+			return tok, nil
+		}
 		c.note(func() { c.log.Error("auth_token_write_failed", logging.Fields{"error": err.Error()}) })
 		return tok, nil
 	}

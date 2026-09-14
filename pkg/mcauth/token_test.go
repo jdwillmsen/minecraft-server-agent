@@ -768,3 +768,56 @@ func TestCachingTokenSource_ARotationThatOnlyReachedTheFallbackIsWrittenAgain(t 
 		t.Errorf("the primary was written %d times, want 2: a write it never took is not a write", saves)
 	}
 }
+
+// conflictStore rejects the next Save the way a compare-and-swap store does
+// when another process wrote the row first, and answers reads with what that
+// process left there.
+type conflictStore struct {
+	*memStore
+	conflicts int
+}
+
+func (c *conflictStore) Save(ctx context.Context, tok *oauth2.Token) error {
+	if c.conflicts > 0 {
+		c.conflicts--
+		return ErrStoreConflict
+	}
+	return c.memStore.Save(ctx, tok)
+}
+
+// Two live agents at once is a designed state, not a Kubernetes failure:
+// leadership can be forced when the lock holder is gone without having
+// released it. The loser of a write must take the winner's token rather than
+// go on with one the store no longer holds -- and must not record its own as
+// stored.
+func TestCachingTokenSource_AWriteThatLostToAnotherProcessTakesTheWinnersToken(t *testing.T) {
+	ctx := context.Background()
+	backing := &memStore{}
+	backing.seed(t, &oauth2.Token{AccessToken: "winner", RefreshToken: "r2", Expiry: time.Now().Add(time.Hour)})
+	store := &conflictStore{memStore: backing, conflicts: 1}
+
+	cts := &cachingTokenSource{
+		store: store,
+		out:   io.Discard,
+		live:  func() bool { return true },
+		inner: &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "loser", RefreshToken: "r9", Expiry: time.Now().Add(time.Hour)}}},
+	}
+
+	if _, err := cts.Token(); err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	tok, err := cts.Token()
+	if err != nil {
+		t.Fatalf("Token after the lost write: %v", err)
+	}
+	if tok.RefreshToken != "r2" {
+		t.Errorf("answered with %q, want the winner's stored token", tok.RefreshToken)
+	}
+	stored, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if stored.RefreshToken != "r2" {
+		t.Errorf("the row now holds %q, want the winner's token untouched", stored.RefreshToken)
+	}
+}
