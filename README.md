@@ -169,8 +169,13 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   Bedrock connection); `NoopVoice` remains for tests. `!ping` never times
   the bridge call itself - the bridge collects console output for a fixed
   800ms window, so that number would be the same every time
-- `internal/mcauth` - Xbox Live device-code login with on-disk token
-  caching, so a restart doesn't require a fresh interactive login
+- `pkg/mcauth` - Xbox Live device-code login, and the `Store` seam the
+  resulting token is cached behind, so a restart doesn't require a fresh
+  interactive login
+- `internal/authcache` - the Postgres implementation of that seam: one row
+  per account on the pool the agent already holds, so a standby on another
+  node can read the token while the live agent still holds the game - see
+  "Where the token is cached" below
 - `internal/leader` - the lock that makes exactly one process the live
   agent, and the warm standby that waits for it. One Xbox Live account holds
   one connection, so this is what stops two pods taking turns kicking each
@@ -205,7 +210,7 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 | `RECONNECT_MAX_MS` | `300000` | Reconnect backoff ceiling |
 | `AUTH_RETRY_DELAY_MS` | `900000` | Flat wait before retrying after Xbox Live rejects the account itself (e.g. `invalid_grant`), instead of the reconnect ladder above |
 | `HTTP_ADDR` | `:8080` | `/healthz` + `/readyz` + `/metrics` listen address |
-| `AUTH_CACHE_DIR` | `/data/auth` | Where the Xbox Live token is cached, one file per `MC_USERNAME` |
+| `AUTH_CACHE_DIR` | `/data/auth` | File token cache, one file per `MC_USERNAME`. Used on its own when `PG_HOST` is unset, and read-through only when it is - see "Where the token is cached" |
 | `COMMAND_RATE_LIMIT_PER_MINUTE` | `10` | Max `!` commands a single actor (XUID) may trigger per rolling minute |
 | `CONSOLE_BRIDGE_URL` | *(required)* | Base URL of `mc-console-bridge`'s HTTP API |
 | `CONSOLE_BRIDGE_TOKEN` | *(required)* | Bearer token the bridge authenticates every request against |
@@ -841,25 +846,83 @@ not a bare name token, which `mc-console-bridge`'s allowlist deliberately
 keeps whitespace-free and which a gamertag containing a space (Xbox
 gamertags may) couldn't satisfy anyway.
 
+## Where the token is cached
+
+The Xbox Live refresh token outlives the process, so it has to be written
+somewhere. Where is a `mcauth.Store`, chosen at startup:
+
+| `PG_HOST` | Store | Why |
+|---|---|---|
+| unset | the file under `AUTH_CACHE_DIR` | local development; there is no database to use |
+| set | `minecraft.auth_tokens`, falling back to the file for reads | two agent pods coexist during a release and both need the token |
+
+The database is what makes a warm standby possible at all. A file cache lives
+on a `ReadWriteOnce` volume, which one pod at a time may mount: a standby
+scheduled onto another node waits in `ContainerCreating` until the pod it is
+replacing lets the volume go, which is the absence the handover exists to
+remove. A row both pods can read costs no new Kubernetes object - the pool is
+already open for profiles and for the leader lock.
+
+**Only the live agent writes.** Microsoft rotates the refresh token on every
+refresh, so a standby that wrote one back would invalidate the copy the live
+agent is holding the game with. A standby still *refreshes* - paying that
+round trip before the handover is the point of a warm standby - and keeps the
+result to itself until it wins the lock, at which point its first refresh is
+written. `auth_token_written` and `auth_token_write_skipped` in the pod logs
+are how you tell the two roles apart.
+
+The file cache stays behind the database one as a **read-through fallback**,
+and never as a write target: two copies of a rotating token are one too many.
+That gives the move off the volume for free - the row starts empty, the first
+load comes from the file, and the first refresh the live agent persists lands
+in the database. From then on the file is never read again.
+
+The table is migrated by `jdwlabs/platform`'s `jdwillmsen-schemas` service,
+not by the agent:
+
+```sql
+CREATE TABLE minecraft.auth_tokens (
+    account    TEXT PRIMARY KEY,
+    token      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+A file cache was protected by its `0600` mode. A row has no equivalent, and
+the replacement is the **grant**: only the agent's runtime role may select
+from or write to this table. Nothing else in the schema references it, and
+nothing joins to it.
+
+Until that migration and its grant land, the agent reports the store as
+unavailable and falls through to the file, which is why the fallback is not
+removed with the volume.
+
 ## First-run login
 
-The device-code login runs in exactly one case: no cache file exists yet for
-`MC_USERNAME` under `AUTH_CACHE_DIR`. The agent then prints a Microsoft
-device-code login URL and code to stdout - in a container, that means the pod
-logs. Complete the login once; the resulting token is cached under
-`AUTH_CACHE_DIR` (a persistent volume in production) and refreshed
-automatically on subsequent runs.
+The device-code login runs in exactly one case: the store holds no token for
+`MC_USERNAME` yet. The agent then prints a Microsoft device-code login URL
+and code to stdout - in a container, that means the pod logs. Complete the
+login once; the resulting token is written to whichever store was chosen
+above and refreshed automatically on subsequent runs.
+
+With the database store that path no longer needs the volume: a pod started
+with an empty table prints the code, and the completed login is written
+straight to the row. Do it with the deployment scaled to one, so only one pod
+prints a code and only one login answers it.
 
 Any other cache problem is deliberately *not* an interactive re-login, since
 a container would otherwise block on a device code nobody is watching for:
 
-- **Corrupt, unreadable, or refresh-token-less cache file** - startup fails
-  loudly and the process exits non-zero. Recover by deleting the
-  `token-*.json` file for that username under `AUTH_CACHE_DIR` and
+- **Corrupt or refresh-token-less cached token** - startup fails loudly and
+  the process exits non-zero. Recover by deleting the stored token - the row
+  for that account, or the `token-*.json` file under `AUTH_CACHE_DIR` - and
   restarting, which takes the first-run path above.
+- **Store unreachable, or released ahead of its migration** - reported as
+  unavailable, never as empty, so no device code is printed for what is a
+  database problem. Startup fails unless the file fallback can answer.
 - **Expired or revoked refresh token** - surfaces as a dial failure and the
   connect loop retries with backoff indefinitely; no login prompt is ever
-  printed. Recover the same way: delete the cache file and restart.
+  printed. Recover the same way: delete the stored token and restart.
 
 ## Handing over to a standby
 
@@ -1014,8 +1077,10 @@ connection under the same probe a lock held from the start gets.
 **What the chart still has to do.** The agent side of this is only half the
 fix, and the heartbeat above is what makes the other half safe: with
 `Recreate`, two agent pods never coexist and nothing can reach the bound, while
-a rolling update makes coexisting pods the normal case. Until the Helm chart
-moves from `Recreate` to `RollingUpdate` with
+a rolling update makes coexisting pods the normal case. The token cache no
+longer stands in the way of that - see "Where the token is cached" - so what
+is left is the chart itself and the token volume it can now drop. Until the
+Helm chart moves from `Recreate` to `RollingUpdate` with
 `maxSurge: 1` and `maxUnavailable: 0`, the old pod is still stopped before
 the new one starts and there is never a standby to hand over to - so the
 lock is always free when the new pod asks for it, and a release costs what it

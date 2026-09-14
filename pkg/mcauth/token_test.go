@@ -3,150 +3,28 @@ package mcauth
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
-	"os"
-	"path/filepath"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
-	"time"
 
 	"golang.org/x/oauth2"
 )
 
-func TestSaveAndLoadToken_RoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "token.json")
-
-	want := &oauth2.Token{
-		AccessToken:  "access",
-		RefreshToken: "refresh",
-		Expiry:       time.Now().Add(time.Hour).Truncate(time.Second),
-	}
-	if err := saveToken(path, want); err != nil {
-		t.Fatalf("saveToken: %v", err)
-	}
-
-	got, err := loadToken(path)
-	if err != nil {
-		t.Fatalf("loadToken: %v", err)
-	}
-	if got.AccessToken != want.AccessToken || got.RefreshToken != want.RefreshToken {
-		t.Errorf("got %+v, want %+v", got, want)
-	}
-}
-
-func TestLoadToken_MissingFile(t *testing.T) {
-	dir := t.TempDir()
-	_, err := loadToken(filepath.Join(dir, "does-not-exist.json"))
-	if err == nil {
-		t.Fatal("expected an error for a missing token file")
-	}
-}
-
-func TestLoadToken_MissingRefreshTokenRejected(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "token.json")
-	if err := saveToken(path, &oauth2.Token{AccessToken: "access-only"}); err != nil {
-		t.Fatalf("saveToken: %v", err)
-	}
-
-	if _, err := loadToken(path); err == nil {
-		t.Fatal("expected an error for a token with no refresh token")
-	}
-}
-
 type stubTokenSource struct {
+	mu     sync.Mutex
 	tokens []*oauth2.Token
 	calls  int
 }
 
 func (s *stubTokenSource) Token() (*oauth2.Token, error) {
-	tok := s.tokens[s.calls]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// The last token repeats once the script runs out, which is what a real
+	// source does between refreshes: the same token until it expires.
+	tok := s.tokens[min(s.calls, len(s.tokens)-1)]
 	s.calls++
 	return tok, nil
-}
-
-func TestCachingTokenSource_PersistsEachRefresh(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "token.json")
-
-	stub := &stubTokenSource{tokens: []*oauth2.Token{
-		{AccessToken: "first", RefreshToken: "r1"},
-		{AccessToken: "second", RefreshToken: "r2"},
-	}}
-	cts := &cachingTokenSource{path: path, inner: stub}
-
-	if _, err := cts.Token(); err != nil {
-		t.Fatalf("Token: %v", err)
-	}
-	got, err := loadToken(path)
-	if err != nil {
-		t.Fatalf("loadToken after first call: %v", err)
-	}
-	if got.AccessToken != "first" {
-		t.Errorf("AccessToken = %q, want first", got.AccessToken)
-	}
-
-	if _, err := cts.Token(); err != nil {
-		t.Fatalf("Token: %v", err)
-	}
-	got, err = loadToken(path)
-	if err != nil {
-		t.Fatalf("loadToken after second call: %v", err)
-	}
-	if got.AccessToken != "second" {
-		t.Errorf("AccessToken = %q, want second after refresh", got.AccessToken)
-	}
-}
-
-func TestTokenFileName_IsDistinctPerUsername(t *testing.T) {
-	a, err := tokenFileName("AgentOne")
-	if err != nil {
-		t.Fatalf("tokenFileName: %v", err)
-	}
-	b, err := tokenFileName("AgentTwo")
-	if err != nil {
-		t.Fatalf("tokenFileName: %v", err)
-	}
-	if a == b {
-		t.Errorf("two usernames share cache file %q", a)
-	}
-}
-
-func TestTokenFileName_SlugCollisionsStayDistinct(t *testing.T) {
-	a, err := tokenFileName("agent.one")
-	if err != nil {
-		t.Fatalf("tokenFileName: %v", err)
-	}
-	b, err := tokenFileName("agent/one")
-	if err != nil {
-		t.Fatalf("tokenFileName: %v", err)
-	}
-	if a == b {
-		t.Errorf("usernames that slug identically share cache file %q", a)
-	}
-}
-
-func TestTokenFileName_StaysInsideCacheDir(t *testing.T) {
-	dir := t.TempDir()
-	for _, hostile := range []string{"../../etc/hosts", "a/b/c", `..\..\win`, strings.Repeat("x", 200)} {
-		name, err := tokenFileName(hostile)
-		if err != nil {
-			t.Fatalf("tokenFileName(%q): %v", hostile, err)
-		}
-		path := filepath.Join(dir, name)
-		if filepath.Dir(path) != dir {
-			t.Errorf("tokenFileName(%q) = %q escapes cache dir: %q", hostile, name, path)
-		}
-	}
-}
-
-func TestTokenFileName_RejectsBlankUsername(t *testing.T) {
-	if _, err := tokenFileName("   "); err == nil {
-		t.Fatal("expected an error for a blank username")
-	}
 }
 
 // withStubLogin swaps requestLiveToken for the duration of a test and
@@ -159,26 +37,22 @@ func withStubLogin(t *testing.T, stub func(ctx context.Context, out io.Writer) (
 	t.Cleanup(func() { requestLiveToken = orig })
 }
 
-func TestTokenSource_MissingCacheFileTriggersLogin(t *testing.T) {
-	dir := t.TempDir()
+func TestTokenSource_ColdStartWithNothingCachedLogsIn(t *testing.T) {
+	store := &memStore{}
 	loginCalls := 0
 	withStubLogin(t, func(ctx context.Context, out io.Writer) (*oauth2.Token, error) {
 		loginCalls++
 		return &oauth2.Token{AccessToken: "fresh", RefreshToken: "fresh-refresh"}, nil
 	})
 
-	if _, err := TokenSource(context.Background(), dir, "agent-one", io.Discard); err != nil {
+	if _, err := TokenSource(context.Background(), store, io.Discard); err != nil {
 		t.Fatalf("TokenSource: %v", err)
 	}
 	if loginCalls != 1 {
-		t.Errorf("login called %d times, want 1 for a missing cache file", loginCalls)
+		t.Errorf("login called %d times, want 1 for an empty store", loginCalls)
 	}
 
-	name, err := tokenFileName("agent-one")
-	if err != nil {
-		t.Fatal(err)
-	}
-	saved, err := loadToken(filepath.Join(dir, name))
+	saved, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("the token the login returned was not persisted: %v", err)
 	}
@@ -187,154 +61,289 @@ func TestTokenSource_MissingCacheFileTriggersLogin(t *testing.T) {
 	}
 }
 
-func TestTokenSource_CorruptCacheFileIsAHardErrorNotALoginPrompt(t *testing.T) {
-	dir := t.TempDir()
-	name, err := tokenFileName("agent-one")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, name), []byte("not json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+func TestTokenSource_CorruptCacheIsAHardErrorNotALoginPrompt(t *testing.T) {
+	store := &memStore{failLoad: errors.New("cached token is not valid JSON")}
 
 	loginCalls := 0
 	withStubLogin(t, func(ctx context.Context, out io.Writer) (*oauth2.Token, error) {
 		loginCalls++
-		t.Error("interactive login must not be attempted for a corrupt cache file")
+		t.Error("interactive login must not be attempted for a corrupt cache")
 		return nil, errors.New("should not be reached")
 	})
 
-	if _, err := TokenSource(context.Background(), dir, "agent-one", io.Discard); err == nil {
-		t.Fatal("expected TokenSource to fail hard on a corrupt cache file")
+	if _, err := TokenSource(context.Background(), store, io.Discard); err == nil {
+		t.Fatal("expected TokenSource to fail hard on a corrupt cache")
 	}
 	if loginCalls != 0 {
 		t.Errorf("login called %d times, want 0", loginCalls)
 	}
 }
 
-func TestTokenSource_MissingRefreshTokenIsAHardErrorNotALoginPrompt(t *testing.T) {
-	dir := t.TempDir()
-	name, err := tokenFileName("agent-one")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := saveToken(filepath.Join(dir, name), &oauth2.Token{AccessToken: "access-only"}); err != nil {
-		t.Fatal(err)
-	}
+// A store that cannot be reached is the state a pod is in when it has been
+// released ahead of the migration that gives it its table, and it is the one
+// most worth getting right: a device code printed into a pod log that nobody
+// is watching blocks the agent for as long as the code lasts, on a database
+// problem that would have cleared itself.
+func TestTokenSource_UnavailableStoreIsAHardErrorNotALoginPrompt(t *testing.T) {
+	store := &memStore{failLoad: ErrStoreUnavailable}
 
 	withStubLogin(t, func(ctx context.Context, out io.Writer) (*oauth2.Token, error) {
-		t.Error("interactive login must not be attempted when the cache file lacks a refresh token")
+		t.Error("interactive login must not be attempted when the store cannot be read")
 		return nil, errors.New("should not be reached")
 	})
 
-	if _, err := TokenSource(context.Background(), dir, "agent-one", io.Discard); err == nil {
-		t.Fatal("expected TokenSource to fail hard rather than prompt a login")
+	_, err := TokenSource(context.Background(), store, io.Discard)
+	if err == nil {
+		t.Fatal("expected TokenSource to fail hard on an unavailable store")
+	}
+	if !errors.Is(err, ErrStoreUnavailable) {
+		t.Errorf("error = %v, want it to carry ErrStoreUnavailable", err)
 	}
 }
 
-func TestSaveToken_IsAtomic_NoTempFileLeftOnSuccess(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "token.json")
-
-	if err := saveToken(path, &oauth2.Token{AccessToken: "a", RefreshToken: "r"}); err != nil {
-		t.Fatalf("saveToken: %v", err)
+func TestTokenSource_RejectsANilStore(t *testing.T) {
+	if _, err := TokenSource(context.Background(), nil, io.Discard); err == nil {
+		t.Fatal("expected an error for a nil store")
 	}
-	entries, err := os.ReadDir(dir)
+}
+
+func TestCachingTokenSource_PersistsEachRefresh(t *testing.T) {
+	ctx := context.Background()
+	store := &memStore{}
+	store.seed(t, &oauth2.Token{AccessToken: "first", RefreshToken: "r1"})
+
+	cts := &cachingTokenSource{
+		store:   store,
+		allowed: func() bool { return true },
+		inner: &stubTokenSource{tokens: []*oauth2.Token{
+			{AccessToken: "first", RefreshToken: "r1"},
+			{AccessToken: "second", RefreshToken: "r2"},
+		}},
+	}
+
+	if _, err := cts.Token(); err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	got, err := store.Load(ctx)
 	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
+		t.Fatalf("Load after first call: %v", err)
 	}
-	if len(entries) != 1 || entries[0].Name() != "token.json" {
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		t.Errorf("cache dir after a successful save = %v, want only [token.json]", names)
+	if got.AccessToken != "first" {
+		t.Errorf("AccessToken = %q, want first", got.AccessToken)
 	}
-	got, err := loadToken(path)
-	if err != nil || got.AccessToken != "a" {
-		t.Errorf("loadToken after save = (%+v, %v), want AccessToken=a, nil", got, err)
+
+	if _, err := cts.Token(); err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	got, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after second call: %v", err)
+	}
+	if got.AccessToken != "second" {
+		t.Errorf("AccessToken = %q, want second after refresh", got.AccessToken)
 	}
 }
 
-func TestSaveToken_ConcurrentSaversNeverExposeAPartialFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "token.json")
-
-	if err := saveToken(path, &oauth2.Token{AccessToken: "seed", RefreshToken: "r"}); err != nil {
-		t.Fatalf("seed saveToken: %v", err)
+func TestCachingTokenSource_UnchangedTokenIsNotRewritten(t *testing.T) {
+	store := &memStore{}
+	cts := &cachingTokenSource{
+		store:   store,
+		allowed: func() bool { return true },
+		inner:   &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "a", RefreshToken: "r1"}}},
 	}
 
-	const savers = 4
-	const savesEach = 10
-
-	stop := make(chan struct{})
-	readErrCh := make(chan error, 1)
-	readerDone := make(chan struct{})
-	go func() {
-		defer close(readerDone)
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			if _, err := loadToken(path); err != nil {
-				readErrCh <- err
-				return
-			}
+	for i := 0; i < 5; i++ {
+		if _, err := cts.Token(); err != nil {
+			t.Fatalf("Token: %v", err)
 		}
-	}()
+	}
+	if _, saves := store.counts(); saves != 1 {
+		t.Errorf("saves = %d, want 1: a token that has not rotated is not news", saves)
+	}
+}
+
+// The invariant the warm standby rests on: two processes hold the same
+// account's token, and only the live one may rotate what is stored.
+func TestCachingTokenSource_StandbyRefreshesWithoutWriting(t *testing.T) {
+	ctx := context.Background()
+	store := &memStore{}
+	store.seed(t, &oauth2.Token{AccessToken: "live-token", RefreshToken: "r1"})
+
+	standby := &cachingTokenSource{
+		store:   store,
+		allowed: func() bool { return false },
+		inner:   &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "standby-refreshed", RefreshToken: "r2"}}},
+	}
+
+	tok, err := standby.Token()
+	if err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if tok.AccessToken != "standby-refreshed" {
+		t.Errorf("a standby got %q, want its own refreshed token", tok.AccessToken)
+	}
+	if _, saves := store.counts(); saves != 0 {
+		t.Errorf("standby wrote %d times, want 0", saves)
+	}
+	stored, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if stored.RefreshToken != "r1" {
+		t.Errorf("stored RefreshToken = %q, want the live agent's r1 left untouched", stored.RefreshToken)
+	}
+}
+
+// A standby that refreshed while it waited holds a token nothing has
+// recorded. Going live has to write it, or a restart would fall back to a
+// refresh token Microsoft has already rotated away from.
+func TestCachingTokenSource_StandbyWritesWhatItRefreshedOnceItGoesLive(t *testing.T) {
+	ctx := context.Background()
+	store := &memStore{}
+	store.seed(t, &oauth2.Token{AccessToken: "old", RefreshToken: "r1"})
+
+	var live atomic.Bool
+	cts := &cachingTokenSource{
+		store:   store,
+		allowed: live.Load,
+		inner:   &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "refreshed", RefreshToken: "r2"}}},
+	}
+
+	if _, err := cts.Token(); err != nil {
+		t.Fatalf("Token as standby: %v", err)
+	}
+	if _, saves := store.counts(); saves != 0 {
+		t.Fatalf("standby wrote %d times, want 0", saves)
+	}
+
+	live.Store(true)
+	if _, err := cts.Token(); err != nil {
+		t.Fatalf("Token as leader: %v", err)
+	}
+	stored, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if stored.RefreshToken != "r2" {
+		t.Errorf("stored RefreshToken = %q, want r2 flushed on going live", stored.RefreshToken)
+	}
+}
+
+// Both roles against one store at once, which is what a rolling release
+// actually looks like. The assertion is not just that nothing races: it is
+// that the stored token is only ever one the live agent put there.
+func TestCachingTokenSource_LiveAndStandbyShareOneStoreConcurrently(t *testing.T) {
+	ctx := context.Background()
+	store := &memStore{}
+	store.seed(t, &oauth2.Token{AccessToken: "seed", RefreshToken: "live-0"})
+
+	liveTokens := make([]*oauth2.Token, 50)
+	for i := range liveTokens {
+		liveTokens[i] = &oauth2.Token{AccessToken: "live", RefreshToken: "live-" + string(rune('a'+i%26))}
+	}
+	standbyTokens := make([]*oauth2.Token, 50)
+	for i := range standbyTokens {
+		standbyTokens[i] = &oauth2.Token{AccessToken: "standby", RefreshToken: "standby-only"}
+	}
+
+	liveAgent := &cachingTokenSource{
+		store:   store,
+		allowed: func() bool { return true },
+		inner:   &stubTokenSource{tokens: liveTokens},
+	}
+	standby := &cachingTokenSource{
+		store:   store,
+		allowed: func() bool { return false },
+		inner:   &stubTokenSource{tokens: standbyTokens},
+	}
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, savers)
-	for i := 0; i < savers; i++ {
-		wg.Add(1)
-		go func(i int) {
+	errCh := make(chan error, 2*len(liveTokens))
+	for i := 0; i < len(liveTokens); i++ {
+		wg.Add(2)
+		go func() {
 			defer wg.Done()
-			for j := 0; j < savesEach; j++ {
-				tok := &oauth2.Token{AccessToken: fmt.Sprintf("a-%d-%d", i, j), RefreshToken: "r"}
-				if err := saveToken(path, tok); err != nil {
-					errCh <- err
-					return
-				}
+			if _, err := liveAgent.Token(); err != nil {
+				errCh <- err
 			}
-		}(i)
+		}()
+		go func() {
+			defer wg.Done()
+			tok, err := standby.Token()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			// The standby's whole reason to exist: it holds a usable token
+			// of its own the entire time, without a volume and without
+			// touching the live agent's.
+			if tok.AccessToken != "standby" {
+				errCh <- errors.New("standby did not get its own token")
+			}
+		}()
 	}
 	wg.Wait()
-	close(stop)
-	<-readerDone
 	close(errCh)
-
 	for err := range errCh {
-		t.Fatalf("saveToken during concurrent saves: %v", err)
-	}
-	select {
-	case err := <-readErrCh:
-		t.Fatalf("loadToken saw a partially-written file during concurrent saves: %v", err)
-	default:
+		t.Errorf("concurrent Token() call: %v", err)
 	}
 
-	entries, err := os.ReadDir(dir)
+	stored, err := store.Load(ctx)
 	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
-	if len(entries) != 1 {
-		t.Errorf("cache dir holds %d entries after concurrent saves, want only token.json", len(entries))
+	if stored.RefreshToken == "standby-only" {
+		t.Error("the standby's refresh token reached the store")
+	}
+	if stored.AccessToken != "live" {
+		t.Errorf("stored AccessToken = %q, want the live agent's", stored.AccessToken)
+	}
+}
+
+// A store that has gone away costs the next restart a re-authentication. It
+// must not cost this process its connection, which is the one thing keeping
+// the agent in the game.
+func TestCachingTokenSource_SaveFailureDoesNotFailTheCall(t *testing.T) {
+	store := &memStore{failSave: ErrStoreUnavailable}
+	cts := &cachingTokenSource{
+		store:   store,
+		allowed: func() bool { return true },
+		inner:   &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "a", RefreshToken: "r1"}}},
+	}
+
+	tok, err := cts.Token()
+	if err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if tok.AccessToken != "a" {
+		t.Errorf("AccessToken = %q, want a", tok.AccessToken)
+	}
+
+	// And the failure is not remembered as a success: the next call tries
+	// again rather than assuming the store holds what it does not.
+	if _, err := cts.Token(); err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if _, saves := store.counts(); saves != 2 {
+		t.Errorf("saves = %d, want 2 attempts", saves)
 	}
 }
 
 func TestCachingTokenSource_TokenIsSafeForConcurrentUse(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "token.json")
-	stub := &stubTokenSource{tokens: make([]*oauth2.Token, 50)}
-	for i := range stub.tokens {
-		stub.tokens[i] = &oauth2.Token{AccessToken: "tok", RefreshToken: "refresh"}
+	store := &memStore{}
+	tokens := make([]*oauth2.Token, 50)
+	for i := range tokens {
+		tokens[i] = &oauth2.Token{AccessToken: "tok", RefreshToken: "refresh"}
 	}
-	cts := &cachingTokenSource{path: path, inner: stub}
+	cts := &cachingTokenSource{
+		store:   store,
+		allowed: func() bool { return true },
+		inner:   &stubTokenSource{tokens: tokens},
+	}
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, len(stub.tokens))
-	for range stub.tokens {
+	errCh := make(chan error, len(tokens))
+	for range tokens {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -347,31 +356,5 @@ func TestCachingTokenSource_TokenIsSafeForConcurrentUse(t *testing.T) {
 	close(errCh)
 	for err := range errCh {
 		t.Errorf("concurrent Token() call failed: %v", err)
-	}
-}
-
-func TestTokenSource_UsesPerUsernameCacheFile(t *testing.T) {
-	dir := t.TempDir()
-	name, err := tokenFileName("agent-one")
-	if err != nil {
-		t.Fatalf("tokenFileName: %v", err)
-	}
-	if err := saveToken(filepath.Join(dir, name), &oauth2.Token{AccessToken: "a", RefreshToken: "r"}); err != nil {
-		t.Fatalf("saveToken: %v", err)
-	}
-
-	// A cached token for agent-one must not be picked up for agent-two;
-	// without a real login available here, the proof is that the second
-	// account's cache file simply doesn't exist yet.
-	other, err := tokenFileName("agent-two")
-	if err != nil {
-		t.Fatalf("tokenFileName: %v", err)
-	}
-	if _, err := loadToken(filepath.Join(dir, other)); err == nil {
-		t.Error("agent-two loaded a token cached for agent-one")
-	}
-
-	if _, err := loadToken(filepath.Join(dir, name)); err != nil {
-		t.Errorf("agent-one could not load its own cached token: %v", err)
 	}
 }
