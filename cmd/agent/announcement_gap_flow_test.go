@@ -291,8 +291,7 @@ func TestAProcessThatHasNotTakenTheLockDoesNotBroadcast(t *testing.T) {
 		newDeliveryAudience(playerRoster, siblingBotXUIDs()),
 		announcePermissions{resolver: fakePermResolver(t, nil)}, logging.New("info"),
 		announce.WithFreshJoinGrace(joins, freshJoinGrace),
-		announce.WithLeadership(srv),
-		announce.WithSession(joins))
+		announce.WithLeadership(srv))
 
 	a := announce.Announcement{ID: 1, Body: "server restarting in 5 minutes", TargetKind: announce.TargetOnlineOnly}
 	if _, err := d.SendNow(context.Background(), a, a.ID); err != nil {
@@ -319,5 +318,60 @@ func TestAProcessThatHasNotTakenTheLockDoesNotBroadcast(t *testing.T) {
 	}
 	if lines := voice.spoken(); len(lines) != 1 {
 		t.Errorf("lines = %+v, want exactly one once this process holds the lock", lines)
+	}
+}
+
+// broadcastNow publishes an everyone-targeted announcement through the
+// deliverer, the way a schedule or the HTTP API does, and reports whether the
+// server was spoken to.
+func (g *connectionGap) broadcastNow(t *testing.T, body string) bool {
+	t.Helper()
+	before := len(g.voice.spoken())
+	a := announce.Announcement{ID: 99, Body: body, TargetKind: announce.TargetOnlineOnly}
+	if _, err := g.drainer.SendNow(context.Background(), a, a.ID); err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	return len(g.voice.spoken()) > before
+}
+
+// TestABlindBroadcastTellsNotKnownApartFromNobody walks the three states an
+// empty roster can mean, which the deliverer must not treat alike. Two of
+// them are "who is here is not known", where the console bridge is a separate
+// process that still reaches the server and an online-only announcement has
+// no second chance; the third is a roster that has been told who is here and
+// names nobody, where the message would be a console line no player could
+// hear.
+//
+// This test fails if the not-known states are read from the connection alone.
+// The agent is connected the instant it begins watching, a full packet before
+// its first roster arrives, so a publish landing there would be suppressed as
+// an idle server while the world may be full.
+func TestABlindBroadcastTellsNotKnownApartFromNobody(t *testing.T) {
+	at := time.Date(2026, 9, 13, 9, 0, 0, 0, time.UTC)
+	g := newConnectionGap(t, at)
+
+	g.arrive(t, "LightKing0221")
+	g.clock.advance(freshJoinGrace + time.Minute)
+	connectionEnded(g.roster, g.joins)
+
+	if !g.broadcastNow(t, "one: the gap between connections") {
+		t.Error("silent in the gap — an online-only announcement has no second chance")
+	}
+
+	// Connected, watching, and not yet told: BeginSession has emptied the
+	// roster and the opening PlayerList has not arrived.
+	g.beginWatching()
+	if !g.broadcastNow(t, "two: connected, before the first roster packet") {
+		t.Error("silent before the opening roster arrived — the server may be full and the agent simply not told yet")
+	}
+
+	// Told, and the only name on it is the agent's own, which the audience
+	// filters out: genuinely nobody to hear it.
+	g.apply(t, addEntry(selfXUID, "ServerAgent"))
+	if online := g.audience.Online(); len(online) != 0 {
+		t.Fatalf("audience = %v, want nobody — this case proves nothing if someone is on", online)
+	}
+	if g.broadcastNow(t, "three: watching an empty server") {
+		t.Error("spoke to an empty server the agent is watching — the roster is right, there is nobody there")
 	}
 }

@@ -89,11 +89,29 @@ func (v *fakeVoice) Say(_ context.Context, message string) error {
 }
 
 // fakeRoster reports a fixed set of online XUIDs.
-type fakeRoster struct{ online []string }
+//
+// knows is false by default, which is the state a roster is in whenever it
+// cannot say who is here: between connections, and after one opens until its
+// first roster packet. Tests about a server the agent is watching set it.
+type fakeRoster struct {
+	online []string
+	knows  bool
+}
 
 var _ Roster = fakeRoster{}
 
 func (r fakeRoster) Online() []string { return r.online }
+
+func (r fakeRoster) IsOnline(xuid string) bool {
+	for _, x := range r.online {
+		if x == xuid {
+			return true
+		}
+	}
+	return false
+}
+
+func (r fakeRoster) Knows() bool { return r.knows }
 
 // fakePermissions resolves each xuid to whatever level the test wired in,
 // defaulting to "" for an xuid it wasn't told about.
@@ -950,33 +968,19 @@ func TestSendNowWhispersOnAStandbyIsAlreadyNothing(t *testing.T) {
 	}
 }
 
-// fadingRoster answers with online until it has been read once, then with
-// nobody: a player who quits between the roster naming them and their turn
-// in a send loop.
-type fadingRoster struct {
-	mu     sync.Mutex
-	online []string
-	reads  int
+// partedRoster names everyone a send was aimed at while reporting only some
+// of them as still online: a player who quit between the roster naming them
+// and their turn in the send loop that follows.
+type partedRoster struct {
+	named []string
+	still map[string]bool
 }
 
-var _ Roster = (*fadingRoster)(nil)
+var _ Roster = partedRoster{}
 
-func (r *fadingRoster) Online() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.reads++
-	if r.reads > 1 {
-		return nil
-	}
-	return r.online
-}
-
-// fakeSession is a Session whose answer the test fixes.
-type fakeSession struct{ connected bool }
-
-var _ Session = fakeSession{}
-
-func (s fakeSession) Connected() bool { return s.connected }
+func (r partedRoster) Online() []string          { return r.named }
+func (r partedRoster) IsOnline(xuid string) bool { return r.still[xuid] }
+func (r partedRoster) Knows() bool               { return true }
 
 // A drain is scheduled by an arrival and fires seconds later. A player who
 // quits inside that wait is gone, but the console accepts a tellraw that
@@ -1035,7 +1039,7 @@ func TestSendNowSkipsAWhisperRecipientWhoLeftMidLoop(t *testing.T) {
 	store := &fakeStore{enabled: true}
 	voice := &fakeVoice{}
 	d := NewDeliverer(store, voice,
-		&fadingRoster{online: []string{"op-1", "op-2"}},
+		partedRoster{named: []string{"op-1", "op-2"}, still: map[string]bool{"op-1": true}},
 		fakePermissions{levels: map[string]string{"op-1": "operator", "op-2": "operator"}},
 		testLogger())
 
@@ -1043,21 +1047,23 @@ func TestSendNowSkipsAWhisperRecipientWhoLeftMidLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendNow: %v", err)
 	}
-	if sent != 0 || len(voice.tells) != 0 || len(store.delivered) != 0 {
-		t.Errorf("sent = %d, tells = %v, rows = %v; want nothing sent or recorded once the roster no longer names them", sent, voice.tells, store.delivered)
+	if sent != 1 || len(voice.tells) != 1 || voice.tells[0].xuid != "op-1" {
+		t.Errorf("sent = %d, tells = %v; want just op-1, who was still there", sent, voice.tells)
+	}
+	if len(store.delivered) != 1 || store.delivered[0].xuid != "op-1" {
+		t.Errorf("rows = %v, want one for op-1 — op-2 left, so what they are owed must survive", store.delivered)
 	}
 }
 
 func TestSendNowStaysSilentOnAnIdleConnectedServer(t *testing.T) {
-	// Connected with nobody online is not a gap: the roster is right, there
-	// is genuinely nobody to hear it, and a console line sent anyway is
-	// noise counted as a broadcast.
+	// A roster that has been told who is here and names nobody is right:
+	// there is genuinely nobody to hear it, and a console line sent anyway
+	// is noise counted as a broadcast.
 	a := Announcement{Body: "server restarting in 5 minutes", TargetKind: TargetOnlineOnly}
 	store := &fakeStore{enabled: true}
 	voice := &fakeVoice{}
-	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger(),
-		WithLeadership(fakeLeadership{live: true}),
-		WithSession(fakeSession{connected: true}))
+	d := NewDeliverer(store, voice, fakeRoster{knows: true}, fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: true}))
 
 	sent, err := d.SendNow(context.Background(), a, 22)
 	if err != nil {
@@ -1072,15 +1078,15 @@ func TestSendNowStaysSilentOnAnIdleConnectedServer(t *testing.T) {
 }
 
 func TestSendNowBroadcastsWhenTheSameRosterMeansAGap(t *testing.T) {
-	// The identical empty roster, from a leader whose connection is down:
-	// the console bridge is a separate process and still reaches whoever is
-	// on the server, and online-only never queues, so this is its one chance.
+	// The identical empty roster, from a leader whose roster has not been
+	// told who is here: the console bridge is a separate process and still
+	// reaches whoever is on the server, and online-only never queues, so
+	// this is its one chance.
 	a := Announcement{Body: "server restarting in 5 minutes", TargetKind: TargetOnlineOnly}
 	store := &fakeStore{enabled: true}
 	voice := &fakeVoice{}
 	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger(),
-		WithLeadership(fakeLeadership{live: true}),
-		WithSession(fakeSession{connected: false}))
+		WithLeadership(fakeLeadership{live: true}))
 
 	if _, err := d.SendNow(context.Background(), a, 23); err != nil {
 		t.Fatalf("SendNow: %v", err)

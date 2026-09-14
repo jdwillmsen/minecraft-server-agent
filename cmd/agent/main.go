@@ -198,11 +198,8 @@ func main() {
 		announce.WithFreshJoinGrace(joins, freshJoinGrace),
 		// A publish can reach any replica, because the announcement API is
 		// mounted for the process; only the one holding the lock is playing
-		// on the server a broadcast would be heard on, and only while it is
-		// between connections is its empty roster a gap rather than an idle
-		// server.
+		// on the server a broadcast would be heard on.
 		announce.WithLeadership(httpServer),
-		announce.WithSession(joins),
 	)
 	// Wrapped only now: the stores above type-assert the concrete Postgres
 	// to borrow its pool, which the wrapper would hide from them.
@@ -435,8 +432,8 @@ func sampleOnce(ctx context.Context, pinger *adapters.ServerPinger, link func() 
 // A function rather than two statements inline so the gap is a state a test
 // can reach the way runConnectLoop reaches it.
 func connectionEnded(playerRoster *roster.Roster, joinClock *joinTimes) {
-	joinClock.disconnected()
 	playerRoster.EndSession()
+	joinClock.disconnected()
 }
 
 // runConnectLoop owns the reconnect/backoff policy. Each iteration runs one

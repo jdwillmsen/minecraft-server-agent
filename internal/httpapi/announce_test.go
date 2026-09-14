@@ -54,6 +54,9 @@ func mounted(t *testing.T, token string, pub *fakePublisher, players fakePlayers
 		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { srv.ln.Close() })
+	// The live agent: what every case below is about. A process that is not
+	// has its own test.
+	srv.SetRole(RoleLive)
 	srv.MountAnnouncements(token, pub, players, logging.New("error"))
 	return srv
 }
@@ -292,5 +295,69 @@ func TestAnnouncementsReportTheStoreState(t *testing.T) {
 				t.Errorf("status = %d, want %d (%s)", rec.Code, tc.want, rec.Body)
 			}
 		})
+	}
+}
+
+// This route is mounted for the whole process and a standby answers /readyz,
+// so it sits in the Service endpoints like any other pod -- a publish has a
+// real chance of landing on one every time. It is in no game, so it must not
+// accept the request: an online-only announcement never queues, so a row
+// stored here would be picked up by nothing and spoken to nobody while the
+// caller was told it was created.
+func TestAPublishIsRefusedByAProcessThatIsNotTheLiveAgent(t *testing.T) {
+	for _, role := range []struct {
+		name string
+		role Role
+	}{
+		{"starting", RoleStarting},
+		{"standby", RoleStandby},
+	} {
+		t.Run(role.name, func(t *testing.T) {
+			pub := &fakePublisher{}
+			srv := mounted(t, testToken, pub, fakePlayers{})
+			srv.SetRole(role.role)
+
+			rec := post(srv, "Bearer "+testToken, okBody)
+
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("status = %d, want 503 so the caller retries and reaches the live agent", rec.Code)
+			}
+			if len(pub.got) != 0 {
+				t.Errorf("published %+v, want nothing stored by a process that cannot deliver it", pub.got)
+			}
+			if !strings.Contains(rec.Body.String(), "not the live agent") {
+				t.Errorf("body = %q, want it to say why", rec.Body.String())
+			}
+		})
+	}
+}
+
+// The same request on the process that is playing is served as before.
+func TestAPublishIsServedByTheLiveAgent(t *testing.T) {
+	pub := &fakePublisher{reached: 3}
+	srv := mounted(t, testToken, pub, fakePlayers{})
+
+	rec := post(srv, "Bearer "+testToken, okBody)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", rec.Code)
+	}
+	if len(pub.got) != 1 {
+		t.Errorf("published %+v, want exactly one announcement", pub.got)
+	}
+}
+
+// Authentication comes first: an unauthenticated caller learns nothing about
+// this pod, not even which role it is in.
+func TestAStandbyStillRefusesAnUnauthenticatedPublishAsUnauthorized(t *testing.T) {
+	pub := &fakePublisher{}
+	srv := mounted(t, testToken, pub, fakePlayers{})
+	srv.SetRole(RoleStandby)
+
+	if rec := post(srv, "Bearer wrong", okBody); rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+	if len(pub.got) != 0 {
+		t.Error("an unauthenticated request published something")
 	}
 }

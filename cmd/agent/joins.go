@@ -123,26 +123,6 @@ func (j *joinTimes) Ended() <-chan struct{} {
 	return j.ended
 }
 
-// Connected implements announce.Session: whether a Bedrock session is live
-// right now. Read from the same channel Ended hands out, which connected
-// opens and disconnected closes, so there is no second record of the fact to
-// fall out of step with it.
-func (j *joinTimes) Connected() bool {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	if j.since.IsZero() {
-		// Never connected at all: the channel is open only because no
-		// connection has opened one of its own yet.
-		return false
-	}
-	select {
-	case <-j.ended:
-		return false
-	default:
-		return true
-	}
-}
-
 // Generation implements plugins.Connections.
 func (j *joinTimes) Generation() uint64 {
 	j.mu.Lock()

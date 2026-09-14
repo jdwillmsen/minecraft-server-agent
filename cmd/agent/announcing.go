@@ -97,6 +97,25 @@ func (a *deliveryAudience) Online() []string {
 	return out
 }
 
+// IsOnline satisfies announce.Roster, excluding the same bots Online() does:
+// a Deliverer asking whether one recipient is still there must get the same
+// answer it would get by looking for them in the list.
+func (a *deliveryAudience) IsOnline(xuid string) bool {
+	a.mu.RLock()
+	self := a.self
+	a.mu.RUnlock()
+
+	if chat.IsSelfOrSibling(xuid, self, a.siblings) {
+		return false
+	}
+	return a.roster.IsOnline(xuid)
+}
+
+// Knows satisfies announce.Roster. Passed straight through: which players
+// this filters out has nothing to do with whether the roster behind it has
+// been told who is here.
+func (a *deliveryAudience) Knows() bool { return a.roster.Knows() }
+
 // nameArchive is the durable half of resolving a gamertag: the names this
 // server has recorded, as opposed to the names currently connected.
 // Narrowed from store.Store to the single read that needs it.

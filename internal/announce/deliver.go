@@ -22,12 +22,21 @@ type Voice interface {
 	Say(ctx context.Context, message string) error
 }
 
-// Roster is who a Deliverer can currently reach. Online-only: a Deliverer
+// Roster is who a Deliverer can currently reach. Presence only: a Deliverer
 // never needs a gamertag (Tell and the store both key on XUID), so this
-// deliberately doesn't ask for NameFor.
+// deliberately doesn't ask for NameFor -- and a name would be no evidence of
+// presence anyway, since it outlives the session that taught it.
 type Roster interface {
 	// Online returns the XUIDs currently connected.
 	Online() []string
+	// IsOnline reports whether one XUID is still among them, without
+	// building the whole list to look.
+	IsOnline(xuid string) bool
+	// Knows reports whether this roster can answer who is on the server at
+	// all: false in the gap between connections, and false again after one
+	// opens until its first roster packet arrives. An empty Online() means
+	// "nobody" only when this is true.
+	Knows() bool
 }
 
 // JoinClock tells a Deliverer how long ago a player joined, so a message
@@ -57,18 +66,6 @@ type JoinClock interface {
 type Leadership interface {
 	// Live reports whether this process holds the agent lock right now.
 	Live() bool
-}
-
-// Session reports whether the agent currently has a live Bedrock connection.
-// It is what tells an empty roster's two meanings apart: connected with
-// nobody online is an idle server, where a broadcast would be a console line
-// nobody could hear, while disconnected is the gap, where the roster cannot
-// answer who is there but the console bridge still can. Narrowed to the one
-// question rather than folded into Roster, which answers who is reachable
-// and has no notion of the connection behind it.
-type Session interface {
-	// Connected reports whether a Bedrock session is live right now.
-	Connected() bool
 }
 
 // Permissions resolves a player's current permission level, as a plain
@@ -110,10 +107,6 @@ type Deliverer struct {
 	// WithLeadership is passed, which reads as live: a deployment with no
 	// lock to wait for has always been the live agent.
 	leader Leadership
-	// session says whether that same broadcast would be going into a gap or
-	// into an idle server. Nil unless WithSession is passed, which reads as
-	// disconnected: nothing has claimed a session is up.
-	session Session
 }
 
 // Option configures a Deliverer at construction.
@@ -144,14 +137,6 @@ func WithLeadership(l Leadership) Option {
 	return func(d *Deliverer) { d.leader = l }
 }
 
-// WithSession lets a Deliverer tell an idle server from a connection gap.
-//
-// Without it an empty roster is read as a gap, because that is the only
-// state a Deliverer with no session source can be sure it cannot see into.
-func WithSession(s Session) Option {
-	return func(d *Deliverer) { d.session = s }
-}
-
 // NewDeliverer builds a Deliverer over the given Store, Voice, Roster and
 // Permissions.
 func NewDeliverer(s Store, v Voice, r Roster, p Permissions, log *logging.Logger, opts ...Option) *Deliverer {
@@ -169,20 +154,19 @@ func (d *Deliverer) live() bool {
 	return d.leader == nil || d.leader.Live()
 }
 
-// connected reports whether the agent is in the game right now. False when
-// no Session was wired: a Deliverer that was never given one cannot claim a
-// connection it has no way to observe.
-func (d *Deliverer) connected() bool {
-	return d.session != nil && d.session.Connected()
-}
-
-// inTheGap reports whether an empty roster means "who is here is unknowable"
-// rather than "nobody is here". Only the live agent between connections is
-// in that state: a standby is in no game at all, and a connected agent with
-// an empty roster is simply on an idle server, where a broadcast would be a
-// console line no player could hear.
-func (d *Deliverer) inTheGap() bool {
-	return d.live() && !d.connected()
+// mayBroadcastBlind reports whether an empty roster means "who is here is not
+// known" rather than "nobody is here", and this process is the one entitled
+// to act on that.
+//
+// Not known covers two states, and the roster tells both from the third: the
+// gap between connections, and the moments after one opens before its first
+// roster packet. A server the agent is watching with nobody on it is the
+// third, where the roster is right and a broadcast would be a console line no
+// player could hear. A standby fails the other half -- its roster never knows
+// anything, and the server it would speak into belongs to whoever holds the
+// lock.
+func (d *Deliverer) mayBroadcastBlind() bool {
+	return d.live() && !d.roster.Knows()
 }
 
 // departed reports whether xuid has left since the roster named them.
@@ -194,12 +178,7 @@ func (d *Deliverer) inTheGap() bool {
 // against someone who has gone is the permanent loss this package exists to
 // avoid -- nothing retries a delivery that has a row.
 func (d *Deliverer) departed(xuid string) bool {
-	for _, online := range d.roster.Online() {
-		if online == xuid {
-			return false
-		}
-	}
-	return true
+	return !d.roster.IsOnline(xuid)
 }
 
 // stillLoading reports whether xuid's client may be too freshly loaded to
@@ -286,13 +265,11 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 		// whispered on a later join, and online-only never queues, so this
 		// is its only chance to be heard at all.
 		//
-		// Only the gap earns that. A standby is in no game and its roster
-		// is empty for its whole life rather than for a backoff, so the
-		// server it would speak into belongs to the process holding the
-		// lock; a connected agent with an empty roster is on an idle
-		// server, where the roster is right and there is nobody to hear.
-		if len(targets) == 0 && !d.inTheGap() {
-			d.log.Info("announce_say_skipped_no_audience", logging.Fields{"announcement_id": id, "connected": d.connected(), "live": d.live()})
+		// Only a roster that cannot answer earns that -- see
+		// mayBroadcastBlind. A watching roster with nobody on it is right,
+		// and a standby's roster never knows anything at all.
+		if len(targets) == 0 && !d.mayBroadcastBlind() {
+			d.log.Info("announce_say_skipped_no_audience", logging.Fields{"announcement_id": id, "roster_knows": d.roster.Knows(), "live": d.live()})
 			return 0, nil
 		}
 		err := d.voice.Say(ctx, a.Body)

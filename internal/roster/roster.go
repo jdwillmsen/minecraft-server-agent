@@ -292,6 +292,18 @@ func (r *Roster) NameFor(xuid string) (name string, ok bool) {
 	return name, ok
 }
 
+// Knows reports whether this Roster can currently answer who is on the
+// server: true once the live connection's opening PlayerList has been
+// applied. False in the gap between connections, and false again in the
+// moments after one opens before its first PlayerList arrives -- in both,
+// an empty Online() means "not known yet" rather than "nobody is here", and
+// a caller that cannot tell those apart will act on the wrong one.
+func (r *Roster) Knows() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.snapshotSeen
+}
+
 // IsOnline reports whether xuid is on the roster the current connection is
 // watching. Separate from NameFor because the two stop being true at
 // different moments -- see names.

@@ -48,6 +48,17 @@ type publishRoster []string
 
 func (r publishRoster) Online() []string { return r }
 
+func (r publishRoster) IsOnline(xuid string) bool {
+	for _, x := range r {
+		if x == xuid {
+			return true
+		}
+	}
+	return false
+}
+
+func (r publishRoster) Knows() bool { return true }
+
 type publishPerms map[string]string
 
 func (p publishPerms) Resolve(_ context.Context, xuid string) string { return p[xuid] }

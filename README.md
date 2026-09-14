@@ -508,16 +508,20 @@ announcement addressed to a player or to a permission is whispered, and a
 whisper needs someone to send it to, so that one stays silent and stays
 pending.
 
-Only the gap earns that, and only for the live agent. An empty roster on a
-server the agent *is* connected to means what it says - nobody is on -
-and nothing is spoken, exactly as before. The announcement API is served by
-every pod, including a warm standby, whose roster is empty for its whole
-life rather than for a backoff and whose console bridge is up like any
-other; a publish that reaches one and names nobody is not spoken, because
-the server belongs to whichever process holds the lock. A process counts as
-a standby from startup until it actually takes the lock, and again the
-moment it loses one, so neither window can broadcast into a game it is not
-in. See "Handing over to a standby".
+Only a roster that cannot answer earns that, and only for the live agent.
+"Cannot answer" is two states, not one: the gap between connections, and the
+moments after a connection opens before its first roster packet arrives -
+the agent is in the game there, but has not been told who else is, and the
+world may well be full. An empty roster the agent *has* been told is right:
+nobody is on, and nothing is spoken, exactly as before.
+
+The other half is leadership. The announcement API is served by every pod,
+including a warm standby, whose roster never learns anything and whose
+console bridge is up like any other; a publish that reaches one is refused
+rather than spoken, because the server belongs to whichever process holds the
+lock. A process counts as a standby from startup until it actually takes the
+lock, and again the moment it loses one, so neither window can broadcast into
+a game it is not in. See "Handing over to a standby".
 
 A delivery already under way stops the same moment, between one message and
 the next. The connection ending cancels the drain where it stands, so the
@@ -767,8 +771,15 @@ curl -sS -X POST http://<agent>:8080/announcements \
 - `400` for an invalid request, including unknown fields and keys that
   differ in case or appear twice (keys match exactly), `401` without the
   right bearer token, `413` past the 16 KiB request cap, `422` for an
-  unknown player, `503` when announcements are not configured or the
-  database is not ready.
+  unknown player, `503` when announcements are not configured, when the
+  database is not ready, or when this process is not the live agent.
+- The route is served by every pod, and a warm standby is in the Service
+  like any other, so a publish can land on one that is in no game. It
+  refuses with `503` rather than accepting: nothing stored, nothing said,
+  and the caller's own retry reaches the same Service with the live agent
+  behind it. Storing it would be worse than refusing - `online_only` never
+  queues, so nothing would ever pick it up while the caller had been told
+  `201`.
 
 The token is compared in constant time and checked before the body is
 read. With the variable unset the route is not mounted at all. The token is

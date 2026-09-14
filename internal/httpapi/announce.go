@@ -54,11 +54,15 @@ const (
 // With no token nothing is mounted, so the path answers the mux's own 404
 // like any path that was never there. A disabled API is indistinguishable
 // from an absent one, and there is no configuration in which it is open.
+//
+// Mounted for the process rather than for a turn as the live agent, because
+// the listener is: what changes with the role is the answer, not the route --
+// see the leadership refusal in the handler.
 func (s *Server) MountAnnouncements(token string, pub AnnouncementPublisher, players PlayerResolver, log *logging.Logger) bool {
 	if token == "" {
 		return false
 	}
-	s.mux.Handle("/announcements", announcementsHandler(token, pub, players, log, time.Now))
+	s.mux.Handle("/announcements", announcementsHandler(token, s.Live, pub, players, log, time.Now))
 	return true
 }
 
@@ -79,7 +83,7 @@ type announcementResponse struct {
 	Reached int   `json:"reached"`
 }
 
-func announcementsHandler(token string, pub AnnouncementPublisher, players PlayerResolver, log *logging.Logger, now func() time.Time) http.Handler {
+func announcementsHandler(token string, live func() bool, pub AnnouncementPublisher, players PlayerResolver, log *logging.Logger, now func() time.Time) http.Handler {
 	// Compared as digests so the comparison runs over equal lengths:
 	// ConstantTimeCompare returns early on a length mismatch, which would
 	// tell a caller how long the token is.
@@ -96,6 +100,18 @@ func announcementsHandler(token string, pub AnnouncementPublisher, players Playe
 		if !bearerMatches(r.Header.Get("Authorization"), want) {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeError(w, http.StatusUnauthorized, "a valid bearer token is required")
+			return
+		}
+
+		// Refused before anything is read or stored. This route is mounted
+		// for the whole process and a standby answers /readyz, so it sits in
+		// the Service endpoints like any other pod -- but it is in no game.
+		// Storing the row here would be worse than refusing: an online-only
+		// announcement never queues, so nothing would ever pick it up, and
+		// the caller would have been told 201. A 503 is a request the caller
+		// can simply make again, and the leader is behind the same Service.
+		if !live() {
+			writeError(w, http.StatusServiceUnavailable, "this process is not the live agent; retry so the request reaches the one that is")
 			return
 		}
 
