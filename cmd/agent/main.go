@@ -268,7 +268,7 @@ func main() {
 	// below reads what the live agent stored rather than rotating the
 	// account's refresh token out from under it.
 	tokenGate := &tokenLiveGate{}
-	ts, err := mcauth.TokenSource(ctx, tokenStore, os.Stdout,
+	ts, err := newTokenSource(ctx, tokenStore, os.Stdout, log,
 		mcauth.WithLiveGate(tokenGate.isOpen),
 		mcauth.WithLogger(log),
 	)

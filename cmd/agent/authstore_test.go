@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -232,3 +233,98 @@ func (unavailableStore) Load(context.Context) (*oauth2.Token, error) {
 func (unavailableStore) Save(context.Context, *oauth2.Token) error {
 	return mcauth.ErrStoreUnavailable
 }
+
+// flakyStore cannot answer for its first failures loads, then holds a token
+// like any other store: a database that was still coming up when the pod did.
+type flakyStore struct {
+	mu       sync.Mutex
+	failures int
+	loads    int
+	token    *oauth2.Token
+}
+
+func (f *flakyStore) Load(context.Context) (*oauth2.Token, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.loads++
+	if f.loads <= f.failures {
+		return nil, mcauth.ErrStoreUnavailable
+	}
+	if f.token == nil {
+		return nil, mcauth.ErrNoToken
+	}
+	return f.token, nil
+}
+
+func (f *flakyStore) Save(_ context.Context, tok *oauth2.Token) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.token = tok
+	return nil
+}
+
+func (f *flakyStore) loadCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loads
+}
+
+func withRetryDelay(t *testing.T, d time.Duration) {
+	t.Helper()
+	orig := tokenStoreRetryDelay
+	tokenStoreRetryDelay = d
+	t.Cleanup(func() { tokenStoreRetryDelay = orig })
+}
+
+// With the volume dropped the database is the only store there is, so a
+// two-second blip while the pod starts would otherwise be an exit and a crash
+// loop -- for exactly the outage the agent is supposed to survive.
+func TestNewTokenSource_WaitsOutAStoreThatCannotAnswerYet(t *testing.T) {
+	withRetryDelay(t, time.Millisecond)
+	store := &flakyStore{failures: 2, token: storable("a", "r")}
+
+	ts, err := newTokenSource(context.Background(), store, io.Discard, quietLogger())
+	if err != nil {
+		t.Fatalf("newTokenSource: %v", err)
+	}
+	if ts == nil {
+		t.Fatal("no token source")
+	}
+	if store.loadCount() != 3 {
+		t.Errorf("loaded %d times, want the two failures and the answer", store.loadCount())
+	}
+}
+
+// Bounded, because the other way a store cannot answer is a release that
+// landed ahead of its migration, and that does not clear on its own: it has
+// to end as a failure an operator can see.
+func TestNewTokenSource_GivesUpOnAStoreThatStaysUnavailable(t *testing.T) {
+	withRetryDelay(t, time.Millisecond)
+	store := &flakyStore{failures: 1000}
+
+	if _, err := newTokenSource(context.Background(), store, io.Discard, quietLogger()); !errors.Is(err, mcauth.ErrStoreUnavailable) {
+		t.Fatalf("newTokenSource = %v, want ErrStoreUnavailable", err)
+	}
+	if store.loadCount() != tokenStoreAttempts {
+		t.Errorf("loaded %d times, want %d", store.loadCount(), tokenStoreAttempts)
+	}
+}
+
+// And nothing else is retried: a corrupt entry reads the same on every
+// attempt, and waiting on it only delays the operator who has to delete it.
+func TestNewTokenSource_DoesNotWaitOnAFailureThatCannotClear(t *testing.T) {
+	withRetryDelay(t, time.Hour)
+	store := &corruptStore{}
+
+	if _, err := newTokenSource(context.Background(), store, io.Discard, quietLogger()); err == nil {
+		t.Fatal("a corrupt store was accepted")
+	}
+}
+
+type corruptStore struct{}
+
+func (corruptStore) Load(context.Context) (*oauth2.Token, error) {
+	return nil, errors.New("mcauth: cached token is not valid JSON")
+}
+
+func (corruptStore) Save(context.Context, *oauth2.Token) error { return nil }
