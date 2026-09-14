@@ -516,3 +516,54 @@ func TestTheUnlockedReportClearsWhenTheTurnEnds(t *testing.T) {
 		t.Errorf("mc_agent_leader_unlocked = %v after the turn ended, want 0", got)
 	}
 }
+
+// A lost lock is a lock a successor may already hold, and it refreshes from
+// the same row this process would. Microsoft retires a refresh token as it
+// issues the replacement, so the claim has to be gone before anything else
+// reacts to the turn ending -- not after the connect loop has finished
+// draining, which is minutes of a disconnect the successor does not wait for.
+func TestLosingTheLockEndsTheClaimOnTheLoginBeforeTheTurnUnwinds(t *testing.T) {
+	var gate tokenLiveGate
+	term := newFakeTerm(&steps{})
+
+	liveCtx, endTurn := beginTurn(t.Context(), &gate)
+	if !gate.isOpen() {
+		t.Fatal("the live agent may not refresh the token it is playing on")
+	}
+	go endTermOnLockLoss(liveCtx, term, endTurn, quiet())
+
+	close(term.lost)
+
+	<-liveCtx.Done()
+	// Ordered, not merely eventual: liveCtx is what every live-only worker
+	// watches, so anything still open here is open while a successor plays.
+	if gate.isOpen() {
+		t.Error("the turn ended with this process still entitled to rotate the stored token")
+	}
+}
+
+func TestAGracefulTurnEndAlsoEndsTheClaim(t *testing.T) {
+	var gate tokenLiveGate
+
+	_, endTurn := beginTurn(t.Context(), &gate)
+	endTurn()
+
+	if gate.isOpen() {
+		t.Error("a process that handed over is still entitled to rotate the stored token")
+	}
+}
+
+// Each turn is a fresh claim: a process that lost the lock becomes a standby
+// and campaigns again, and taking the lock back is what re-entitles it.
+func TestTheClaimIsReopenedByTheNextTurn(t *testing.T) {
+	var gate tokenLiveGate
+
+	_, endTurn := beginTurn(t.Context(), &gate)
+	endTurn()
+	_, endSecond := beginTurn(t.Context(), &gate)
+	defer endSecond()
+
+	if !gate.isOpen() {
+		t.Error("winning the lock back did not restore the right to refresh")
+	}
+}

@@ -22,34 +22,39 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
-// saveTimeout bounds one persistence attempt. Generous for a single row or a
+// storeTimeout bounds one attempt to read or write the store from inside
+// Token, which has no context of its own. Generous for a single row or a
 // single file, and short relative to the hour an access token lasts, so a
 // store that has gone away costs a refresh rather than the connection.
-const saveTimeout = 5 * time.Second
+const storeTimeout = 5 * time.Second
 
 // requestLiveToken is the interactive device-code login. A package-level
-// var, not a direct call, so tests can substitute a stub and prove
-// TokenSource only reaches it on a genuinely empty store - never on one that
-// is merely unreadable (see the Load error handling below).
+// var, not a direct call, so tests can substitute a stub and prove it is
+// reached only on a genuinely empty store - never on one that is merely
+// unreadable - and only by a process the gate says holds the login.
 var requestLiveToken = auth.RequestLiveTokenContext
 
 // Option configures a TokenSource.
 type Option func(*cachingTokenSource)
 
-// WithWriteGate makes persistence conditional on allowed returning true at
-// the moment a token is refreshed.
+// WithLiveGate makes every use of the shared login conditional on live
+// returning true: refreshing the cached token, persisting the result, and the
+// first-run device-code login.
 //
-// This is how a warm standby stays harmless. Microsoft rotates the refresh
-// token on every refresh, so two processes refreshing the same cached token
-// invalidate each other's copy; the gate lets the caller say that only the
-// live agent may write one back. The gate is consulted per refresh rather
-// than once at construction because a standby becomes the live agent without
-// rebuilding anything, and the token it refreshed while waiting is the token
-// its first write must persist.
-func WithWriteGate(allowed func() bool) Option {
+// This is how a warm standby stays harmless. Microsoft retires a refresh
+// token the moment it issues the replacement, so the damage a second process
+// does is done by the refresh itself and not by storing it -- a gate on the
+// write alone would suppress the copy and leave the live agent holding a
+// credential that has already been revoked. A standby therefore rotates
+// nothing and reads the live agent's work out of the store instead; see
+// Token.
+//
+// The gate is consulted per call rather than once at construction because a
+// standby becomes the live agent without rebuilding anything.
+func WithLiveGate(live func() bool) Option {
 	return func(c *cachingTokenSource) {
-		if allowed != nil {
-			c.allowed = allowed
+		if live != nil {
+			c.live = live
 		}
 	}
 }
@@ -64,41 +69,39 @@ func WithLogger(l *logging.Logger) Option {
 // TokenSource returns an oauth2.TokenSource backed by the token cached in
 // store for one account.
 //
-// If the store holds no token yet, it performs an interactive device-code
-// login, writing the code and URL to out - which in a container is stdout,
-// so the instructions land in the pod's logs exactly like
-// minecraft-afk-bot's device_code_required event does today. Any other load
-// failure (a corrupt entry, a store that cannot be reached, a transient I/O
-// error) is a hard error instead: falling through to an interactive login on
-// those would silently block reconnect attempts for up to ~15 minutes
-// waiting on a device code nobody is watching for, every time.
+// A store that holds nothing for this account yet is not an error here: the
+// device-code login it calls for is deferred to the first Token call made by
+// a process the gate says may hold the login, because a standby that printed
+// a code would print it into a pod log nobody is watching and block for as
+// long as the code lasts. Any other load failure (a corrupt entry, a store
+// that cannot be reached, a transient I/O error) is a hard error instead,
+// for the same reason stated the other way round: those must never be
+// mistaken for an empty store and answered with a prompt.
 //
-// Every subsequent refresh is persisted back to the store, subject to
-// WithWriteGate, so a later restart resumes without a fresh login as long as
-// the refresh token is still valid.
+// ctx bounds the initial load and, later, that deferred login, so a process
+// asked to shut down while it waits on a device code stops waiting.
+//
+// Every refresh is persisted back to the store, subject to WithLiveGate, so
+// a later restart resumes without a fresh login as long as the refresh token
+// is still valid.
 func TokenSource(ctx context.Context, store Store, out io.Writer, opts ...Option) (oauth2.TokenSource, error) {
 	if store == nil {
 		return nil, errors.New("mcauth: nil token store")
 	}
 
 	tok, err := store.Load(ctx)
-	if err != nil {
-		if !errors.Is(err, ErrNoToken) {
-			return nil, fmt.Errorf("mcauth: load cached token: %w", err)
-		}
-		tok, err = requestLiveToken(ctx, out)
-		if err != nil {
-			return nil, fmt.Errorf("mcauth: device-code login: %w", err)
-		}
-		if err := store.Save(ctx, tok); err != nil {
-			return nil, fmt.Errorf("mcauth: save token: %w", err)
-		}
+	if err != nil && !errors.Is(err, ErrNoToken) {
+		return nil, fmt.Errorf("mcauth: load cached token: %w", err)
 	}
 
 	c := &cachingTokenSource{
-		store:   store,
-		inner:   auth.RefreshTokenSourceWriter(tok, out),
-		allowed: func() bool { return true },
+		store:    store,
+		out:      out,
+		loginCtx: ctx,
+		live:     func() bool { return true },
+	}
+	if tok != nil {
+		c.adopt(tok)
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -106,47 +109,63 @@ func TokenSource(ctx context.Context, store Store, out io.Writer, opts ...Option
 	return c, nil
 }
 
-// cachingTokenSource wraps another oauth2.TokenSource and persists every
-// token it returns, so a background refresh doesn't get lost on restart.
+// cachingTokenSource holds one account's token for one process and persists
+// every rotation of it, so a background refresh doesn't get lost on restart.
 //
 // gophertunnel may call Token() concurrently with its own background refresh
-// goroutine, so access to inner and to the store is serialised by mu rather
-// than relying on inner's own thread-safety for the write side.
+// goroutine, so access to inner, to held and to the store is serialised by mu
+// rather than relying on inner's own thread-safety for the write side.
 type cachingTokenSource struct {
-	mu      sync.Mutex
-	store   Store
-	inner   oauth2.TokenSource
-	allowed func() bool
-	log     *logging.Logger
+	mu    sync.Mutex
+	store Store
+	out   io.Writer
+	// loginCtx bounds the deferred device-code login, the one call here that
+	// blocks for minutes rather than milliseconds. Held on the struct
+	// because oauth2.TokenSource gives Token() no context to inherit and
+	// the login no longer happens at construction, where ctx was in scope.
+	loginCtx context.Context
+	// inner refreshes held, and is rebuilt whenever held is replaced by a
+	// token this process did not derive from the previous one. nil until
+	// there is a token at all, which is the cold start.
+	inner oauth2.TokenSource
+	held  *oauth2.Token
+	live  func() bool
+	log   *logging.Logger
 	// saved is the refresh token this process has written, and starts empty
 	// even though the store was just read: what was loaded is not
 	// necessarily what the store the agent writes to holds. A token read
-	// through a Fallback came from the file the cluster is moving away from,
-	// and a token a standby refreshed while waiting was never written at
-	// all. Starting empty costs one redundant write per process and makes
-	// both of those land the moment this process is allowed to write.
+	// through a Fallback came from the file the cluster is moving away from.
+	// Starting empty costs one redundant write per process and makes that
+	// land the moment this process is allowed to write.
 	saved string
 }
 
+// Token returns a usable token, doing only what this process is entitled to
+// do to get one.
+//
+// The live agent holds the account's login and so may rotate it: it
+// refreshes, or on a cold start logs in, and persists the result. A standby
+// holds nothing and may rotate nothing -- see standbyToken.
 func (c *cachingTokenSource) Token() (*oauth2.Token, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	tok, err := c.inner.Token()
+	if !c.live() {
+		return c.standbyToken()
+	}
+
+	tok, err := c.liveToken()
 	if err != nil {
 		return nil, err
 	}
+	c.held = tok
 	if tok.RefreshToken == c.saved {
-		return tok, nil
-	}
-	if !c.allowed() {
-		c.note(func() { c.log.Info("auth_token_write_skipped", logging.Fields{"reason": "not the live agent"}) })
 		return tok, nil
 	}
 	// Bounded and detached: oauth2 gives Token() no context to inherit, and
 	// an unbounded write against an unreachable database would hold the
 	// mutex that every dial and every background refresh waits on.
-	saveCtx, cancel := context.WithTimeout(context.Background(), saveTimeout)
+	saveCtx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
 	// Best-effort: a failed cache write shouldn't fail the connection, but
 	// it does mean the next restart re-authenticates.
@@ -157,6 +176,66 @@ func (c *cachingTokenSource) Token() (*oauth2.Token, error) {
 	c.saved = tok.RefreshToken
 	c.note(func() { c.log.Info("auth_token_written", nil) })
 	return tok, nil
+}
+
+// liveToken refreshes the held token, or performs the first-run device-code
+// login when there is none to refresh.
+//
+// The login lands here rather than at construction because this is the first
+// moment the process is known to be the one entitled to it, and the account
+// allows one login at a time: two pods prompting independently produce two
+// grants, of which the stored one is not necessarily the one either process
+// is using.
+func (c *cachingTokenSource) liveToken() (*oauth2.Token, error) {
+	if c.inner != nil {
+		return c.inner.Token()
+	}
+	c.note(func() { c.log.Info("auth_device_code_login", nil) })
+	tok, err := requestLiveToken(c.loginCtx, c.out)
+	if err != nil {
+		return nil, fmt.Errorf("mcauth: device-code login: %w", err)
+	}
+	c.adopt(tok)
+	return tok, nil
+}
+
+// standbyToken answers without rotating anything.
+//
+// The token this process loaded stays usable until its access token expires.
+// Past that, refreshing is not an option a standby has: Microsoft retires the
+// refresh token as it issues the replacement, so a standby that refreshed
+// would revoke the credential the live agent is holding the game with and
+// leave neither process able to reconnect. What it does instead is re-read
+// the store, because the live agent persists every rotation -- staying warm
+// on the other process's work rather than on work of its own.
+//
+// A store that has nothing newer leaves this process unwarmed, which is
+// reported rather than worked around. It costs the handover one refresh; the
+// alternative costs the account its login.
+func (c *cachingTokenSource) standbyToken() (*oauth2.Token, error) {
+	if c.held.Valid() {
+		return c.held, nil
+	}
+	loadCtx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+	tok, err := c.store.Load(loadCtx)
+	if err != nil {
+		return nil, fmt.Errorf("mcauth: standby reload: %w", err)
+	}
+	c.adopt(tok)
+	c.note(func() { c.log.Info("auth_token_standby_reloaded", nil) })
+	if !tok.Valid() {
+		return nil, errors.New("mcauth: standby holds no unexpired token and may not refresh one")
+	}
+	return tok, nil
+}
+
+// adopt makes tok the token this process holds, rebuilding the refresher
+// around it: inner keeps its own copy, so replacing held without this would
+// leave the next refresh working from the token it superseded.
+func (c *cachingTokenSource) adopt(tok *oauth2.Token) {
+	c.held = tok
+	c.inner = auth.RefreshTokenSourceWriter(tok, c.out)
 }
 
 // note runs emit only when a logger was configured. A closure rather than a

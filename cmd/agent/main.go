@@ -264,12 +264,12 @@ func main() {
 	// (and, on a load failure, potentially re-triggering an interactive
 	// device-code login) on every single attempt.
 	//
-	// The gate is closed until this process wins a turn, so the refresh
-	// below is paid without being written anywhere a second process would
-	// read it.
-	writes := &tokenWriteGate{}
+	// The gate is closed until this process wins a turn, so the warm-up
+	// below reads what the live agent stored rather than rotating the
+	// account's refresh token out from under it.
+	tokenGate := &tokenLiveGate{}
 	ts, err := mcauth.TokenSource(ctx, tokenStore, os.Stdout,
-		mcauth.WithWriteGate(writes.isOpen),
+		mcauth.WithLiveGate(tokenGate.isOpen),
 		mcauth.WithLogger(log),
 	)
 	if err != nil {
@@ -277,7 +277,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Refreshed here, before the wait below rather than after it: every cost
+	// Warmed here, before the wait below rather than after it: every cost
 	// paid while this process is still a standby is a cost the handover does
 	// not pay.
 	warmXboxToken(ts, log)
@@ -294,23 +294,19 @@ func main() {
 		if !live {
 			break
 		}
-		// Only the live agent persists a refreshed token, and this is the
-		// moment it becomes one. Whatever it refreshed as a standby is
-		// written on its next refresh, since nothing it held was ever
-		// written before now.
-		writes.open()
-
-		// Ends with this turn, not with the process: the connect loop and
-		// every live-only writer below run under it, so losing the lock takes
-		// the agent out of the game without taking the process down.
+		// liveCtx ends with this turn, not with the process: the connect
+		// loop and every live-only writer below run under it, so losing the
+		// lock takes the agent out of the game without taking the process
+		// down. The claim on the Xbox Live login is opened and closed with
+		// it -- see beginTurn.
 		//
-		// Standing down demotes the role first, so nothing that reads it acts
-		// on a game this process no longer has a claim to while the connect
-		// loop is still unwinding.
-		liveCtx, cancelTurn := context.WithCancel(ctx)
+		// Standing down demotes the role ahead of both, so nothing that
+		// reads it acts on a game this process no longer has a claim to
+		// while the connect loop is still unwinding.
+		liveCtx, endClaim := beginTurn(ctx, tokenGate)
 		endTurn := func() {
 			httpServer.SetRole(httpapi.RoleStandby)
-			cancelTurn()
+			endClaim()
 		}
 		go endTermOnLockLoss(liveCtx, term, endTurn, log)
 		// A turn that began without the lock -- because whoever holds it is
@@ -322,10 +318,6 @@ func main() {
 		runConnectLoop(liveCtx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblings, permResolver, ans, playerStore, auditor, link, joins)
 
 		endTurn()
-		// Closed before the handover, not after it: the successor takes the
-		// lock the moment it is released, and from then on it is the one
-		// entitled to rotate the stored token.
-		writes.close()
 		// The agent is out of the game by now -- the connect loop waits for
 		// its own disconnect to reach the server -- so the sessions it was
 		// watching can be closed at the moment it stopped watching, and only

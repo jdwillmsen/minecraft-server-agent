@@ -176,11 +176,15 @@ func (f *FileStore) Save(_ context.Context, tok *oauth2.Token) error {
 // refresh token out of a running pod and paste it somewhere to migrate it,
 // which is a credential printed into a terminal that this avoids entirely.
 //
-// Writes deliberately never fall back. A token written to the secondary
-// while the primary is merely unreachable would be the newer one, and the
-// next load -- which prefers the primary -- would take the older, already
-// rotated one and fail to refresh it. One writer, one truth: a primary that
-// cannot be written to is a logged failure, not a second copy.
+// Writes fall back exactly where reads do, and nowhere else. A primary that
+// answers is the only truth: a token written to the secondary while the
+// primary merely rejected the write would be the newer one, and the next
+// load -- which prefers the primary -- would take the older, already rotated
+// one and fail to refresh it. But a primary that cannot answer at all is one
+// the next load will not answer from either, so the secondary is where that
+// load will look. Refreshing rotates the credential at Microsoft whether or
+// not the result is stored, so a rotated token written nowhere is not a
+// missing copy, it is the account locked out until someone logs in by hand.
 type Fallback struct {
 	primary   Store
 	secondary Store
@@ -202,7 +206,19 @@ func (f *Fallback) Load(ctx context.Context) (*oauth2.Token, error) {
 		// database released ahead of the migration that gives it the table.
 		// The second is the ordinary state during a rollout and must not
 		// cost the agent a login it already has a token for.
-		return f.secondary.Load(ctx)
+		tok, secondaryErr := f.secondary.Load(ctx)
+		if secondaryErr == nil {
+			return tok, nil
+		}
+		// An unreadable primary outranks an empty secondary, because only
+		// ErrNoToken licenses a device-code login and the two facts are not
+		// the same: "the database could not be read" is not "this account
+		// has never logged in". Collapsing them prints a code nobody is
+		// watching for into a pod log, for a problem that clears itself.
+		if errors.Is(err, ErrStoreUnavailable) && errors.Is(secondaryErr, ErrNoToken) {
+			return nil, err
+		}
+		return nil, secondaryErr
 	default:
 		// A corrupt or refresh-token-less row is not a reason to reach past
 		// it. Whatever is in the primary is what the agent would write back
@@ -212,7 +228,14 @@ func (f *Fallback) Load(ctx context.Context) (*oauth2.Token, error) {
 }
 
 func (f *Fallback) Save(ctx context.Context, tok *oauth2.Token) error {
-	return f.primary.Save(ctx, tok)
+	err := f.primary.Save(ctx, tok)
+	if err == nil || !errors.Is(err, ErrStoreUnavailable) {
+		return err
+	}
+	if secondaryErr := f.secondary.Save(ctx, tok); secondaryErr != nil {
+		return errors.Join(err, secondaryErr)
+	}
+	return nil
 }
 
 // tokenFileName derives the per-account cache filename for username. The

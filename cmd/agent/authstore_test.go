@@ -154,25 +154,25 @@ func TestOpenTokenStore_RejectsABlankUsernameWithNoDatabase(t *testing.T) {
 	}
 }
 
-func TestTokenWriteGate_ClosedUntilThisProcessIsLive(t *testing.T) {
-	var g tokenWriteGate
+func TestTokenLiveGate_ClosedUntilThisProcessIsLive(t *testing.T) {
+	var g tokenLiveGate
 	if g.isOpen() {
-		t.Error("a process that has not won a turn may not write a token")
+		t.Error("a process that has not won a turn may not rotate the token")
 	}
 	g.open()
 	if !g.isOpen() {
-		t.Error("the live agent must be able to write")
+		t.Error("the live agent must be able to refresh and write")
 	}
 	g.close()
 	if g.isOpen() {
-		t.Error("a process that handed over may not still be writing")
+		t.Error("a process that handed over may not still be rotating")
 	}
 }
 
 // The gate is read from gophertunnel's refresh goroutine while the main loop
 // opens and closes it around each turn.
-func TestTokenWriteGate_IsSafeForConcurrentUse(t *testing.T) {
-	var g tokenWriteGate
+func TestTokenLiveGate_IsSafeForConcurrentUse(t *testing.T) {
+	var g tokenLiveGate
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
 		wg.Add(2)
@@ -182,8 +182,10 @@ func TestTokenWriteGate_IsSafeForConcurrentUse(t *testing.T) {
 	wg.Wait()
 }
 
-// A standby that cannot read the store must not print a device code into a
-// pod log nobody is watching, and must not be mistaken for a cold start.
+// A store that cannot be read must not be mistaken for a cold start, and
+// that holds all the way through the wiring this file builds: an unavailable
+// database with the volume already gone is the ordinary state of a pod
+// released ahead of its migration.
 func TestTokenSourceOverAnUnavailableStoreFailsRatherThanPrompting(t *testing.T) {
 	unavailable := unavailableStore{}
 	_, err := mcauth.TokenSource(context.Background(), unavailable, os.Stdout)
@@ -192,6 +194,25 @@ func TestTokenSourceOverAnUnavailableStoreFailsRatherThanPrompting(t *testing.T)
 	}
 	if !errors.Is(err, mcauth.ErrStoreUnavailable) {
 		t.Errorf("error = %v, want it to carry ErrStoreUnavailable", err)
+	}
+}
+
+func TestTokenSourceOverAnUnavailableDatabaseAndNoVolumeStillFailsLoudly(t *testing.T) {
+	cfg := authConfig(t.TempDir())
+	store, err := openTokenStore(cfg, unavailableStore{}, quietLogger())
+	if err != nil {
+		t.Fatalf("openTokenStore: %v", err)
+	}
+
+	_, err = mcauth.TokenSource(context.Background(), store, os.Stdout)
+	if err == nil {
+		t.Fatal("an unavailable database with an empty cache dir was taken for a cold start")
+	}
+	if !errors.Is(err, mcauth.ErrStoreUnavailable) {
+		t.Errorf("error = %v, want it to carry ErrStoreUnavailable", err)
+	}
+	if errors.Is(err, mcauth.ErrNoToken) {
+		t.Error("reported as an empty store, which is licence to print a device code")
 	}
 }
 

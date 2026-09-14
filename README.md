@@ -863,16 +863,29 @@ replacing lets the volume go, which is the absence the handover exists to
 remove. A row both pods can read costs no new Kubernetes object - the pool is
 already open for profiles and for the leader lock.
 
-**Only the live agent writes.** Microsoft rotates the refresh token on every
-refresh, so a standby that wrote one back would invalidate the copy the live
-agent is holding the game with. A standby still *refreshes* - paying that
-round trip before the handover is the point of a warm standby - and keeps the
-result to itself until it wins the lock, at which point its first refresh is
-written. `auth_token_written` and `auth_token_write_skipped` in the pod logs
-are how you tell the two roles apart.
+**Only the live agent refreshes.** Microsoft retires the refresh token as it
+issues the replacement, so the damage a second process does is done by the
+refresh itself and not by storing the result - suppressing the write would
+leave the live agent holding a credential that has already been revoked. A
+standby therefore rotates nothing. It stays warm the other way round: what it
+loaded is good until its access token expires, and past that it re-reads the
+store, which the live agent keeps current. The round trip the handover would
+have paid is paid against the database instead of against Microsoft.
+`auth_token_written` and `auth_token_standby_reloaded` in the pod logs are how
+you tell the two roles apart. A standby with nothing fresh to read says so
+(`auth_token_refresh_failed`) and goes on waiting; it costs the handover one
+refresh, where refreshing would cost the account its login.
 
-The file cache stays behind the database one as a **read-through fallback**,
-and never as a write target: two copies of a rotating token are one too many.
+The file cache stays behind the database one as a **read-through fallback**.
+It is written only when the database cannot answer at all - the write falls
+back exactly where the read does, and nowhere else. A database that answers is
+the only truth, so a write it *rejects* is reported rather than copied
+elsewhere: the next load would prefer its older row anyway. But a database
+that cannot answer is one the next load will not read either, and refreshing
+rotates the credential at Microsoft whether or not anything stores the result
+- so a rotated token written nowhere is not a missing copy, it is the account
+locked out until someone logs in by hand.
+
 That gives the move off the volume for free - the row starts empty, the first
 load comes from the file, and the first refresh the live agent persists lands
 in the database. From then on the file is never read again.
@@ -895,7 +908,9 @@ nothing joins to it.
 
 Until that migration and its grant land, the agent reports the store as
 unavailable and falls through to the file, which is why the fallback is not
-removed with the volume.
+removed with the volume. A database that is simply *down* reads the same way -
+the pool connects lazily, so it surfaces as the first statement never being
+answered - and for the same reason: a blip must not cost the server its agent.
 
 ## First-run login
 
@@ -907,8 +922,11 @@ above and refreshed automatically on subsequent runs.
 
 With the database store that path no longer needs the volume: a pod started
 with an empty table prints the code, and the completed login is written
-straight to the row. Do it with the deployment scaled to one, so only one pod
-prints a code and only one login answers it.
+straight to the row. Only the pod holding the leader lock prints one - a
+standby that found the store empty waits instead, because a code printed into
+a log nobody is watching blocks that pod for as long as it lasts, and a code
+that *is* answered creates a second grant the pod in the game knows nothing
+about.
 
 Any other cache problem is deliberately *not* an interactive re-login, since
 a container would otherwise block on a device code nobody is watching for:
@@ -919,7 +937,9 @@ a container would otherwise block on a device code nobody is watching for:
   restarting, which takes the first-run path above.
 - **Store unreachable, or released ahead of its migration** - reported as
   unavailable, never as empty, so no device code is printed for what is a
-  database problem. Startup fails unless the file fallback can answer.
+  database problem. The file fallback answers if it can, and startup fails if
+  it cannot: an unreadable store is never downgraded to an empty one on the
+  way through the fallback.
 - **Expired or revoked refresh token** - surfaces as a dial failure and the
   connect loop retries with backoff indefinitely; no login prompt is ever
   printed. Recover the same way: delete the stored token and restart.

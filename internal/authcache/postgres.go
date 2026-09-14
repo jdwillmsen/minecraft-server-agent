@@ -67,11 +67,7 @@ func (p *Postgres) Load(ctx context.Context) (*oauth2.Token, error) {
 	case err == nil:
 	case errors.Is(err, pgx.ErrNoRows):
 		return nil, mcauth.ErrNoToken
-	case pgerr.Unready(err):
-		// The agent released ahead of its migration, or ahead of the grant
-		// that migration owes it. Reported as the store being unavailable
-		// rather than as an empty store, so nothing takes it as licence to
-		// print a device code into the pod log.
+	case unavailable(err):
 		return nil, fmt.Errorf("%w: %v", mcauth.ErrStoreUnavailable, err)
 	default:
 		return nil, fmt.Errorf("authcache: read token: %w", err)
@@ -91,10 +87,22 @@ func (p *Postgres) Save(ctx context.Context, tok *oauth2.Token) error {
 		SET token = EXCLUDED.token, updated_at = EXCLUDED.updated_at`,
 		p.account, string(encoded),
 	); err != nil {
-		if pgerr.Unready(err) {
+		if unavailable(err) {
 			return fmt.Errorf("%w: %v", mcauth.ErrStoreUnavailable, err)
 		}
 		return fmt.Errorf("authcache: write token: %w", err)
 	}
 	return nil
 }
+
+// unavailable reports the failures that mean this store cannot say whether it
+// holds a token, as opposed to saying it holds none.
+//
+// Two ways in: the agent released ahead of its migration or ahead of the grant
+// that migration owes it, and the database not answering at all. They are one
+// answer here because the caller does the same thing with both -- fall through
+// to the file cache, and fail loudly if that cannot answer either. What
+// neither may become is ErrNoToken: an empty store is licence to print a
+// device code into a pod log, and a database problem that clears itself must
+// never buy one.
+func unavailable(err error) bool { return pgerr.Unready(err) || pgerr.Unreachable(err) }

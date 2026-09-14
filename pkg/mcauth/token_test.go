@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"golang.org/x/oauth2"
 )
@@ -27,6 +28,12 @@ func (s *stubTokenSource) Token() (*oauth2.Token, error) {
 	return tok, nil
 }
 
+func (s *stubTokenSource) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
 // withStubLogin swaps requestLiveToken for the duration of a test and
 // restores the real one afterward, since it's a package-level var shared
 // across the test binary.
@@ -45,8 +52,12 @@ func TestTokenSource_ColdStartWithNothingCachedLogsIn(t *testing.T) {
 		return &oauth2.Token{AccessToken: "fresh", RefreshToken: "fresh-refresh"}, nil
 	})
 
-	if _, err := TokenSource(context.Background(), store, io.Discard); err != nil {
+	ts, err := TokenSource(context.Background(), store, io.Discard)
+	if err != nil {
 		t.Fatalf("TokenSource: %v", err)
+	}
+	if _, err := ts.Token(); err != nil {
+		t.Fatalf("Token: %v", err)
 	}
 	if loginCalls != 1 {
 		t.Errorf("login called %d times, want 1 for an empty store", loginCalls)
@@ -58,6 +69,65 @@ func TestTokenSource_ColdStartWithNothingCachedLogsIn(t *testing.T) {
 	}
 	if saved.AccessToken != "fresh" {
 		t.Errorf("saved AccessToken = %q, want fresh", saved.AccessToken)
+	}
+}
+
+// A standby has no lock, so it has no claim on the one login the account
+// allows. Prompting anyway costs that pod ~15 minutes blocked on a code
+// nobody is watching for, and an operator who does answer it creates a second
+// grant the process holding the game knows nothing about.
+func TestTokenSource_AStandbyDoesNotPromptForAColdStart(t *testing.T) {
+	store := &memStore{}
+	withStubLogin(t, func(ctx context.Context, out io.Writer) (*oauth2.Token, error) {
+		t.Error("a standby printed a device code")
+		return nil, errors.New("should not be reached")
+	})
+
+	ts, err := TokenSource(context.Background(), store, io.Discard, WithLiveGate(func() bool { return false }))
+	if err != nil {
+		t.Fatalf("TokenSource: %v", err)
+	}
+	if _, err := ts.Token(); err == nil {
+		t.Fatal("a standby reported a usable token from an empty store")
+	}
+}
+
+// And the login is not lost, only deferred: the moment this process is the
+// one entitled to it, it runs.
+func TestTokenSource_TheDeferredLoginRunsOnceTheProcessGoesLive(t *testing.T) {
+	store := &memStore{}
+	var live atomic.Bool
+	loginCalls := 0
+	withStubLogin(t, func(ctx context.Context, out io.Writer) (*oauth2.Token, error) {
+		loginCalls++
+		return &oauth2.Token{AccessToken: "fresh", RefreshToken: "fresh-refresh"}, nil
+	})
+
+	ts, err := TokenSource(context.Background(), store, io.Discard, WithLiveGate(live.Load))
+	if err != nil {
+		t.Fatalf("TokenSource: %v", err)
+	}
+	if _, err := ts.Token(); err == nil {
+		t.Fatal("a standby reported a usable token from an empty store")
+	}
+
+	live.Store(true)
+	tok, err := ts.Token()
+	if err != nil {
+		t.Fatalf("Token once live: %v", err)
+	}
+	if tok.AccessToken != "fresh" {
+		t.Errorf("AccessToken = %q, want the login's", tok.AccessToken)
+	}
+	if loginCalls != 1 {
+		t.Errorf("login called %d times, want 1", loginCalls)
+	}
+	saved, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("the token the login returned was not persisted: %v", err)
+	}
+	if saved.RefreshToken != "fresh-refresh" {
+		t.Errorf("saved RefreshToken = %q, want the login's", saved.RefreshToken)
 	}
 }
 
@@ -113,8 +183,9 @@ func TestCachingTokenSource_PersistsEachRefresh(t *testing.T) {
 	store.seed(t, &oauth2.Token{AccessToken: "first", RefreshToken: "r1"})
 
 	cts := &cachingTokenSource{
-		store:   store,
-		allowed: func() bool { return true },
+		store: store,
+		out:   io.Discard,
+		live:  func() bool { return true },
 		inner: &stubTokenSource{tokens: []*oauth2.Token{
 			{AccessToken: "first", RefreshToken: "r1"},
 			{AccessToken: "second", RefreshToken: "r2"},
@@ -147,9 +218,10 @@ func TestCachingTokenSource_PersistsEachRefresh(t *testing.T) {
 func TestCachingTokenSource_UnchangedTokenIsNotRewritten(t *testing.T) {
 	store := &memStore{}
 	cts := &cachingTokenSource{
-		store:   store,
-		allowed: func() bool { return true },
-		inner:   &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "a", RefreshToken: "r1"}}},
+		store: store,
+		out:   io.Discard,
+		live:  func() bool { return true },
+		inner: &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "a", RefreshToken: "r1"}}},
 	}
 
 	for i := 0; i < 5; i++ {
@@ -162,25 +234,34 @@ func TestCachingTokenSource_UnchangedTokenIsNotRewritten(t *testing.T) {
 	}
 }
 
-// The invariant the warm standby rests on: two processes hold the same
-// account's token, and only the live one may rotate what is stored.
-func TestCachingTokenSource_StandbyRefreshesWithoutWriting(t *testing.T) {
+// The invariant the warm standby rests on, and the reason the gate cannot sit
+// on the write alone: Microsoft retires the old refresh token as it issues
+// the new one, so a standby that refreshed would revoke the credential the
+// live agent is playing on -- the row would still say r1, and r1 would be
+// dead. Suppressing the write does not undo that.
+func TestCachingTokenSource_StandbyNeverRotatesTheSharedToken(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
 	store.seed(t, &oauth2.Token{AccessToken: "live-token", RefreshToken: "r1"})
 
+	refresher := &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "standby-refreshed", RefreshToken: "r2"}}}
 	standby := &cachingTokenSource{
-		store:   store,
-		allowed: func() bool { return false },
-		inner:   &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "standby-refreshed", RefreshToken: "r2"}}},
+		store: store,
+		out:   io.Discard,
+		live:  func() bool { return false },
+		inner: refresher,
+		held:  &oauth2.Token{AccessToken: "live-token", RefreshToken: "r1"},
 	}
 
 	tok, err := standby.Token()
 	if err != nil {
 		t.Fatalf("Token: %v", err)
 	}
-	if tok.AccessToken != "standby-refreshed" {
-		t.Errorf("a standby got %q, want its own refreshed token", tok.AccessToken)
+	if refresher.callCount() != 0 {
+		t.Errorf("standby refreshed %d times, want 0", refresher.callCount())
+	}
+	if tok.RefreshToken != "r1" {
+		t.Errorf("standby got %q, want the token the live agent is using", tok.RefreshToken)
 	}
 	if _, saves := store.counts(); saves != 0 {
 		t.Errorf("standby wrote %d times, want 0", saves)
@@ -194,19 +275,72 @@ func TestCachingTokenSource_StandbyRefreshesWithoutWriting(t *testing.T) {
 	}
 }
 
-// A standby that refreshed while it waited holds a token nothing has
-// recorded. Going live has to write it, or a restart would fall back to a
-// refresh token Microsoft has already rotated away from.
-func TestCachingTokenSource_StandbyWritesWhatItRefreshedOnceItGoesLive(t *testing.T) {
+// How a standby stays warm without rotating anything: when what it holds has
+// expired, it re-reads the store, which the live agent keeps current. The
+// round trip the handover would have paid is paid here, against the database
+// instead of against Microsoft.
+func TestCachingTokenSource_StandbyRewarmsFromWhatTheLiveAgentStored(t *testing.T) {
+	store := &memStore{}
+	store.seed(t, &oauth2.Token{AccessToken: "live-refreshed", RefreshToken: "r2", Expiry: time.Now().Add(time.Hour)})
+
+	refresher := &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "must-not-happen", RefreshToken: "r3"}}}
+	standby := &cachingTokenSource{
+		store: store,
+		out:   io.Discard,
+		live:  func() bool { return false },
+		inner: refresher,
+		held:  &oauth2.Token{AccessToken: "stale", RefreshToken: "r1", Expiry: time.Now().Add(-time.Minute)},
+	}
+
+	tok, err := standby.Token()
+	if err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if refresher.callCount() != 0 {
+		t.Errorf("standby refreshed %d times, want 0", refresher.callCount())
+	}
+	if tok.RefreshToken != "r2" {
+		t.Errorf("standby got %q, want the live agent's stored r2", tok.RefreshToken)
+	}
+	if _, saves := store.counts(); saves != 0 {
+		t.Errorf("standby wrote %d times, want 0", saves)
+	}
+}
+
+// With nothing newer to read, the standby stays cold and says so rather than
+// refreshing its way out of it.
+func TestCachingTokenSource_AnUnwarmableStandbyReportsItRatherThanRefreshing(t *testing.T) {
+	refresher := &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "must-not-happen", RefreshToken: "r2"}}}
+	standby := &cachingTokenSource{
+		store: &memStore{failLoad: ErrStoreUnavailable},
+		out:   io.Discard,
+		live:  func() bool { return false },
+		inner: refresher,
+		held:  &oauth2.Token{AccessToken: "stale", RefreshToken: "r1", Expiry: time.Now().Add(-time.Minute)},
+	}
+
+	if _, err := standby.Token(); err == nil {
+		t.Fatal("an unwarmable standby reported success")
+	}
+	if refresher.callCount() != 0 {
+		t.Errorf("standby refreshed %d times, want 0", refresher.callCount())
+	}
+}
+
+// Going live is what lifts the restriction, and the first refresh after it is
+// written -- nothing this process held was ever recorded from here before.
+func TestCachingTokenSource_RefreshesAndWritesOnceItGoesLive(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
 	store.seed(t, &oauth2.Token{AccessToken: "old", RefreshToken: "r1"})
 
 	var live atomic.Bool
 	cts := &cachingTokenSource{
-		store:   store,
-		allowed: live.Load,
-		inner:   &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "refreshed", RefreshToken: "r2"}}},
+		store: store,
+		out:   io.Discard,
+		live:  live.Load,
+		inner: &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "refreshed", RefreshToken: "r2"}}},
+		held:  &oauth2.Token{AccessToken: "old", RefreshToken: "r1"},
 	}
 
 	if _, err := cts.Token(); err != nil {
@@ -225,7 +359,7 @@ func TestCachingTokenSource_StandbyWritesWhatItRefreshedOnceItGoesLive(t *testin
 		t.Fatalf("Load: %v", err)
 	}
 	if stored.RefreshToken != "r2" {
-		t.Errorf("stored RefreshToken = %q, want r2 flushed on going live", stored.RefreshToken)
+		t.Errorf("stored RefreshToken = %q, want r2 written once live", stored.RefreshToken)
 	}
 }
 
@@ -243,18 +377,21 @@ func TestCachingTokenSource_LiveAndStandbyShareOneStoreConcurrently(t *testing.T
 	}
 	standbyTokens := make([]*oauth2.Token, 50)
 	for i := range standbyTokens {
-		standbyTokens[i] = &oauth2.Token{AccessToken: "standby", RefreshToken: "standby-only"}
+		standbyTokens[i] = &oauth2.Token{AccessToken: "must-not-happen", RefreshToken: "standby-only"}
 	}
 
 	liveAgent := &cachingTokenSource{
-		store:   store,
-		allowed: func() bool { return true },
-		inner:   &stubTokenSource{tokens: liveTokens},
+		store: store,
+		out:   io.Discard,
+		live:  func() bool { return true },
+		inner: &stubTokenSource{tokens: liveTokens},
 	}
 	standby := &cachingTokenSource{
-		store:   store,
-		allowed: func() bool { return false },
-		inner:   &stubTokenSource{tokens: standbyTokens},
+		store: store,
+		out:   io.Discard,
+		live:  func() bool { return false },
+		inner: &stubTokenSource{tokens: standbyTokens},
+		held:  &oauth2.Token{AccessToken: "standby", RefreshToken: "standby-held"},
 	}
 
 	var wg sync.WaitGroup
@@ -275,10 +412,10 @@ func TestCachingTokenSource_LiveAndStandbyShareOneStoreConcurrently(t *testing.T
 				return
 			}
 			// The standby's whole reason to exist: it holds a usable token
-			// of its own the entire time, without a volume and without
-			// touching the live agent's.
+			// the entire time, without a volume -- and without rotating the
+			// one the live agent is playing on.
 			if tok.AccessToken != "standby" {
-				errCh <- errors.New("standby did not get its own token")
+				errCh <- errors.New("standby refreshed instead of holding what it had")
 			}
 		}()
 	}
@@ -306,9 +443,10 @@ func TestCachingTokenSource_LiveAndStandbyShareOneStoreConcurrently(t *testing.T
 func TestCachingTokenSource_SaveFailureDoesNotFailTheCall(t *testing.T) {
 	store := &memStore{failSave: ErrStoreUnavailable}
 	cts := &cachingTokenSource{
-		store:   store,
-		allowed: func() bool { return true },
-		inner:   &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "a", RefreshToken: "r1"}}},
+		store: store,
+		out:   io.Discard,
+		live:  func() bool { return true },
+		inner: &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "a", RefreshToken: "r1"}}},
 	}
 
 	tok, err := cts.Token()
@@ -336,9 +474,10 @@ func TestCachingTokenSource_TokenIsSafeForConcurrentUse(t *testing.T) {
 		tokens[i] = &oauth2.Token{AccessToken: "tok", RefreshToken: "refresh"}
 	}
 	cts := &cachingTokenSource{
-		store:   store,
-		allowed: func() bool { return true },
-		inner:   &stubTokenSource{tokens: tokens},
+		store: store,
+		out:   io.Discard,
+		live:  func() bool { return true },
+		inner: &stubTokenSource{tokens: tokens},
 	}
 
 	var wg sync.WaitGroup

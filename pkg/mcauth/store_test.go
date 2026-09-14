@@ -361,6 +361,9 @@ func TestFallback_CorruptPrimaryIsNotMaskedBySecondary(t *testing.T) {
 	}
 }
 
+// An empty primary really is empty, and a secondary with nothing either is
+// the genuine cold start the device-code login exists for -- the one case
+// that must stay ErrNoToken.
 func TestFallback_EmptyEverywhereIsErrNoToken(t *testing.T) {
 	_, err := NewFallback(&memStore{}, &memStore{}).Load(context.Background())
 	if !errors.Is(err, ErrNoToken) {
@@ -397,15 +400,88 @@ func TestFallback_WritesOnlyToThePrimary(t *testing.T) {
 	}
 }
 
+// A primary that rejected the write still answers reads, so the next load
+// would prefer its older row over anything written beside it. Reporting the
+// failure is the only honest answer.
 func TestFallback_SaveFailureIsReportedNotRedirected(t *testing.T) {
-	primary := &memStore{failSave: fmt.Errorf("%w: relation does not exist", ErrStoreUnavailable)}
+	primary := &memStore{failSave: errors.New("duplicate key value violates unique constraint")}
 	secondary := &memStore{}
 
 	err := NewFallback(primary, secondary).Save(context.Background(), &oauth2.Token{AccessToken: "a", RefreshToken: "r"})
-	if !errors.Is(err, ErrStoreUnavailable) {
-		t.Fatalf("Save = %v, want the primary's failure", err)
+	if err == nil {
+		t.Fatal("Save = nil, want the primary's failure")
 	}
 	if _, saves := secondary.counts(); saves != 0 {
 		t.Errorf("secondary saves = %d, want 0", saves)
+	}
+}
+
+// The state the README calls "released ahead of its migration": the primary
+// cannot answer, so the secondary is where the next load will look -- and
+// refreshing rotated the credential at Microsoft whether or not anything
+// stored the result, so a token written nowhere is an account locked out.
+func TestFallback_UnavailablePrimaryWritesThroughToTheSecondary(t *testing.T) {
+	ctx := context.Background()
+	primary := &memStore{failSave: fmt.Errorf("%w: relation does not exist", ErrStoreUnavailable), failLoad: fmt.Errorf("%w: relation does not exist", ErrStoreUnavailable)}
+	secondary := &memStore{}
+	secondary.seed(t, &oauth2.Token{AccessToken: "a", RefreshToken: "r1"})
+
+	fb := NewFallback(primary, secondary)
+	if err := fb.Save(ctx, &oauth2.Token{AccessToken: "b", RefreshToken: "r2"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// And it is the copy the next start reads, which is the only reason to
+	// have written it.
+	got, err := fb.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.RefreshToken != "r2" {
+		t.Errorf("RefreshToken = %q, want the rotated r2 to have survived", got.RefreshToken)
+	}
+}
+
+func TestFallback_WriteThroughFailingEverywhereIsReported(t *testing.T) {
+	primary := &memStore{failSave: fmt.Errorf("%w: relation does not exist", ErrStoreUnavailable)}
+	secondary := &memStore{failSave: errors.New("read-only file system")}
+
+	err := NewFallback(primary, secondary).Save(context.Background(), &oauth2.Token{AccessToken: "a", RefreshToken: "r"})
+	if err == nil {
+		t.Fatal("Save = nil with nowhere to write")
+	}
+	if !errors.Is(err, ErrStoreUnavailable) {
+		t.Errorf("Save = %v, want it to still carry the primary's failure", err)
+	}
+}
+
+// The one collapse that costs a device code: an unreadable primary and an
+// empty secondary is a database problem, not a cold start, and only a cold
+// start may print a code into a pod log.
+func TestFallback_UnavailablePrimaryOutranksAnEmptySecondary(t *testing.T) {
+	primary := &memStore{failLoad: fmt.Errorf("%w: relation does not exist", ErrStoreUnavailable)}
+	secondary := &memStore{}
+
+	_, err := NewFallback(primary, secondary).Load(context.Background())
+	if !errors.Is(err, ErrStoreUnavailable) {
+		t.Errorf("Load = %v, want ErrStoreUnavailable", err)
+	}
+	if errors.Is(err, ErrNoToken) {
+		t.Error("a store that could not be read was reported as an empty one")
+	}
+}
+
+// A secondary that fails for its own reason is reported as itself: an
+// unreadable file is not an empty one either.
+func TestFallback_SecondaryFailureIsNotReplacedByThePrimarys(t *testing.T) {
+	primary := &memStore{failLoad: fmt.Errorf("%w: relation does not exist", ErrStoreUnavailable)}
+	secondary := &memStore{failLoad: errors.New("cached token is not valid JSON")}
+
+	_, err := NewFallback(primary, secondary).Load(context.Background())
+	if err == nil {
+		t.Fatal("Load = nil with nothing readable anywhere")
+	}
+	if !strings.Contains(err.Error(), "not valid JSON") {
+		t.Errorf("Load = %v, want the secondary's own failure", err)
 	}
 }

@@ -44,22 +44,21 @@ func openTokenStore(cfg config.Config, shared mcauth.Store, log *logging.Logger)
 	return mcauth.NewFallback(shared, file), nil
 }
 
-// tokenWriteGate says whether this process may persist a refreshed token.
+// tokenLiveGate says whether this process currently holds the account's Xbox
+// Live login, and so may refresh it, persist the result, and answer a
+// first-run device code.
 //
-// Microsoft rotates the refresh token on every refresh, so the copy a
-// standby leaves behind after refreshing is one the live agent can no longer
-// use. Only one of the two processes may write, and the live agent is the
-// one whose token is being used to hold the login -- so the gate opens with
-// the turn and closes with the handover.
-//
-// A standby still refreshes: paying that round trip before it is needed is
-// the point of a warm standby. It simply keeps the result to itself, and
-// writes it the moment it goes live.
-type tokenWriteGate struct {
-	allowed atomic.Bool
+// Microsoft retires the refresh token as it issues the replacement, so a
+// second process that refreshes revokes the credential the first one is
+// playing on -- the damage is the refresh, not the write. Exactly one
+// process may do it, and that is the one holding the lock, so the gate opens
+// with the turn and closes with it. A standby stays warm by re-reading what
+// the live agent stored, not by rotating anything of its own.
+type tokenLiveGate struct {
+	live atomic.Bool
 }
 
-func (g *tokenWriteGate) open()  { g.allowed.Store(true) }
-func (g *tokenWriteGate) close() { g.allowed.Store(false) }
+func (g *tokenLiveGate) open()  { g.live.Store(true) }
+func (g *tokenLiveGate) close() { g.live.Store(false) }
 
-func (g *tokenWriteGate) isOpen() bool { return g.allowed.Load() }
+func (g *tokenLiveGate) isOpen() bool { return g.live.Load() }
