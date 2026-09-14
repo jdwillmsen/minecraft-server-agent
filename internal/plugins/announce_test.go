@@ -810,3 +810,32 @@ func TestInboxDoesNotClaimAnEmptyQueueWhenSomethingIsStillOwed(t *testing.T) {
 		t.Errorf("reply %q ends in a question mark", reply)
 	}
 }
+
+// An uncounted reach has two causes and they call for different answers. A
+// whisper that reached its player and lost its delivery row must not be
+// reported as the agent being unable to see who is online: the roster was
+// never in doubt, and the operator would go looking for a connection problem
+// that is not there.
+func TestAnnounceNowDoesNotBlameTheRosterForAWhisperItCouldNotRecord(t *testing.T) {
+	cmd := announceCommand(t, "announce")
+	pctx := &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: true},
+		Deliverer:     &fakeAnnounceDeliverer{uncounted: true},
+		Roster:        fakeAnnounceRoster{online: map[string]string{"LightKing0221": "xuid-1"}},
+	}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"@LightKing0221", "your", "waypoint", "is", "at", "spawn"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.Contains(strings.ToLower(reply), "who is online") {
+		t.Errorf("reply %q blames the roster for a whisper whose record failed", reply)
+	}
+	if !strings.Contains(strings.ToLower(reply), "record") {
+		t.Errorf("reply %q should say the record is what failed", reply)
+	}
+}

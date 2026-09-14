@@ -177,8 +177,8 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   other out of the game during a release - see "Handing over to a standby"
   below
 - `internal/httpapi` - `/healthz`, `/readyz` (the live agent's real Bedrock
-  session state, or a standby's wait - both are ready), the role that says
-  which of the two this process is,
+  session state, or a standby's wait, which are the two ready answers; a pod
+  still starting is the third role and is not ready), the role itself,
   `/metrics`, and `POST /announcements` when `ANNOUNCE_API_TOKEN` is set
 - `internal/metrics` - every series the agent exports beyond the session
   gauge and reconnect counter; callers record through small functions and

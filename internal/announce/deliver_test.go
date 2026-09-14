@@ -1447,9 +1447,11 @@ func TestSendNowStillCountsAWhisperNobodyWasTold(t *testing.T) {
 	}
 }
 
-// One row failing among several is not a zero, so the count still stands for
-// the players whose rows did write.
-func TestSendNowStillCountsTheWhispersWhoseRowsWrote(t *testing.T) {
+// One row failing among several is not a count short by one: op-2 read the
+// whisper, so a reported 1 of 2 understates what the server saw while giving
+// the caller no sign anything is missing. The same rule the broadcast loop
+// holds to -- a recipient sent to and not recorded is not accounted for.
+func TestSendNowDoesNotCountWhispersWhenOneRowFailed(t *testing.T) {
 	a := Announcement{Body: "the nether hub is open", TargetKind: TargetPermission, TargetValue: "operator"}
 	store := &fakeStore{enabled: true, markErr: map[string]error{"op-2": errors.New("db unavailable")}}
 	voice := &fakeVoice{}
@@ -1462,7 +1464,86 @@ func TestSendNowStillCountsTheWhispersWhoseRowsWrote(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendNow: %v", err)
 	}
-	if !sent.Counted || sent.Players != 1 {
-		t.Errorf("sent = %+v, want one counted player — op-1's row wrote and op-2's did not", sent)
+	if len(voice.tells) != 2 {
+		t.Fatalf("Tell calls = %v, want both operators told", voice.tells)
+	}
+	if sent.Counted {
+		t.Errorf("sent = %+v, want an uncounted reach — op-2 read it and no row says so", sent)
+	}
+	// op-1's row still wrote, so they are not whispered it again.
+	if len(store.delivered) != 1 || store.delivered[0].xuid != "op-1" {
+		t.Errorf("rows = %v, want one for op-1", store.delivered)
+	}
+}
+
+// Every row writing is still a real count: nothing is unaccounted for, and
+// the caller gets a number it can act on.
+func TestSendNowCountsWhispersWhenEveryRowWrote(t *testing.T) {
+	a := Announcement{Body: "the nether hub is open", TargetKind: TargetPermission, TargetValue: "operator"}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice,
+		fakeRoster{online: []string{"op-1", "op-2"}},
+		fakePermissions{levels: map[string]string{"op-1": "operator", "op-2": "operator"}},
+		testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 74)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if !sent.Counted || sent.Players != 2 {
+		t.Errorf("sent = %+v, want two counted players", sent)
+	}
+}
+
+// A leader that has just lost the lock keeps its roster for as long as the
+// connect loop takes to unwind, so the empty-roster guard never fires for it.
+// Its console bridge is up like any other, and the server it would speak into
+// now belongs to whoever took the lock -- so the role, not the roster, has to
+// be what decides whether it speaks.
+func TestSendNowDoesNotBroadcastFromADemotedLeaderThatStillNamesPlayers(t *testing.T) {
+	a := Announcement{Body: "deploying v2", TargetKind: TargetEveryone}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice,
+		fakeRoster{online: []string{"steve", "alex"}},
+		fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: false}))
+
+	sent, err := d.SendNow(context.Background(), a, 81)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 0 {
+		t.Errorf("Say calls = %v, want none — this process no longer holds the lock", voice.says)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing: it said nothing", store.delivered)
+	}
+	if !sent.Queued {
+		t.Errorf("sent = %+v, want it reported as queued for whoever holds the lock", sent)
+	}
+}
+
+// The same populated roster on the process that does hold the lock still
+// broadcasts and still records, so the guard is the role and not the players.
+func TestSendNowStillBroadcastsFromTheLeaderWithPlayersOnTheRoster(t *testing.T) {
+	a := Announcement{Body: "deploying v2", TargetKind: TargetEveryone}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice,
+		fakeRoster{online: []string{"steve", "alex"}},
+		fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: true}))
+
+	sent, err := d.SendNow(context.Background(), a, 82)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 {
+		t.Errorf("Say calls = %v, want exactly one", voice.says)
+	}
+	if !sent.Counted || sent.Players != 2 {
+		t.Errorf("sent = %+v, want two counted players", sent)
 	}
 }
