@@ -476,19 +476,31 @@ func TestCachingTokenSource_RefreshesAndWritesOnceItGoesLive(t *testing.T) {
 
 // Both roles against one store at once, which is what a rolling release
 // actually looks like. The assertion is not just that nothing races: it is
-// that the stored token is only ever one the live agent put there.
+// that the stored token is only ever one the live agent put there, and that
+// the standby got every token it answered with out of the live agent's row.
+//
+// The standby's held token is expired on purpose. A zero Expiry reads as
+// "never expires" to oauth2, which would have the standby answer from memory
+// every time and touch the shared store not once -- the property this is
+// here for, serialised away by construction.
 func TestCachingTokenSource_LiveAndStandbyShareOneStoreConcurrently(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
-	store.seed(t, &oauth2.Token{AccessToken: "seed", RefreshToken: "live-0"})
+	// The live agent's own token, since that is all this store ever holds:
+	// a standby that reads before the first rotation below still reads one.
+	store.seed(t, &oauth2.Token{AccessToken: "live", RefreshToken: "live-seed", Expiry: time.Now().Add(time.Hour)})
 
 	liveTokens := make([]*oauth2.Token, 50)
 	for i := range liveTokens {
-		liveTokens[i] = &oauth2.Token{AccessToken: "live", RefreshToken: "live-" + string(rune('a'+i%26))}
+		liveTokens[i] = &oauth2.Token{
+			AccessToken:  "live",
+			RefreshToken: "live-" + string(rune('a'+i%26)),
+			Expiry:       time.Now().Add(time.Hour),
+		}
 	}
 	standbyTokens := make([]*oauth2.Token, 50)
 	for i := range standbyTokens {
-		standbyTokens[i] = &oauth2.Token{AccessToken: "must-not-happen", RefreshToken: "standby-only"}
+		standbyTokens[i] = &oauth2.Token{AccessToken: "must-not-happen", RefreshToken: "standby-only", Expiry: time.Now().Add(time.Hour)}
 	}
 
 	liveAgent := &cachingTokenSource{
@@ -497,12 +509,13 @@ func TestCachingTokenSource_LiveAndStandbyShareOneStoreConcurrently(t *testing.T
 		live:  func() bool { return true },
 		inner: &stubTokenSource{tokens: liveTokens},
 	}
+	standbyRefresher := &stubTokenSource{tokens: standbyTokens}
 	standby := &cachingTokenSource{
 		store: store,
 		out:   io.Discard,
 		live:  func() bool { return false },
-		inner: &stubTokenSource{tokens: standbyTokens},
-		held:  &oauth2.Token{AccessToken: "standby", RefreshToken: "standby-held"},
+		inner: standbyRefresher,
+		held:  &oauth2.Token{AccessToken: "standby", RefreshToken: "standby-held", Expiry: time.Now().Add(-time.Minute)},
 	}
 
 	var wg sync.WaitGroup
@@ -519,14 +532,17 @@ func TestCachingTokenSource_LiveAndStandbyShareOneStoreConcurrently(t *testing.T
 			defer wg.Done()
 			tok, err := standby.Token()
 			if err != nil {
-				errCh <- err
+				// The one failure a standby is allowed: nothing fresh in the
+				// store and no licence to refresh its way out of that.
+				if !errors.Is(err, ErrStandbyUnwarmed) {
+					errCh <- err
+				}
 				return
 			}
-			// The standby's whole reason to exist: it holds a usable token
-			// the entire time, without a volume -- and without rotating the
-			// one the live agent is playing on.
-			if tok.AccessToken != "standby" {
-				errCh <- errors.New("standby refreshed instead of holding what it had")
+			// Whatever it answers with came out of the live agent's row --
+			// it has no other source, having rotated nothing itself.
+			if tok.AccessToken != "live" {
+				errCh <- errors.New("standby answered with a token the live agent never stored")
 			}
 		}()
 	}
@@ -534,6 +550,17 @@ func TestCachingTokenSource_LiveAndStandbyShareOneStoreConcurrently(t *testing.T
 	close(errCh)
 	for err := range errCh {
 		t.Errorf("concurrent Token() call: %v", err)
+	}
+
+	if standbyRefresher.callCount() != 0 {
+		t.Errorf("standby refreshed %d times, want 0", standbyRefresher.callCount())
+	}
+	loads, saves := store.counts()
+	if loads == 0 {
+		t.Error("the standby never read the shared store, so neither role exercised it")
+	}
+	if saves != len(liveTokens) {
+		t.Errorf("saves = %d, want one per live refresh (%d): only the live agent writes", saves, len(liveTokens))
 	}
 
 	stored, err := store.Load(ctx)
@@ -606,5 +633,110 @@ func TestCachingTokenSource_TokenIsSafeForConcurrentUse(t *testing.T) {
 	close(errCh)
 	for err := range errCh {
 		t.Errorf("concurrent Token() call failed: %v", err)
+	}
+}
+
+// errTokenSource is a refresher that only fails, which is what Microsoft's
+// does once the token it holds has been retired by a newer one.
+type errTokenSource struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+func (e *errTokenSource) Token() (*oauth2.Token, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls++
+	return nil, e.err
+}
+
+func (e *errTokenSource) callCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
+}
+
+// A promoted standby holds whatever the store said when it last read it, and
+// the live agent has rotated since. Microsoft retired that token as it issued
+// the replacement, so the first thing the new live agent must do with the
+// login is read the row -- not write its own copy over it. Flushing leaves
+// the account's only stored credential dead: this process fails at its next
+// refresh, and every restart after it loads the dead one too.
+func TestCachingTokenSource_PromotionReadsTheStoreBeforeWritingToIt(t *testing.T) {
+	ctx := context.Background()
+	store := &memStore{}
+	store.seed(t, &oauth2.Token{AccessToken: "boot", RefreshToken: "r1", Expiry: time.Now().Add(time.Hour)})
+
+	var live atomic.Bool
+	cts := &cachingTokenSource{store: store, out: io.Discard, live: live.Load}
+	if _, err := cts.Token(); err != nil {
+		t.Fatalf("Token while standing by: %v", err)
+	}
+
+	// The live agent rotates r1 into r2 and stores it, which is what retires
+	// r1 at Microsoft.
+	if err := store.Save(ctx, &oauth2.Token{AccessToken: "live", RefreshToken: "r2", Expiry: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatalf("the live agent's Save: %v", err)
+	}
+
+	live.Store(true)
+	tok, err := cts.Token()
+	if err != nil {
+		t.Fatalf("Token once promoted: %v", err)
+	}
+	if tok.RefreshToken != "r2" {
+		t.Errorf("promoted standby answered with %q, want the stored r2", tok.RefreshToken)
+	}
+	stored, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if stored.RefreshToken != "r2" {
+		t.Errorf("the row now holds %q: a promoted standby overwrote a newer token with a retired one", stored.RefreshToken)
+	}
+}
+
+// The same handover with the standby's copy already expired, which is the
+// likelier half: refreshing from the retired token answers invalid_grant, and
+// the connect loop then parks on AUTH_RETRY_DELAY_MS -- the handover cost this
+// design exists to remove. The store holds a usable token the whole time.
+func TestCachingTokenSource_PromotionWithAnExpiredCopyTakesTheStoredTokenNotARefresh(t *testing.T) {
+	ctx := context.Background()
+	withStubLogin(t, func(ctx context.Context, out io.Writer) (*oauth2.Token, error) {
+		t.Error("a promoted standby printed a device code with a usable token in the store")
+		return nil, errors.New("should not be reached")
+	})
+
+	store := &memStore{}
+	store.seed(t, &oauth2.Token{AccessToken: "boot", RefreshToken: "r1", Expiry: time.Now().Add(-time.Minute)})
+
+	var live atomic.Bool
+	refresher := &errTokenSource{err: errors.New("oauth2: invalid_grant")}
+	cts := &cachingTokenSource{
+		store: store,
+		out:   io.Discard,
+		live:  live.Load,
+		inner: refresher,
+		held:  &oauth2.Token{AccessToken: "boot", RefreshToken: "r1", Expiry: time.Now().Add(-time.Minute)},
+	}
+	if _, err := cts.Token(); err == nil {
+		t.Fatal("a standby with nothing unexpired to read reported a usable token")
+	}
+
+	if err := store.Save(ctx, &oauth2.Token{AccessToken: "live", RefreshToken: "r2", Expiry: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatalf("the live agent's Save: %v", err)
+	}
+
+	live.Store(true)
+	tok, err := cts.Token()
+	if err != nil {
+		t.Fatalf("Token once promoted: %v", err)
+	}
+	if tok.RefreshToken != "r2" {
+		t.Errorf("promoted standby answered with %q, want the stored r2", tok.RefreshToken)
+	}
+	if refresher.callCount() != 0 {
+		t.Errorf("refreshed %d times from a token the live agent retired, want 0", refresher.callCount())
 	}
 }

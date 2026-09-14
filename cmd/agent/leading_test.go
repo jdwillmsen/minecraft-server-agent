@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -479,6 +482,57 @@ func TestAFailedTokenRefreshIsNotFatal(t *testing.T) {
 	ts := &tokenSource{err: errors.New("invalid_grant")}
 
 	warmXboxToken(ts, quiet())
+}
+
+// captureStderr returns everything fn writes to stderr, which is where the
+// logger puts error-level events. A logger captures its writers at
+// construction, so any logger whose output matters must be built inside fn.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("read pipe: %v", err)
+	}
+	return buf.String()
+}
+
+// A standby whose stored token was written more than one access-token
+// lifetime ago finds nothing it can use, and may not refresh its way out of
+// that. It is the ordinary state of a standby, so it must not reach the
+// stream alerts are keyed on.
+func TestAnUnwarmedStandbyLogsNothingAtErrorLevel(t *testing.T) {
+	ts := &tokenSource{err: mcauth.ErrStandbyUnwarmed}
+
+	stderr := captureStderr(t, func() { warmXboxToken(ts, logging.New("error")) })
+
+	if stderr != "" {
+		t.Errorf("a standby with nothing fresh to read logged at error level: %s", stderr)
+	}
+}
+
+// And the quiet is only for that one state: a store or an account that is
+// actually broken still says so where an alert can see it.
+func TestATokenFailureThatIsNotOrdinaryStillLogsAtErrorLevel(t *testing.T) {
+	ts := &tokenSource{err: errors.New("cached token is not valid JSON")}
+
+	stderr := captureStderr(t, func() { warmXboxToken(ts, logging.New("error")) })
+
+	if !strings.Contains(stderr, "auth_token_refresh_failed") {
+		t.Errorf("a broken store logged %q, want auth_token_refresh_failed at error level", stderr)
+	}
 }
 
 // An agent that is live without the lock has given up the one guarantee the

@@ -117,6 +117,10 @@ func TokenSource(ctx context.Context, store Store, out io.Writer, opts ...Option
 	for _, opt := range opts {
 		opt(c)
 	}
+	// A process that starts as a standby reads the store again before it
+	// rotates anything, however long it stands by first: what was loaded
+	// here is the live agent's token, and the live agent goes on rotating it.
+	c.mustReload = !c.live()
 	return c, nil
 }
 
@@ -145,10 +149,17 @@ type cachingTokenSource struct {
 	// saved is the refresh token this process has written, and starts empty
 	// even though the store was just read: what was loaded is not
 	// necessarily what the store the agent writes to holds. A token read
-	// through a Fallback came from the file the cluster is moving away from.
-	// Starting empty costs one redundant write per process and makes that
-	// land the moment this process is allowed to write.
+	// through a Fallback came from the file the cluster is moving away from,
+	// and the one write that starting empty costs is what copies it into the
+	// row. It is only ever that copy: a process that stood by first seeds
+	// this from the store before it rotates anything, so an empty saved can
+	// no longer flush a superseded token over a newer one -- see reload.
 	saved string
+	// mustReload records that the store may hold a token newer than the one
+	// this process is holding: it stood by while another process was live,
+	// or a write of its own lost to one. Cleared by the reload the next live
+	// call performs.
+	mustReload bool
 }
 
 // Token returns a usable token, doing only what this process is entitled to
@@ -162,7 +173,24 @@ func (c *cachingTokenSource) Token() (*oauth2.Token, error) {
 	defer c.mu.Unlock()
 
 	if !c.live() {
+		// Another process is rotating the account's token while this one
+		// stands by, so anything this one holds may be superseded before it
+		// is allowed to use it.
+		c.mustReload = true
 		return c.standbyToken()
+	}
+	if c.mustReload {
+		if err := c.reload(); err != nil {
+			// A token that may have been superseded is still one this
+			// process can dial with; what it may not do is rotate from it,
+			// since refreshing a token Microsoft has already retired is what
+			// costs the account its login. The connect loop calls Token per
+			// dial, so the reload retries within seconds.
+			if c.held.Valid() {
+				return c.held, nil
+			}
+			return nil, err
+		}
 	}
 
 	tok, err := c.liveToken()
@@ -187,6 +215,38 @@ func (c *cachingTokenSource) Token() (*oauth2.Token, error) {
 	c.saved = tok.RefreshToken
 	c.note(func() { c.log.Info("auth_token_written", nil) })
 	return tok, nil
+}
+
+// reload takes what the store holds before this process rotates anything.
+//
+// The gate opens on a process that has been standing by, holding the token it
+// last read. The agent that was live has rotated the account since, and
+// Microsoft retired that copy as it issued the replacement: refreshing from
+// it fails, and writing it back leaves the account's only stored credential
+// dead and the next restart loading it too.
+//
+// An empty store is not a failure here. That is the cold start, and the
+// migration window where the row is empty and the load was answered by the
+// file behind it -- leaving saved empty is what copies that file into the row
+// on the first write.
+func (c *cachingTokenSource) reload() error {
+	loadCtx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+
+	tok, err := c.store.Load(loadCtx)
+	switch {
+	case errors.Is(err, ErrNoToken):
+	case err != nil:
+		return fmt.Errorf("mcauth: reload before rotating: %w", err)
+	default:
+		if c.held == nil || tok.RefreshToken != c.held.RefreshToken {
+			c.adopt(tok)
+			c.note(func() { c.log.Info("auth_token_adopted_from_store", nil) })
+		}
+		c.saved = tok.RefreshToken
+	}
+	c.mustReload = false
+	return nil
 }
 
 // liveToken refreshes the held token, or performs the first-run device-code
@@ -234,23 +294,34 @@ func (c *cachingTokenSource) standbyToken() (*oauth2.Token, error) {
 	loadCtx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
 	tok, err := c.store.Load(loadCtx)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrNoToken):
+		return nil, ErrStandbyUnwarmed
+	case err != nil:
 		return nil, fmt.Errorf("mcauth: standby reload: %w", err)
+	case !tok.Valid():
+		// Adopting would point the refresher at this token, and a standby
+		// that already holds one reaches here only because what it holds is
+		// no fresher -- so taking the reload over would leave the process
+		// rotating from whichever of the two is older.
+		//
+		// A process holding nothing is the exception: an expired token is
+		// still a refresh token, and having one to rotate from on promotion
+		// beats having none at all.
+		if c.held == nil {
+			c.adopt(tok)
+		}
+		return nil, ErrStandbyUnwarmed
 	}
 	// Adopting rebuilds the refresher, so on this path -- reached only once
 	// what is held has expired -- the single thing it can still change is
-	// which credential a later rotation starts from. A reload that is no
-	// more usable than what it replaces must not take that over: the store
-	// answering at all does not make its answer the newer one, and a
+	// which credential a later rotation starts from. Only an unexpired
+	// reload earns that, which the switch above has already established: a
+	// store answering at all does not make its answer the newer one, and a
 	// fallback reaching past an unreachable database returns the copy the
 	// migration left behind.
-	if tok.Valid() || c.held == nil {
-		c.adopt(tok)
-	}
+	c.adopt(tok)
 	c.note(func() { c.log.Info("auth_token_standby_reloaded", nil) })
-	if !tok.Valid() {
-		return nil, ErrStandbyUnwarmed
-	}
 	return tok, nil
 }
 
