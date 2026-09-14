@@ -3,6 +3,7 @@ package mcauth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -738,5 +739,32 @@ func TestCachingTokenSource_PromotionWithAnExpiredCopyTakesTheStoredTokenNotARef
 	}
 	if refresher.callCount() != 0 {
 		t.Errorf("refreshed %d times from a token the live agent retired, want 0", refresher.callCount())
+	}
+}
+
+// A rotation that reached only the file is not one the row holds, and the row
+// is what the next load prefers. Recording it as saved leaves the row wrong
+// until the next rotation -- about an access token's lifetime -- and a
+// restart in that window loads the superseded token from a healthy database
+// and cannot refresh it. The connect loop calls Token per dial, so retrying
+// the primary converges in seconds.
+func TestCachingTokenSource_ARotationThatOnlyReachedTheFallbackIsWrittenAgain(t *testing.T) {
+	primary := &memStore{failSave: fmt.Errorf("%w: connection reset by peer", ErrStoreUnavailable)}
+	secondary := &memStore{}
+	cts := &cachingTokenSource{
+		store: NewFallback(primary, secondary),
+		out:   io.Discard,
+		live:  func() bool { return true },
+		inner: &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "a", RefreshToken: "r2", Expiry: time.Now().Add(time.Hour)}}},
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := cts.Token(); err != nil {
+			t.Fatalf("Token: %v", err)
+		}
+	}
+
+	if _, saves := primary.counts(); saves != 2 {
+		t.Errorf("the primary was written %d times, want 2: a write it never took is not a write", saves)
 	}
 }

@@ -34,6 +34,13 @@ var ErrNoToken = errors.New("mcauth: no cached token")
 // read is a reason to stop and say so.
 var ErrStoreUnavailable = errors.New("mcauth: token store unavailable")
 
+// ErrSavedToFallback means a Save reached the secondary store because the
+// primary could not take it. The rotation is durable -- which is what the
+// account's login depends on -- but not where the next load prefers to look,
+// so a caller that treats it as stored leaves the primary holding a token
+// Microsoft has already retired. Reported so the write can be retried.
+var ErrSavedToFallback = errors.New("mcauth: token saved to the fallback store only")
+
 // Store is where a refresh token lives between runs.
 //
 // The seam exists because the agent runs as two pods during a release, and a
@@ -180,11 +187,17 @@ func (f *FileStore) Save(_ context.Context, tok *oauth2.Token) error {
 // answers is the only truth: a token written to the secondary while the
 // primary merely rejected the write would be the newer one, and the next
 // load -- which prefers the primary -- would take the older, already rotated
-// one and fail to refresh it. But a primary that cannot answer at all is one
-// the next load will not answer from either, so the secondary is where that
-// load will look. Refreshing rotates the credential at Microsoft whether or
-// not the result is stored, so a rotated token written nowhere is not a
+// one and fail to refresh it. But a primary that cannot answer at all may be
+// one the next load will not answer from either, so the secondary is where
+// that load will look. Refreshing rotates the credential at Microsoft whether
+// or not the result is stored, so a rotated token written nowhere is not a
 // missing copy, it is the account locked out until someone logs in by hand.
+//
+// A write that went there is reported as ErrSavedToFallback rather than as
+// success, because "cannot answer" covers a database that is structurally
+// not ready and one whose connection dropped for two seconds. The second
+// recovers holding the superseded token, and only the writer knows the
+// rotation it has in hand is newer than the row.
 type Fallback struct {
 	primary   Store
 	secondary Store
@@ -235,7 +248,7 @@ func (f *Fallback) Save(ctx context.Context, tok *oauth2.Token) error {
 	if secondaryErr := f.secondary.Save(ctx, tok); secondaryErr != nil {
 		return errors.Join(err, secondaryErr)
 	}
-	return nil
+	return fmt.Errorf("%w: %w", ErrSavedToFallback, err)
 }
 
 // tokenFileName derives the per-account cache filename for username. The

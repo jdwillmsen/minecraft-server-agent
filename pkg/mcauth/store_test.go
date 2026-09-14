@@ -371,7 +371,7 @@ func TestFallback_EmptyEverywhereIsErrNoToken(t *testing.T) {
 	}
 }
 
-func TestFallback_WritesOnlyToThePrimary(t *testing.T) {
+func TestFallback_AHealthyPrimaryTakesEveryWriteAndEveryRead(t *testing.T) {
 	ctx := context.Background()
 	primary := &memStore{}
 	secondary := &memStore{}
@@ -427,8 +427,10 @@ func TestFallback_UnavailablePrimaryWritesThroughToTheSecondary(t *testing.T) {
 	secondary.seed(t, &oauth2.Token{AccessToken: "a", RefreshToken: "r1"})
 
 	fb := NewFallback(primary, secondary)
-	if err := fb.Save(ctx, &oauth2.Token{AccessToken: "b", RefreshToken: "r2"}); err != nil {
-		t.Fatalf("Save: %v", err)
+	// Reported, not failed: the rotation is durable, and the report is what
+	// tells the writer the primary still holds the token it superseded.
+	if err := fb.Save(ctx, &oauth2.Token{AccessToken: "b", RefreshToken: "r2"}); !errors.Is(err, ErrSavedToFallback) {
+		t.Fatalf("Save = %v, want ErrSavedToFallback", err)
 	}
 
 	// And it is the copy the next start reads, which is the only reason to
@@ -439,6 +441,30 @@ func TestFallback_UnavailablePrimaryWritesThroughToTheSecondary(t *testing.T) {
 	}
 	if got.RefreshToken != "r2" {
 		t.Errorf("RefreshToken = %q, want the rotated r2 to have survived", got.RefreshToken)
+	}
+}
+
+// A write-through is durable, but not where the next load prefers to look:
+// the primary still holds the token this one superseded. Saying so is what
+// lets the caller retry the primary rather than record the rotation as
+// stored -- a dropped connection during one Save otherwise leaves the row
+// wrong for an access token's lifetime, and a restart in that window loads
+// the dead token from the healthy primary.
+func TestFallback_AWriteThroughReportsThatThePrimaryDidNotTakeIt(t *testing.T) {
+	ctx := context.Background()
+	primary := &memStore{failSave: fmt.Errorf("%w: connection reset by peer", ErrStoreUnavailable)}
+	secondary := &memStore{}
+
+	err := NewFallback(primary, secondary).Save(ctx, &oauth2.Token{AccessToken: "b", RefreshToken: "r2", Expiry: time.Now().Add(time.Hour)})
+	if !errors.Is(err, ErrSavedToFallback) {
+		t.Fatalf("Save = %v, want it to report that only the fallback took the write", err)
+	}
+	got, err := secondary.Load(ctx)
+	if err != nil {
+		t.Fatalf("secondary Load: %v", err)
+	}
+	if got.RefreshToken != "r2" {
+		t.Errorf("the fallback holds %q, want the rotated token to have survived", got.RefreshToken)
 	}
 }
 

@@ -209,6 +209,14 @@ func (c *cachingTokenSource) Token() (*oauth2.Token, error) {
 	// Best-effort: a failed cache write shouldn't fail the connection, but
 	// it does mean the next restart re-authenticates.
 	if err := c.store.Save(saveCtx, tok); err != nil {
+		if errors.Is(err, ErrSavedToFallback) {
+			// Durable, but not where the next load prefers to look. Leaving
+			// saved untouched is what retries the primary: the connect loop
+			// calls Token per dial, so the row catches up in seconds rather
+			// than at the end of this access token's life.
+			c.note(func() { c.log.Info("auth_token_written_to_fallback", nil) })
+			return tok, nil
+		}
 		c.note(func() { c.log.Error("auth_token_write_failed", logging.Fields{"error": err.Error()}) })
 		return tok, nil
 	}
