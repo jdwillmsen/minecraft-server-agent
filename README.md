@@ -146,11 +146,14 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   memory the flood rule and the notice and warning throttles need, and the
   store behind `minecraft.moderation_events`. Only flagged messages are
   stored, for 90 days
-- `internal/pgerr` - recognises the two ways a configured database refuses a
+- `internal/pgerr` - recognises the ways a configured database refuses a
   statement for a reason a deploy is responsible for: the tables are not
   migrated yet, or the role was never granted access to them. Both are
   states a command can answer for and an operator can fix, so neither
-  reaches a player as silence
+  reaches a player as silence. It also tells a database that never answered
+  at all from a statement that is wrong, which is what lets the token cache
+  report a blip as unavailable rather than empty - see "Where the token is
+  cached" below
 - `internal/tools` - the read-only capability surface the `@server` answer
   path may call. Every tool answers a question; none of them change
   anything, so a prompt-injection attempt sitting in player chat has nothing
@@ -1221,6 +1224,14 @@ never production: these tests write rows.
 from `V6__minecraft_moderation.sql`: `go test -tags livedb
 ./internal/moderation/`. It inserts and deletes rows, so point it at a
 disposable database built from the migrations, never at production.
+
+`internal/authcache` has one against `minecraft.auth_tokens` - the table
+`jdwillmsen-schemas` migrates for the token cache, see "Where the token is
+cached" above: `go test -tags livedb ./internal/authcache/`. It is the only
+place the standby half of the cache can be exercised at all, since what it
+asserts is two connections reading and writing one row the way a live agent
+and its standby do. It writes and deletes a row keyed on a test account, so
+the same throwaway-database rule applies.
 
 `internal/leader` has one as well, and it needs no table at all - advisory
 locks and `LISTEN`/`NOTIFY` are both server state, not schema - so the same
