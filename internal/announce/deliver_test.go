@@ -90,9 +90,11 @@ func (v *fakeVoice) Say(_ context.Context, message string) error {
 
 // fakeRoster reports a fixed set of online XUIDs.
 //
-// knows is false by default, which is the state a roster is in whenever it
-// cannot say who is here: between connections, and after one opens until its
-// first roster packet. Tests about a server the agent is watching set it.
+// knows only has to be set for a roster that names nobody. The real one
+// learns who is here and that it has been told from the same packet, so a
+// roster holding players has necessarily been told; the state worth setting
+// by hand is the empty one, which means "nobody is on" when it knows and
+// "not told yet" when it does not.
 type fakeRoster struct {
 	online []string
 	knows  bool
@@ -111,7 +113,7 @@ func (r fakeRoster) IsOnline(xuid string) bool {
 	return false
 }
 
-func (r fakeRoster) Knows() bool { return r.knows }
+func (r fakeRoster) Knows() bool { return r.knows || len(r.online) > 0 }
 
 // fakePermissions resolves each xuid to whatever level the test wired in,
 // defaulting to "" for an xuid it wasn't told about.
@@ -974,13 +976,16 @@ func TestSendNowWhispersOnAStandbyIsAlreadyNothing(t *testing.T) {
 type partedRoster struct {
 	named []string
 	still map[string]bool
+	// forgot is the connection dying while the send was in flight: the
+	// roster stops knowing anyone at all, not merely these players.
+	forgot bool
 }
 
 var _ Roster = partedRoster{}
 
 func (r partedRoster) Online() []string          { return r.named }
-func (r partedRoster) IsOnline(xuid string) bool { return r.still[xuid] }
-func (r partedRoster) Knows() bool               { return true }
+func (r partedRoster) IsOnline(xuid string) bool { return !r.forgot && r.still[xuid] }
+func (r partedRoster) Knows() bool               { return !r.forgot }
 
 // A drain is scheduled by an arrival and fires seconds later. A player who
 // quits inside that wait is gone, but the console accepts a tellraw that
@@ -1124,5 +1129,73 @@ func TestSendNowDoesNotRecordABroadcastForAPlayerWhoLeftDuringTheSay(t *testing.
 	}
 	if sent.Players != 1 || !sent.Counted {
 		t.Errorf("sent = %+v, want one counted player", sent)
+	}
+}
+
+// Say is one bridge round-trip, and the Bedrock connection can die inside
+// it: connectionEnded empties the roster, so every recipient chosen a moment
+// earlier now reads as departed and nothing is recorded. The announcement
+// still went out -- the console bridge is a separate process -- so reporting
+// a counted zero would say the opposite of what happened. A caller that
+// retries on zero, which the API documents as safe, would then publish again
+// into a pod that is now in the gap and broadcast the same line twice.
+func TestSendNowReportsAnUncountedBroadcastWhenTheConnectionDiesDuringTheSay(t *testing.T) {
+	a := Announcement{Body: "server restarting in 5 minutes", TargetKind: TargetOnlineOnly}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	roster := &forgettingRoster{named: []string{"steve"}}
+	d := NewDeliverer(store, voice, roster, fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 41)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 {
+		t.Fatalf("Say calls = %v, want exactly one — it was broadcast before the connection died", voice.says)
+	}
+	if sent.Counted {
+		t.Errorf("sent = %+v, want an uncounted reach — a counted zero reads as \"nobody heard it\" and invites a second broadcast", sent)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing — there is no roster left to record from", store.delivered)
+	}
+}
+
+// forgettingRoster names its players until the send begins, then answers as a
+// roster whose connection has died: it knows nothing and nobody.
+type forgettingRoster struct {
+	named []string
+	dead  bool
+}
+
+var _ Roster = (*forgettingRoster)(nil)
+
+func (r *forgettingRoster) Online() []string {
+	names := r.named
+	// The Say that follows this read is when the connection drops.
+	r.dead = true
+	return names
+}
+
+func (r *forgettingRoster) IsOnline(string) bool { return false }
+func (r *forgettingRoster) Knows() bool          { return !r.dead }
+
+// The connection surviving the Say is the ordinary case, and it must still
+// report a real count: everyone who left is skipped, and what is left is an
+// answer rather than an absence of one.
+func TestSendNowStillCountsWhenTheRosterOutlivesTheSay(t *testing.T) {
+	a := Announcement{Body: "the nether hub is open", TargetKind: TargetEveryone}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice,
+		partedRoster{named: []string{"stayed", "left"}, still: map[string]bool{"stayed": true}},
+		fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 42)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if !sent.Counted || sent.Players != 1 {
+		t.Errorf("sent = %+v, want one counted player — the roster is still watching, so this is a real answer", sent)
 	}
 }

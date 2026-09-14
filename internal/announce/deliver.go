@@ -305,12 +305,6 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 			d.log.Error("announce_say_failed", logging.Fields{"announcement_id": id, "error": err.Error()})
 			return reached(0), nil
 		}
-		if blind {
-			// Heard by whoever is on the server, and there is no roster to
-			// say who that was -- so there is nothing to record and no
-			// count to report.
-			return uncounted, nil
-		}
 		// Say is one console command with no per-recipient receipt, so
 		// "who heard this" has to come from the roster snapshot taken at
 		// send time, one row per player present — without those rows,
@@ -356,6 +350,15 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		}
 		if deferred > 0 {
 			d.log.Info("announce_deferred_for_joining", logging.Fields{"announcement_id": id, "players": deferred})
+		}
+		if blind || !d.roster.Knows() {
+			// Said, with no roster to count from: either there was none when
+			// the recipients were chosen, or the connection died during the
+			// Say, which is one bridge round-trip long. Whoever was on the
+			// server heard it either way; what became impossible is naming
+			// them, and a counted zero would say the opposite -- sending a
+			// caller who retries on it to broadcast the same line twice.
+			return uncounted, nil
 		}
 		// Counted as reached: everyone recorded, plus everyone withheld on
 		// nothing worse than a guess. A player who demonstrably just

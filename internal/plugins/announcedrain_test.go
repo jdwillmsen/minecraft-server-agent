@@ -821,12 +821,14 @@ func TestAnnounceDrain_ConnectionEndingMidSendSendsNoSummary(t *testing.T) {
 	}
 }
 
-// drainPresence answers presence from a fixed set.
+// drainPresence answers presence from a fixed set, on a roster that has been
+// told who is here.
 type drainPresence struct{ online map[string]bool }
 
 var _ plugin.Presence = drainPresence{}
 
 func (p drainPresence) IsOnline(xuid string) bool { return p.online[xuid] }
+func (p drainPresence) Knows() bool               { return true }
 
 // A drain that delivered nothing because the player left reports the whole
 // backlog as still owed, which reads identically to the cap holding it back.

@@ -795,12 +795,18 @@ func TestModerationCountsEveryFlagItRecords(t *testing.T) {
 	}
 }
 
-// modPresence answers presence from a fixed set.
-type modPresence struct{ online map[string]bool }
+// modPresence answers presence from a fixed set. unaware is the window after
+// a connection opens and before its first roster packet: the roster has been
+// told nothing, so it answers no about everyone.
+type modPresence struct {
+	online  map[string]bool
+	unaware bool
+}
 
 var _ plugin.Presence = modPresence{}
 
 func (p modPresence) IsOnline(xuid string) bool { return p.online[xuid] }
+func (p modPresence) Knows() bool               { return !p.unaware }
 
 // A warning is dispatched to a worker goroutine, so the player can quit
 // between posting the flagged message and the whisper going out. Their
@@ -860,5 +866,26 @@ func TestModerationWarnsWhenPresenceIsUnknown(t *testing.T) {
 	got := r.waitRecorded(t, 1)
 	if got[0].Action != moderation.ActionWarned {
 		t.Errorf("action = %q, want warned when presence cannot be asked", got[0].Action)
+	}
+}
+
+// A chat message is itself evidence the player is standing in the world. In
+// the window after a connection opens and before its first roster packet the
+// roster has been told nothing, so IsOnline answers no about everybody --
+// absence of knowledge, not knowledge of absence. Reading it as departure
+// withholds the warning and files the flag as merely logged for a player who
+// is right there.
+func TestModerationWarnsBeforeTheOpeningRosterHasArrived(t *testing.T) {
+	r := newModRig(t, "griefer")
+	r.pctx.Presence = modPresence{unaware: true, online: map[string]bool{}}
+
+	r.say(t, modPlayer, "you absolute GRIEFER")
+
+	got := r.waitRecorded(t, 1)
+	if got[0].Action != moderation.ActionWarned {
+		t.Errorf("action = %q, want warned — the roster has not looked yet, and their message says they are here", got[0].Action)
+	}
+	if told := r.voice.told(); len(told) != 1 || told[0] != modPlayer+": "+moderationWarning {
+		t.Errorf("whispers = %v, want one warning to the player who just chatted", told)
 	}
 }

@@ -517,11 +517,15 @@ nobody is on, and nothing is spoken, exactly as before.
 
 The other half is leadership. The announcement API is served by every pod,
 including a warm standby, whose roster never learns anything and whose
-console bridge is up like any other; a publish that reaches one is refused
-rather than spoken, because the server belongs to whichever process holds the
-lock. A process counts as a standby from startup until it actually takes the
-lock, and again the moment it loses one, so neither window can broadcast into
-a game it is not in. See "Handing over to a standby".
+console bridge is up like any other. Such a pod never speaks: the server
+belongs to whichever process holds the lock. What it does with a publish
+depends on whether the target queues - an announcement to everyone, to a
+named player or to a permission is stored there and delivered by the leader
+on the next join, while an `online_only` one, which never queues, is refused
+outright rather than stored for nothing to pick up. A process counts as a
+standby from startup until it actually takes the lock, and again the moment
+it loses one, so neither window can broadcast into a game it is not in. See
+"Handing over to a standby" and the API's own status codes below.
 
 A delivery already under way stops the same moment, between one message and
 the next. The connection ending cancels the drain where it stands, so the

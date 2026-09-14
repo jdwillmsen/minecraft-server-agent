@@ -352,8 +352,13 @@ type Roster interface {
 // evidence at all that the player is still there.
 type Presence interface {
 	// IsOnline reports whether xuid is on the roster the live connection is
-	// watching.
+	// watching. Meaningful only while Knows is true.
 	IsOnline(xuid string) bool
+	// Knows reports whether the roster can answer who is on the server at
+	// all: false between connections, and false again after one opens until
+	// its first roster packet arrives. IsOnline says "no" about everyone in
+	// both, which is absence of knowledge rather than knowledge of absence.
+	Knows() bool
 }
 
 // KnownOffline reports whether this process can say for certain that xuid
@@ -361,8 +366,15 @@ type Presence interface {
 // positive knowledge of absence, so a Context with no Presence wired keeps
 // doing what it did before rather than silently withholding everything it
 // would otherwise send. cmd/agent always supplies one.
+//
+// A roster that has not been told who is here says nothing about anyone. In
+// the window between a connection opening and its first roster packet a
+// player can be standing in the world, chatting -- their message is itself
+// evidence they are there -- while IsOnline still answers no for everybody.
+// Reading that as departure would withhold what they are owed on the word of
+// a roster that has not looked yet.
 func (c *Context) KnownOffline(xuid string) bool {
-	return c != nil && c.Presence != nil && !c.Presence.IsOnline(xuid)
+	return c != nil && c.Presence != nil && c.Presence.Knows() && !c.Presence.IsOnline(xuid)
 }
 
 // Registry holds every registered plugin and routes commands to them.
