@@ -69,3 +69,33 @@ func TestAddDigpIgnoresMalformedKeysAndValues(t *testing.T) {
 		t.Errorf("index has %d entries after malformed input, want 0", len(ix))
 	}
 }
+
+func TestAddDigpFoldsADimensionItDoesNotKnowIntoUnrecognised(t *testing.T) {
+	// A dimension int outside 0..2 used to be stored verbatim, and the
+	// report iterates a fixed list of dimensions - so those actors were
+	// counted in "decoded" and then vanished from every section below it.
+	for _, raw := range []int32{3, 7, -9, 1 << 20} {
+		dim := raw
+		ix := dimensionIndex{}
+		ix.addDigp(digpKey(1, 2, &dim), actorID(5))
+		if got := ix.lookup(actorID(5)); got != UnrecognisedDimension {
+			t.Errorf("dimension %d resolved to %v, want unrecognised", raw, got)
+		}
+	}
+}
+
+func TestAnUnrecognisedDimensionIsNotAMissingDigpRecord(t *testing.T) {
+	// -1 is UnknownDimension's own value, so a digp record naming it used
+	// to be indistinguishable from an actor whose chunk carried no record
+	// at all. They call for different work: one is a code gap, the other a
+	// chunk the scan could not place.
+	minusOne := int32(-1)
+	ix := dimensionIndex{}
+	ix.addDigp(digpKey(1, 2, &minusOne), actorID(6))
+	if got := ix.lookup(actorID(6)); got != UnrecognisedDimension {
+		t.Errorf("a digp record naming -1 resolved to %v, want unrecognised", got)
+	}
+	if got := ix.lookup(actorID(7)); got != UnknownDimension {
+		t.Errorf("an actor with no digp record resolved to %v, want unknown", got)
+	}
+}

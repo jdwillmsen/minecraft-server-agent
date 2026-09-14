@@ -1,6 +1,7 @@
 package census
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -130,5 +131,37 @@ func TestRenderStatesOneNumberWhereOnlyOneEnvironmentSpawnsTheCategory(t *testin
 	}
 	if !strings.Contains(out, "animal") || !strings.Contains(out, "1 / 4") {
 		t.Errorf("report does not grade the cow against the animal cap of 4\n---\n%s", out)
+	}
+}
+
+func TestRenderAccountsForEveryDecodedEntityByDimension(t *testing.T) {
+	// The dimension breakdown iterates a fixed list. Any dimension missing
+	// from it makes the section sum to less than the decoded count printed
+	// two lines above, with nothing to say entities went missing.
+	entities := []Entity{
+		{Identifier: "zombie", Dimension: Overworld, X: 0, Y: 64, Z: 0},
+		{Identifier: "zombie", Dimension: Nether, X: 0, Y: 64, Z: 0},
+		{Identifier: "zombie", Dimension: End, X: 0, Y: 64, Z: 0},
+		{Identifier: "zombie", Dimension: UnknownDimension, X: 0, Y: 64, Z: 0},
+		{Identifier: "zombie", Dimension: UnrecognisedDimension, X: 0, Y: 64, Z: 0},
+	}
+	c := Aggregate(entities, ScanStats{Records: 5, Decoded: 5}, time.Unix(0, 0).UTC(), "archive")
+
+	out := Render(c, DefaultReportOptions())
+	section, _, ok := strings.Cut(out[strings.Index(out, "entities by dimension\n"):], "\n\n")
+	if !ok {
+		t.Fatalf("report has no dimension section\n---\n%s", out)
+	}
+	sum := 0
+	for _, line := range strings.Split(section, "\n")[1:] {
+		fields := strings.Fields(line)
+		n, err := strconv.Atoi(fields[len(fields)-1])
+		if err != nil {
+			t.Fatalf("dimension line %q does not end in a count: %v", line, err)
+		}
+		sum += n
+	}
+	if sum != len(entities) {
+		t.Errorf("dimension breakdown sums to %d, want %d\n---\n%s", sum, len(entities), out)
 	}
 }

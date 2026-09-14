@@ -41,7 +41,7 @@ func Render(c Census, opts ReportOptions) string {
 		byDimension[t.Dimension] += t.Count
 	}
 	fmt.Fprintf(&b, "entities by dimension\n")
-	for _, d := range []Dimension{Overworld, Nether, End, UnknownDimension} {
+	for _, d := range []Dimension{Overworld, Nether, End, UnknownDimension, UnrecognisedDimension} {
 		if n, ok := byDimension[d]; ok {
 			fmt.Fprintf(&b, "  %-10s %6d\n", d, n)
 		}
@@ -63,7 +63,7 @@ func Render(c Census, opts ReportOptions) string {
 	// end-city shulkers whose counts dwarf everything else, and a single
 	// global ranking buries the overworld and nether regions a player can
 	// actually do something about.
-	for _, d := range []Dimension{Overworld, Nether, End, UnknownDimension} {
+	for _, d := range []Dimension{Overworld, Nether, End, UnknownDimension, UnrecognisedDimension} {
 		shown := 0
 		for _, r := range c.Regions {
 			if r.Key.Dimension != d {

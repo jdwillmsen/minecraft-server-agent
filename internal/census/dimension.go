@@ -25,7 +25,7 @@ func (ix dimensionIndex) addDigp(key, value []byte) {
 	case 8:
 		dim = Overworld
 	case 12:
-		dim = Dimension(int32(binary.LittleEndian.Uint32(suffix[8:])))
+		dim = knownDimension(int32(binary.LittleEndian.Uint32(suffix[8:])))
 	default:
 		return
 	}
@@ -36,6 +36,19 @@ func (ix dimensionIndex) addDigp(key, value []byte) {
 		var id [8]byte
 		copy(id[:], value[i:i+8])
 		ix[id] = dim
+	}
+}
+
+// knownDimension keeps the index closed over the dimensions the report can
+// render. Bedrock has three; anything else is either a dimension added
+// after this code or a corrupt record, and storing it verbatim dropped
+// those actors out of every per-dimension section without a word.
+func knownDimension(raw int32) Dimension {
+	switch d := Dimension(raw); d {
+	case Overworld, Nether, End:
+		return d
+	default:
+		return UnrecognisedDimension
 	}
 }
 

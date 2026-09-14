@@ -15,6 +15,13 @@ const (
 	// record. They are real entities that cannot be placed, so they are
 	// counted separately rather than silently attributed to the overworld.
 	UnknownDimension Dimension = -1
+
+	// UnrecognisedDimension covers actors whose chunk named a dimension
+	// this code does not know. That is a different fact from a missing
+	// record - the scan read a placement and could not use it, which is
+	// work for whoever added the dimension - and folding the two together
+	// would hide it.
+	UnrecognisedDimension Dimension = -2
 )
 
 func (d Dimension) String() string {
@@ -25,6 +32,8 @@ func (d Dimension) String() string {
 		return "nether"
 	case End:
 		return "end"
+	case UnrecognisedDimension:
+		return "unrecognised"
 	default:
 		return "unknown"
 	}
