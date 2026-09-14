@@ -99,6 +99,17 @@ Per entity the census extracts: `identifier`, `UniqueID`, dimension, `Pos`,
 `CustomName`, `CustomNameVisible`, `Persistent`, `Health`, `Age`, `Tags`,
 `OwnerNew`.
 
+A dimension int the code does not know is reported as its own value rather
+than kept verbatim, so no entity can be counted as decoded and then appear in
+no per-dimension section.
+
+Records that will not decode are counted, and past 5% of the world the run
+fails instead of reporting: a backup taken from a running server yields the
+odd torn record, but a Bedrock release that moves the actor NBT layout takes
+every record with it, and a report built from nothing renders every section
+empty - which reads exactly like a quiet world. An empty world still reports
+as an empty world.
+
 Aggregation produces:
 
 - Totals by dimension and identifier.
