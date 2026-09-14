@@ -70,6 +70,49 @@ func TestScanCountsUnplacedEntities(t *testing.T) {
 	}
 }
 
+func TestScanCountsRecordsThatNameNoEntity(t *testing.T) {
+	// A record that decodes and places but carries no identifier cannot be
+	// categorised, so it presses against no cap and appears in the report
+	// as a blank line. Counting it is what lets the run refuse a world
+	// whose identifier tag has moved.
+	path := writeFixtureWorld(t, []fixtureActor{
+		{ID: 4, NBT: map[string]any{"Pos": pos(1, 64, 2), "UniqueID": int64(4)}},
+	})
+	entities, stats, err := Scan(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(entities) != 0 {
+		t.Errorf("got %d entities, want 0", len(entities))
+	}
+	if stats.Unidentified != 1 || stats.Decoded != 0 {
+		t.Errorf("stats = %+v, want 1 unidentified and 0 decoded", stats)
+	}
+	if stats.Records != 1 {
+		t.Errorf("Records = %d, want 1", stats.Records)
+	}
+}
+
+func TestScanStatsAccountForEveryRecordItSaw(t *testing.T) {
+	// Records is the denominator of the unreadable ratio, so every record
+	// must land in exactly one of the outcomes that make up its numerator
+	// or in Decoded. A record that lands in none is a failure mode the
+	// threshold cannot see.
+	nether := int32(1)
+	path := writeFixtureWorld(t, []fixtureActor{
+		{ID: 1, NBT: map[string]any{"identifier": "minecraft:zombie", "Pos": pos(1, 64, 2)}},
+		{ID: 2, Dimension: &nether, NBT: map[string]any{"identifier": "minecraft:ghast"}},
+		{ID: 3, NBT: map[string]any{"Pos": pos(3, 64, 4)}},
+	})
+	_, stats, err := Scan(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if got := stats.Decoded + stats.Unusable(); got != stats.Records {
+		t.Errorf("decoded %d plus unusable %d = %d, want records %d", stats.Decoded, stats.Unusable(), got, stats.Records)
+	}
+}
+
 func TestScanRejectsAMissingWorld(t *testing.T) {
 	if _, _, err := Scan(context.Background(), t.TempDir()+"/does-not-exist"); err == nil {
 		t.Error("Scan of a missing world returned nil error")
@@ -127,6 +170,13 @@ func TestScanStatsSeparatesTornRecordsFromAWholesaleDecodeFailure(t *testing.T) 
 		{"a few torn records", ScanStats{Records: 1000, Decoded: 950, Unparsable: 50}, false},
 		{"past the limit", ScanStats{Records: 1000, Decoded: 949, Unparsable: 51}, true},
 		{"the layout moved", ScanStats{Records: 412000, Unparsable: 412000}, true},
+		// NBT that decodes is not NBT the census can use: a renamed or
+		// retyped Pos leaves every record decoding and none of them
+		// placeable, and a moved identifier leaves every record placed
+		// and nothing named. Both render an empty report.
+		{"Pos moved", ScanStats{Records: 412000, Unplaced: 412000}, true},
+		{"identifier moved", ScanStats{Records: 412000, Unidentified: 412000}, true},
+		{"failures spread across reasons", ScanStats{Records: 1000, Decoded: 940, Unparsable: 20, Unplaced: 20, Unidentified: 20}, true},
 	} {
 		if got := tc.stats.Unreadable(); got != tc.want {
 			t.Errorf("%s: Unreadable() = %v, want %v", tc.name, got, tc.want)

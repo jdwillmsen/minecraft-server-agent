@@ -18,14 +18,15 @@ const actorPrefix = "actorprefix"
 // world it failed to read instead of quietly reporting a short count.
 type ScanStats struct {
 	Records            int    // actorprefix keys seen
-	Decoded            int    // records that became entities
+	Decoded            int    // records that became usable entities
 	Unparsable         int    // records whose NBT would not decode
 	Unplaced           int    // records decoded but carrying no usable position
+	Unidentified       int    // records placed but naming no entity
 	FirstUnparsableErr string // first decode failure seen, or empty if none
 }
 
-// MaxUnparsableRatio is how much of a world may fail to decode before the
-// records that did survive stop being a census.
+// MaxUnusableRatio is how much of a world may fail to yield an entity before
+// the records that did survive stop being a census.
 //
 // A backup is taken while the server runs, so a few torn records are normal
 // and failing the nightly job over them would only teach operators to
@@ -34,14 +35,23 @@ type ScanStats struct {
 // line matters far less than drawing one: 5% of a 400,000-record world is
 // 20,000 records, far past torn-write noise and far short of a layout
 // change.
-const MaxUnparsableRatio = 0.05
+const MaxUnusableRatio = 0.05
 
-// Unreadable reports whether so much of the world failed to decode that the
+// Unusable counts the records that produced no entity. Decoding is only the
+// first of the ways a layout change breaks a record: well-formed NBT decodes
+// into a map whatever the game renamed, and the census then loses the record
+// on a position it cannot read or an entity it cannot name. Counting only
+// the decode failures would leave both of those looking like a quiet world.
+func (s ScanStats) Unusable() int {
+	return s.Unparsable + s.Unplaced + s.Unidentified
+}
+
+// Unreadable reports whether so much of the world yielded nothing that the
 // rest cannot be reported as a census. A world with no actor records at all
 // is not unreadable: an empty world is a fact about the world, and a report
 // saying so must stay distinguishable from one built out of nothing.
 func (s ScanStats) Unreadable() bool {
-	return s.Records > 0 && float64(s.Unparsable) > MaxUnparsableRatio*float64(s.Records)
+	return s.Records > 0 && float64(s.Unusable()) > MaxUnusableRatio*float64(s.Records)
 }
 
 // Scan reads every entity out of a Bedrock world's LevelDB.
@@ -87,6 +97,13 @@ func Scan(ctx context.Context, dbPath string) ([]Entity, ScanStats, error) {
 		e, ok := EntityFromNBT(m)
 		if !ok {
 			stats.Unplaced++
+			return
+		}
+		// An entity with no identifier can be neither categorised nor
+		// graded, and renders as a blank line in every section that would
+		// name it, so it is not an entity the census can report on.
+		if e.Identifier == "" {
+			stats.Unidentified++
 			return
 		}
 		e.Dimension = index.lookup(k[len(actorPrefix):])

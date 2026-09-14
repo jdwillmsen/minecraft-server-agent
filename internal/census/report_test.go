@@ -46,12 +46,16 @@ func TestRenderReportsUnreadableRecordsRatherThanHidingThem(t *testing.T) {
 	c := sampleCensus()
 	c.Stats.Unparsable = 3
 	c.Stats.Unplaced = 2
+	c.Stats.Unidentified = 1
 	out := Render(c, DefaultReportOptions())
 	if !strings.Contains(out, "3") || !strings.Contains(out, "unparsable") {
 		t.Error("report does not surface unparsable records")
 	}
 	if !strings.Contains(out, "unplaced") {
 		t.Error("report does not surface unplaced records")
+	}
+	if !strings.Contains(out, "unidentified 1") {
+		t.Errorf("report does not surface records that named no entity\n---\n%s", out)
 	}
 }
 

@@ -158,6 +158,54 @@ func TestRunRefusesToReportAWorldItCouldNotDecode(t *testing.T) {
 	}
 }
 
+func TestRunRefusesToReportAWorldWhosePositionsMoved(t *testing.T) {
+	// The failure a Bedrock layout change actually produces: the NBT still
+	// decodes, so nothing is unparsable, but Pos is no longer three
+	// float32s and not one record can be placed in a region. Every section
+	// of the report renders empty and the job would otherwise exit 0.
+	payload, err := nbt.MarshalEncoding(map[string]any{
+		"identifier": "minecraft:zombie",
+		"Pos":        []any{float64(1), float64(64), float64(2)},
+		"UniqueID":   int64(1),
+	}, nbt.LittleEndian)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	dir := t.TempDir()
+	buildArchiveFromRecord(t, dir, payload)
+
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"-backup-dir", dir}, &out); err == nil {
+		t.Fatal("run returned nil error for a world where no record could be placed")
+	}
+	if out.Len() != 0 {
+		t.Errorf("run wrote %q to stdout, want no report at all", out.String())
+	}
+}
+
+func TestRunRefusesToReportAWorldWhoseRecordsNameNothing(t *testing.T) {
+	// The variant that escapes a placement check entirely: every record
+	// decodes and places, and the report lists entities with a blank
+	// identifier, no graded regions and an exit code of 0.
+	payload, err := nbt.MarshalEncoding(map[string]any{
+		"Pos":      []any{float32(1), float32(64), float32(2)},
+		"UniqueID": int64(1),
+	}, nbt.LittleEndian)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	dir := t.TempDir()
+	buildArchiveFromRecord(t, dir, payload)
+
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"-backup-dir", dir}, &out); err == nil {
+		t.Fatal("run returned nil error for a world where no record named an entity")
+	}
+	if out.Len() != 0 {
+		t.Errorf("run wrote %q to stdout, want no report at all", out.String())
+	}
+}
+
 func TestRunRemovesTheExtractionWhenItIsCancelled(t *testing.T) {
 	// The pod can be terminated part way through a multi-minute extraction,
 	// and what must not survive it is the ~570MB tree on the backup volume.

@@ -29,8 +29,8 @@ func Render(c Census, opts ReportOptions) string {
 	}
 	fmt.Fprintf(&b, "FWB mob census\n")
 	fmt.Fprintf(&b, "world taken at %s via %s\n", taken, sourceKindOrUnknown(c.SourceKind))
-	fmt.Fprintf(&b, "records %d, decoded %d, unparsable %d, unplaced %d\n",
-		c.Stats.Records, c.Stats.Decoded, c.Stats.Unparsable, c.Stats.Unplaced)
+	fmt.Fprintf(&b, "records %d, decoded %d, unparsable %d, unplaced %d, unidentified %d\n",
+		c.Stats.Records, c.Stats.Decoded, c.Stats.Unparsable, c.Stats.Unplaced, c.Stats.Unidentified)
 	if c.Stats.FirstUnparsableErr != "" {
 		fmt.Fprintf(&b, "first decode failure: %s\n", c.Stats.FirstUnparsableErr)
 	}

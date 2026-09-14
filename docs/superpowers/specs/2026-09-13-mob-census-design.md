@@ -103,12 +103,16 @@ A dimension int the code does not know is reported as its own value rather
 than kept verbatim, so no entity can be counted as decoded and then appear in
 no per-dimension section.
 
-Records that will not decode are counted, and past 5% of the world the run
-fails instead of reporting: a backup taken from a running server yields the
-odd torn record, but a Bedrock release that moves the actor NBT layout takes
-every record with it, and a report built from nothing renders every section
-empty - which reads exactly like a quiet world. An empty world still reports
-as an empty world.
+Records that produce no entity are counted - NBT that will not decode, a
+position that cannot be read, an entity that names nothing - and past 5% of
+the world the run fails instead of reporting. A backup taken from a running
+server yields the odd torn record, but a Bedrock release that moves the actor
+NBT layout takes every record with it, and a report built from nothing renders
+every section empty, which reads exactly like a quiet world. Decoding is not
+the test that catches such a release on its own: well-formed NBT decodes into
+a map whatever the game renamed, so a moved layout surfaces as records that
+decode and then cannot be placed or cannot be named, with nothing unparsable
+at all. An empty world still reports as an empty world.
 
 Aggregation produces:
 
