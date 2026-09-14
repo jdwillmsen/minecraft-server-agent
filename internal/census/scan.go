@@ -23,6 +23,26 @@ type ScanStats struct {
 	FirstUnparsableErr string // first decode failure seen, or empty if none
 }
 
+// MaxUnparsableRatio is how much of a world may fail to decode before the
+// records that did survive stop being a census.
+//
+// A backup is taken while the server runs, so a few torn records are normal
+// and failing the nightly job over them would only teach operators to
+// ignore it. A Bedrock release that moves the actor NBT layout takes every
+// record with it. The two cases sit orders of magnitude apart, so the exact
+// line matters far less than drawing one: 5% of a 400,000-record world is
+// 20,000 records, far past torn-write noise and far short of a layout
+// change.
+const MaxUnparsableRatio = 0.05
+
+// Unreadable reports whether so much of the world failed to decode that the
+// rest cannot be reported as a census. A world with no actor records at all
+// is not unreadable: an empty world is a fact about the world, and a report
+// saying so must stay distinguishable from one built out of nothing.
+func (s ScanStats) Unreadable() bool {
+	return s.Records > 0 && float64(s.Unparsable) > MaxUnparsableRatio*float64(s.Records)
+}
+
 // Scan reads every entity out of a Bedrock world's LevelDB.
 //
 // The database is opened read-only: the census must never be able to modify

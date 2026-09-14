@@ -63,6 +63,15 @@ func run(ctx context.Context, args []string, stdout io.Writer) (err error) {
 		return fmt.Errorf("scan archive %s: %w", world.Archive, scanErr)
 	}
 
+	// Every section of a report built from records that would not decode
+	// renders empty, and an empty report reads exactly like a quiet world.
+	// Exit non-zero with the counts instead, so the CronJob goes red rather
+	// than publishing a world with no mobs in it.
+	if stats.Unreadable() {
+		return fmt.Errorf("archive %s: %d of %d actor records failed to decode, over the %.0f%% limit; first failure: %s",
+			world.Archive, stats.Unparsable, stats.Records, census.MaxUnparsableRatio*100, stats.FirstUnparsableErr)
+	}
+
 	report := census.Render(
 		census.Aggregate(entities, stats, world.TakenAt, world.Kind),
 		census.ReportOptions{TopRegions: *topRegions, TopTypes: *topTypes},

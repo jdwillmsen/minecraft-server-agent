@@ -21,6 +21,21 @@ import (
 // exercised end to end against the archive shape it actually receives.
 func buildArchive(t *testing.T, dir string) {
 	t.Helper()
+	payload, err := nbt.MarshalEncoding(map[string]any{
+		"identifier": "minecraft:zombie",
+		"Pos":        []any{float32(1), float32(64), float32(2)},
+		"UniqueID":   int64(1),
+	}, nbt.LittleEndian)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	buildArchiveFromRecord(t, dir, payload)
+}
+
+// buildArchiveFromRecord builds that archive around a caller-supplied
+// actorprefix value, so a test can stand in bytes the decoder will refuse.
+func buildArchiveFromRecord(t *testing.T, dir string, actorRecord []byte) {
+	t.Helper()
 	stage := t.TempDir()
 	dbPath := filepath.Join(stage, "FWB", "db")
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
@@ -32,15 +47,7 @@ func buildArchive(t *testing.T, dir string) {
 	}
 	id := make([]byte, 8)
 	binary.LittleEndian.PutUint64(id, 1)
-	payload, err := nbt.MarshalEncoding(map[string]any{
-		"identifier": "minecraft:zombie",
-		"Pos":        []any{float32(1), float32(64), float32(2)},
-		"UniqueID":   int64(1),
-	}, nbt.LittleEndian)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if err := db.Put(append([]byte("actorprefix"), id...), payload, nil); err != nil {
+	if err := db.Put(append([]byte("actorprefix"), id...), actorRecord, nil); err != nil {
 		t.Fatalf("put actor: %v", err)
 	}
 	digp := append([]byte("digp"), make([]byte, 8)...)
@@ -128,5 +135,24 @@ func TestRunRejectsUnknownFlags(t *testing.T) {
 	var out bytes.Buffer
 	if err := run(context.Background(), []string{"-nonsense"}, &out); err == nil {
 		t.Error("run accepted an unknown flag")
+	}
+}
+
+func TestRunRefusesToReportAWorldItCouldNotDecode(t *testing.T) {
+	// Every section of a report built from nothing renders empty, which is
+	// indistinguishable from a quiet world. The run must fail instead.
+	dir := t.TempDir()
+	buildArchiveFromRecord(t, dir, []byte{0xff, 0xff, 0xff})
+
+	var out bytes.Buffer
+	err := run(context.Background(), []string{"-backup-dir", dir}, &out)
+	if err == nil {
+		t.Fatal("run returned nil error for a world whose every record failed to decode")
+	}
+	if !strings.Contains(err.Error(), "decode") {
+		t.Errorf("error does not say records failed to decode: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("run wrote %q to stdout, want no report at all", out.String())
 	}
 }

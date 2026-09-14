@@ -109,3 +109,25 @@ func TestScanCapturesFirstUnparsableError(t *testing.T) {
 		t.Error("FirstUnparsableErr is empty, want error message")
 	}
 }
+
+func TestScanStatsSeparatesTornRecordsFromAWholesaleDecodeFailure(t *testing.T) {
+	// A backup is taken while the server runs, so a handful of torn records
+	// is normal and must not fail the job. A Bedrock release that moves the
+	// actor NBT layout takes every record with it. The two live orders of
+	// magnitude apart, and only the second one invalidates the report.
+	for _, tc := range []struct {
+		name  string
+		stats ScanStats
+		want  bool
+	}{
+		{"empty world", ScanStats{}, false},
+		{"nothing failed", ScanStats{Records: 1000, Decoded: 1000}, false},
+		{"a few torn records", ScanStats{Records: 1000, Decoded: 950, Unparsable: 50}, false},
+		{"past the limit", ScanStats{Records: 1000, Decoded: 949, Unparsable: 51}, true},
+		{"the layout moved", ScanStats{Records: 412000, Unparsable: 412000}, true},
+	} {
+		if got := tc.stats.Unreadable(); got != tc.want {
+			t.Errorf("%s: Unreadable() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
