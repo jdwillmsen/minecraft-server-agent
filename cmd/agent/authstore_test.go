@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/oauth2"
 
@@ -40,6 +41,12 @@ func (s *sharedStore) Save(_ context.Context, tok *oauth2.Token) error {
 	return nil
 }
 
+// storable is a token the stores will take back out again: mcauth refuses one
+// that has no refresh token to rotate with, or no expiry to rotate at.
+func storable(access, refresh string) *oauth2.Token {
+	return &oauth2.Token{AccessToken: access, RefreshToken: refresh, Expiry: time.Now().Add(time.Hour)}
+}
+
 func authConfig(dir string) config.Config {
 	return config.Config{AuthCacheDir: dir, MCUsername: "agent-one"}
 }
@@ -54,7 +61,7 @@ func TestOpenTokenStore_WithoutADatabaseUsesTheFileCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openTokenStore: %v", err)
 	}
-	if err := got.Save(ctx, &oauth2.Token{AccessToken: "a", RefreshToken: "r"}); err != nil {
+	if err := got.Save(ctx, storable("a", "r")); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -77,7 +84,7 @@ func TestOpenTokenStore_PrefersTheDatabaseAndReadsTheFileThrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
-	if err := file.Save(ctx, &oauth2.Token{AccessToken: "a", RefreshToken: "on-the-volume"}); err != nil {
+	if err := file.Save(ctx, storable("a", "on-the-volume")); err != nil {
 		t.Fatalf("file Save: %v", err)
 	}
 
@@ -97,7 +104,7 @@ func TestOpenTokenStore_PrefersTheDatabaseAndReadsTheFileThrough(t *testing.T) {
 
 	// And the first write goes to the database, which is what retires the
 	// volume without anyone reading a refresh token out of a pod.
-	if err := got.Save(ctx, &oauth2.Token{AccessToken: "b", RefreshToken: "rotated"}); err != nil {
+	if err := got.Save(ctx, storable("b", "rotated")); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	if shared.saves != 1 {
@@ -135,7 +142,7 @@ func TestOpenTokenStore_UnusableCacheDirIsFatalOnlyWithoutADatabase(t *testing.T
 	if err != nil {
 		t.Fatalf("openTokenStore with a database: %v", err)
 	}
-	if err := got.Save(ctx, &oauth2.Token{AccessToken: "a", RefreshToken: "r"}); err != nil {
+	if err := got.Save(ctx, storable("a", "r")); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	if shared.saves != 1 {

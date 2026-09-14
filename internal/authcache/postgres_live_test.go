@@ -71,7 +71,7 @@ func TestSaveThenLoadRoundTripsEveryFieldThatMatters(t *testing.T) {
 	ctx := context.Background()
 	s := liveStore(t, livePool(t))
 
-	want := &oauth2.Token{AccessToken: "access", RefreshToken: "refresh", TokenType: "Bearer"}
+	want := liveToken("refresh")
 	if err := s.Save(ctx, want); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestSaveReplacesRatherThanAccumulating(t *testing.T) {
 	s := liveStore(t, pool)
 
 	for _, refresh := range []string{"r1", "r2", "r3"} {
-		if err := s.Save(ctx, &oauth2.Token{AccessToken: "a", RefreshToken: refresh}); err != nil {
+		if err := s.Save(ctx, liveToken(refresh)); err != nil {
 			t.Fatalf("Save %s: %v", refresh, err)
 		}
 	}
@@ -126,7 +126,7 @@ func TestLiveAgentWritesAndStandbyReadsTheSameRow(t *testing.T) {
 	liveAgent := NewPostgres(pool, account)
 	standby := NewPostgres(pool, account)
 
-	if err := liveAgent.Save(ctx, &oauth2.Token{AccessToken: "a", RefreshToken: "rotated-by-the-leader"}); err != nil {
+	if err := liveAgent.Save(ctx, liveToken("rotated-by-the-leader")); err != nil {
 		t.Fatalf("live agent Save: %v", err)
 	}
 	got, err := standby.Load(ctx)
@@ -147,7 +147,7 @@ func TestConcurrentReadersAndWriterNeverSeeAPartialToken(t *testing.T) {
 	})
 
 	writer := NewPostgres(pool, account)
-	if err := writer.Save(ctx, &oauth2.Token{AccessToken: "seed", RefreshToken: "r0"}); err != nil {
+	if err := writer.Save(ctx, liveToken("r0")); err != nil {
 		t.Fatalf("seed Save: %v", err)
 	}
 
@@ -159,7 +159,7 @@ func TestConcurrentReadersAndWriterNeverSeeAPartialToken(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < rounds; i++ {
-			tok := &oauth2.Token{AccessToken: fmt.Sprintf("a-%d", i), RefreshToken: fmt.Sprintf("r-%d", i)}
+			tok := liveToken(fmt.Sprintf("r-%d", i))
 			if err := writer.Save(ctx, tok); err != nil {
 				errCh <- err
 				return
@@ -202,7 +202,7 @@ func TestAcceptsATokenEncodedByAnotherStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
-	want := &oauth2.Token{AccessToken: "from-the-volume", RefreshToken: "r1"}
+	want := liveToken("r1")
 	if err := file.Save(ctx, want); err != nil {
 		t.Fatalf("file Save: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestAMissingTableReportsItselfUnavailableNotEmpty(t *testing.T) {
 		t.Error("a missing table reported itself as an empty store")
 	}
 
-	err = missing.Save(ctx, &oauth2.Token{AccessToken: "a", RefreshToken: "r"})
+	err = missing.Save(ctx, liveToken("r"))
 	if !errors.Is(err, mcauth.ErrStoreUnavailable) {
 		t.Fatalf("Save against a missing table = %v, want ErrStoreUnavailable", err)
 	}

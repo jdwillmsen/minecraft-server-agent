@@ -2,6 +2,7 @@ package mcauth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -73,6 +74,13 @@ func (m *memStore) counts() (loads, saves int) {
 	return m.loads, m.saves
 }
 
+// storable is a token a store will take back out again: a refresh token to
+// rotate with, and an access half that has not expired -- DecodeToken refuses
+// a token that neither role would ever refresh.
+func storable(access, refresh string) *oauth2.Token {
+	return &oauth2.Token{AccessToken: access, RefreshToken: refresh, Expiry: time.Now().Add(time.Hour)}
+}
+
 func fileStore(t *testing.T, dir, username string) *FileStore {
 	t.Helper()
 	fs, err := NewFileStore(dir, username)
@@ -136,7 +144,7 @@ func TestFileStore_SaveIsAtomic_NoTempFileLeftOnSuccess(t *testing.T) {
 	ctx := context.Background()
 	fs := fileStore(t, dir, "agent-one")
 
-	if err := fs.Save(ctx, &oauth2.Token{AccessToken: "a", RefreshToken: "r"}); err != nil {
+	if err := fs.Save(ctx, storable("a", "r")); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	entries, err := os.ReadDir(dir)
@@ -161,7 +169,7 @@ func TestFileStore_ConcurrentSaversNeverExposeAPartialFile(t *testing.T) {
 	ctx := context.Background()
 	fs := fileStore(t, dir, "agent-one")
 
-	if err := fs.Save(ctx, &oauth2.Token{AccessToken: "seed", RefreshToken: "r"}); err != nil {
+	if err := fs.Save(ctx, storable("seed", "r")); err != nil {
 		t.Fatalf("seed Save: %v", err)
 	}
 
@@ -193,7 +201,7 @@ func TestFileStore_ConcurrentSaversNeverExposeAPartialFile(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			for j := 0; j < savesEach; j++ {
-				tok := &oauth2.Token{AccessToken: fmt.Sprintf("a-%d-%d", i, j), RefreshToken: "r"}
+				tok := storable(fmt.Sprintf("a-%d-%d", i, j), "r")
 				if err := fs.Save(ctx, tok); err != nil {
 					errCh <- err
 					return
@@ -230,7 +238,7 @@ func TestFileStore_UsesPerUsernameCacheFile(t *testing.T) {
 
 	one := fileStore(t, dir, "agent-one")
 	two := fileStore(t, dir, "agent-two")
-	if err := one.Save(ctx, &oauth2.Token{AccessToken: "a", RefreshToken: "r"}); err != nil {
+	if err := one.Save(ctx, storable("a", "r")); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -319,7 +327,7 @@ func TestFallback_ReadsThroughWhenPrimaryIsEmpty(t *testing.T) {
 	ctx := context.Background()
 	primary := &memStore{}
 	secondary := &memStore{}
-	secondary.seed(t, &oauth2.Token{AccessToken: "a", RefreshToken: "on-the-volume"})
+	secondary.seed(t, storable("a", "on-the-volume"))
 
 	got, err := NewFallback(primary, secondary).Load(ctx)
 	if err != nil {
@@ -336,7 +344,7 @@ func TestFallback_ReadsThroughWhenPrimaryIsUnavailable(t *testing.T) {
 	// migration that gives the database its table.
 	primary := &memStore{failLoad: fmt.Errorf("%w: relation does not exist", ErrStoreUnavailable)}
 	secondary := &memStore{}
-	secondary.seed(t, &oauth2.Token{AccessToken: "a", RefreshToken: "on-the-volume"})
+	secondary.seed(t, storable("a", "on-the-volume"))
 
 	got, err := NewFallback(primary, secondary).Load(ctx)
 	if err != nil {
@@ -351,7 +359,7 @@ func TestFallback_CorruptPrimaryIsNotMaskedBySecondary(t *testing.T) {
 	ctx := context.Background()
 	primary := &memStore{failLoad: errors.New("cached token has no refresh token")}
 	secondary := &memStore{}
-	secondary.seed(t, &oauth2.Token{AccessToken: "a", RefreshToken: "on-the-volume"})
+	secondary.seed(t, storable("a", "on-the-volume"))
 
 	if _, err := NewFallback(primary, secondary).Load(ctx); err == nil {
 		t.Fatal("a corrupt primary was answered from the secondary instead of reported")
@@ -375,10 +383,10 @@ func TestFallback_AHealthyPrimaryTakesEveryWriteAndEveryRead(t *testing.T) {
 	ctx := context.Background()
 	primary := &memStore{}
 	secondary := &memStore{}
-	secondary.seed(t, &oauth2.Token{AccessToken: "a", RefreshToken: "on-the-volume"})
+	secondary.seed(t, storable("a", "on-the-volume"))
 
 	fb := NewFallback(primary, secondary)
-	if err := fb.Save(ctx, &oauth2.Token{AccessToken: "b", RefreshToken: "rotated"}); err != nil {
+	if err := fb.Save(ctx, storable("b", "rotated")); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	if _, saves := secondary.counts(); saves != 0 {
@@ -407,7 +415,7 @@ func TestFallback_SaveFailureIsReportedNotRedirected(t *testing.T) {
 	primary := &memStore{failSave: errors.New("duplicate key value violates unique constraint")}
 	secondary := &memStore{}
 
-	err := NewFallback(primary, secondary).Save(context.Background(), &oauth2.Token{AccessToken: "a", RefreshToken: "r"})
+	err := NewFallback(primary, secondary).Save(context.Background(), storable("a", "r"))
 	if err == nil {
 		t.Fatal("Save = nil, want the primary's failure")
 	}
@@ -424,12 +432,12 @@ func TestFallback_UnavailablePrimaryWritesThroughToTheSecondary(t *testing.T) {
 	ctx := context.Background()
 	primary := &memStore{failSave: fmt.Errorf("%w: relation does not exist", ErrStoreUnavailable), failLoad: fmt.Errorf("%w: relation does not exist", ErrStoreUnavailable)}
 	secondary := &memStore{}
-	secondary.seed(t, &oauth2.Token{AccessToken: "a", RefreshToken: "r1"})
+	secondary.seed(t, storable("a", "r1"))
 
 	fb := NewFallback(primary, secondary)
 	// Reported, not failed: the rotation is durable, and the report is what
 	// tells the writer the primary still holds the token it superseded.
-	if err := fb.Save(ctx, &oauth2.Token{AccessToken: "b", RefreshToken: "r2"}); !errors.Is(err, ErrSavedToFallback) {
+	if err := fb.Save(ctx, storable("b", "r2")); !errors.Is(err, ErrSavedToFallback) {
 		t.Fatalf("Save = %v, want ErrSavedToFallback", err)
 	}
 
@@ -472,7 +480,7 @@ func TestFallback_WriteThroughFailingEverywhereIsReported(t *testing.T) {
 	primary := &memStore{failSave: fmt.Errorf("%w: relation does not exist", ErrStoreUnavailable)}
 	secondary := &memStore{failSave: errors.New("read-only file system")}
 
-	err := NewFallback(primary, secondary).Save(context.Background(), &oauth2.Token{AccessToken: "a", RefreshToken: "r"})
+	err := NewFallback(primary, secondary).Save(context.Background(), storable("a", "r"))
 	if err == nil {
 		t.Fatal("Save = nil with nowhere to write")
 	}
@@ -509,5 +517,40 @@ func TestFallback_SecondaryFailureIsNotReplacedByThePrimarys(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not valid JSON") {
 		t.Errorf("Load = %v, want the secondary's own failure", err)
+	}
+}
+
+// oauth2 reads a zero Expiry as "never expires", so a token stored without
+// one would be served by both roles forever, refreshed by neither, and
+// rejected by the server from the moment its access half really did expire.
+// Refusing it here is the same bargain DecodeToken already makes for a
+// missing refresh token.
+func TestDecodeToken_RejectsATokenThatWouldNeverBeRefreshed(t *testing.T) {
+	data, err := json.Marshal(&oauth2.Token{AccessToken: "a", RefreshToken: "r"})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	if _, err := DecodeToken(data); err == nil {
+		t.Fatal("a token with no expiry was accepted")
+	}
+}
+
+// ExpiresIn is relative to an issue time nothing stores, so it says nothing
+// once reloaded -- Expiry carries the same fact absolutely. Nothing reads it
+// today, and it is zeroed so nothing can start.
+func TestEncodeToken_LeavesNoExpiresInForALaterReaderToTrust(t *testing.T) {
+	tok := &oauth2.Token{AccessToken: "a", RefreshToken: "r", Expiry: time.Now().Add(time.Hour), ExpiresIn: 3600}
+
+	data, err := EncodeToken(tok)
+	if err != nil {
+		t.Fatalf("EncodeToken: %v", err)
+	}
+
+	if strings.Contains(string(data), "expires_in") {
+		t.Errorf("encoded token carries expires_in: %s", data)
+	}
+	if tok.ExpiresIn != 3600 {
+		t.Error("EncodeToken changed the caller's token")
 	}
 }

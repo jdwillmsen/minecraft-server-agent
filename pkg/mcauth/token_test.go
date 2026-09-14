@@ -55,7 +55,7 @@ func TestTokenSource_ColdStartWithNothingCachedLogsIn(t *testing.T) {
 	loginCalls := 0
 	withStubLogin(t, func(ctx context.Context, out io.Writer) (*oauth2.Token, error) {
 		loginCalls++
-		return &oauth2.Token{AccessToken: "fresh", RefreshToken: "fresh-refresh"}, nil
+		return &oauth2.Token{AccessToken: "fresh", RefreshToken: "fresh-refresh", Expiry: time.Now().Add(time.Hour)}, nil
 	})
 
 	ts, err := TokenSource(context.Background(), store, io.Discard)
@@ -106,7 +106,7 @@ func TestTokenSource_TheDeferredLoginRunsOnceTheProcessGoesLive(t *testing.T) {
 	loginCalls := 0
 	withStubLogin(t, func(ctx context.Context, out io.Writer) (*oauth2.Token, error) {
 		loginCalls++
-		return &oauth2.Token{AccessToken: "fresh", RefreshToken: "fresh-refresh"}, nil
+		return &oauth2.Token{AccessToken: "fresh", RefreshToken: "fresh-refresh", Expiry: time.Now().Add(time.Hour)}, nil
 	})
 
 	ts, err := TokenSource(context.Background(), store, io.Discard, WithLiveGate(live.Load))
@@ -186,15 +186,15 @@ func TestTokenSource_RejectsANilStore(t *testing.T) {
 func TestCachingTokenSource_PersistsEachRefresh(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
-	store.seed(t, &oauth2.Token{AccessToken: "first", RefreshToken: "r1"})
+	store.seed(t, storable("first", "r1"))
 
 	cts := &cachingTokenSource{
 		store: store,
 		out:   io.Discard,
 		live:  func() bool { return true },
 		inner: &stubTokenSource{tokens: []*oauth2.Token{
-			{AccessToken: "first", RefreshToken: "r1"},
-			{AccessToken: "second", RefreshToken: "r2"},
+			storable("first", "r1"),
+			storable("second", "r2"),
 		}},
 	}
 
@@ -227,7 +227,7 @@ func TestCachingTokenSource_UnchangedTokenIsNotRewritten(t *testing.T) {
 		store: store,
 		out:   io.Discard,
 		live:  func() bool { return true },
-		inner: &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "a", RefreshToken: "r1"}}},
+		inner: &stubTokenSource{tokens: []*oauth2.Token{storable("a", "r1")}},
 	}
 
 	for i := 0; i < 5; i++ {
@@ -248,15 +248,15 @@ func TestCachingTokenSource_UnchangedTokenIsNotRewritten(t *testing.T) {
 func TestCachingTokenSource_StandbyNeverRotatesTheSharedToken(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
-	store.seed(t, &oauth2.Token{AccessToken: "live-token", RefreshToken: "r1"})
+	store.seed(t, storable("live-token", "r1"))
 
-	refresher := &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "standby-refreshed", RefreshToken: "r2"}}}
+	refresher := &stubTokenSource{tokens: []*oauth2.Token{storable("standby-refreshed", "r2")}}
 	standby := &cachingTokenSource{
 		store: store,
 		out:   io.Discard,
 		live:  func() bool { return false },
 		inner: refresher,
-		held:  &oauth2.Token{AccessToken: "live-token", RefreshToken: "r1"},
+		held:  storable("live-token", "r1"),
 	}
 
 	tok, err := standby.Token()
@@ -289,7 +289,7 @@ func TestCachingTokenSource_StandbyRewarmsFromWhatTheLiveAgentStored(t *testing.
 	store := &memStore{}
 	store.seed(t, &oauth2.Token{AccessToken: "live-refreshed", RefreshToken: "r2", Expiry: time.Now().Add(time.Hour)})
 
-	refresher := &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "must-not-happen", RefreshToken: "r3"}}}
+	refresher := &stubTokenSource{tokens: []*oauth2.Token{storable("must-not-happen", "r3")}}
 	standby := &cachingTokenSource{
 		store: store,
 		out:   io.Discard,
@@ -316,7 +316,7 @@ func TestCachingTokenSource_StandbyRewarmsFromWhatTheLiveAgentStored(t *testing.
 // With nothing newer to read, the standby stays cold and says so rather than
 // refreshing its way out of it.
 func TestCachingTokenSource_AnUnwarmableStandbyReportsItRatherThanRefreshing(t *testing.T) {
-	refresher := &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "must-not-happen", RefreshToken: "r2"}}}
+	refresher := &stubTokenSource{tokens: []*oauth2.Token{storable("must-not-happen", "r2")}}
 	standby := &cachingTokenSource{
 		store: &memStore{failLoad: ErrStoreUnavailable},
 		out:   io.Discard,
@@ -444,15 +444,15 @@ func TestCachingTokenSource_AStandbyHoldingNothingAdoptsAnExpiredReload(t *testi
 func TestCachingTokenSource_RefreshesAndWritesOnceItGoesLive(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
-	store.seed(t, &oauth2.Token{AccessToken: "old", RefreshToken: "r1"})
+	store.seed(t, storable("old", "r1"))
 
 	var live atomic.Bool
 	cts := &cachingTokenSource{
 		store: store,
 		out:   io.Discard,
 		live:  live.Load,
-		inner: &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "refreshed", RefreshToken: "r2"}}},
-		held:  &oauth2.Token{AccessToken: "old", RefreshToken: "r1"},
+		inner: &stubTokenSource{tokens: []*oauth2.Token{storable("refreshed", "r2")}},
+		held:  storable("old", "r1"),
 	}
 
 	if _, err := cts.Token(); err != nil {
@@ -489,7 +489,7 @@ func TestCachingTokenSource_LiveAndStandbyShareOneStoreConcurrently(t *testing.T
 	store := &memStore{}
 	// The live agent's own token, since that is all this store ever holds:
 	// a standby that reads before the first rotation below still reads one.
-	store.seed(t, &oauth2.Token{AccessToken: "live", RefreshToken: "live-seed", Expiry: time.Now().Add(time.Hour)})
+	store.seed(t, storable("live", "live-seed"))
 
 	liveTokens := make([]*oauth2.Token, 50)
 	for i := range liveTokens {
@@ -585,7 +585,7 @@ func TestCachingTokenSource_SaveFailureDoesNotFailTheCall(t *testing.T) {
 		store: store,
 		out:   io.Discard,
 		live:  func() bool { return true },
-		inner: &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "a", RefreshToken: "r1"}}},
+		inner: &stubTokenSource{tokens: []*oauth2.Token{storable("a", "r1")}},
 	}
 
 	tok, err := cts.Token()
@@ -610,7 +610,7 @@ func TestCachingTokenSource_TokenIsSafeForConcurrentUse(t *testing.T) {
 	store := &memStore{}
 	tokens := make([]*oauth2.Token, 50)
 	for i := range tokens {
-		tokens[i] = &oauth2.Token{AccessToken: "tok", RefreshToken: "refresh"}
+		tokens[i] = storable("tok", "refresh")
 	}
 	cts := &cachingTokenSource{
 		store: store,
@@ -667,7 +667,7 @@ func (e *errTokenSource) callCount() int {
 func TestCachingTokenSource_PromotionReadsTheStoreBeforeWritingToIt(t *testing.T) {
 	ctx := context.Background()
 	store := &memStore{}
-	store.seed(t, &oauth2.Token{AccessToken: "boot", RefreshToken: "r1", Expiry: time.Now().Add(time.Hour)})
+	store.seed(t, storable("boot", "r1"))
 
 	var live atomic.Bool
 	cts := &cachingTokenSource{store: store, out: io.Discard, live: live.Load}
@@ -677,7 +677,7 @@ func TestCachingTokenSource_PromotionReadsTheStoreBeforeWritingToIt(t *testing.T
 
 	// The live agent rotates r1 into r2 and stores it, which is what retires
 	// r1 at Microsoft.
-	if err := store.Save(ctx, &oauth2.Token{AccessToken: "live", RefreshToken: "r2", Expiry: time.Now().Add(time.Hour)}); err != nil {
+	if err := store.Save(ctx, storable("live", "r2")); err != nil {
 		t.Fatalf("the live agent's Save: %v", err)
 	}
 
@@ -725,7 +725,7 @@ func TestCachingTokenSource_PromotionWithAnExpiredCopyTakesTheStoredTokenNotARef
 		t.Fatal("a standby with nothing unexpired to read reported a usable token")
 	}
 
-	if err := store.Save(ctx, &oauth2.Token{AccessToken: "live", RefreshToken: "r2", Expiry: time.Now().Add(time.Hour)}); err != nil {
+	if err := store.Save(ctx, storable("live", "r2")); err != nil {
 		t.Fatalf("the live agent's Save: %v", err)
 	}
 
@@ -755,7 +755,7 @@ func TestCachingTokenSource_ARotationThatOnlyReachedTheFallbackIsWrittenAgain(t 
 		store: NewFallback(primary, secondary),
 		out:   io.Discard,
 		live:  func() bool { return true },
-		inner: &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "a", RefreshToken: "r2", Expiry: time.Now().Add(time.Hour)}}},
+		inner: &stubTokenSource{tokens: []*oauth2.Token{storable("a", "r2")}},
 	}
 
 	for i := 0; i < 2; i++ {
@@ -793,14 +793,14 @@ func (c *conflictStore) Save(ctx context.Context, tok *oauth2.Token) error {
 func TestCachingTokenSource_AWriteThatLostToAnotherProcessTakesTheWinnersToken(t *testing.T) {
 	ctx := context.Background()
 	backing := &memStore{}
-	backing.seed(t, &oauth2.Token{AccessToken: "winner", RefreshToken: "r2", Expiry: time.Now().Add(time.Hour)})
+	backing.seed(t, storable("winner", "r2"))
 	store := &conflictStore{memStore: backing, conflicts: 1}
 
 	cts := &cachingTokenSource{
 		store: store,
 		out:   io.Discard,
 		live:  func() bool { return true },
-		inner: &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "loser", RefreshToken: "r9", Expiry: time.Now().Add(time.Hour)}}},
+		inner: &stubTokenSource{tokens: []*oauth2.Token{storable("loser", "r9")}},
 	}
 
 	if _, err := cts.Token(); err != nil {
@@ -884,7 +884,7 @@ func TestCachingTokenSource_AGrantThatArrivesAfterTheTurnIsNotStored(t *testing.
 	withStubLogin(t, func(context.Context, io.Writer) (*oauth2.Token, error) {
 		// The operator answers just as the lock moves on.
 		live.Store(false)
-		return &oauth2.Token{AccessToken: "a", RefreshToken: "grant-a", Expiry: time.Now().Add(time.Hour)}, nil
+		return storable("a", "grant-a"), nil
 	})
 
 	store := &memStore{}

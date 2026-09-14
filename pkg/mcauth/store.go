@@ -78,7 +78,12 @@ type Store interface {
 // moving the cache from a file to a database a copy rather than a
 // re-authentication.
 func EncodeToken(tok *oauth2.Token) ([]byte, error) {
-	data, err := json.Marshal(tok)
+	// ExpiresIn is a number of seconds from an issue time nobody records, so
+	// it means nothing to whoever reloads this; Expiry states the same fact
+	// absolutely. Dropped on the way out so a later reader cannot trust it.
+	stored := *tok
+	stored.ExpiresIn = 0
+	data, err := json.Marshal(&stored)
 	if err != nil {
 		return nil, fmt.Errorf("mcauth: encode token: %w", err)
 	}
@@ -89,6 +94,11 @@ func EncodeToken(tok *oauth2.Token) ([]byte, error) {
 // refreshed. A token with no refresh token would dial successfully until its
 // access token expired and then fail forever, which is a worse failure than
 // refusing it here.
+//
+// A token with no expiry is refused for the same reason read the other way
+// round: oauth2 takes a zero Expiry for "never expires", so neither role
+// would ever refresh it, and it would be rejected at every dial from the
+// moment its access half really did expire.
 func DecodeToken(data []byte) (*oauth2.Token, error) {
 	var tok oauth2.Token
 	if err := json.Unmarshal(data, &tok); err != nil {
@@ -96,6 +106,9 @@ func DecodeToken(data []byte) (*oauth2.Token, error) {
 	}
 	if tok.RefreshToken == "" {
 		return nil, errors.New("mcauth: cached token has no refresh token")
+	}
+	if tok.Expiry.IsZero() {
+		return nil, errors.New("mcauth: cached token has no expiry")
 	}
 	return &tok, nil
 }

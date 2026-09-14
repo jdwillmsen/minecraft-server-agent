@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/oauth2"
@@ -60,7 +61,7 @@ func TestLoadAgainstADatabaseThatIsDownIsUnavailableNotAPlainError(t *testing.T)
 func TestSaveAgainstADatabaseThatIsDownIsUnavailableNotAPlainError(t *testing.T) {
 	s := NewPostgres(deadPool(t), "agent-one")
 
-	err := s.Save(context.Background(), &oauth2.Token{AccessToken: "a", RefreshToken: "r"})
+	err := s.Save(context.Background(), &oauth2.Token{AccessToken: "a", RefreshToken: "r", Expiry: time.Now().Add(time.Hour)})
 	if err == nil {
 		t.Fatal("Save against a dead database succeeded")
 	}
@@ -79,7 +80,7 @@ func TestADatabaseThatIsDownFallsThroughToTheFileCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileStore: %v", err)
 	}
-	if err := file.Save(ctx, &oauth2.Token{AccessToken: "a", RefreshToken: "on-the-volume"}); err != nil {
+	if err := file.Save(ctx, &oauth2.Token{AccessToken: "a", RefreshToken: "on-the-volume", Expiry: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatalf("file Save: %v", err)
 	}
 
