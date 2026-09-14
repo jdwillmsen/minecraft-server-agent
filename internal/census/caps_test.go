@@ -9,12 +9,12 @@ func TestCapsForMatchesTheBedrockTable(t *testing.T) {
 		want Caps
 	}{
 		{Overworld, Monster, Caps{Surface: 8, Cave: 16}},
-		{Overworld, Animal, Caps{Surface: 4, Cave: 0}},
-		{Overworld, WaterAnimal, Caps{Surface: 36, Cave: 0}},
-		{Overworld, Ambient, Caps{Surface: 0, Cave: 2}},
+		{Overworld, Animal, Caps{Surface: 4, Cave: NoSpawn}},
+		{Overworld, WaterAnimal, Caps{Surface: 36, Cave: NoSpawn}},
+		{Overworld, Ambient, Caps{Surface: NoSpawn, Cave: 2}},
 		{Overworld, Pillager, Caps{Surface: 8, Cave: 8}},
-		{Nether, Monster, Caps{Surface: 0, Cave: 16}},
-		{Nether, Animal, Caps{Surface: 0, Cave: 4}},
+		{Nether, Monster, Caps{Surface: NoSpawn, Cave: 16}},
+		{Nether, Animal, Caps{Surface: NoSpawn, Cave: 4}},
 		{End, Monster, Caps{Surface: 10, Cave: 8}},
 	} {
 		got, ok := CapsFor(tc.d, tc.c)
@@ -61,14 +61,53 @@ func TestStatusOfReportsARangeNotAFalsePrecision(t *testing.T) {
 	}
 }
 
-func TestStatusOfHandlesAZeroSurfaceCap(t *testing.T) {
-	// Nether monsters are 0 surface / 16 cave. The lower bound is zero, so
-	// any mob at all is already past it.
-	if got := StatusOf(Nether, Monster, 1); got != AtRisk {
-		t.Errorf("StatusOf(nether,monster,1) = %v, want AtRisk", got)
+func TestStatusOfGradesOnlyTheEnvironmentsACategorySpawnsIn(t *testing.T) {
+	// An environment a category cannot spawn in carries no ceiling, and an
+	// absent ceiling is not a ceiling of zero. Grading against one made a
+	// single cow, bat or zombified piglin enough to call a region at risk,
+	// which left the status column with nothing to say.
+	for _, tc := range []struct {
+		d     Dimension
+		c     Category
+		count int
+		want  Status
+	}{
+		{Overworld, Animal, 1, Headroom},
+		{Overworld, Animal, 4, Headroom},
+		{Overworld, Animal, 5, Capped},
+		{Overworld, Ambient, 1, Headroom},
+		{Overworld, Ambient, 2, Headroom},
+		{Overworld, Ambient, 3, Capped},
+		{Nether, Monster, 1, Headroom},
+		{Nether, Monster, 16, Headroom},
+		{Nether, Monster, 17, Capped},
+	} {
+		if got := StatusOf(tc.d, tc.c, tc.count); got != tc.want {
+			t.Errorf("StatusOf(%v,%v,%d) = %v, want %v", tc.d, tc.c, tc.count, got, tc.want)
+		}
 	}
-	if got := StatusOf(Nether, Monster, 17); got != Capped {
-		t.Errorf("StatusOf(nether,monster,17) = %v, want Capped", got)
+}
+
+func TestCapTableHasNoCellWithoutAnApplicableCap(t *testing.T) {
+	// A cell where neither environment spawns the category is not a cap of
+	// nothing - it means the category does not spawn in that dimension at
+	// all, and the row must be absent so CapsFor reports false.
+	for d, byCategory := range capTable {
+		for c, caps := range byCategory {
+			if caps.Surface == NoSpawn && caps.Cave == NoSpawn {
+				t.Errorf("capTable[%v][%v] has no applicable cap; drop the row instead", d, c)
+			}
+		}
+	}
+}
+
+func TestCapsForHasNoEntryWhereACategoryCannotSpawn(t *testing.T) {
+	// The nether has no water, no bats and no pillager patrols, so these
+	// categories have no environmental spawning there to grade against.
+	for _, c := range []Category{WaterAnimal, Ambient, Pillager} {
+		if caps, ok := CapsFor(Nether, c); ok {
+			t.Errorf("CapsFor(nether,%v) = %+v, want no entry", c, caps)
+		}
 	}
 }
 
@@ -93,6 +132,18 @@ func TestStatusOfGradesTheEndsInvertedCaps(t *testing.T) {
 	} {
 		if got := StatusOf(End, Monster, tc.count); got != tc.want {
 			t.Errorf("StatusOf(end,monster,%d) = %v, want %v", tc.count, got, tc.want)
+		}
+	}
+}
+
+func TestCapsForHasNoEntryForCategoriesThatCannotSpawnInTheEnd(t *testing.T) {
+	// The enderman is the End's only environmental spawn. Shulkers and the
+	// dragon come from world generation and endermites from ender pearls,
+	// and no animal, fish, bat or pillager will ever spawn there, so there
+	// is no cap for them to press against.
+	for _, c := range []Category{Animal, WaterAnimal, Ambient, Pillager} {
+		if caps, ok := CapsFor(End, c); ok {
+			t.Errorf("CapsFor(end,%v) = %+v, want no entry", c, caps)
 		}
 	}
 }

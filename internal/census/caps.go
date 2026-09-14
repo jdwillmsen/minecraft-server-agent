@@ -6,43 +6,62 @@ package census
 // save cannot show.
 const GlobalCap = 200
 
+// NoSpawn marks an environment a category cannot spawn in: animals do not
+// spawn underground, and nothing in the nether spawns under open sky.
+//
+// It is deliberately not zero. A ceiling of zero and an environment with no
+// ceiling behave identically for spawning - nothing spawns either way - but
+// they differ entirely when grading mobs that are already there, because
+// those mobs spawned under the other environment's ceiling, or were bred or
+// name-tagged and never counted against a spawn cap at all.
+const NoSpawn = -1
+
 // Caps is one cell of the population-control table. Surface and Cave are
-// separate ceilings for the same category.
+// separate ceilings for the same category, either of which may be NoSpawn.
 type Caps struct {
 	Surface, Cave int
 }
 
-// Range returns the caps as an ordered pair. The End inverts the usual
-// relationship — its monster caps are 10 surface and 8 cave — so callers
-// must never assume Surface is the lower bound.
+// Range returns the applicable caps as an ordered pair. The End inverts the
+// usual relationship — its monster caps are 10 surface and 8 cave — so
+// callers must never assume Surface is the lower bound.
+//
+// Where only one environment spawns the category, both bounds are that cap:
+// the ambiguity the range exists to express is gone, and the count can be
+// graded exactly.
 func (c Caps) Range() (lower, upper int) {
-	if c.Surface > c.Cave {
+	switch {
+	case c.Surface == NoSpawn:
+		return c.Cave, c.Cave
+	case c.Cave == NoSpawn:
+		return c.Surface, c.Surface
+	case c.Surface > c.Cave:
 		return c.Cave, c.Surface
+	default:
+		return c.Surface, c.Cave
 	}
-	return c.Surface, c.Cave
 }
 
+// capTable holds a cell only where the category spawns in that dimension.
+// An absent row is a category Bedrock never spawns there, which is a
+// different statement from a cap it cannot exceed.
 var capTable = map[Dimension]map[Category]Caps{
 	Overworld: {
 		Monster:     {Surface: 8, Cave: 16},
-		Animal:      {Surface: 4, Cave: 0},
-		WaterAnimal: {Surface: 36, Cave: 0},
-		Ambient:     {Surface: 0, Cave: 2},
+		Animal:      {Surface: 4, Cave: NoSpawn},
+		WaterAnimal: {Surface: 36, Cave: NoSpawn},
+		Ambient:     {Surface: NoSpawn, Cave: 2},
 		Pillager:    {Surface: 8, Cave: 8},
 	},
+	// Nothing in the nether spawns under open sky, so every nether spawn is
+	// a cave spawn. Water animals, bats and pillager patrols have no nether
+	// spawning at all.
 	Nether: {
-		Monster:     {Surface: 0, Cave: 16},
-		Animal:      {Surface: 0, Cave: 4},
-		WaterAnimal: {Surface: 0, Cave: 0},
-		Ambient:     {Surface: 0, Cave: 0},
-		Pillager:    {Surface: 0, Cave: 0},
+		Monster: {Surface: NoSpawn, Cave: 16},
+		Animal:  {Surface: NoSpawn, Cave: 4},
 	},
 	End: {
-		Monster:     {Surface: 10, Cave: 8},
-		Animal:      {Surface: 4, Cave: 0},
-		WaterAnimal: {Surface: 36, Cave: 0},
-		Ambient:     {Surface: 0, Cave: 2},
-		Pillager:    {Surface: 8, Cave: 8},
+		Monster: {Surface: 10, Cave: 8},
 	},
 }
 

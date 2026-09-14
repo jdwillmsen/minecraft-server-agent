@@ -261,3 +261,27 @@ func TestAggregateOrdersConcentrationsTiedOnEverythingButY(t *testing.T) {
 		}
 	}
 }
+
+func TestAggregateDoesNotGradeACategoryThatCannotSpawnInTheDimension(t *testing.T) {
+	// Sheep carried to an end city are real entities and belong in the
+	// totals, but no sheep will ever spawn in the End - so grading them
+	// against an animal cap there reports spawn pressure that cannot exist.
+	var entities []Entity
+	for i := 0; i < 5; i++ {
+		entities = append(entities, Entity{
+			Identifier: "sheep", Dimension: End,
+			X: float64(i), Y: 64, Z: 0, CustomName: "Woolly", Persistent: true,
+		})
+	}
+
+	c := Aggregate(entities, ScanStats{Records: 5, Decoded: 5}, time.Unix(0, 0), "archive")
+	if len(c.Regions) != 0 {
+		t.Errorf("got %d graded regions for sheep in the End, want 0: %+v", len(c.Regions), c.Regions)
+	}
+	if len(c.Totals) != 1 || c.Totals[0].Count != 5 {
+		t.Errorf("totals = %+v, want the five sheep still counted", c.Totals)
+	}
+	if len(c.Named) != 5 {
+		t.Errorf("got %d named entities, want the five name tags still listed", len(c.Named))
+	}
+}

@@ -132,19 +132,28 @@ overworld monsters, 8 to 16 — and classifies each region:
 This is the honest limit of what the save supports. Any single number claiming
 to be "the" cap utilisation would be invented.
 
+The range only holds where both bounds are real caps. A category that spawns
+in only one of the two environments — animals above ground, bats below it,
+everything in the nether, where nothing sees open sky — has one known ceiling,
+and its count is graded against that exactly. Reading the absent bound as a
+cap of zero would grade a single cow as spawn pressure.
+
 ### Cap table
 
 Encoded as data, per dimension and category, surface and cave:
 
-Each cell is `surface / cave`.
+Each cell is `surface / cave`. A dash marks an environment the category does
+not spawn in; an empty cell means it has no environmental spawning in that
+dimension at all and is counted but never graded there. The End's only
+environmental spawn is the enderman.
 
 | Category | Overworld | Nether | End |
 |---|---|---|---|
-| Monster | 8 / 16 | 0 / 16 | 10 / 8 |
-| Animal | 4 / 0 | 0 / 4 | 4 / 0 |
-| Water animal | 36 / 0 | 0 / 0 | 36 / 0 |
-| Ambient | 0 / 2 | 0 / 0 | 0 / 2 |
-| Pillager | 8 / 8 | 0 / 0 | 8 / 8 |
+| Monster | 8 / 16 | – / 16 | 10 / 8 |
+| Animal | 4 / – | – / 4 | |
+| Water animal | 36 / – | | |
+| Ambient | – / 2 | | |
+| Pillager | 8 / 8 | | |
 
 Global cap is 200 across all environmental spawning, not scaled by player
 count. The census reports world totals against it as context; it cannot

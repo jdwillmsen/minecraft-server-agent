@@ -115,3 +115,20 @@ func TestRenderAnEmptyCensusDoesNotPanic(t *testing.T) {
 		t.Error("Render returned an empty string for an empty census")
 	}
 }
+
+func TestRenderStatesOneNumberWhereOnlyOneEnvironmentSpawnsTheCategory(t *testing.T) {
+	// Animals only spawn above ground, so the overworld's animal cap is a
+	// single known number. Printing it as "4..4" reads like a bug and
+	// suggests an ambiguity the save does not actually leave open.
+	c := Aggregate([]Entity{
+		{Identifier: "cow", Dimension: Overworld, X: 0, Y: 64, Z: 0},
+	}, ScanStats{Records: 1, Decoded: 1}, time.Unix(0, 0).UTC(), "archive")
+
+	out := Render(c, DefaultReportOptions())
+	if strings.Contains(out, "4..4") {
+		t.Errorf("report renders a range where the cap is exact\n---\n%s", out)
+	}
+	if !strings.Contains(out, "animal") || !strings.Contains(out, "1 / 4") {
+		t.Errorf("report does not grade the cow against the animal cap of 4\n---\n%s", out)
+	}
+}

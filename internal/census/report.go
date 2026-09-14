@@ -3,6 +3,7 @@ package census
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -55,8 +56,9 @@ func Render(c Census, opts ReportOptions) string {
 	}
 
 	fmt.Fprintf(&b, "\nregions closest to their spawn cap (%d blocks square)\n", RegionSize)
-	fmt.Fprintf(&b, "  surface and cave caps differ and the save does not record which applies,\n")
-	fmt.Fprintf(&b, "  so each region is graded against the range rather than one number\n")
+	fmt.Fprintf(&b, "  where a category spawns both above and below ground the two caps differ\n")
+	fmt.Fprintf(&b, "  and the save does not record which applies, so those regions are graded\n")
+	fmt.Fprintf(&b, "  against the range rather than one number\n")
 	// Ranked within each dimension rather than globally. The End is full of
 	// end-city shulkers whose counts dwarf everything else, and a single
 	// global ranking buries the overworld and nether regions a player can
@@ -75,9 +77,8 @@ func Render(c Census, opts ReportOptions) string {
 			}
 			minX, maxX, minZ, maxZ := r.Key.Bounds()
 			caps, _ := CapsFor(r.Key.Dimension, r.Category)
-			lower, upper := caps.Range()
-			fmt.Fprintf(&b, "    x %6d..%-6d z %6d..%-6d %-12s %4d / %d..%d  %s\n",
-				minX, maxX, minZ, maxZ, r.Category, r.Count, lower, upper, r.Status)
+			fmt.Fprintf(&b, "    x %6d..%-6d z %6d..%-6d %-12s %4d / %-6s %s\n",
+				minX, maxX, minZ, maxZ, r.Category, r.Count, capBounds(caps), r.Status)
 			shown++
 		}
 	}
@@ -125,6 +126,17 @@ func Render(c Census, opts ReportOptions) string {
 	}
 
 	return b.String()
+}
+
+// capBounds renders a cell's caps. A category that spawns in only one
+// environment has one known ceiling, and printing "4..4" for it would
+// advertise an ambiguity the save does not leave open.
+func capBounds(c Caps) string {
+	lower, upper := c.Range()
+	if lower == upper {
+		return strconv.Itoa(upper)
+	}
+	return fmt.Sprintf("%d..%d", lower, upper)
 }
 
 func sourceKindOrUnknown(kind string) string {
