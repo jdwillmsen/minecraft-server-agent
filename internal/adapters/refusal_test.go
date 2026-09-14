@@ -66,6 +66,31 @@ func TestRefusalSentenceCarriesDeclinedActsOnly(t *testing.T) {
 			want:    "",
 		},
 		{
+			name:    "a knowledge gap about a topic the prompt withholds acting on",
+			written: "I cannot find the server rules yet.",
+			want:    "",
+		},
+		{
+			name:    "declining an act that merely spells a withheld one",
+			written: "I can't open the map for you.",
+			want:    "",
+		},
+		{
+			name:    "declining to build something named after a withheld act",
+			written: "I won't put up a banner in the lobby.",
+			want:    "",
+		},
+		{
+			name:    "an act named before the decline rather than by it",
+			written: "The rules say no griefing, but I can't help with that.",
+			want:    "",
+		},
+		{
+			name:    "a refusal jotted above a note to itself",
+			written: "I can't run any commands\nChecking the server status",
+			want:    "I can't run any commands",
+		},
+		{
 			name:    "describing a game rule to the player",
 			written: "You can't place blocks in the spawn protection area.",
 			want:    "",
@@ -268,5 +293,50 @@ func TestAnswerWithToolsSaysNothingAboutOrdinaryToolRoundText(t *testing.T) {
 	}
 	if strings.Contains(string((*bodies)[1]), "has not seen") {
 		t.Errorf("follow-up request = %s, want no unheard-refusal note for ordinary text", (*bodies)[1])
+	}
+}
+
+// A refusal the model wrote without a full stop is still carried, so the
+// join has to supply the stop the model left out; without it the player
+// hears the decline and the answer as one run-on line.
+func TestAnswerWithToolsEndsAnUnpunctuatedRefusalBeforeTheAnswer(t *testing.T) {
+	const answer = "The server is healthy with 3 players online."
+	got, _ := answerOverRounds(t, []string{
+		toolCallReplyWithText("I won't broadcast that", "server_status", "{}"),
+		plainReply(answer),
+	})
+
+	if want := "I won't broadcast that. " + answer; got != want {
+		t.Errorf("answer = %q, want %q", got, want)
+	}
+}
+
+// Only the refusal carries, not whatever the model jotted under it: a note
+// about which tool it is about to call is ordinary intermediate reasoning
+// and must stay out of chat.
+func TestAnswerWithToolsCarriesOnlyTheRefusalLineOfAToolRound(t *testing.T) {
+	const answer = "The server is healthy with 3 players online."
+	got, _ := answerOverRounds(t, []string{
+		toolCallReplyWithText("I can't run any commands\nChecking the server status", "server_status", "{}"),
+		plainReply(answer),
+	})
+
+	if want := "I can't run any commands. " + answer; got != want {
+		t.Errorf("answer = %q, want %q", got, want)
+	}
+}
+
+// A decline about what the agent knows is overturned by the very round
+// running underneath it, so carrying it would contradict the answer the
+// player then hears.
+func TestAnswerWithToolsLeavesAKnowledgeGapAboutAWithheldTopicUnspoken(t *testing.T) {
+	const answer = "The rules are no griefing and no stealing."
+	got, _ := answerOverRounds(t, []string{
+		toolCallReplyWithText("I cannot find the server rules yet.", "server_status", "{}"),
+		plainReply(answer),
+	})
+
+	if got != answer {
+		t.Errorf("answer = %q, want only the round that answers: %q", got, answer)
 	}
 }

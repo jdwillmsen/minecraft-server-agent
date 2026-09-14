@@ -513,7 +513,7 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 		// its next turn.
 		calls = withNonEmptyIDs(calls)
 		if len(calls) == 0 || round >= MaxToolRounds {
-			return cleanReply(withUnheardRefusal(unheard, ExtractText(payload))), nil
+			return cleanReply(withUnheardRefusal(unheard, cutToolMarkup(messageContent(payload)))), nil
 		}
 
 		// The text the model wrote in the same turn as its tool calls belongs
