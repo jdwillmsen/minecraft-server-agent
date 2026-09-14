@@ -755,6 +755,7 @@ curl -sS -X POST http://<agent>:8080/announcements \
        "priority": "normal",
        "expires_in_seconds": 3600}'
 # 201 {"id": 42, "reached": 3}
+# 201 {"id": 43, "reached": null}   # broadcast; the agent could not see who heard it
 ```
 
 - `target.kind` is `everyone`, `player`, `permission` or `online_only`.
@@ -768,18 +769,28 @@ curl -sS -X POST http://<agent>:8080/announcements \
   queues and so takes none.
 - `201` carries the announcement id and how many players heard it
   immediately; the rest are the queue's to deliver.
+- `reached` is `null`, not `0`, when the announcement was broadcast while
+  the agent could not see who was on the server - during its reconnect gap,
+  or in the moments after a connection opens before the first roster packet.
+  It was said and heard by whoever was there; nobody could be named, so
+  nothing was recorded. `0` keeps its old meaning of "nobody heard it", so a
+  caller that retries on `0` will not broadcast the same line twice.
 - `400` for an invalid request, including unknown fields and keys that
   differ in case or appear twice (keys match exactly), `401` without the
   right bearer token, `413` past the 16 KiB request cap, `422` for an
   unknown player, `503` when announcements are not configured, when the
-  database is not ready, or when this process is not the live agent.
+  database is not ready, or when an `online_only` announcement reaches a pod
+  that is not the live agent.
 - The route is served by every pod, and a warm standby is in the Service
-  like any other, so a publish can land on one that is in no game. It
-  refuses with `503` rather than accepting: nothing stored, nothing said,
-  and the caller's own retry reaches the same Service with the live agent
-  behind it. Storing it would be worse than refusing - `online_only` never
-  queues, so nothing would ever pick it up while the caller had been told
-  `201`.
+  like any other, so a publish can land on one that is in no game. That
+  matters most during the live agent's own reconnect gap: its readiness
+  drops while it has no session, so the standby is the only pod left
+  answering. A target that queues - `everyone`, a named `player`, a
+  `permission` - is accepted there and stored: the pod says nothing itself,
+  and whoever holds the lock delivers it on the next join. `online_only` is
+  the one that cannot be, because it never queues, so a row stored by a pod
+  that will not speak would be picked up by nothing while the caller had
+  been told `201`. That one is refused with `503` and nothing is stored.
 
 The token is compared in constant time and checked before the body is
 read. With the variable unset the route is not mounted at all. The token is

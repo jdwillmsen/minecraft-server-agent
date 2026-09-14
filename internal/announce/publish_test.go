@@ -77,8 +77,8 @@ func TestPublishStoresThenSendsAndDerivesDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
-	if id != 1 || sent != 1 {
-		t.Errorf("Publish = (id %d, sent %d), want (1, 1)", id, sent)
+	if id != 1 || sent.Players != 1 || !sent.Counted {
+		t.Errorf("Publish = (id %d, sent %+v), want (1, one counted player)", id, sent)
 	}
 	if got := s.inserted[0].Delivery; got != DeliveryWhisper {
 		t.Errorf("stored delivery = %s, want whisper", got)

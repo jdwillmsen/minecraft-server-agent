@@ -240,13 +240,18 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 	// agent or a sibling bot is filtered out of every audience. "Told X"
 	// in any of those cases is a report of a delivery that did not occur.
 	switch {
-	case target == announce.TargetPlayer && sent == 0:
+	case !sent.Counted:
+		// Broadcast while the roster could not say who is here, so it went
+		// out and nobody can be named. Claiming a number would be a count
+		// this agent did not have.
+		return "Announced, but I can't see who is online right now.", nil
+	case target == announce.TargetPlayer && sent.Players == 0:
 		// The row is stored and unexpired, so this is a promise the queue
 		// can keep: their next join or their own !inbox drains it.
 		return "Queued for " + displayName + ".", nil
 	case target == announce.TargetPlayer:
 		return "Told " + displayName + ".", nil
-	case target == announce.TargetOnlineOnly && sent == 0:
+	case target == announce.TargetOnlineOnly && sent.Players == 0:
 		// online_only is the one target with no queue behind it, so nobody
 		// hearing it now means nobody ever will.
 		return "Nobody was online to hear that.", nil

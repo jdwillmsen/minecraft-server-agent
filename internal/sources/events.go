@@ -25,7 +25,7 @@ import (
 // Publisher stores an announcement and sends it to whoever is online.
 // Satisfied by announce.Deliverer.
 type Publisher interface {
-	Publish(ctx context.Context, a announce.Announcement) (id int64, sent int, err error)
+	Publish(ctx context.Context, a announce.Announcement) (id int64, sent announce.Reach, err error)
 }
 
 // publishTimeout bounds one event's store write and immediate delivery. A

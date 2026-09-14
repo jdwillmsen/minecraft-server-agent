@@ -127,13 +127,14 @@ type nameArchive interface {
 // and the profile store second.
 //
 // One tier is not enough, and which one is missing decides whether the
-// feature works at all. The roster holds only who is connected and is
-// emptied at the start of every session, so a lookup that stopped there
-// could never name the player an offline announcement is for -- and being
-// able to leave a message for someone who is not here is the entire reason
-// the queue exists. The store alone would be worse in the other direction:
-// it cannot answer for a player this agent has watched arrive but never
-// written down.
+// feature works at all. The roster resolves a name only for someone who is
+// on the server right now -- Roster.XUIDFor scans presence, which every
+// session boundary empties, not the names it retains -- so a lookup that
+// stopped there could never name the player an offline announcement is for,
+// and being able to leave a message for someone who is not here is the
+// entire reason the queue exists. The store alone would be worse in the
+// other direction: it cannot answer for a player this agent has watched
+// arrive but never written down.
 //
 // Ordered roster-first for cost, not correctness. The roster is an in-memory
 // map and is by definition current, and the two only ever disagree while a

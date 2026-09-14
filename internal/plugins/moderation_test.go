@@ -129,11 +129,11 @@ type modDeliverer struct {
 	sent []int64
 }
 
-func (d *modDeliverer) SendNow(_ context.Context, _ announce.Announcement, id int64) (int, error) {
+func (d *modDeliverer) SendNow(_ context.Context, _ announce.Announcement, id int64) (announce.Reach, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.sent = append(d.sent, id)
-	return 1, nil
+	return announce.Reach{Players: 1, Counted: true}, nil
 }
 
 func (d *modDeliverer) DrainAll(context.Context, string, time.Time) (int, int, error) {

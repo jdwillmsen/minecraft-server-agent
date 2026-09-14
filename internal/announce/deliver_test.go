@@ -205,8 +205,8 @@ func TestSendNowWritesOneDeliveryRowPerOnlinePlayerForABroadcast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendNow: %v", err)
 	}
-	if delivered != 3 {
-		t.Errorf("delivered = %d, want 3", delivered)
+	if delivered.Players != 3 {
+		t.Errorf("delivered.Players = %d, want 3", delivered.Players)
 	}
 	if len(voice.says) != 1 {
 		t.Errorf("Say called %d times, want 1", len(voice.says))
@@ -236,8 +236,8 @@ func TestSendNowBroadcastStillRecordsOtherRowsWhenOneMarkDeliveredFails(t *testi
 	if err != nil {
 		t.Fatalf("SendNow: %v", err)
 	}
-	if delivered != 2 {
-		t.Errorf("delivered = %d, want 2 (xuid-2's row failed, xuid-1 and xuid-3 still land)", delivered)
+	if delivered.Players != 2 {
+		t.Errorf("delivered.Players = %d, want 2 (xuid-2's row failed, xuid-1 and xuid-3 still land)", delivered.Players)
 	}
 	if len(voice.says) != 1 {
 		t.Errorf("Say called %d times, want 1 — one row failing to record must not trigger a second broadcast", len(voice.says))
@@ -268,8 +268,8 @@ func TestSendNowSkipsPlayersWhoseTargetDoesNotIncludeThem(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendNow: %v", err)
 	}
-	if delivered != 1 {
-		t.Fatalf("delivered = %d, want 1", delivered)
+	if delivered.Players != 1 {
+		t.Fatalf("delivered.Players = %d, want 1", delivered.Players)
 	}
 	if len(voice.tells) != 1 || voice.tells[0].xuid != "op-1" {
 		t.Errorf("tells = %+v, want exactly one Tell to op-1", voice.tells)
@@ -304,8 +304,8 @@ func TestSendNowDerivesDeliveryFromTargetNotPersistedField(t *testing.T) {
 	if len(voice.says) != 0 {
 		t.Errorf("Say called %d times, want 0 — a player-targeted message must whisper even if its persisted Delivery says broadcast", len(voice.says))
 	}
-	if delivered != 1 || len(voice.tells) != 1 || voice.tells[0].xuid != "xuid-1" {
-		t.Errorf("tells = %+v, delivered = %d, want exactly one Tell to xuid-1", voice.tells, delivered)
+	if delivered.Players != 1 || len(voice.tells) != 1 || voice.tells[0].xuid != "xuid-1" {
+		t.Errorf("tells = %+v, delivered.Players = %d, want exactly one Tell to xuid-1", voice.tells, delivered.Players)
 	}
 	if len(store.delivered) != 1 || store.delivered[0].xuid != "xuid-1" {
 		t.Errorf("store.delivered = %+v, want exactly one row for xuid-1", store.delivered)
@@ -329,8 +329,8 @@ func TestSendNowStopsWhenContextAlreadyCancelled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendNow: %v", err)
 	}
-	if delivered != 0 {
-		t.Errorf("delivered = %d, want 0", delivered)
+	if delivered.Players != 0 {
+		t.Errorf("delivered.Players = %d, want 0", delivered.Players)
 	}
 	if len(voice.tells) != 0 {
 		t.Errorf("Tell called %d times against a cancelled context, want 0", len(voice.tells))
@@ -372,8 +372,8 @@ func TestDisabledStoreReturnsZeroAndNoError(t *testing.T) {
 	roster := fakeRoster{online: []string{"xuid-1"}}
 	d := NewDeliverer(store, voice, roster, fakePermissions{}, testLogger())
 
-	if n, err := d.SendNow(context.Background(), Announcement{TargetKind: TargetEveryone, Delivery: DeliveryBroadcast}, 1); n != 0 || err != nil {
-		t.Errorf("SendNow on disabled store = (%d, %v), want (0, nil)", n, err)
+	if n, err := d.SendNow(context.Background(), Announcement{TargetKind: TargetEveryone, Delivery: DeliveryBroadcast}, 1); n.Players != 0 || err != nil {
+		t.Errorf("SendNow on disabled store = (%+v, %v), want (0, nil)", n, err)
 	}
 	if delivered, remaining, err := d.DrainForJoin(context.Background(), "xuid-1", time.Now()); delivered != 0 || remaining != 0 || err != nil {
 		t.Errorf("DrainForJoin on disabled store = (%d, %d, %v), want (0, 0, nil)", delivered, remaining, err)
@@ -611,8 +611,8 @@ func TestSendNowDefersAWhisperToAFreshArrival(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendNow: %v", err)
 	}
-	if delivered != 0 {
-		t.Errorf("delivered = %d, want 0: the joining client cannot render it yet", delivered)
+	if delivered.Players != 0 {
+		t.Errorf("delivered.Players = %d, want 0: the joining client cannot render it yet", delivered.Players)
 	}
 	if len(voice.tells) != 0 {
 		t.Errorf("told %v, want nothing sent to a loading client", voice.tells)
@@ -634,8 +634,8 @@ func TestSendNowStillWhispersASettledPlayer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendNow: %v", err)
 	}
-	if delivered != 1 || len(voice.tells) != 1 {
-		t.Errorf("delivered = %d, tells = %v, want one of each", delivered, voice.tells)
+	if delivered.Players != 1 || len(voice.tells) != 1 {
+		t.Errorf("delivered.Players = %d, tells = %v, want one of each", delivered.Players, voice.tells)
 	}
 }
 
@@ -655,8 +655,8 @@ func TestSendNowBroadcastsButDoesNotRecordAFreshArrival(t *testing.T) {
 	if len(voice.says) != 1 {
 		t.Fatalf("says = %v, want the broadcast to go out once", voice.says)
 	}
-	if delivered != 1 {
-		t.Errorf("delivered = %d, want 1: the player who just arrived rendered nothing", delivered)
+	if delivered.Players != 1 {
+		t.Errorf("delivered.Players = %d, want 1: the player who just arrived rendered nothing", delivered.Players)
 	}
 	if len(store.delivered) != 1 {
 		t.Errorf("recorded %v, want only the settled player", store.delivered)
@@ -679,8 +679,8 @@ func TestSendNowWithoutAJoinClockDefersNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendNow: %v", err)
 	}
-	if delivered != 1 {
-		t.Errorf("delivered = %d, want 1", delivered)
+	if delivered.Players != 1 {
+		t.Errorf("delivered.Players = %d, want 1", delivered.Players)
 	}
 }
 
@@ -797,8 +797,8 @@ func TestSendNowCountsDeferredBroadcastRecipientsAsReached(t *testing.T) {
 	if len(voice.says) != 1 {
 		t.Fatalf("says = %v, want the broadcast to go out once", voice.says)
 	}
-	if sent != 2 {
-		t.Errorf("sent = %d, want 2: both heard it, only their delivery rows were withheld", sent)
+	if sent.Players != 2 {
+		t.Errorf("sent.Players = %d, want 2: both heard it, only their delivery rows were withheld", sent.Players)
 	}
 	if len(store.delivered) != 0 {
 		t.Errorf("recorded %v, want nothing recorded inside the connect window", store.delivered)
@@ -828,8 +828,8 @@ func TestSendNowCountsOnlyGuessedDeferralsAsReached(t *testing.T) {
 	if len(voice.says) != 1 {
 		t.Fatalf("says = %v, want the broadcast to go out once", voice.says)
 	}
-	if sent != 1 {
-		t.Errorf("sent = %d, want 1: the snapshot player heard it, the fresh arrival did not", sent)
+	if sent.Players != 1 {
+		t.Errorf("sent.Players = %d, want 1: the snapshot player heard it, the fresh arrival did not", sent.Players)
 	}
 	if len(store.delivered) != 0 {
 		t.Errorf("recorded %v, want nothing: neither copy may be marked", store.delivered)
@@ -857,8 +857,8 @@ func TestSendNowBroadcastsWithNobodyOnTheRoster(t *testing.T) {
 	if len(store.delivered) != 0 {
 		t.Errorf("store recorded %v, want nothing: there is no roster snapshot to record from, and a row for a player who may have left loses the message for good", store.delivered)
 	}
-	if sent != 0 {
-		t.Errorf("sent = %d, want 0 — it was said, but nobody is known to have heard it", sent)
+	if sent.Counted {
+		t.Errorf("sent = %+v, want an uncounted reach — it was said, and the roster could name nobody to count", sent)
 	}
 }
 
@@ -881,8 +881,8 @@ func TestSendNowStaysSilentForAWhisperWithNobodyOnTheRoster(t *testing.T) {
 	if len(store.delivered) != 0 {
 		t.Errorf("store recorded %v, want nothing", store.delivered)
 	}
-	if sent != 0 {
-		t.Errorf("sent = %d, want 0", sent)
+	if sent.Players != 0 || !sent.Counted {
+		t.Errorf("sent = %+v, want a counted zero — nothing was said, so nobody heard it, and that is an answer", sent)
 	}
 }
 
@@ -916,8 +916,8 @@ func TestSendNowStaysSilentOnAStandby(t *testing.T) {
 	if len(store.delivered) != 0 {
 		t.Errorf("store recorded %v, want nothing", store.delivered)
 	}
-	if sent != 0 {
-		t.Errorf("sent = %d, want 0", sent)
+	if sent.Players != 0 || !sent.Counted {
+		t.Errorf("sent = %+v, want a counted zero — nothing was said, so nobody heard it, and that is an answer", sent)
 	}
 }
 
@@ -942,8 +942,8 @@ func TestSendNowBroadcastsFromTheLeaderInTheGap(t *testing.T) {
 	if len(store.delivered) != 0 {
 		t.Errorf("store recorded %v, want nothing", store.delivered)
 	}
-	if sent != 0 {
-		t.Errorf("sent = %d, want 0 — it was said, but nobody is known to have heard it", sent)
+	if sent.Counted {
+		t.Errorf("sent = %+v, want an uncounted reach — it was said, and the roster could name nobody to count", sent)
 	}
 }
 
@@ -1047,8 +1047,8 @@ func TestSendNowSkipsAWhisperRecipientWhoLeftMidLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendNow: %v", err)
 	}
-	if sent != 1 || len(voice.tells) != 1 || voice.tells[0].xuid != "op-1" {
-		t.Errorf("sent = %d, tells = %v; want just op-1, who was still there", sent, voice.tells)
+	if sent.Players != 1 || len(voice.tells) != 1 || voice.tells[0].xuid != "op-1" {
+		t.Errorf("sent.Players = %d, tells = %v; want just op-1, who was still there", sent.Players, voice.tells)
 	}
 	if len(store.delivered) != 1 || store.delivered[0].xuid != "op-1" {
 		t.Errorf("rows = %v, want one for op-1 — op-2 left, so what they are owed must survive", store.delivered)
@@ -1072,8 +1072,8 @@ func TestSendNowStaysSilentOnAnIdleConnectedServer(t *testing.T) {
 	if len(voice.says) != 0 {
 		t.Errorf("Say calls = %v, want none on an idle server the agent is connected to", voice.says)
 	}
-	if sent != 0 || len(store.delivered) != 0 {
-		t.Errorf("sent = %d, rows = %v, want nothing", sent, store.delivered)
+	if sent.Players != 0 || len(store.delivered) != 0 {
+		t.Errorf("sent.Players = %d, rows = %v, want nothing", sent.Players, store.delivered)
 	}
 }
 
@@ -1096,5 +1096,33 @@ func TestSendNowBroadcastsWhenTheSameRosterMeansAGap(t *testing.T) {
 	}
 	if len(store.delivered) != 0 {
 		t.Errorf("store recorded %v, want nothing — there is no roster snapshot to record from", store.delivered)
+	}
+}
+
+// Say is one bridge round-trip, bounded by the operator's bridge timeout, so
+// a player can quit while it is in flight. The recording loop runs against
+// the roster snapshot taken before it, and a row for someone who has gone
+// permanently suppresses the redelivery their next join would otherwise pay
+// -- the same loss the whisper loop refuses.
+func TestSendNowDoesNotRecordABroadcastForAPlayerWhoLeftDuringTheSay(t *testing.T) {
+	a := Announcement{Body: "the nether hub is open", TargetKind: TargetEveryone}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice,
+		partedRoster{named: []string{"stayed", "left"}, still: map[string]bool{"stayed": true}},
+		fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 31)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 {
+		t.Fatalf("Say calls = %v, want exactly one — everyone on the server hears a broadcast", voice.says)
+	}
+	if len(store.delivered) != 1 || store.delivered[0].xuid != "stayed" {
+		t.Errorf("rows = %v, want one for stayed — a row for a player who quit loses the message for good", store.delivered)
+	}
+	if sent.Players != 1 || !sent.Counted {
+		t.Errorf("sent = %+v, want one counted player", sent)
 	}
 }

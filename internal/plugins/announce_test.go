@@ -46,8 +46,10 @@ type fakeAnnounceDeliverer struct {
 	sent []announce.Announcement
 	// sentNow is what SendNow reports as actually delivered. Zero by
 	// default, which is what a real deliverer reports for a target who is
-	// offline -- the case the queue exists for.
+	// offline -- the case the queue exists for. uncounted overrides it with
+	// the answer a blind broadcast gives: it was said, nobody can be named.
 	sentNow        int
+	uncounted      bool
 	sendErr        error
 	drainXUID      string
 	drainCount     int
@@ -57,12 +59,15 @@ type fakeAnnounceDeliverer struct {
 
 var _ plugin.AnnounceDeliverer = (*fakeAnnounceDeliverer)(nil)
 
-func (f *fakeAnnounceDeliverer) SendNow(_ context.Context, a announce.Announcement, _ int64) (int, error) {
+func (f *fakeAnnounceDeliverer) SendNow(_ context.Context, a announce.Announcement, _ int64) (announce.Reach, error) {
 	if f.sendErr != nil {
-		return 0, f.sendErr
+		return announce.Reach{Counted: true}, f.sendErr
 	}
 	f.sent = append(f.sent, a)
-	return f.sentNow, nil
+	if f.uncounted {
+		return announce.Reach{}, nil
+	}
+	return announce.Reach{Players: f.sentNow, Counted: true}, nil
 }
 
 func (f *fakeAnnounceDeliverer) DrainAll(_ context.Context, xuid string, _ time.Time) (int, int, error) {
@@ -271,6 +276,34 @@ func TestAnnounceNowWithNobodyOnlineSaysNobodyHeardIt(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(reply), "nobody") {
 		t.Errorf("reply %q should say nobody heard it", reply)
+	}
+}
+
+// "Nobody heard that" is a claim about the server, and the agent can only
+// make it when it can see who is on one. Broadcasting while the roster
+// cannot answer -- the reconnect gap, or the moments before the first roster
+// packet -- reaches whoever is there, so the operator is told what actually
+// happened rather than a count the agent never had.
+func TestAnnounceNowSaysSoWhenItCannotSeeWhoHeardIt(t *testing.T) {
+	cmd := announceCommand(t, "announce")
+	pctx := &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: true},
+		Deliverer:     &fakeAnnounceDeliverer{uncounted: true},
+	}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"!now", "restarting", "in", "five"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.Contains(strings.ToLower(reply), "nobody") {
+		t.Errorf("reply %q claims nobody heard it, but it was broadcast to a server the agent cannot see", reply)
+	}
+	if !strings.Contains(strings.ToLower(reply), "can't see who is online") {
+		t.Errorf("reply %q should say the audience could not be counted", reply)
 	}
 }
 

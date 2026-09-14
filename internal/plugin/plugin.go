@@ -312,7 +312,7 @@ type AnnounceStore interface {
 // !inbox need -- not announce.Deliverer's full method set, since join-time
 // draining is the announce-drain event handler's job, not a chat command's.
 type AnnounceDeliverer interface {
-	SendNow(ctx context.Context, a announce.Announcement, id int64) (int, error)
+	SendNow(ctx context.Context, a announce.Announcement, id int64) (announce.Reach, error)
 	DrainAll(ctx context.Context, xuid string, now time.Time) (delivered, remaining int, err error)
 }
 

@@ -240,11 +240,34 @@ func (d *Deliverer) recipients(ctx context.Context, a Announcement) []string {
 	}
 }
 
+// Reach is what one immediate send actually achieved.
+//
+// Players alone could not say it: a broadcast that goes out while the roster
+// cannot answer who is here reaches whoever is on the server, and this
+// process has no way to count them. Reporting that as zero would read as
+// "nobody heard it" -- the same value a suppressed send returns -- and a
+// caller retrying on zero would broadcast into the server twice.
+type Reach struct {
+	// Players is how many are known to have received it. Meaningful only
+	// when Counted is true.
+	Players int
+	// Counted is whether Players is an answer at all. False only for a
+	// broadcast said to an audience the roster could not name.
+	Counted bool
+}
+
+// reached is a counted answer: this many players, and the count is real.
+func reached(players int) Reach { return Reach{Players: players, Counted: true} }
+
+// uncounted is a broadcast that went out to an audience this process could
+// not see.
+var uncounted = Reach{}
+
 // SendNow delivers a immediately to whoever is online and matches its
-// target, and returns how many actually received it.
-func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int, error) {
+// target, and reports what that reached.
+func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reach, error) {
 	if !d.store.Enabled() {
-		return 0, nil
+		return reached(0), nil
 	}
 	targets := d.recipients(ctx, a)
 	now := time.Now()
@@ -270,8 +293,9 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 		// and a standby's roster never knows anything at all.
 		if len(targets) == 0 && !d.mayBroadcastBlind() {
 			d.log.Info("announce_say_skipped_no_audience", logging.Fields{"announcement_id": id, "roster_knows": d.roster.Knows(), "live": d.live()})
-			return 0, nil
+			return reached(0), nil
 		}
+		blind := len(targets) == 0
 		err := d.voice.Say(ctx, a.Body)
 		metrics.AnnounceDelivery(metrics.DeliveryBroadcast, err)
 		if err != nil {
@@ -279,7 +303,13 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 			// delivery here would make an online player's next join
 			// silently skip a message they never actually received.
 			d.log.Error("announce_say_failed", logging.Fields{"announcement_id": id, "error": err.Error()})
-			return 0, nil
+			return reached(0), nil
+		}
+		if blind {
+			// Heard by whoever is on the server, and there is no roster to
+			// say who that was -- so there is nothing to record and no
+			// count to report.
+			return uncounted, nil
 		}
 		// Say is one console command with no per-recipient receipt, so
 		// "who heard this" has to come from the roster snapshot taken at
@@ -294,6 +324,13 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 				// Cancelled: stop rather than attempt (and log) a store
 				// write for every remaining recipient that would fail anyway.
 				break
+			}
+			if d.departed(xuid) {
+				// Left during the Say, which is one bridge round-trip long.
+				// They are gone, so a row for them would suppress the
+				// redelivery their next join would otherwise pay -- the same
+				// permanent loss the whisper loop refuses below.
+				continue
 			}
 			if d.stillLoading(xuid) {
 				// Heard by everyone whose client is up, but not by this one:
@@ -324,7 +361,7 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 		// nothing worse than a guess. A player who demonstrably just
 		// arrived is not counted -- their client rendered nothing, and
 		// their own drain still owes them the same text.
-		return delivered + heard, nil
+		return reached(delivered + heard), nil
 	}
 
 	if len(targets) == 0 {
@@ -332,7 +369,7 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 		// stays pending in the store (if it queues at all) for whoever
 		// joins later. Unlike a broadcast, a whisper needs an XUID to go
 		// to, so there is nothing to send into the gap.
-		return 0, nil
+		return reached(0), nil
 	}
 
 	// Whisper: each recipient gets their own Tell, and only a recipient
@@ -376,7 +413,7 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 	if deferred > 0 {
 		d.log.Info("announce_deferred_for_joining", logging.Fields{"announcement_id": id, "players": deferred})
 	}
-	return delivered, nil
+	return reached(delivered), nil
 }
 
 // ErrDisabled is what Publish returns when there is no store to write an
@@ -386,21 +423,21 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (int,
 var ErrDisabled = errors.New("announce: no announcement store configured")
 
 // Publish stores a and then sends it to whoever is online and matches it,
-// reporting the stored id and how many heard it immediately.
+// reporting the stored id and what the immediate send reached.
 //
 // The one path for every source that has no command reply to shape: a
 // schedule, a server event, the HTTP API. Delivery is re-derived here from
 // the target whatever the caller set, for the same reason SendNow never
 // trusts it off a row. A send that reaches nobody is not an error -- the
 // row is stored and the queue owns it from here.
-func (d *Deliverer) Publish(ctx context.Context, a Announcement) (id int64, sent int, err error) {
+func (d *Deliverer) Publish(ctx context.Context, a Announcement) (id int64, sent Reach, err error) {
 	if !d.store.Enabled() {
-		return 0, 0, ErrDisabled
+		return 0, reached(0), ErrDisabled
 	}
 	a.Delivery = DeliveryFor(a.TargetKind)
 	id, err = d.store.Insert(ctx, a)
 	if err != nil {
-		return 0, 0, err
+		return 0, reached(0), err
 	}
 	a.ID = id
 	sent, err = d.SendNow(ctx, a, id)

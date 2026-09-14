@@ -34,9 +34,9 @@ func (s scriptedProfiles) RecordLeave(context.Context, string, time.Time, time.T
 // source publishes off the caller's goroutine.
 type signallingPublisher struct{ got chan announce.Announcement }
 
-func (p signallingPublisher) Publish(_ context.Context, a announce.Announcement) (int64, int, error) {
+func (p signallingPublisher) Publish(_ context.Context, a announce.Announcement) (int64, announce.Reach, error) {
 	p.got <- a
-	return 1, 0, nil
+	return 1, announce.Reach{Counted: true}, nil
 }
 
 func wrapScripted(s scriptedProfiles) (store.Store, signallingPublisher) {

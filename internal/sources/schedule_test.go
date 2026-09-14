@@ -89,11 +89,11 @@ type recordingSender struct {
 	sent []int64
 }
 
-func (r *recordingSender) SendNow(_ context.Context, _ announce.Announcement, id int64) (int, error) {
+func (r *recordingSender) SendNow(_ context.Context, _ announce.Announcement, id int64) (announce.Reach, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.sent = append(r.sent, id)
-	return 1, nil
+	return announce.Reach{Players: 1, Counted: true}, nil
 }
 
 func (r *recordingSender) count() int {

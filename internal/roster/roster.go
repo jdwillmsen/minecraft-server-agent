@@ -332,13 +332,21 @@ func (r *Roster) Online() []string {
 	return out
 }
 
-// XUIDFor is NameFor's reverse: it resolves a gamertag back to the XUID
-// currently on record for it, so a caller that only has a display name
-// (e.g. a "@PlayerName" reference typed into a command) can turn it into
-// the identity Voice.Tell and the announcement store actually key on. ok is
-// false if name isn't the current username of anyone on the roster.
+// XUIDFor resolves a gamertag back to the XUID currently on record for it,
+// so a caller that only has a display name (e.g. a "@PlayerName" reference
+// typed into a command) can turn it into the identity Voice.Tell and the
+// announcement store actually key on. ok is false if name isn't the current
+// username of anyone on the roster.
 //
-// This assumes gamertags are unique per server, same as NameFor's map
+// Not NameFor's reverse, and the asymmetry is deliberate: this scans the
+// presence map, which a session boundary empties, while NameFor answers from
+// the retained names one. After a connection dies NameFor still resolves an
+// XUID to "Steve" -- a reply already in flight has to stay addressable --
+// but XUIDFor("Steve") finds nobody, because nobody is on the server. A
+// caller that needs that round trip for an offline player wants the durable
+// record instead; see cmd/agent's playerLookup.
+//
+// This assumes gamertags are unique per server, same as the names map
 // already assumes in the other direction. If that were ever violated —
 // two entries on the roster sharing a name — whichever is encountered
 // first during the scan wins, with no significance attached to which that
@@ -347,9 +355,10 @@ func (r *Roster) Online() []string {
 //
 // This is a linear scan rather than a second index: the roster is sized to
 // a Bedrock server's concurrent player count, not a lookup table, and the
-// map already gives O(1) resolution the other direction (NameFor), which is
-// the hot path (every Tell). A reverse index would double the bookkeeping
-// Apply has to keep consistent for a lookup that isn't on that hot path.
+// maps already give O(1) resolution the other direction (NameFor, IsOnline),
+// which is the hot path (every Tell, every recipient). A reverse index would
+// double the bookkeeping Apply has to keep consistent for a lookup that
+// isn't on that hot path.
 func (r *Roster) XUIDFor(name string) (xuid string, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

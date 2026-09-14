@@ -23,7 +23,7 @@ import (
 // AnnouncementPublisher stores an announcement and sends it to whoever is
 // online. Satisfied by announce.Deliverer.
 type AnnouncementPublisher interface {
-	Publish(ctx context.Context, a announce.Announcement) (id int64, sent int, err error)
+	Publish(ctx context.Context, a announce.Announcement) (id int64, sent announce.Reach, err error)
 }
 
 // PlayerResolver turns a gamertag into an XUID, through the same two-tier
@@ -79,8 +79,12 @@ type announcementRequest struct {
 }
 
 type announcementResponse struct {
-	ID      int64 `json:"id"`
-	Reached int   `json:"reached"`
+	ID int64 `json:"id"`
+	// Reached is how many players heard it immediately, and null when the
+	// announcement was broadcast while the agent could not see who was on
+	// the server. Null rather than 0 on purpose: 0 means nobody heard it,
+	// and a caller retrying on that would broadcast into the server twice.
+	Reached *int `json:"reached"`
 }
 
 func announcementsHandler(token string, live func() bool, pub AnnouncementPublisher, players PlayerResolver, log *logging.Logger, now func() time.Time) http.Handler {
@@ -103,18 +107,6 @@ func announcementsHandler(token string, live func() bool, pub AnnouncementPublis
 			return
 		}
 
-		// Refused before anything is read or stored. This route is mounted
-		// for the whole process and a standby answers /readyz, so it sits in
-		// the Service endpoints like any other pod -- but it is in no game.
-		// Storing the row here would be worse than refusing: an online-only
-		// announcement never queues, so nothing would ever pick it up, and
-		// the caller would have been told 201. A 503 is a request the caller
-		// can simply make again, and the leader is behind the same Service.
-		if !live() {
-			writeError(w, http.StatusServiceUnavailable, "this process is not the live agent; retry so the request reaches the one that is")
-			return
-		}
-
 		req, status, msg := decodeAnnouncement(w, r)
 		if status != 0 {
 			writeError(w, status, msg)
@@ -128,8 +120,21 @@ func announcementsHandler(token string, live func() bool, pub AnnouncementPublis
 			writeError(w, status, msg)
 			return
 		}
+		// This route is mounted for the whole process and a standby answers
+		// /readyz, so it sits in the Service endpoints like any other pod --
+		// and during the live agent's own reconnect gap its readiness drops
+		// and the standby is the only pod left answering. A target that
+		// queues is still worth taking there: the row is stored, this
+		// process says nothing, and whoever holds the lock delivers it on
+		// the next join. Online-only is the one that cannot be: it never
+		// queues, so a row stored here would be picked up by nothing while
+		// the caller had been told it was created.
+		if !live() && !announce.Queues(a.TargetKind) {
+			writeError(w, http.StatusServiceUnavailable, "this process is not the live agent and an online_only announcement cannot be queued for one; retry so the request reaches the agent that is")
+			return
+		}
 
-		id, reached, err := pub.Publish(ctx, a)
+		id, sent, err := pub.Publish(ctx, a)
 		switch {
 		case errors.Is(err, announce.ErrDisabled), pgerr.NotMigrated(err):
 			writeError(w, http.StatusServiceUnavailable, "announcements are not configured")
@@ -148,7 +153,11 @@ func announcementsHandler(token string, live func() bool, pub AnnouncementPublis
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(announcementResponse{ID: id, Reached: reached})
+		resp := announcementResponse{ID: id}
+		if sent.Counted {
+			resp.Reached = &sent.Players
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 }
 

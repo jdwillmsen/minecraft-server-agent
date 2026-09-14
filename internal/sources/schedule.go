@@ -23,7 +23,7 @@ type ScheduleRunner interface {
 // Sender delivers an already-stored announcement to whoever is online.
 // Satisfied by announce.Deliverer.
 type Sender interface {
-	SendNow(ctx context.Context, a announce.Announcement, id int64) (int, error)
+	SendNow(ctx context.Context, a announce.Announcement, id int64) (announce.Reach, error)
 }
 
 // ScheduleInterval is how often the loop looks for due schedules. A daily

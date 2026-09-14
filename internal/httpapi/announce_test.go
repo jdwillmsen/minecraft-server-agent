@@ -20,18 +20,24 @@ import (
 const testToken = "s3cret-token"
 
 type fakePublisher struct {
-	got     []announce.Announcement
-	reached int
-	err     error
-	id      int64
+	got []announce.Announcement
+	// reached is what the immediate send counted. uncounted overrides it
+	// with the answer a blind broadcast gives: said, audience unknown.
+	reached   int
+	uncounted bool
+	err       error
+	id        int64
 }
 
-func (f *fakePublisher) Publish(_ context.Context, a announce.Announcement) (int64, int, error) {
+func (f *fakePublisher) Publish(_ context.Context, a announce.Announcement) (int64, announce.Reach, error) {
 	f.got = append(f.got, a)
 	if f.err != nil {
-		return f.id, 0, f.err
+		return f.id, announce.Reach{Counted: true}, f.err
 	}
-	return 42, f.reached, nil
+	if f.uncounted {
+		return 42, announce.Reach{}, nil
+	}
+	return 42, announce.Reach{Players: f.reached, Counted: true}, nil
 }
 
 type fakePlayers struct {
@@ -154,7 +160,7 @@ func TestAnnouncementsCreateAndReportTheCountReached(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.ID != 42 || resp.Reached != 3 {
+	if resp.ID != 42 || resp.Reached == nil || *resp.Reached != 3 {
 		t.Errorf("response = %+v, want id 42 reached 3", resp)
 	}
 	a := pub.got[0]
@@ -299,12 +305,15 @@ func TestAnnouncementsReportTheStoreState(t *testing.T) {
 }
 
 // This route is mounted for the whole process and a standby answers /readyz,
-// so it sits in the Service endpoints like any other pod -- a publish has a
-// real chance of landing on one every time. It is in no game, so it must not
-// accept the request: an online-only announcement never queues, so a row
-// stored here would be picked up by nothing and spoken to nobody while the
-// caller was told it was created.
-func TestAPublishIsRefusedByAProcessThatIsNotTheLiveAgent(t *testing.T) {
+// so it sits in the Service endpoints like any other pod. It matters most
+// during the live agent's own reconnect gap: readiness drops for the pod
+// whose session is down, so the standby is the only one left answering.
+//
+// A target that queues is still worth taking there. The row is stored, this
+// process says nothing, and whoever holds the lock delivers it on the next
+// join -- refusing would make the API unusable for the whole reconnect
+// backoff.
+func TestAQueueingPublishIsStoredByAProcessThatIsNotTheLiveAgent(t *testing.T) {
 	for _, role := range []struct {
 		name string
 		role Role
@@ -319,16 +328,73 @@ func TestAPublishIsRefusedByAProcessThatIsNotTheLiveAgent(t *testing.T) {
 
 			rec := post(srv, "Bearer "+testToken, okBody)
 
-			if rec.Code != http.StatusServiceUnavailable {
-				t.Errorf("status = %d, want 503 so the caller retries and reaches the live agent", rec.Code)
+			if rec.Code != http.StatusCreated {
+				t.Errorf("status = %d, want 201 — everyone queues, so the leader delivers it on the next join", rec.Code)
 			}
-			if len(pub.got) != 0 {
-				t.Errorf("published %+v, want nothing stored by a process that cannot deliver it", pub.got)
-			}
-			if !strings.Contains(rec.Body.String(), "not the live agent") {
-				t.Errorf("body = %q, want it to say why", rec.Body.String())
+			if len(pub.got) != 1 {
+				t.Errorf("published %+v, want the announcement stored for the leader to deliver", pub.got)
 			}
 		})
+	}
+}
+
+// Online-only is the one target that cannot be taken here: it never queues,
+// so a row stored by a process that will not speak would be picked up by
+// nothing while the caller had been told it was created.
+func TestAnOnlineOnlyPublishIsRefusedByAProcessThatIsNotTheLiveAgent(t *testing.T) {
+	pub := &fakePublisher{}
+	srv := mounted(t, testToken, pub, fakePlayers{})
+	srv.SetRole(RoleStandby)
+
+	rec := post(srv, "Bearer "+testToken, `{"body":"restarting now","target":{"kind":"online_only"}}`)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 so the caller retries and reaches the live agent", rec.Code)
+	}
+	if len(pub.got) != 0 {
+		t.Errorf("published %+v, want nothing stored: nothing would ever pick it up", pub.got)
+	}
+	if !strings.Contains(rec.Body.String(), "not the live agent") {
+		t.Errorf("body = %q, want it to say why", rec.Body.String())
+	}
+}
+
+// The live agent takes online_only like any other target.
+func TestAnOnlineOnlyPublishIsServedByTheLiveAgent(t *testing.T) {
+	pub := &fakePublisher{}
+	srv := mounted(t, testToken, pub, fakePlayers{})
+
+	rec := post(srv, "Bearer "+testToken, `{"body":"restarting now","target":{"kind":"online_only"}}`)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (%s)", rec.Code, rec.Body)
+	}
+	if len(pub.got) != 1 {
+		t.Errorf("published %+v, want exactly one announcement", pub.got)
+	}
+}
+
+// A broadcast said while the agent cannot see who is on the server reaches
+// whoever is there and can name none of them. Reporting 0 would read as
+// "nobody heard it" -- and a caller retrying on that would broadcast twice.
+func TestAnUncountedBroadcastReportsNoRecipientCount(t *testing.T) {
+	pub := &fakePublisher{uncounted: true}
+	srv := mounted(t, testToken, pub, fakePlayers{})
+
+	rec := post(srv, "Bearer "+testToken, okBody)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (%s)", rec.Code, rec.Body)
+	}
+	var resp announcementResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Reached != nil {
+		t.Errorf("reached = %d, want null — it was said, and the audience could not be counted", *resp.Reached)
+	}
+	if !strings.Contains(rec.Body.String(), `"reached":null`) {
+		t.Errorf("body = %q, want reached rendered as null", rec.Body.String())
 	}
 }
 
