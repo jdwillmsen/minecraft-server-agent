@@ -199,7 +199,8 @@ func (f *FileStore) Save(_ context.Context, tok *oauth2.Token) error {
 }
 
 // Fallback reads through to a second store when the first has nothing to
-// give, and writes only to the first.
+// give, and writes to the first, falling back to the second only when the
+// first could not take the write at all -- and saying so when it does.
 //
 // It exists for the window in which the token is moving from the pod's
 // volume into the database. The primary starts empty, so the first load

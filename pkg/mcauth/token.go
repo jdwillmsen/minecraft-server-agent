@@ -344,6 +344,11 @@ func (c *cachingTokenSource) turnContext() (context.Context, context.CancelFunc)
 // the store, because the live agent persists every rotation -- staying warm
 // on the other process's work rather than on work of its own.
 //
+// In practice a standby asks for a token once, at start-up, and has no use
+// for another until it is live. Staying current across the wait is not this
+// function's job but reload's, which runs before the promoted process rotates
+// anything.
+//
 // A store that has nothing newer leaves this process unwarmed, which is
 // reported rather than worked around. It costs the handover one refresh; the
 // alternative costs the account its login.
