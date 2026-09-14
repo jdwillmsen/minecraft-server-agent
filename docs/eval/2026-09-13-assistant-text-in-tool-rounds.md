@@ -87,7 +87,12 @@ surfaces it rather than causing it: the agent has always spoken only the
 final round's text, so any sentence the model wrote in an earlier round was
 already unheard. Fixing that means either carrying earlier rounds' prose
 into the reply or telling the model the player has not seen it, and both
-change what players hear. Left open deliberately.
+change what players hear. Left open deliberately at the time of this run,
+and closed afterwards by doing both: the round history now tells the model
+the player has seen nothing yet, and a refusal written while calling a tool
+is carried in front of the answer when the answering round does not decline
+again. These numbers predate that change as well. See
+`internal/adapters/refusal.go` and README's "Answering with tools".
 
 ## By category
 

@@ -319,9 +319,27 @@ would otherwise keep calling them instead of answering. Each round is
 carried into the next as the standard message shape has it: the assistant
 turn keeps both what the model wrote and the calls it asked for, so a
 refusal it made while calling a tool is still in front of it on the round
-that answers. Only a player hears less than the model does - the reply is
-the final round's text. The full surface, as wired in
-`internal/toolset/toolset.go`:
+that answers. A player still hears less than the model does - the reply is
+the final round's text - with one exception, since one kind of sentence is
+not superseded by whatever a tool returns.
+
+A refusal the model writes while calling a tool reaches the player. It has
+to: no tool result makes the agent willing to run the command, so a player
+who asked for one and hears only the tool-backed answer has been answered
+past rather than declined. Two things make it audible. The round history
+says outright that the player has seen nothing yet, which lets the model
+decline again in its own words - one authored sentence, and the better
+reply; and if it does not, the earlier sentence is put in front of the
+answer. Either way the combined text goes through the same length budget
+and no-question rule as any other reply, and the whisper-versus-broadcast
+decision is unchanged.
+
+The distinction is drawn on what a sentence declines, not on how certain it
+sounds. Only a first-person "no" that names something the prompt withholds -
+running commands, changing rules, making announcements - carries forward.
+"Let me look that up" is a note to itself, and "I cannot find that waypoint"
+is the very claim the tool round underneath it exists to overturn; both stay
+out of chat. The full surface, as wired in `internal/toolset/toolset.go`:
 
 - `knowledge_lookup` - look up a recorded topic
 - `waypoint_lookup` - the asker's own coordinates saved under a name

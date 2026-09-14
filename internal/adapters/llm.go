@@ -324,12 +324,22 @@ func trimTrailingQuestions(s string) string {
 }
 
 // lastSentenceEnd is the index just past the last sentence terminator, and
-// any closers after it, or 0 when s is a single sentence. An ASCII
-// terminator counts only when a space follows, which keeps a version like
-// "1.21.100.7" from reading as four sentences. A fullwidth one needs no
-// space: the scripts that use it, like Chinese, put none between sentences.
+// any closers after it, or 0 when s is a single sentence.
 func lastSentenceEnd(s string) int {
-	end := 0
+	ends := sentenceBoundaries(s)
+	if len(ends) == 0 {
+		return 0
+	}
+	return ends[len(ends)-1]
+}
+
+// sentenceBoundaries is the index just past each sentence terminator in s,
+// and any closers after it. An ASCII terminator counts only when a space
+// follows, which keeps a version like "1.21.100.7" from reading as four
+// sentences. A fullwidth one needs no space: the scripts that use it, like
+// Chinese, put none between sentences.
+func sentenceBoundaries(s string) []int {
+	var ends []int
 	for i, r := range s {
 		spaced := r == '.' || r == '!' || r == '?'
 		if !spaced && r != '。' && r != '！' && r != '？' {
@@ -337,10 +347,10 @@ func lastSentenceEnd(s string) int {
 		}
 		rest := strings.TrimLeft(s[i+utf8.RuneLen(r):], sentenceClosers)
 		if !spaced || strings.HasPrefix(rest, " ") {
-			end = len(s) - len(rest)
+			ends = append(ends, len(s)-len(rest))
 		}
 	}
-	return end
+	return ends
 }
 
 // statementBefore is the index of the last clause break in a closing
@@ -477,6 +487,10 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 
 	_, _, initial := c.BuildRequest(asker, question)
 	messages := initial.Messages
+	// A refusal written while calling a tool, which the player has not heard
+	// because only the round that answers is spoken. Kept so the round that
+	// answers can be made to carry it.
+	var unheard string
 
 	for round := 0; ; round++ {
 		body := chatRequest{Model: c.model, MaxTokens: c.maxTokens, Messages: messages}
@@ -499,7 +513,7 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 		// its next turn.
 		calls = withNonEmptyIDs(calls)
 		if len(calls) == 0 || round >= MaxToolRounds {
-			return ExtractText(payload), nil
+			return cleanReply(withUnheardRefusal(unheard, cutToolMarkup(messageContent(payload)))), nil
 		}
 
 		// The text the model wrote in the same turn as its tool calls belongs
@@ -513,9 +527,20 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 		// the model remembering words it never wrote. Only unparsed call
 		// markup goes: that is a half-written call the backend handed back as
 		// text, not prose, and showing one back invites another.
+		written := cutToolMarkup(messageContent(payload))
+		// Only the first refusal is tracked: once the model has been told the
+		// player is unaware of it, a later round repeating it is the model
+		// answering that note, not a second thing left unsaid.
+		noteUnheard := false
+		if unheard == "" {
+			if refusal := refusalSentence(written); refusal != "" {
+				unheard, noteUnheard = refusal, true
+			}
+		}
+
 		messages = append(messages, chatMessage{
 			Role:      "assistant",
-			Content:   cutToolMarkup(messageContent(payload)),
+			Content:   written,
 			ToolCalls: calls,
 		})
 		for _, call := range calls {
@@ -537,6 +562,11 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 			messages = append(messages, chatMessage{
 				Role: "tool", ToolCallID: call.ID, Content: result,
 			})
+		}
+		// After the round's results, so the model reads it as the last word
+		// before it writes the reply rather than as an aside to its own turn.
+		if noteUnheard {
+			messages = append(messages, chatMessage{Role: "system", Content: unheardRefusalNote})
 		}
 	}
 }
