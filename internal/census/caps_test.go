@@ -42,17 +42,19 @@ func TestCapsForHasNoEntryForUncountedCategories(t *testing.T) {
 func TestStatusOfReportsARangeNotAFalsePrecision(t *testing.T) {
 	// Surface-versus-cave is fixed when a mob spawns and is not written to
 	// the save, so the exact cap is unknowable. Overworld monsters are
-	// capped somewhere in 8..16: at or below 8 there is headroom for
-	// certain, above 16 the region is saturated for certain, between the
-	// two it depends on how those mobs spawned.
+	// capped somewhere in 8..16: below 8 there is headroom for certain, at
+	// 16 the region is saturated for certain, between the two it depends on
+	// how those mobs spawned.
 	for _, tc := range []struct {
 		count int
 		want  Status
 	}{
 		{0, Headroom},
-		{8, Headroom},
+		{7, Headroom},
+		{8, AtRisk},
 		{9, AtRisk},
-		{16, AtRisk},
+		{15, AtRisk},
+		{16, Capped},
 		{17, Capped},
 	} {
 		if got := StatusOf(Overworld, Monster, tc.count); got != tc.want {
@@ -73,14 +75,13 @@ func TestStatusOfGradesOnlyTheEnvironmentsACategorySpawnsIn(t *testing.T) {
 		want  Status
 	}{
 		{Overworld, Animal, 1, Headroom},
-		{Overworld, Animal, 4, Headroom},
-		{Overworld, Animal, 5, Capped},
+		{Overworld, Animal, 3, Headroom},
+		{Overworld, Animal, 4, Capped},
 		{Overworld, Ambient, 1, Headroom},
-		{Overworld, Ambient, 2, Headroom},
-		{Overworld, Ambient, 3, Capped},
+		{Overworld, Ambient, 2, Capped},
 		{Nether, Monster, 1, Headroom},
-		{Nether, Monster, 16, Headroom},
-		{Nether, Monster, 17, Capped},
+		{Nether, Monster, 15, Headroom},
+		{Nether, Monster, 16, Capped},
 	} {
 		if got := StatusOf(tc.d, tc.c, tc.count); got != tc.want {
 			t.Errorf("StatusOf(%v,%v,%d) = %v, want %v", tc.d, tc.c, tc.count, got, tc.want)
@@ -125,10 +126,10 @@ func TestStatusOfGradesTheEndsInvertedCaps(t *testing.T) {
 		count int
 		want  Status
 	}{
-		{8, Headroom},
+		{7, Headroom},
+		{8, AtRisk},
 		{9, AtRisk},
-		{10, AtRisk},
-		{11, Capped},
+		{10, Capped},
 	} {
 		if got := StatusOf(End, Monster, tc.count); got != tc.want {
 			t.Errorf("StatusOf(end,monster,%d) = %v, want %v", tc.count, got, tc.want)
@@ -144,6 +145,65 @@ func TestCapsForHasNoEntryForCategoriesThatCannotSpawnInTheEnd(t *testing.T) {
 	for _, c := range []Category{Animal, WaterAnimal, Ambient, Pillager} {
 		if caps, ok := CapsFor(End, c); ok {
 			t.Errorf("CapsFor(end,%v) = %+v, want no entry", c, caps)
+		}
+	}
+}
+
+func TestStatusOfTreatsACountOnItsCapAsCapped(t *testing.T) {
+	// Bedrock stops spawning once the count reaches the ceiling, not once
+	// it passes it, so a region sitting exactly on its cap has no room
+	// left. "16 / 16 headroom" is precisely the line an operator would read
+	// as room to spare.
+	for _, tc := range []struct {
+		d     Dimension
+		c     Category
+		count int
+		want  Status
+	}{
+		{Nether, Monster, 16, Capped},
+		{Overworld, Animal, 4, Capped},
+		{Overworld, Ambient, 2, Capped},
+		{Overworld, WaterAnimal, 36, Capped},
+		{Overworld, Pillager, 8, Capped},
+	} {
+		if got := StatusOf(tc.d, tc.c, tc.count); got != tc.want {
+			t.Errorf("StatusOf(%v,%v,%d) = %v, want %v", tc.d, tc.c, tc.count, got, tc.want)
+		}
+	}
+}
+
+func TestStatusOfTreatsACountOnTheLowerBoundAsAtRisk(t *testing.T) {
+	// Where the two environments carry different ceilings, reaching the
+	// lower one is already enough to stop spawning if that is the ceiling
+	// that applies - which the save cannot say.
+	for _, tc := range []struct {
+		d     Dimension
+		c     Category
+		count int
+		want  Status
+	}{
+		{Overworld, Monster, 8, AtRisk},
+		{End, Monster, 8, AtRisk},
+	} {
+		if got := StatusOf(tc.d, tc.c, tc.count); got != tc.want {
+			t.Errorf("StatusOf(%v,%v,%d) = %v, want %v", tc.d, tc.c, tc.count, got, tc.want)
+		}
+	}
+}
+
+func TestCapsWithNoSpawnableEnvironmentHaveNoRangeToGradeAgainst(t *testing.T) {
+	// Caps and its methods are exported, so a caller can hand in a cell the
+	// table would never hold. Falling through to the first arm returned a
+	// range of -1..-1, which graded a count of zero as capped and printed a
+	// ceiling of -1.
+	none := Caps{Surface: NoSpawn, Cave: NoSpawn}
+	lower, upper := none.Range()
+	if lower != NoSpawn || upper != NoSpawn {
+		t.Errorf("Range() = (%d,%d), want (%d,%d)", lower, upper, NoSpawn, NoSpawn)
+	}
+	for _, count := range []int{0, 1, 100} {
+		if got := none.Status(count); got != StatusUnknown {
+			t.Errorf("Status(%d) = %v, want StatusUnknown", count, got)
 		}
 	}
 }

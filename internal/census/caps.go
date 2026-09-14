@@ -11,9 +11,12 @@ const GlobalCap = 200
 //
 // It is deliberately not zero. A ceiling of zero and an environment with no
 // ceiling behave identically for spawning - nothing spawns either way - but
-// they differ entirely when grading mobs that are already there, because
-// those mobs spawned under the other environment's ceiling, or were bred or
-// name-tagged and never counted against a spawn cap at all.
+// they differ entirely when grading mobs that are already there. Every mob
+// present occupies its category's density regardless of how it got there, so
+// the count is real; what is absent is a ceiling of this environment's to
+// measure it against, because those mobs arrived under the other
+// environment's ceiling, or were bred, spawned from an egg or led in. Zero
+// would grade every one of them as over cap.
 const NoSpawn = -1
 
 // Caps is one cell of the population-control table. Surface and Cave are
@@ -31,6 +34,10 @@ type Caps struct {
 // graded exactly.
 func (c Caps) Range() (lower, upper int) {
 	switch {
+	// Neither environment spawns the category, so there are no bounds to
+	// grade against - which is not the same as bounds of zero.
+	case c.Surface == NoSpawn && c.Cave == NoSpawn:
+		return NoSpawn, NoSpawn
 	case c.Surface == NoSpawn:
 		return c.Cave, c.Cave
 	case c.Cave == NoSpawn:
@@ -105,20 +112,28 @@ func (s Status) String() string {
 // Bedrock fixes whether a mob counts as a surface or a cave spawn at spawn
 // time and does not write that to the save, so the exact applicable cap
 // cannot be recovered. Rather than invent a single number, the count is
-// graded against both bounds: at or below the lower bound there is headroom
-// whichever way the mobs spawned, above the upper bound the region is
-// saturated whichever way, and between them it depends on facts the save
-// does not carry.
+// graded against both bounds. Bedrock refuses a spawn once the count reaches
+// the ceiling, so below the lower bound there is headroom whichever way the
+// mobs spawned, at or above the upper bound the region is saturated whichever
+// way, and between them it depends on facts the save does not carry.
 func StatusOf(d Dimension, c Category, count int) Status {
 	caps, ok := CapsFor(d, c)
 	if !ok {
 		return StatusUnknown
 	}
-	lower, upper := caps.Range()
+	return caps.Status(count)
+}
+
+// Status grades a count against this cell's caps.
+func (c Caps) Status(count int) Status {
+	lower, upper := c.Range()
+	if upper == NoSpawn {
+		return StatusUnknown
+	}
 	switch {
-	case count > upper:
+	case count >= upper:
 		return Capped
-	case count > lower:
+	case count >= lower:
 		return AtRisk
 	default:
 		return Headroom

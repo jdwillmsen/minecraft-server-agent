@@ -133,6 +133,9 @@ func Render(c Census, opts ReportOptions) string {
 // advertise an ambiguity the save does not leave open.
 func capBounds(c Caps) string {
 	lower, upper := c.Range()
+	if upper == NoSpawn {
+		return "none"
+	}
 	if lower == upper {
 		return strconv.Itoa(upper)
 	}

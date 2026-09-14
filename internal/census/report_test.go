@@ -165,3 +165,12 @@ func TestRenderAccountsForEveryDecodedEntityByDimension(t *testing.T) {
 		t.Errorf("dimension breakdown sums to %d, want %d\n---\n%s", sum, len(entities), out)
 	}
 }
+
+func TestCapBoundsPrintsNoCeilingRatherThanMinusOne(t *testing.T) {
+	// Caps is exported and NoSpawn is -1, so a cell nothing spawns in must
+	// not render as a ceiling of "-1" in the one column an operator reads
+	// the count against.
+	if got := capBounds(Caps{Surface: NoSpawn, Cave: NoSpawn}); got != "none" {
+		t.Errorf("capBounds(no spawnable environment) = %q, want %q", got, "none")
+	}
+}
