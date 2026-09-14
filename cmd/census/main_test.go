@@ -16,7 +16,9 @@ import (
 )
 
 // buildArchive writes a one-zombie world and tars it the way the backup job
-// does, so the binary is exercised end to end rather than from a stub.
+// does - `tar czf "$ARCHIVE_TMP" -C "$STAGE" .`, so "./" is member 0 and
+// every directory gets an entry ahead of its files - so the binary is
+// exercised end to end against the archive shape it actually receives.
 func buildArchive(t *testing.T, dir string) {
 	t.Helper()
 	stage := t.TempDir()
@@ -57,18 +59,29 @@ func buildArchive(t *testing.T, dir string) {
 	gz := gzip.NewWriter(out)
 	tw := tar.NewWriter(gz)
 	if err := filepath.WalkDir(stage, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
 			return err
 		}
 		rel, err := filepath.Rel(stage, path)
 		if err != nil {
 			return err
 		}
+		name := "./" + filepath.ToSlash(rel)
+		if d.IsDir() {
+			if rel == "." {
+				name = "./"
+			} else {
+				name += "/"
+			}
+			return tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeDir, Mode: 0o755})
+		}
 		body, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		if err := tw.WriteHeader(&tar.Header{Name: rel, Mode: 0o644, Size: int64(len(body))}); err != nil {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name, Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(body)),
+		}); err != nil {
 			return err
 		}
 		_, err = tw.Write(body)

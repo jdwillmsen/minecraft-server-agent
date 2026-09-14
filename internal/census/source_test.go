@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -134,5 +135,83 @@ func TestArchiveSourceAcceptsBenignArchives(t *testing.T) {
 	}
 	if err := cleanup(); err != nil {
 		t.Fatalf("cleanup: %v", err)
+	}
+}
+
+// writeBackupArchive writes an archive with the member shape the backup job
+// actually produces. `tar czf "$ARCHIVE_TMP" -C "$STAGE" .` emits "./" as
+// member 0 and a directory entry for every directory ahead of its files;
+// both GNU tar and the busybox tar in the backup image do. An archive built
+// from regular-file members alone never exercises those entries.
+func writeBackupArchive(t *testing.T, dir, name string, files map[string]string) string {
+	t.Helper()
+	paths := make([]string, 0, len(files))
+	for p := range files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	headers := []*tar.Header{{Name: "./", Typeflag: tar.TypeDir, Mode: 0o755}}
+	seen := map[string]bool{"./": true}
+	for _, p := range paths {
+		segments := strings.Split(p, "/")
+		prefix := "./"
+		for _, segment := range segments[:len(segments)-1] {
+			prefix += segment + "/"
+			if seen[prefix] {
+				continue
+			}
+			seen[prefix] = true
+			headers = append(headers, &tar.Header{Name: prefix, Typeflag: tar.TypeDir, Mode: 0o755})
+		}
+		headers = append(headers, &tar.Header{
+			Name: "./" + p, Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(files[p])),
+		})
+	}
+
+	path := filepath.Join(dir, name)
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create archive: %v", err)
+	}
+	defer f.Close()
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	for _, header := range headers {
+		if err := tw.WriteHeader(header); err != nil {
+			t.Fatalf("tar header %s: %v", header.Name, err)
+		}
+		if header.Typeflag != tar.TypeReg {
+			continue
+		}
+		if _, err := tw.Write([]byte(files[strings.TrimPrefix(header.Name, "./")])); err != nil {
+			t.Fatalf("tar body %s: %v", header.Name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("close gzip: %v", err)
+	}
+	return path
+}
+
+func TestArchiveSourceAcceptsTheShapeTheBackupJobWrites(t *testing.T) {
+	dir := t.TempDir()
+	writeBackupArchive(t, dir, "fwb-20260913T000000Z.tar.gz", map[string]string{"FWB/db/CURRENT": "valid"})
+
+	world, cleanup, err := ArchiveSource{Dir: dir}.Open(context.Background())
+	if err != nil {
+		t.Fatalf("Open of a real backup archive failed: %v", err)
+	}
+	defer cleanup()
+
+	body, err := os.ReadFile(filepath.Join(world.DBPath, "CURRENT"))
+	if err != nil {
+		t.Fatalf("read extracted world: %v", err)
+	}
+	if string(body) != "valid" {
+		t.Errorf("extracted %q, want %q", body, "valid")
 	}
 }

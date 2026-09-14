@@ -128,8 +128,11 @@ func extract(ctx context.Context, archive, root string) error {
 		if filepath.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(os.PathSeparator)) {
 			return fmt.Errorf("archive %s contains an entry escaping the extraction root: %q", archive, header.Name)
 		}
+		// The archive's own root member - "./", which tar writes first in
+		// every backup - cleans to "." and joins back to the extraction
+		// root itself. That is the root, not an escape from it.
 		target := filepath.Join(root, cleaned)
-		if !strings.HasPrefix(target, filepath.Clean(root)+string(os.PathSeparator)) {
+		if target != filepath.Clean(root) && !strings.HasPrefix(target, filepath.Clean(root)+string(os.PathSeparator)) {
 			return fmt.Errorf("archive %s contains an entry escaping the extraction root: %q", archive, header.Name)
 		}
 
