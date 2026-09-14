@@ -1,7 +1,6 @@
 // Package mcauth handles Xbox Live device-code authentication and caches
 // the resulting token so the agent doesn't need an interactive login on
-// every restart - the same problem minecraft-afk-bot solves with
-// prismarine-auth's profilesFolder, adapted to gophertunnel's auth package.
+// every restart, built on gophertunnel's auth package.
 //
 // Where the token is cached is a Store, not a path: two agent processes
 // coexist during a release, and only a cache both of them can read lets the

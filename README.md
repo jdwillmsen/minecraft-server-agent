@@ -870,31 +870,52 @@ already open for profiles and for the leader lock.
 issues the replacement, so the damage a second process does is done by the
 refresh itself and not by storing the result - suppressing the write would
 leave the live agent holding a credential that has already been revoked. A
-standby therefore rotates nothing. It stays warm the other way round: what it
-loaded is good until its access token expires, and past that it re-reads the
-store, which holds whatever the live agent persisted last. The round trip the
-handover would have paid is paid against the database instead of against
-Microsoft. `auth_token_written` and `auth_token_standby_reloaded` in the pod
-logs are how you tell the two roles apart.
+standby therefore rotates nothing.
+
+What a standby does instead is read. It reads the store once at start-up, so
+the token is in hand rather than being fetched between winning the lock and
+joining the game. Past the point where what it loaded expires it re-reads,
+because the live agent persists every rotation - the round trip the handover
+would have paid is paid against the database instead of against Microsoft.
+And the first thing a promoted standby does is read again and take whatever
+the last live agent left there, *before* refreshing anything: by then what it
+holds may be a token Microsoft has already retired, and both refreshing from
+it and writing it back cost the account its login.
+
+`auth_token_written`, `auth_token_standby_reloaded` and
+`auth_token_adopted_from_store` in the pod logs are how you tell the two roles
+apart.
 
 The live agent only writes when the credential *rotates*, though, and a stable
 connection can go hours without rotating - so a standby that started long after
 the last rotation reads back a token whose access half has already expired.
-That is an ordinary state and not an error: the standby stays cold, says so
-(`auth_token_standby_unwarmed`), and goes on waiting. It costs the handover the
-one refresh the warm-up hoped to save, where refreshing as a standby would cost
-the account its login. `auth_token_refresh_failed` stays what it says it is - a
-store or an account that is actually broken - so an alert may key on it.
+That is an ordinary state and not an error: the standby stays unwarmed, says so
+(`auth_token_standby_unwarmed`, at info), and goes on waiting. It costs the
+handover the one refresh the warm-up hoped to save, where refreshing as a
+standby would cost the account its login. `auth_token_refresh_failed` stays
+what it says it is - a store or an account that is actually broken - so an
+alert may key on it.
+
+**One writer at a time, enforced by the row.** Every write is conditional on
+`updated_at` still being what that process last read, so a write that would
+replace a token written since is refused (`auth_token_write_superseded`) and
+the writer re-reads and takes the winner's token instead. Last-writer-wins
 
 The file cache stays behind the database one as a **read-through fallback**.
 It is written only when the database cannot answer at all - the write falls
 back exactly where the read does, and nowhere else. A database that answers is
 the only truth, so a write it *rejects* is reported rather than copied
 elsewhere: the next load would prefer its older row anyway. But a database
-that cannot answer is one the next load will not read either, and refreshing
-rotates the credential at Microsoft whether or not anything stores the result
-- so a rotated token written nowhere is not a missing copy, it is the account
-locked out until someone logs in by hand.
+that cannot answer may be one the next load will not read either, and
+refreshing rotates the credential at Microsoft whether or not anything stores
+the result - so a rotated token written nowhere is not a missing copy, it is
+the account locked out until someone logs in by hand.
+
+A write that went to the file says so (`auth_token_written_to_fallback`)
+rather than reporting a write to the row, because "cannot answer" covers a
+database that is not migrated yet and one whose connection dropped for two
+seconds. The second comes back holding the token that write superseded, so
+the agent keeps trying the row - once per dial - until one lands there.
 
 That gives the move off the volume for free - the row starts empty, the first
 load comes from the file, and the first refresh the live agent persists lands
@@ -930,6 +951,12 @@ unavailable and falls through to the file, which is why the fallback is not
 removed with the volume. A database that is simply *down* reads the same way -
 the pool connects lazily, so it surfaces as the first statement never being
 answered - and for the same reason: a blip must not cost the server its agent.
+At start-up, where there is no file left to fall through to, the load is
+retried a few seconds apart (`auth_store_unavailable_retrying`) before the
+process gives up, so a database that is still coming up costs the pod a wait
+rather than a crash loop. It is bounded: a release that landed ahead of its
+migration does not clear on its own, and has to end as a failure an operator
+can see.
 
 ## First-run login
 
@@ -950,10 +977,12 @@ about.
 Any other cache problem is deliberately *not* an interactive re-login, since
 a container would otherwise block on a device code nobody is watching for:
 
-- **Corrupt or refresh-token-less cached token** - startup fails loudly and
-  the process exits non-zero. Recover by deleting the stored token - the row
-  for that account, or the `token-*.json` file under `AUTH_CACHE_DIR` - and
-  restarting, which takes the first-run path above.
+- **Corrupt cached token** - one that is not JSON, or that carries no refresh
+  token to rotate with or no expiry to rotate at, since oauth2 reads a missing
+  expiry as "never expires" and neither role would ever refresh it. Startup
+  fails loudly and the process exits non-zero. Recover by deleting the stored
+  token - the row for that account, or the `token-*.json` file under
+  `AUTH_CACHE_DIR` - and restarting, which takes the first-run path above.
 - **Store unreachable, or released ahead of its migration** - reported as
   unavailable, never as empty, so no device code is printed for what is a
   database problem. The file fallback answers if it can, and startup fails if
@@ -1227,11 +1256,15 @@ disposable database built from the migrations, never at production.
 
 `internal/authcache` has one against `minecraft.auth_tokens` - the table
 `jdwillmsen-schemas` migrates for the token cache, see "Where the token is
-cached" above: `go test -tags livedb ./internal/authcache/`. It is the only
-place the standby half of the cache can be exercised at all, since what it
-asserts is two connections reading and writing one row the way a live agent
-and its standby do. It writes and deletes a row keyed on a test account, so
-the same throwaway-database rule applies.
+cached" above: `MC_TEST_DSN=... go test -tags livedb ./internal/authcache/`.
+Two things are pinned only here. It is the one place the standby half of the
+cache is exercised at all, since what it asserts is two connections reading
+and writing a single row the way a live agent and its standby do. And it is
+where the compare-and-swap on `updated_at` is pinned - that a write which
+would replace a token stored since is refused rather than applied - which no
+unit test can say, because the guard is in the statement. It writes and
+deletes rows keyed to the test that wrote them, so point it at a disposable
+database.
 
 `internal/leader` has one as well, and it needs no table at all - advisory
 locks and `LISTEN`/`NOTIFY` are both server state, not schema - so the same
