@@ -1304,3 +1304,101 @@ func TestSendNowDoesNotReportAnIdleServerAsQueued(t *testing.T) {
 		t.Errorf("sent = %+v, want a counted zero — the roster is watching and names nobody", sent)
 	}
 }
+
+// A player can quit inside the bridge round-trip the Say really is. They
+// read the line before they went, and nobody else was on to be counted, so
+// there is nothing left to name -- and the zero that would otherwise be
+// returned is the one value the API tells a caller is safe to publish again.
+func TestSendNowDoesNotCountABroadcastWhoseOnlyRecipientLeftDuringTheSay(t *testing.T) {
+	a := Announcement{Body: "server restarting in 5 minutes", TargetKind: TargetOnlineOnly}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice,
+		partedRoster{named: []string{"steve"}, still: map[string]bool{}},
+		fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 61)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 {
+		t.Fatalf("Say calls = %v, want exactly one — Steve read it before he quit", voice.says)
+	}
+	if sent.Counted {
+		t.Errorf("sent = %+v, want an uncounted reach — a counted zero says the line was never spoken", sent)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing for a player who has left", store.delivered)
+	}
+}
+
+// The other way a spoken broadcast can name nobody: everyone online arrived
+// moments ago, so each is demonstrably still loading and none of them is
+// counted as having heard it. The Say still went out to whatever clients are
+// up, so the result is unknown rather than zero.
+func TestSendNowDoesNotCountABroadcastHeardOnlyByJustArrivedPlayers(t *testing.T) {
+	a := Announcement{Body: "server restarting in 5 minutes", TargetKind: TargetEveryone}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	joins := fakeJoins{since: map[string]time.Duration{"fresh": time.Second, "alsofresh": 2 * time.Second}}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"fresh", "alsofresh"}}, fakePermissions{}, testLogger(),
+		WithFreshJoinGrace(joins, 7*time.Second))
+
+	sent, err := d.SendNow(context.Background(), a, 62)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 {
+		t.Fatalf("Say calls = %v, want exactly one", voice.says)
+	}
+	if sent.Counted {
+		t.Errorf("sent = %+v, want an uncounted reach — it was said, and nobody on the roster can be counted as having seen it", sent)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing: a just-arrived client rendered none of it", store.delivered)
+	}
+}
+
+// A standby accepts a whisper-target publish and stores it, exactly as it
+// does a broadcast one, so it must report the same queued result. A caller
+// reading a bare zero here would take it for the live agent's empty server,
+// retry, and have the player whispered the same line twice on their join.
+func TestSendNowReportsAStandbysWhisperPublishAsQueued(t *testing.T) {
+	a := Announcement{Body: "your waypoint is at 100 64 -200", TargetKind: TargetPlayer, TargetValue: "xuid-1"}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: false}))
+
+	sent, err := d.SendNow(context.Background(), a, 63)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.tells) != 0 || len(voice.says) != 0 {
+		t.Errorf("Tell = %v and Say = %v, want both empty from a process in no game", voice.tells, voice.says)
+	}
+	if !sent.Queued {
+		t.Errorf("sent = %+v, want it reported as queued for the live agent, the same as a broadcast target", sent)
+	}
+}
+
+// The live agent's own whisper to nobody stays a plain zero: nothing is
+// waiting on another process, and the caller is looking at a real answer.
+func TestSendNowDoesNotReportTheLiveAgentsWhisperToNobodyAsQueued(t *testing.T) {
+	a := Announcement{Body: "your waypoint is at 100 64 -200", TargetKind: TargetPlayer, TargetValue: "xuid-1"}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{knows: true}, fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: true}))
+
+	sent, err := d.SendNow(context.Background(), a, 64)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if sent.Queued {
+		t.Errorf("sent = %+v, want it not reported as queued: this process is the one that speaks", sent)
+	}
+	if !sent.Counted || sent.Players != 0 {
+		t.Errorf("sent = %+v, want a counted zero", sent)
+	}
+}

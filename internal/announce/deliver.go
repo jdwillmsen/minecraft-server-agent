@@ -272,6 +272,17 @@ var uncounted = Reach{}
 // the stored row for whoever holds the lock.
 var queued = Reach{Counted: true, Queued: true}
 
+// nothingSent is what an immediate send that spoke to nobody achieved. On a
+// process that is not the one that speaks it is queued, whatever the target:
+// the row is stored and the live agent owes the delivery, which a caller must
+// be able to tell from the zero a watched, empty server gives.
+func (d *Deliverer) nothingSent() Reach {
+	if !d.live() {
+		return queued
+	}
+	return reached(0)
+}
+
 // SendNow delivers a immediately to whoever is online and matches its
 // target, and reports what that reached.
 func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reach, error) {
@@ -302,17 +313,8 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		// and a standby's roster never knows anything at all.
 		if len(targets) == 0 && !d.mayBroadcastBlind() {
 			d.log.Info("announce_say_skipped_no_audience", logging.Fields{"announcement_id": id, "roster_knows": d.roster.Knows(), "live": d.live()})
-			if !d.live() {
-				// Not this process's to say. The row is stored and the
-				// leader delivers it, which is a different outcome from a
-				// watched server with nobody on it -- and reporting them
-				// alike would have a caller retry a publish that is already
-				// waiting to be delivered.
-				return queued, nil
-			}
-			return reached(0), nil
+			return d.nothingSent(), nil
 		}
-		blind := len(targets) == 0
 		err := d.voice.Say(ctx, a.Body)
 		metrics.AnnounceDelivery(metrics.DeliveryBroadcast, err)
 		if err != nil {
@@ -378,13 +380,13 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		if deferred > 0 {
 			d.log.Info("announce_deferred_for_joining", logging.Fields{"announcement_id": id, "players": deferred})
 		}
-		if blind || !d.roster.Knows() || unaccounted {
-			// Said, and not fully accounted for: there was no roster when
-			// the recipients were chosen, or the connection died during the
-			// Say, or the loop could not finish deciding who heard it.
-			// Whoever was on the server heard it in every case, and a
-			// counted zero would say the opposite -- sending a caller who
-			// retries on it to broadcast the same line twice.
+		if delivered+heard == 0 || !d.roster.Knows() || unaccounted {
+			// The line is in chat and nobody could be named as having heard
+			// it: there was no roster when the recipients were chosen, or
+			// every one of them left or was still loading, or the connection
+			// died, or the loop could not finish. A counted zero would say
+			// the line was never spoken, which is the one thing a caller is
+			// told is safe to publish again.
 			return uncounted, nil
 		}
 		// Counted as reached: everyone recorded, plus everyone withheld on
@@ -399,7 +401,7 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		// stays pending in the store (if it queues at all) for whoever
 		// joins later. Unlike a broadcast, a whisper needs an XUID to go
 		// to, so there is nothing to send into the gap.
-		return reached(0), nil
+		return d.nothingSent(), nil
 	}
 
 	// Whisper: each recipient gets their own Tell, and only a recipient

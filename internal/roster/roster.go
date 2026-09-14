@@ -93,12 +93,16 @@ type Roster struct {
 	// two, every add is a player who was already online -- see Apply.
 	snapshotStarted bool
 	snapshotEnded   bool
-	// told is false until any PlayerList of this session has been applied,
-	// whatever it carried. It answers "has the server said who is here",
-	// which snapshotStarted cannot: a connection to an empty server is told
-	// the truth in a packet with no adds in it, and reading that as "not
-	// told yet" would leave the whole session unable to say the server is
-	// empty.
+	// told is false until a PlayerList of this session carrying at least one
+	// entry has been applied. It answers "has the server said who is here",
+	// which snapshotStarted cannot: the opening list names the agent itself,
+	// so a connection to an otherwise empty server is told the truth in a
+	// packet whose only entries are not players, and reading that as "not
+	// told yet" would leave the whole session unable to say nobody is on.
+	//
+	// A packet with no entries at all says nothing and does not set it: an
+	// empty roster then still means "not told yet", which is the reading
+	// that speaks a broadcast rather than swallowing it.
 	told bool
 	// names is the last gamertag each XUID was seen under. Kept apart from
 	// players because presence and identity stop being true at different
@@ -241,7 +245,9 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entr
 	if adds {
 		r.snapshotStarted = true
 	}
-	r.told = true
+	if len(entries) > 0 {
+		r.told = true
+	}
 
 	for _, e := range entries {
 		if e.Remove {
@@ -308,11 +314,11 @@ func (r *Roster) NameFor(xuid string) (name string, ok bool) {
 // Online() means "not known yet" rather than "nobody is here", and a caller
 // that cannot tell those apart will act on the wrong one.
 //
-// Read from told rather than snapshotStarted: the two look alike on a busy
-// server and part on an empty one, where the opening packet carries no add
-// at all. That session is told who is here -- nobody -- and must be able to
-// say so, while snapshotStarted stays false because there was no population
-// to account for.
+// Read from told rather than snapshotStarted: the two answer different
+// questions. snapshotStarted is whether the players who were already here
+// have begun to be accounted for, which is what separates a snapshot from a
+// burst of arrivals; this is whether the server has said anything about who
+// is here at all.
 func (r *Roster) Knows() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()

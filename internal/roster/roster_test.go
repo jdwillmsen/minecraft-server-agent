@@ -505,3 +505,31 @@ func TestKnowsIsFalseAgainAfterTheConnectionEnds(t *testing.T) {
 		t.Error("Knows() in the gap = true, want false — an empty roster there means nothing is known, not that nobody is on")
 	}
 }
+
+// A packet with no entries says nothing about who is here, so the roster is
+// still untold. Reading it as knowledge would have a broadcast published in
+// that instant suppressed as "nobody is on" -- and an online-only one, which
+// never queues, would be gone.
+func TestAZeroEntryPacketDoesNotMakeTheRosterKnow(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+
+	r.Apply(nil)
+
+	if r.Knows() {
+		t.Error("Knows() after an empty packet = true, want false — nothing has been said about who is here")
+	}
+}
+
+// The opening list names the agent itself, so a connection to a server with
+// no other players still carries an entry and still says so.
+func TestTheOpeningPacketNamingOnlyTheAgentMakesTheRosterKnow(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+
+	r.Apply([]PlayerListEntry{agentEntry})
+
+	if !r.Knows() {
+		t.Error("Knows() after the opening list = false, want true — the server has said who is here, and it is nobody but the agent")
+	}
+}
