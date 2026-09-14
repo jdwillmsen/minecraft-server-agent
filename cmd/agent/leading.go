@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/moderation"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/mcauth"
 )
 
 // leaveGrace is how long the process waits, after closing the Bedrock
@@ -294,15 +296,26 @@ func startLiveWork(
 // a refresh from a standby revokes the credential the live agent is playing
 // on.
 //
-// A failure here is not fatal, and for a standby it is ordinary: the store
-// may hold nothing fresh yet. The connect loop makes the same call through
+// A failure here is not fatal. The connect loop makes the same call through
 // the dialer once this process is live, and already knows how to back off
 // from an account-level rejection -- which exiting here would turn into a
 // crash loop instead.
+//
+// A standby that finds nothing unexpired to read is the one outcome that is
+// not a failure at all: the live agent writes when the credential rotates,
+// and a stable connection goes hours without rotating, so a standby started
+// well after the last one loads a token whose access half has expired. That
+// is the ordinary case rather than the exception, and logging it at the same
+// level as a broken store would have every routine standby boot trip an
+// alert keyed on the agent's errors.
 func warmXboxToken(ts oauth2.TokenSource, log *logging.Logger) {
-	if _, err := ts.Token(); err != nil {
+	_, err := ts.Token()
+	switch {
+	case err == nil:
+		log.Info("auth_token_ready", nil)
+	case errors.Is(err, mcauth.ErrStandbyUnwarmed):
+		log.Info("auth_token_standby_unwarmed", logging.Fields{"error": err.Error()})
+	default:
 		log.Error("auth_token_refresh_failed", logging.Fields{"error": err.Error()})
-		return
 	}
-	log.Info("auth_token_ready", nil)
 }

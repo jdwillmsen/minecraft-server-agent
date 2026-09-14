@@ -16,16 +16,21 @@ type stubTokenSource struct {
 	mu     sync.Mutex
 	tokens []*oauth2.Token
 	calls  int
+	// err stands for the refresh Microsoft rejects -- invalid_grant against
+	// a refresh token something else has already rotated past.
+	err error
 }
 
 func (s *stubTokenSource) Token() (*oauth2.Token, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.calls++
+	if s.err != nil {
+		return nil, s.err
+	}
 	// The last token repeats once the script runs out, which is what a real
 	// source does between refreshes: the same token until it expires.
-	tok := s.tokens[min(s.calls, len(s.tokens)-1)]
-	s.calls++
-	return tok, nil
+	return s.tokens[min(s.calls-1, len(s.tokens)-1)], nil
 }
 
 func (s *stubTokenSource) callCount() int {
@@ -324,6 +329,112 @@ func TestCachingTokenSource_AnUnwarmableStandbyReportsItRatherThanRefreshing(t *
 	}
 	if refresher.callCount() != 0 {
 		t.Errorf("standby refreshed %d times, want 0", refresher.callCount())
+	}
+}
+
+// A process does not necessarily hold the account's current refresh token: a
+// load that reached past an unreachable database answers from the file the
+// migration left behind, and that copy died the first time the live agent
+// rotated. Nothing else re-reads the store, so the rejection has to, or the
+// connect loop retries a dead credential for as long as the process lives
+// while the recovered database holds one that works.
+func TestCachingTokenSource_ARejectedRefreshReReadsTheStore(t *testing.T) {
+	store := &memStore{}
+	store.seed(t, &oauth2.Token{AccessToken: "current", RefreshToken: "r5", Expiry: time.Now().Add(time.Hour)})
+
+	refresher := &stubTokenSource{err: errors.New("invalid_grant")}
+	cts := &cachingTokenSource{
+		store: store,
+		out:   io.Discard,
+		live:  func() bool { return true },
+		inner: refresher,
+		held:  &oauth2.Token{AccessToken: "stale", RefreshToken: "r0", Expiry: time.Now().Add(-time.Minute)},
+	}
+
+	tok, err := cts.Token()
+	if err != nil {
+		t.Fatalf("a rejected refresh was fatal even though the store held a usable token: %v", err)
+	}
+	if tok.RefreshToken != "r5" {
+		t.Errorf("got %q, want the r5 the live agent stored", tok.RefreshToken)
+	}
+	if cts.held.RefreshToken != "r5" {
+		t.Errorf("held RefreshToken = %q, want r5: the dead r0 must not be what the next refresh starts from", cts.held.RefreshToken)
+	}
+}
+
+// The re-read is a second look, not a second chance: a store that agrees with
+// what was just rejected has nothing to add, and swallowing the rejection
+// would hide a genuinely revoked account behind a nil error.
+func TestCachingTokenSource_ARejectedRefreshStandsWhenTheStoreAgrees(t *testing.T) {
+	store := &memStore{}
+	store.seed(t, &oauth2.Token{AccessToken: "stale", RefreshToken: "r0", Expiry: time.Now().Add(-time.Minute)})
+
+	rejection := errors.New("invalid_grant")
+	refresher := &stubTokenSource{err: rejection}
+	cts := &cachingTokenSource{
+		store: store,
+		out:   io.Discard,
+		live:  func() bool { return true },
+		inner: refresher,
+		held:  &oauth2.Token{AccessToken: "stale", RefreshToken: "r0", Expiry: time.Now().Add(-time.Minute)},
+	}
+
+	if _, err := cts.Token(); !errors.Is(err, rejection) {
+		t.Fatalf("err = %v, want the rejection itself", err)
+	}
+	if refresher.callCount() != 1 {
+		t.Errorf("refreshed %d times, want 1: a store that agrees is not worth a retry", refresher.callCount())
+	}
+}
+
+// Adopting rebuilds the refresher, so a reload is only ever an improvement
+// when it can be used. The standby reload runs with what is held already
+// expired, which means the one thing a useless answer can still do is take
+// over which credential a later rotation starts from -- and a fallback
+// reaching past an unreachable database answers with the file's older copy.
+func TestCachingTokenSource_AnUnusableStandbyReloadKeepsTheHeldToken(t *testing.T) {
+	store := &memStore{}
+	store.seed(t, &oauth2.Token{AccessToken: "pre-migration", RefreshToken: "r0", Expiry: time.Now().Add(-time.Hour)})
+
+	refresher := &stubTokenSource{tokens: []*oauth2.Token{{AccessToken: "must-not-happen", RefreshToken: "r6"}}}
+	standby := &cachingTokenSource{
+		store: store,
+		out:   io.Discard,
+		live:  func() bool { return false },
+		inner: refresher,
+		held:  &oauth2.Token{AccessToken: "expired", RefreshToken: "r5", Expiry: time.Now().Add(-time.Minute)},
+	}
+
+	if _, err := standby.Token(); !errors.Is(err, ErrStandbyUnwarmed) {
+		t.Fatalf("err = %v, want ErrStandbyUnwarmed", err)
+	}
+	if standby.held.RefreshToken != "r5" {
+		t.Errorf("held RefreshToken = %q, want r5 kept: the reload was no better than what it replaced", standby.held.RefreshToken)
+	}
+	if standby.inner != oauth2.TokenSource(refresher) {
+		t.Error("the refresher was rebuilt around a token that could not be used")
+	}
+}
+
+// A standby that loaded nothing at all is the exception: an expired token is
+// worse than a usable one and better than none, because its refresh token is
+// what this process will rotate from the moment it goes live.
+func TestCachingTokenSource_AStandbyHoldingNothingAdoptsAnExpiredReload(t *testing.T) {
+	store := &memStore{}
+	store.seed(t, &oauth2.Token{AccessToken: "expired", RefreshToken: "r2", Expiry: time.Now().Add(-time.Minute)})
+
+	standby := &cachingTokenSource{
+		store: store,
+		out:   io.Discard,
+		live:  func() bool { return false },
+	}
+
+	if _, err := standby.Token(); !errors.Is(err, ErrStandbyUnwarmed) {
+		t.Fatalf("err = %v, want ErrStandbyUnwarmed", err)
+	}
+	if standby.held == nil || standby.held.RefreshToken != "r2" {
+		t.Errorf("held = %+v, want the stored r2: a process with nothing has nothing to lose", standby.held)
 	}
 }
 

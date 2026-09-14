@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics/metricstest"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/mcauth"
 )
 
 // fakeTerm is the leadership a live agent holds, with the two facts the
@@ -440,6 +443,31 @@ func TestTheXboxTokenIsRefreshedBeforeTheAgentIsNeeded(t *testing.T) {
 
 	if ts.calls != 1 {
 		t.Errorf("token refreshed %d times during startup, want 1", ts.calls)
+	}
+}
+
+// A standby that reads back a token whose access half has expired is the
+// ordinary case, not a broken one: the live agent writes when the credential
+// rotates, and a stable connection can go hours without rotating. Errors go
+// to stderr and informational lines to stdout, so a line appearing here is
+// the assertion that a routine standby boot cannot trip an alert keyed on the
+// agent's errors.
+func TestAnUnwarmedStandbyIsNotReportedAsAFailure(t *testing.T) {
+	ts := &tokenSource{err: mcauth.ErrStandbyUnwarmed}
+
+	out := captureAgentStdout(t, func() {
+		warmXboxToken(ts, logging.New("info"))
+	})
+
+	line := map[string]any{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &line); err != nil {
+		t.Fatalf("an unwarmed standby logged nothing to stdout, so it went to stderr as an error: %q", out)
+	}
+	if line["event"] != "auth_token_standby_unwarmed" {
+		t.Errorf("event = %v, want auth_token_standby_unwarmed", line["event"])
+	}
+	if line["level"] != "info" {
+		t.Errorf("level = %v, want info: an unwarmed standby is a state, not a failure", line["level"])
 	}
 }
 

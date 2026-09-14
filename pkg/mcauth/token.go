@@ -28,6 +28,17 @@ import (
 // store that has gone away costs a refresh rather than the connection.
 const storeTimeout = 5 * time.Second
 
+// ErrStandbyUnwarmed means this process is not the live agent, what it
+// loaded has expired, and the store holds nothing newer -- so it holds no
+// usable token and may not refresh one into existence.
+//
+// The ordinary state of a standby that started more than an access token's
+// lifetime after the live agent last rotated, not a failure: the live agent
+// writes when the credential rotates, which a stable connection can go hours
+// without doing. It costs the handover the one refresh the warm-up hoped to
+// save, and it is reported so a reader can tell it from a store that broke.
+var ErrStandbyUnwarmed = errors.New("mcauth: standby holds no unexpired token and may not refresh one")
+
 // requestLiveToken is the interactive device-code login. A package-level
 // var, not a direct call, so tests can substitute a stub and prove it is
 // reached only on a genuinely empty store - never on one that is merely
@@ -188,7 +199,11 @@ func (c *cachingTokenSource) Token() (*oauth2.Token, error) {
 // is using.
 func (c *cachingTokenSource) liveToken() (*oauth2.Token, error) {
 	if c.inner != nil {
-		return c.inner.Token()
+		tok, err := c.inner.Token()
+		if err == nil {
+			return tok, nil
+		}
+		return c.reloadAfterFailedRefresh(err)
 	}
 	c.note(func() { c.log.Info("auth_device_code_login", nil) })
 	tok, err := requestLiveToken(c.loginCtx, c.out)
@@ -222,12 +237,55 @@ func (c *cachingTokenSource) standbyToken() (*oauth2.Token, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mcauth: standby reload: %w", err)
 	}
-	c.adopt(tok)
+	// Adopting rebuilds the refresher, so on this path -- reached only once
+	// what is held has expired -- the single thing it can still change is
+	// which credential a later rotation starts from. A reload that is no
+	// more usable than what it replaces must not take that over: the store
+	// answering at all does not make its answer the newer one, and a
+	// fallback reaching past an unreachable database returns the copy the
+	// migration left behind.
+	if tok.Valid() || c.held == nil {
+		c.adopt(tok)
+	}
 	c.note(func() { c.log.Info("auth_token_standby_reloaded", nil) })
 	if !tok.Valid() {
-		return nil, errors.New("mcauth: standby holds no unexpired token and may not refresh one")
+		return nil, ErrStandbyUnwarmed
 	}
 	return tok, nil
+}
+
+// reloadAfterFailedRefresh reads the store again, once, when a refresh has
+// just been rejected.
+//
+// The refresh token this process holds is not always the account's current
+// one. A load that fell through to the file cache because the database could
+// not be reached answers with whatever the volume still holds, and that copy
+// stopped being current the first time the live agent rotated it: Microsoft
+// rejects it, and goes on rejecting it for as long as this process lives,
+// while the database that has since come back holds one that works. A
+// rejected refresh is therefore the moment to look at the store rather than
+// the moment to give up -- the connect loop's backoff would otherwise retry
+// the same dead credential forever.
+//
+// A store that cannot answer, or that answers with the refresh token that
+// was just rejected, has nothing to add, and the original failure stands.
+func (c *cachingTokenSource) reloadAfterFailedRefresh(refreshErr error) (*oauth2.Token, error) {
+	rejected := ""
+	if c.held != nil {
+		rejected = c.held.RefreshToken
+	}
+	loadCtx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+	tok, err := c.store.Load(loadCtx)
+	if err != nil || tok.RefreshToken == rejected {
+		return nil, refreshErr
+	}
+	c.note(func() { c.log.Info("auth_token_reloaded_after_failed_refresh", nil) })
+	c.adopt(tok)
+	if tok.Valid() {
+		return tok, nil
+	}
+	return c.inner.Token()
 }
 
 // adopt makes tok the token this process holds, rebuilding the refresher

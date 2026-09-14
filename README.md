@@ -869,12 +869,19 @@ refresh itself and not by storing the result - suppressing the write would
 leave the live agent holding a credential that has already been revoked. A
 standby therefore rotates nothing. It stays warm the other way round: what it
 loaded is good until its access token expires, and past that it re-reads the
-store, which the live agent keeps current. The round trip the handover would
-have paid is paid against the database instead of against Microsoft.
-`auth_token_written` and `auth_token_standby_reloaded` in the pod logs are how
-you tell the two roles apart. A standby with nothing fresh to read says so
-(`auth_token_refresh_failed`) and goes on waiting; it costs the handover one
-refresh, where refreshing would cost the account its login.
+store, which holds whatever the live agent persisted last. The round trip the
+handover would have paid is paid against the database instead of against
+Microsoft. `auth_token_written` and `auth_token_standby_reloaded` in the pod
+logs are how you tell the two roles apart.
+
+The live agent only writes when the credential *rotates*, though, and a stable
+connection can go hours without rotating - so a standby that started long after
+the last rotation reads back a token whose access half has already expired.
+That is an ordinary state and not an error: the standby stays cold, says so
+(`auth_token_standby_unwarmed`), and goes on waiting. It costs the handover the
+one refresh the warm-up hoped to save, where refreshing as a standby would cost
+the account its login. `auth_token_refresh_failed` stays what it says it is - a
+store or an account that is actually broken - so an alert may key on it.
 
 The file cache stays behind the database one as a **read-through fallback**.
 It is written only when the database cannot answer at all - the write falls
@@ -889,6 +896,15 @@ locked out until someone logs in by hand.
 That gives the move off the volume for free - the row starts empty, the first
 load comes from the file, and the first refresh the live agent persists lands
 in the database. From then on the file is never read again.
+
+Reaching past the database is not a decision the process is then stuck with.
+The file's copy is only current while the database has never been written, so
+a load that fell through because the database was *unreachable* - rather than
+unmigrated - can answer with a credential the live agent rotated away months
+ago. The refresh that credential is rejected for sends the process back to the
+store, and by then the database is usually answering: a blip costs a reconnect
+instead of leaving the process retrying a dead token until someone logs in by
+hand (`auth_token_reloaded_after_failed_refresh`).
 
 The table is migrated by `jdwlabs/platform`'s `jdwillmsen-schemas` service,
 not by the agent:
@@ -940,9 +956,11 @@ a container would otherwise block on a device code nobody is watching for:
   database problem. The file fallback answers if it can, and startup fails if
   it cannot: an unreadable store is never downgraded to an empty one on the
   way through the fallback.
-- **Expired or revoked refresh token** - surfaces as a dial failure and the
-  connect loop retries with backoff indefinitely; no login prompt is ever
-  printed. Recover the same way: delete the stored token and restart.
+- **Expired or revoked refresh token** - the store is read once more first, in
+  case what this process holds has been superseded by what the live agent
+  wrote; if that is no better, it surfaces as a dial failure and the connect
+  loop retries with backoff indefinitely, and no login prompt is ever printed.
+  Recover the same way: delete the stored token and restart.
 
 ## Handing over to a standby
 
