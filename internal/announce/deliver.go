@@ -411,6 +411,9 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 	// nothing else retries it.
 	delivered := 0
 	deferred := 0
+	// Set once any recipient has actually been told, which is what makes a
+	// zero afterwards a lie rather than an answer.
+	spoken := false
 	for _, xuid := range targets {
 		if ctx.Err() != nil {
 			// Cancelled: stop rather than run up a failed bridge attempt
@@ -436,6 +439,7 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 			d.log.Error("announce_tell_failed", logging.Fields{"announcement_id": id, "xuid": xuid, "error": err.Error()})
 			continue
 		}
+		spoken = true
 		if err := d.store.MarkDelivered(ctx, id, xuid, now); err != nil {
 			d.log.Error("announce_mark_delivered_failed", logging.Fields{"announcement_id": id, "xuid": xuid, "error": err.Error()})
 			continue
@@ -444,6 +448,13 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 	}
 	if deferred > 0 {
 		d.log.Info("announce_deferred_for_joining", logging.Fields{"announcement_id": id, "players": deferred})
+	}
+	if spoken && delivered == 0 {
+		// Somebody read the whisper and no row survived to say who: the
+		// same rule the broadcast branch holds to. A counted zero would say
+		// the line was never sent, which is the one thing a caller is told
+		// is safe to publish again.
+		return uncounted, nil
 	}
 	return reached(delivered), nil
 }

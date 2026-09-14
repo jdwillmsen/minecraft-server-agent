@@ -1402,3 +1402,67 @@ func TestSendNowDoesNotReportTheLiveAgentsWhisperToNobodyAsQueued(t *testing.T) 
 		t.Errorf("sent = %+v, want a counted zero", sent)
 	}
 }
+
+// The whisper half of the rule the broadcast branch already holds to: the
+// player has read the line, and the row that would have said so did not
+// write. Reporting zero says nothing was sent, which the API documents as
+// safe to publish again -- so the caller retries, the player is whispered
+// the same line a second time, and the still-pending original makes it a
+// third on their next join.
+func TestSendNowDoesNotCountAWhisperWhoseOnlyRowFailed(t *testing.T) {
+	a := Announcement{Body: "your waypoint is at 100 64 -200", TargetKind: TargetPlayer, TargetValue: "xuid-1"}
+	store := &fakeStore{enabled: true, markErr: map[string]error{"xuid-1": errors.New("db unavailable")}}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"xuid-1"}}, fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 71)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.tells) != 1 {
+		t.Fatalf("Tell calls = %v, want exactly one — the player read it before the row failed", voice.tells)
+	}
+	if sent.Counted {
+		t.Errorf("sent = %+v, want an uncounted reach — a counted zero says the whisper was never sent", sent)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing: the row is what failed, so it stays pending", store.delivered)
+	}
+}
+
+// A whisper nobody was told is a real zero: the Tell failed, nothing reached
+// anyone, and publishing again repeats nothing in chat.
+func TestSendNowStillCountsAWhisperNobodyWasTold(t *testing.T) {
+	a := Announcement{Body: "your waypoint is at 100 64 -200", TargetKind: TargetPlayer, TargetValue: "xuid-1"}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{tellErr: map[string]error{"xuid-1": errors.New("bridge unreachable")}}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"xuid-1"}}, fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 72)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if !sent.Counted || sent.Players != 0 {
+		t.Errorf("sent = %+v, want a counted zero — the send failed, so nothing is in chat", sent)
+	}
+}
+
+// One row failing among several is not a zero, so the count still stands for
+// the players whose rows did write.
+func TestSendNowStillCountsTheWhispersWhoseRowsWrote(t *testing.T) {
+	a := Announcement{Body: "the nether hub is open", TargetKind: TargetPermission, TargetValue: "operator"}
+	store := &fakeStore{enabled: true, markErr: map[string]error{"op-2": errors.New("db unavailable")}}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice,
+		fakeRoster{online: []string{"op-1", "op-2"}},
+		fakePermissions{levels: map[string]string{"op-1": "operator", "op-2": "operator"}},
+		testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 73)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if !sent.Counted || sent.Players != 1 {
+		t.Errorf("sent = %+v, want one counted player — op-1's row wrote and op-2's did not", sent)
+	}
+}

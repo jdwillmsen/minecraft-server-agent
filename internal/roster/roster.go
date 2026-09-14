@@ -94,15 +94,16 @@ type Roster struct {
 	snapshotStarted bool
 	snapshotEnded   bool
 	// told is false until a PlayerList of this session carrying at least one
-	// entry has been applied. It answers "has the server said who is here",
-	// which snapshotStarted cannot: the opening list names the agent itself,
-	// so a connection to an otherwise empty server is told the truth in a
-	// packet whose only entries are not players, and reading that as "not
-	// told yet" would leave the whole session unable to say nobody is on.
+	// add has been applied. It answers "has the server said who is here",
+	// which snapshotStarted cannot: snapshotStarted needs an add this Roster
+	// can key on, while this needs only that the server named somebody. The
+	// opening list always names the agent itself, so a connection to an
+	// otherwise empty server is told the truth and can say nobody is on.
 	//
-	// A packet with no entries at all says nothing and does not set it: an
-	// empty roster then still means "not told yet", which is the reading
-	// that speaks a broadcast rather than swallowing it.
+	// Only an add sets it. A removal says who left, and an empty packet says
+	// nothing at all; neither answers who is here, and treating either as an
+	// answer would have the roster report an empty server it has not been
+	// told about -- swallowing a broadcast that should have been spoken.
 	told bool
 	// names is the last gamertag each XUID was seen under. Kept apart from
 	// players because presence and identity stop being true at different
@@ -245,9 +246,6 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entr
 	if adds {
 		r.snapshotStarted = true
 	}
-	if len(entries) > 0 {
-		r.told = true
-	}
 
 	for _, e := range entries {
 		if e.Remove {
@@ -271,6 +269,7 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entr
 			continue
 		}
 
+		r.told = true
 		if e.XUID == "" {
 			continue
 		}

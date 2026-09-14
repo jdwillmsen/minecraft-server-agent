@@ -451,11 +451,12 @@ func TestEndSessionThenSnapshotReportsNobodyAsJoining(t *testing.T) {
 	}
 }
 
-// A connection to an empty server is told the truth in a packet with no adds
-// in it. Reading that as "not told yet" would leave the whole session unable
-// to say the server is empty -- and a Deliverer reading Knows() would go on
-// broadcasting blind to an audience it could have named as nobody.
-func TestKnowsAfterAnOpeningPacketCarryingNoAdd(t *testing.T) {
+// A removal says who left, not who is here. If the first packet of a session
+// carries only one -- a player who quit in that instant -- the roster is as
+// unanswered as it was before, and the server behind it may be full. Reading
+// it as "told, and the answer is nobody" suppresses a broadcast published in
+// that window, and an online-only one never queues, so it would be gone.
+func TestARemovalOnlyOpeningPacketLeavesTheRosterUntold(t *testing.T) {
 	r := New()
 	r.BeginSession(time.Now(), agentEntry.XUID)
 	if r.Knows() {
@@ -464,11 +465,18 @@ func TestKnowsAfterAnOpeningPacketCarryingNoAdd(t *testing.T) {
 
 	r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}})
 
-	if !r.Knows() {
-		t.Error("Knows() after an applied PlayerList = false, want true — the server has said who is here, and the answer is nobody")
+	if r.Knows() {
+		t.Error("Knows() after a removal-only packet = true, want false — nothing has said who is on the server")
 	}
-	if online := r.Online(); len(online) != 0 {
-		t.Errorf("Online() = %v, want nobody", online)
+
+	// The real snapshot behind it still answers, and still reports its
+	// players as present rather than as arrivals.
+	joins, _, present := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
+	if !r.Knows() {
+		t.Error("Knows() after the opening list = false, want true")
+	}
+	if len(joins) != 0 || len(present) != 2 {
+		t.Errorf("joins = %+v, present = %+v; want nobody joining and both present", joins, present)
 	}
 }
 
