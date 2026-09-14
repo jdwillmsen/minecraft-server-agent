@@ -13,19 +13,26 @@ import (
 )
 
 // Role is what this process is doing with the one game login the account
-// allows: playing, or waiting for its turn to.
+// allows: still getting ready for it, waiting its turn at it, or playing.
 type Role int32
 
 const (
-	// RoleStandby is a process that is not playing: one still starting up,
-	// one waiting for the lock, or one that has just lost it. It is the zero
-	// value because a process becomes live by taking the lock, and until it
-	// has, claiming otherwise would let it act on a game it is not in --
-	// the announcement API is served for the whole process, including the
-	// startup before leadership is settled and the moment after it is gone.
-	// A deployment with no database has no lock to wait for and is set live
-	// explicitly instead -- see awaitLeadership.
-	RoleStandby Role = iota
+	// RoleStarting is a process that has bound this server but has not yet
+	// paid the startup every role shares -- the Xbox token above all, which
+	// can take seconds and, with an unusable auth cache, can block on a
+	// device-code login indefinitely.
+	//
+	// The zero value, because it is what a process is from the moment the
+	// listener answers, and because neither of the other two is safe to
+	// assume there. Live would let a process act on a game it is not in;
+	// standby would report a pod ready before it can take over, which is
+	// the readiness a rolling update removes the live agent on.
+	RoleStarting Role = iota
+	// RoleStandby is a process that has finished every part of its startup
+	// that does not need the login, and is waiting for the lock. A
+	// deployment with no database has no lock to wait for and goes live
+	// straight out of starting instead -- see awaitLeadership.
+	RoleStandby
 	// RoleLive is the process that holds the agent lock and the login.
 	RoleLive
 )
@@ -65,19 +72,23 @@ func New(addr string) (*Server, error) {
 	// else already paid for, and calling that unready would both misreport a
 	// healthy pod and stall the rolling update that only removes the old pod
 	// once the new one is ready -- the update the standby exists to serve.
+	//
+	// A process still starting is neither, and is the one case that must not
+	// answer ready: it cannot take over yet, so a rolling update that
+	// believed it could would remove the live agent and leave the server
+	// with no agent at all until the successor finishes authenticating.
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		if !s.Live() {
+		switch role := Role(s.role.Load()); {
+		case role == RoleStandby:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("standby"))
-			return
-		}
-		if !s.ready.Load() {
+		case role == RoleLive && s.ready.Load():
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ready"))
+		default:
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte("not ready"))
-			return
 		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ready"))
 	})
 	mux.Handle("/metrics", metricsHandler())
 
@@ -119,7 +130,9 @@ func (s *Server) SetRole(role Role) {
 }
 
 // Live reports whether this process is the one currently holding the agent
-// lock, as last recorded by SetRole.
+// lock, as last recorded by SetRole. False while it is still starting, which
+// is what keeps a process that has not won leadership from acting as though
+// it had.
 //
 // Read by anything in the process that may only act once, not once per
 // replica: the announcement API is mounted for the process rather than for a

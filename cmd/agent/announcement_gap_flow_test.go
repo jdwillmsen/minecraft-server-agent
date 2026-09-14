@@ -267,9 +267,10 @@ func TestADrainForAPlayerWhoQuitIsNotWhisperedOrRecorded(t *testing.T) {
 
 // TestAProcessThatHasNotTakenTheLockDoesNotBroadcast wires the Deliverer's
 // leadership signal to a real HTTP server the way main does, and publishes
-// before any role has been assigned -- the window between the announcement
-// API being mounted and the campaign for the lock finishing, during which a
-// pod that is in no game answers requests.
+// through both states that are not leadership -- still starting, then
+// waiting for the lock. The announcement API is mounted for the whole
+// process and answers through both, so a pod that is in no game can be asked
+// to speak into one.
 func TestAProcessThatHasNotTakenTheLockDoesNotBroadcast(t *testing.T) {
 	srv, err := httpapi.New("127.0.0.1:0")
 	if err != nil {
@@ -298,7 +299,17 @@ func TestAProcessThatHasNotTakenTheLockDoesNotBroadcast(t *testing.T) {
 		t.Fatalf("SendNow: %v", err)
 	}
 	if lines := voice.spoken(); len(lines) != 0 {
-		t.Errorf("spoke before holding the lock, want silence:%s", formatTimeline(lines, at))
+		t.Errorf("spoke while still starting, want silence:%s", formatTimeline(lines, at))
+	}
+
+	// Startup paid, waiting for the lock: the pod is ready to be rolled onto
+	// and still must not speak into the game the leader is playing.
+	srv.SetRole(httpapi.RoleStandby)
+	if _, err := d.SendNow(context.Background(), a, a.ID); err != nil {
+		t.Fatalf("SendNow as a standby: %v", err)
+	}
+	if lines := voice.spoken(); len(lines) != 0 {
+		t.Errorf("spoke as a standby, want silence:%s", formatTimeline(lines, at))
 	}
 
 	// Once it is the live agent, the same publish in the same gap is heard.

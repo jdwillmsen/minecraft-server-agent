@@ -857,6 +857,9 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 			adapters.NewMetricsClient(cfg.MCMonitorURL, cfg.BackupExporterURL, bridgeTimeout),
 		),
 		Directory: registry,
+		// The live roster again, asked the other question: not who a name
+		// belongs to, but whether they are still here to see what is sent.
+		Presence: playerRoster,
 		// store.Nop when no database is configured, never nil -- plugin.Context
 		// documents Profiles as possibly nil and the plugins guard for it, but
 		// this binary has no reason to hand them one.

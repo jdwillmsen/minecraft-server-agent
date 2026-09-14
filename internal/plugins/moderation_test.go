@@ -794,3 +794,71 @@ func TestModerationCountsEveryFlagItRecords(t *testing.T) {
 		t.Errorf("term/warned moved by %v after a recorded warning, want at least 1", got)
 	}
 }
+
+// modPresence answers presence from a fixed set.
+type modPresence struct{ online map[string]bool }
+
+var _ plugin.Presence = modPresence{}
+
+func (p modPresence) IsOnline(xuid string) bool { return p.online[xuid] }
+
+// A warning is dispatched to a worker goroutine, so the player can quit
+// between posting the flagged message and the whisper going out. Their
+// gamertag still resolves -- it outlives the session so a reply in flight
+// stays addressable -- and mc-console-bridge answers a tellraw matching
+// nobody with success, so nothing downstream would notice.
+//
+// This test fails if act() takes a successful Tell as evidence the player
+// saw the warning: the row then says warned for something displayed to
+// nobody, which is the inversion act()'s ordering exists to prevent.
+func TestModerationDoesNotWarnAPlayerWhoHasLeft(t *testing.T) {
+	r := newModRig(t, "griefer")
+	r.pctx.Presence = modPresence{online: map[string]bool{}}
+
+	r.say(t, modPlayer, "you absolute GRIEFER")
+
+	got := r.waitRecorded(t, 1)
+	want := moderation.Event{XUID: modPlayer, Gamertag: "Steve", Message: "you absolute GRIEFER",
+		Rule: moderation.RuleTerm, Detail: "griefer", Action: moderation.ActionLogged, OccurredAt: modEpoch}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("recorded %+v, want %+v — the flag is still logged, it just cannot claim they were told", got, want)
+	}
+	if told := r.voice.told(); len(told) != 0 {
+		t.Errorf("whispers = %v, want none to a player who is not on the server", told)
+	}
+}
+
+// The warning is not spent on a player who could not receive it: presence is
+// asked before the claim, so their next visit still gets one.
+func TestModerationWarnsOnTheNextVisitAfterLeavingUnwarned(t *testing.T) {
+	r := newModRig(t, "griefer")
+	presence := modPresence{online: map[string]bool{}}
+	r.pctx.Presence = presence
+
+	r.say(t, modPlayer, "you absolute GRIEFER")
+	r.waitRecorded(t, 1)
+
+	presence.online[modPlayer] = true
+	r.say(t, modPlayer, "still a GRIEFER")
+
+	got := r.waitRecorded(t, 2)
+	if got[1].Action != moderation.ActionWarned {
+		t.Errorf("second flag action = %q, want warned — the first never reached them, so the claim was not spent", got[1].Action)
+	}
+	if told := r.voice.told(); len(told) != 1 || told[0] != modPlayer+": "+moderationWarning {
+		t.Errorf("whispers = %v, want exactly one, to the visit that could see it", told)
+	}
+}
+
+// A Context with nothing to ask keeps doing what it did before rather than
+// silently withholding every warning.
+func TestModerationWarnsWhenPresenceIsUnknown(t *testing.T) {
+	r := newModRig(t, "griefer")
+
+	r.say(t, modPlayer, "you absolute GRIEFER")
+
+	got := r.waitRecorded(t, 1)
+	if got[0].Action != moderation.ActionWarned {
+		t.Errorf("action = %q, want warned when presence cannot be asked", got[0].Action)
+	}
+}

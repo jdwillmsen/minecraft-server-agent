@@ -484,12 +484,20 @@ at - so an `@server` answer that outlives its connection still reaches the
 player who asked for it. The next connection replaces those names as it
 reports them.
 
-A resolvable name is never taken as proof that a player is still here. Every
-announcement whisper checks the roster's online list first, so a backlog
-whose drain was scheduled by an arrival is not sent to someone who quit
-during its wait: the console accepts a `tellraw` matching nobody and reports
-success, which would record the whole backlog as delivered and never offer
-it again. What they are owed survives for their next join instead.
+A resolvable name is never taken as proof that a player is still here.
+Anything whose record would claim the player saw it asks the roster's online
+list first: the console accepts a `tellraw` matching nobody and reports
+success, so a send alone proves nothing. An announcement backlog whose drain
+was scheduled by an arrival is not whispered to someone who quit during its
+wait - and the "N more messages are waiting" trailer is not sent either,
+since everything is still owed because they left rather than because the
+per-join cap held it back. What they are owed survives for their next join.
+
+A moderation warning is the same question with a different record. A player
+who has left is not warned, and the flag is recorded as *logged* rather than
+*warned*, so no row claims a warning was displayed to someone who could not
+see it. The warning itself is not spent either: their next visit still gets
+one.
 
 What the gap makes unknowable is who was online, not whether the server can
 speak. So an announcement to everyone or to whoever is online is still
@@ -841,14 +849,19 @@ soon as the server notices the socket is gone.
 | Live agent with a Bedrock session | `200` | `ready` |
 | Live agent with no session, or dead on a respawn screen | `503` | `not ready` |
 | Warm standby waiting for the lock | `200` | `standby` |
-| Starting up, before the lock | `200` | `standby` |
+| Starting up, before either | `503` | `not ready` |
 
-A process is a standby from the moment it starts until it actually holds the
-lock, and again from the moment it loses one. That is what the role means -
-"not playing" - and it is read by more than `/readyz`: the announcement API
-is served for the whole process, so a role that claimed otherwise during
-startup would let a pod broadcast into a game it is not in. An agent running
-without a database has no lock to wait for and goes live immediately.
+A process runs through three states, not two: **starting** until it has paid
+the startup every role shares - the Xbox token above all - then **standby**
+while it waits for the lock, then **live** while it holds it, and standby
+again the moment it loses one. Starting is its own state because neither of
+the others is safe to assume there. Calling it live would let it act on a
+game it is not in: the announcement API is served for the whole process, so
+a publish can reach a pod that has not joined anything. Calling it standby
+would claim it can take over while it still owes an Xbox token refresh - and
+that claim is exactly what a rolling update removes the live agent on. An
+agent running without a database has no lock to wait for and goes live
+straight out of starting.
 
 A waiting standby is **ready**, which is deliberate twice over: it is a
 healthy pod doing exactly what it should, and a rolling update that waits for

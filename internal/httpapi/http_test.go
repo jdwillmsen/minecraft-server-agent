@@ -206,12 +206,13 @@ func readyz(srv *Server) *httptest.ResponseRecorder {
 	return rec
 }
 
-// A process is a standby until it takes the lock, not from the moment
-// something remembers to say so. The announcement API is mounted for the
-// whole process and answers long before leadership is settled, so a role
-// that read live by default would let a pod that is in no game act as though
-// it were the one playing.
-func TestServer_IsAStandbyUntilItTakesTheLock(t *testing.T) {
+// A starting process is neither of the other two, and the difference is what
+// each mistake costs. Reported live, it would act on a game it is not in --
+// the announcement API answers for the whole process, long before leadership
+// is settled. Reported standby, it would claim it can take over while it
+// still owes the Xbox token refresh, and a rolling update waits on exactly
+// that claim before removing the live agent.
+func TestServer_StartingIsNeitherReadyNorLive(t *testing.T) {
 	srv, err := New("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -219,10 +220,20 @@ func TestServer_IsAStandbyUntilItTakesTheLock(t *testing.T) {
 	defer func() { _ = srv.ln.Close() }()
 
 	if srv.Live() {
-		t.Error("Live() = true before any role was assigned, want false")
+		t.Error("Live() = true before startup finished, want false")
+	}
+	if rec := readyz(srv); rec.Code != http.StatusServiceUnavailable || rec.Body.String() != "not ready" {
+		t.Errorf("readyz while starting = (%d, %q), want (503, not ready) — a pod that cannot take over yet must not be rolled onto", rec.Code, rec.Body.String())
+	}
+
+	// Startup paid, waiting for the lock: ready to be rolled onto, still not
+	// the process that may speak into the game.
+	srv.SetRole(RoleStandby)
+	if srv.Live() {
+		t.Error("Live() = true while waiting for the lock, want false")
 	}
 	if rec := readyz(srv); rec.Code != http.StatusOK || rec.Body.String() != "standby" {
-		t.Errorf("readyz before leadership = (%d, %q), want (200, standby)", rec.Code, rec.Body.String())
+		t.Errorf("readyz as a standby = (%d, %q), want (200, standby)", rec.Code, rec.Body.String())
 	}
 
 	srv.SetRole(RoleLive)
