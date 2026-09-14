@@ -821,3 +821,84 @@ func TestCachingTokenSource_AWriteThatLostToAnotherProcessTakesTheWinnersToken(t
 		t.Errorf("the row now holds %q, want the winner's token untouched", stored.RefreshToken)
 	}
 }
+
+// withGatePoll shortens the interval at which a login in progress notices
+// that this process is no longer the live agent, so a test need not wait a
+// real one.
+func withGatePoll(t *testing.T, d time.Duration) {
+	t.Helper()
+	orig := gatePoll
+	gatePoll = d
+	t.Cleanup(func() { gatePoll = orig })
+}
+
+// A device code blocks for as long as it lasts, which is long enough to
+// outlive the turn that printed it. Cold start with an empty row: this pod
+// prints a code nobody answers and loses the lock, its successor prints its
+// own and an operator answers that one. The first login must stop with the
+// turn -- left waiting, it would answer to a grant of its own and store it
+// over the successor's, and the row would stop describing the pod in the
+// game.
+func TestCachingTokenSource_TheDeviceCodeLoginEndsWithTheTurn(t *testing.T) {
+	withGatePoll(t, time.Millisecond)
+	printed := make(chan struct{})
+	withStubLogin(t, func(ctx context.Context, out io.Writer) (*oauth2.Token, error) {
+		close(printed)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+
+	var live atomic.Bool
+	live.Store(true)
+	cts := &cachingTokenSource{
+		store:    &memStore{},
+		out:      io.Discard,
+		live:     live.Load,
+		loginCtx: context.Background(),
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := cts.Token()
+		done <- err
+	}()
+
+	<-printed
+	live.Store(false)
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the login outlived the turn and reported success")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the login was still waiting for a code after the turn ended")
+	}
+}
+
+// And the same for a code answered at the moment the turn ends: the grant is
+// real, but it belongs to a process that no longer holds the account's login.
+func TestCachingTokenSource_AGrantThatArrivesAfterTheTurnIsNotStored(t *testing.T) {
+	ctx := context.Background()
+	var live atomic.Bool
+	live.Store(true)
+	withStubLogin(t, func(context.Context, io.Writer) (*oauth2.Token, error) {
+		// The operator answers just as the lock moves on.
+		live.Store(false)
+		return &oauth2.Token{AccessToken: "a", RefreshToken: "grant-a", Expiry: time.Now().Add(time.Hour)}, nil
+	})
+
+	store := &memStore{}
+	cts := &cachingTokenSource{
+		store:    store,
+		out:      io.Discard,
+		live:     live.Load,
+		loginCtx: ctx,
+	}
+
+	if _, err := cts.Token(); err == nil {
+		t.Fatal("a grant that arrived after the turn was reported as this process's token")
+	}
+	if _, saves := store.counts(); saves != 0 {
+		t.Errorf("stored the late grant %d times, want 0: the successor's row is not this process's to write", saves)
+	}
+}

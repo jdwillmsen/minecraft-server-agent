@@ -39,6 +39,12 @@ const storeTimeout = 5 * time.Second
 // save, and it is reported so a reader can tell it from a store that broke.
 var ErrStandbyUnwarmed = errors.New("mcauth: standby holds no unexpired token and may not refresh one")
 
+// gatePoll is how often a device-code login in progress asks whether this
+// process is still the one entitled to it. Negligible against the quarter of
+// an hour a code lasts, and the gate is the only liveness this package has --
+// it reports a state, not a moment it changed.
+var gatePoll = time.Second
+
 // requestLiveToken is the interactive device-code login. A package-level
 // var, not a direct call, so tests can substitute a stub and prove it is
 // reached only on a genuinely empty store - never on one that is merely
@@ -61,7 +67,9 @@ type Option func(*cachingTokenSource)
 // Token.
 //
 // The gate is consulted per call rather than once at construction because a
-// standby becomes the live agent without rebuilding anything.
+// standby becomes the live agent without rebuilding anything, and from a
+// second goroutine while a device-code login is in flight, so it has to be
+// safe for concurrent use.
 func WithLiveGate(live func() bool) Option {
 	return func(c *cachingTokenSource) {
 		if live != nil {
@@ -282,12 +290,49 @@ func (c *cachingTokenSource) liveToken() (*oauth2.Token, error) {
 		return c.reloadAfterFailedRefresh(err)
 	}
 	c.note(func() { c.log.Info("auth_device_code_login", nil) })
-	tok, err := requestLiveToken(c.loginCtx, c.out)
+	loginCtx, cancel := c.turnContext()
+	defer cancel()
+	tok, err := requestLiveToken(loginCtx, c.out)
 	if err != nil {
 		return nil, fmt.Errorf("mcauth: device-code login: %w", err)
 	}
+	if !c.live() {
+		// The code was answered after this process stopped being the one
+		// entitled to the login. The grant is real and so is its successor's:
+		// storing this one would leave the row describing neither the pod in
+		// the game nor the token it is playing on.
+		return nil, errors.New("mcauth: device-code login finished after this process's turn ended")
+	}
 	c.adopt(tok)
 	return tok, nil
+}
+
+// turnContext bounds a call by this process's turn as the live agent rather
+// than by the process itself.
+//
+// Only the login needs it. Everything else here is a round trip of
+// milliseconds, where a turn that ends mid-call costs nothing, but a device
+// code lasts about a quarter of an hour: long enough for the lock to move on,
+// for a successor to print its own code and have it answered, and for this
+// one to then write its grant over the successor's.
+func (c *cachingTokenSource) turnContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(c.loginCtx)
+	go func() {
+		ticker := time.NewTicker(gatePoll)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !c.live() {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, cancel
 }
 
 // standbyToken answers without rotating anything.
