@@ -450,3 +450,58 @@ func TestEndSessionThenSnapshotReportsNobodyAsJoining(t *testing.T) {
 		t.Error("nobody reported as present, so their backlog would never be scheduled")
 	}
 }
+
+// A connection to an empty server is told the truth in a packet with no adds
+// in it. Reading that as "not told yet" would leave the whole session unable
+// to say the server is empty -- and a Deliverer reading Knows() would go on
+// broadcasting blind to an audience it could have named as nobody.
+func TestKnowsAfterAnOpeningPacketCarryingNoAdd(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+	if r.Knows() {
+		t.Fatal("Knows() before any packet = true, want false")
+	}
+
+	r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}})
+
+	if !r.Knows() {
+		t.Error("Knows() after an applied PlayerList = false, want true — the server has said who is here, and the answer is nobody")
+	}
+	if online := r.Online(); len(online) != 0 {
+		t.Errorf("Online() = %v, want nobody", online)
+	}
+}
+
+// The two flags answer different questions and must not be collapsed: being
+// told is not the same as having accounted for the players who were already
+// here, and the snapshot-versus-join classification depends on the second.
+func TestAnOpeningPacketWithNoAddStillLetsTheRealSnapshotBePresent(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+	r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}})
+
+	joins, _, present := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
+
+	if len(joins) != 0 {
+		t.Errorf("joins = %+v, want none: the roster behind an empty packet is still a snapshot", joins)
+	}
+	if len(present) != 2 {
+		t.Errorf("present = %+v, want both, so their backlogs are still scheduled", present)
+	}
+}
+
+// A session boundary takes it back: in the gap nobody has told this roster
+// anything about the connection that follows.
+func TestKnowsIsFalseAgainAfterTheConnectionEnds(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
+	if !r.Knows() {
+		t.Fatal("Knows() while watching = false, want true")
+	}
+
+	r.EndSession()
+
+	if r.Knows() {
+		t.Error("Knows() in the gap = true, want false — an empty roster there means nothing is known, not that nobody is on")
+	}
+}

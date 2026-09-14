@@ -66,6 +66,9 @@ type fakeVoice struct {
 	says    []string
 	tellErr map[string]error
 	sayErr  error
+	// onSay runs after the broadcast is recorded, so a test can model the
+	// world changing during the bridge round-trip the Say really is.
+	onSay func()
 }
 
 var _ Voice = (*fakeVoice)(nil)
@@ -83,9 +86,13 @@ func (v *fakeVoice) Tell(_ context.Context, xuid, message string) error {
 
 func (v *fakeVoice) Say(_ context.Context, message string) error {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	v.says = append(v.says, message)
-	return v.sayErr
+	onSay, err := v.onSay, v.sayErr
+	v.mu.Unlock()
+	if onSay != nil {
+		onSay()
+	}
+	return err
 }
 
 // fakeRoster reports a fixed set of online XUIDs.
@@ -238,8 +245,8 @@ func TestSendNowBroadcastStillRecordsOtherRowsWhenOneMarkDeliveredFails(t *testi
 	if err != nil {
 		t.Fatalf("SendNow: %v", err)
 	}
-	if delivered.Players != 2 {
-		t.Errorf("delivered.Players = %d, want 2 (xuid-2's row failed, xuid-1 and xuid-3 still land)", delivered.Players)
+	if delivered.Counted {
+		t.Errorf("delivered = %+v, want an uncounted reach: xuid-2 heard the Say and their row did not write, so what they got is no longer knowable", delivered)
 	}
 	if len(voice.says) != 1 {
 		t.Errorf("Say called %d times, want 1 — one row failing to record must not trigger a second broadcast", len(voice.says))
@@ -1197,5 +1204,103 @@ func TestSendNowStillCountsWhenTheRosterOutlivesTheSay(t *testing.T) {
 	}
 	if !sent.Counted || sent.Players != 1 {
 		t.Errorf("sent = %+v, want one counted player — the roster is still watching, so this is a real answer", sent)
+	}
+}
+
+// Once a Say has gone out the line is in chat, and everything after it is
+// bookkeeping. A row that will not write leaves that recipient neither
+// delivered nor honestly excluded, so the count stops being an answer --
+// reporting zero would say nobody heard a line the whole server just read,
+// and the API documents zero as safe to publish again.
+func TestSendNowDoesNotCountABroadcastWhoseOnlyRowFailed(t *testing.T) {
+	a := Announcement{Body: "server restarting in 5 minutes", TargetKind: TargetOnlineOnly}
+	store := &fakeStore{enabled: true, markErr: map[string]error{"steve": errors.New("db unavailable")}}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"steve"}}, fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 51)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 {
+		t.Fatalf("Say calls = %v, want exactly one — Steve read it before the row failed", voice.says)
+	}
+	if sent.Counted {
+		t.Errorf("sent = %+v, want an uncounted reach — a counted zero invites a second broadcast of a line already said", sent)
+	}
+}
+
+// The same rule for a loop cut short: the recipients it never reached heard
+// the Say like everyone else, and nothing decided what they got.
+func TestSendNowDoesNotCountABroadcastWhoseRecordingWasCancelled(t *testing.T) {
+	a := Announcement{Body: "server restarting in 5 minutes", TargetKind: TargetEveryone}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancelled by the Say itself, so the recording loop that follows it is
+	// the part that is cut short.
+	voice.onSay = cancel
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"steve", "alex"}}, fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(ctx, a, 52)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 1 {
+		t.Fatalf("Say calls = %v, want exactly one — it went out before the cancel took hold", voice.says)
+	}
+	if sent.Counted {
+		t.Errorf("sent = %+v, want an uncounted reach — nobody decided what the recipients left in the list received", sent)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing once the context was gone", store.delivered)
+	}
+}
+
+// A standby says nothing because it is in no game, but the row it stored is
+// the live agent's to deliver. Reporting that identically to a watched,
+// empty server would have a caller retry a publish already waiting in the
+// queue, and the next player to join would be whispered it twice.
+func TestSendNowReportsAStandbysPublishAsQueued(t *testing.T) {
+	a := Announcement{Body: "deploying v2", TargetKind: TargetEveryone}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: false}))
+
+	sent, err := d.SendNow(context.Background(), a, 53)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.says) != 0 {
+		t.Errorf("Say calls = %v, want none from a process that is in no game", voice.says)
+	}
+	if !sent.Queued {
+		t.Errorf("sent = %+v, want it reported as queued for the live agent", sent)
+	}
+	if !sent.Counted || sent.Players != 0 {
+		t.Errorf("sent = %+v, want a counted zero beside it — nothing was spoken here", sent)
+	}
+}
+
+// The live agent watching an empty server is the zero this one must stay
+// distinct from: nothing queued on anyone else's behalf, and nobody heard it
+// because nobody was there.
+func TestSendNowDoesNotReportAnIdleServerAsQueued(t *testing.T) {
+	a := Announcement{Body: "deploying v2", TargetKind: TargetEveryone}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{knows: true}, fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: true}))
+
+	sent, err := d.SendNow(context.Background(), a, 54)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if sent.Queued {
+		t.Errorf("sent = %+v, want it not reported as queued: this process is the one that speaks", sent)
+	}
+	if !sent.Counted || sent.Players != 0 {
+		t.Errorf("sent = %+v, want a counted zero — the roster is watching and names nobody", sent)
 	}
 }

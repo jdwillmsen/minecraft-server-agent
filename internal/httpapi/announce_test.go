@@ -25,6 +25,7 @@ type fakePublisher struct {
 	// with the answer a blind broadcast gives: said, audience unknown.
 	reached   int
 	uncounted bool
+	queued    bool
 	err       error
 	id        int64
 }
@@ -37,7 +38,7 @@ func (f *fakePublisher) Publish(_ context.Context, a announce.Announcement) (int
 	if f.uncounted {
 		return 42, announce.Reach{}, nil
 	}
-	return 42, announce.Reach{Players: f.reached, Counted: true}, nil
+	return 42, announce.Reach{Players: f.reached, Counted: true, Queued: f.queued}, nil
 }
 
 type fakePlayers struct {
@@ -425,5 +426,48 @@ func TestAStandbyStillRefusesAnUnauthenticatedPublishAsUnauthorized(t *testing.T
 	}
 	if len(pub.got) != 0 {
 		t.Error("an unauthenticated request published something")
+	}
+}
+
+// A standby stores the announcement and says nothing, which is a different
+// outcome from the live agent finding nobody on the server. Both report zero
+// recipients, so the response has to tell them apart: a caller that retried
+// the standby's zero would store a second copy and the next player to join
+// would be whispered the same line twice.
+func TestAStandbysStoredPublishIsReportedAsQueued(t *testing.T) {
+	pub := &fakePublisher{queued: true}
+	srv := mounted(t, testToken, pub, fakePlayers{})
+	srv.SetRole(RoleStandby)
+
+	rec := post(srv, "Bearer "+testToken, okBody)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (%s)", rec.Code, rec.Body)
+	}
+	var resp announcementResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Queued {
+		t.Errorf("response = %+v, want queued true — this pod said nothing and the live agent owes the delivery", resp)
+	}
+	if resp.Reached == nil || *resp.Reached != 0 {
+		t.Errorf("reached = %v, want 0: nothing was spoken here", resp.Reached)
+	}
+}
+
+// The live agent's own zero carries no queued flag, so the two are
+// distinguishable on the wire and not merely in the count.
+func TestTheLiveAgentsEmptyServerIsNotReportedAsQueued(t *testing.T) {
+	pub := &fakePublisher{}
+	srv := mounted(t, testToken, pub, fakePlayers{})
+
+	rec := post(srv, "Bearer "+testToken, okBody)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (%s)", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), "queued") {
+		t.Errorf("body = %q, want no queued flag from the process that does the speaking", rec.Body.String())
 	}
 }

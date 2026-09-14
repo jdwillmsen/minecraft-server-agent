@@ -93,6 +93,13 @@ type Roster struct {
 	// two, every add is a player who was already online -- see Apply.
 	snapshotStarted bool
 	snapshotEnded   bool
+	// told is false until any PlayerList of this session has been applied,
+	// whatever it carried. It answers "has the server said who is here",
+	// which snapshotStarted cannot: a connection to an empty server is told
+	// the truth in a packet with no adds in it, and reading that as "not
+	// told yet" would leave the whole session unable to say the server is
+	// empty.
+	told bool
 	// names is the last gamertag each XUID was seen under. Kept apart from
 	// players because presence and identity stop being true at different
 	// moments: presence ends with the connection that reported it, a name
@@ -164,6 +171,7 @@ func (r *Roster) clearPresence() {
 	r.xuidByUUID = make(map[string]string)
 	r.snapshotStarted = false
 	r.snapshotEnded = false
+	r.told = false
 }
 
 // Since reports when the current session began watching, as given to
@@ -233,6 +241,7 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entr
 	if adds {
 		r.snapshotStarted = true
 	}
+	r.told = true
 
 	for _, e := range entries {
 		if e.Remove {
@@ -293,15 +302,21 @@ func (r *Roster) NameFor(xuid string) (name string, ok bool) {
 }
 
 // Knows reports whether this Roster can currently answer who is on the
-// server: true once the live connection's opening PlayerList has been
-// applied. False in the gap between connections, and false again in the
-// moments after one opens before its first PlayerList arrives -- in both,
-// an empty Online() means "not known yet" rather than "nobody is here", and
-// a caller that cannot tell those apart will act on the wrong one.
+// server: true once any PlayerList of the live connection has been applied.
+// False in the gap between connections, and false again in the moments after
+// one opens before its first PlayerList arrives -- in both, an empty
+// Online() means "not known yet" rather than "nobody is here", and a caller
+// that cannot tell those apart will act on the wrong one.
+//
+// Read from told rather than snapshotStarted: the two look alike on a busy
+// server and part on an empty one, where the opening packet carries no add
+// at all. That session is told who is here -- nobody -- and must be able to
+// say so, while snapshotStarted stays false because there was no population
+// to account for.
 func (r *Roster) Knows() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.snapshotSeen
+	return r.told
 }
 
 // IsOnline reports whether xuid is on the roster the current connection is

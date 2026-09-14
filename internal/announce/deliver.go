@@ -251,17 +251,26 @@ type Reach struct {
 	// Players is how many are known to have received it. Meaningful only
 	// when Counted is true.
 	Players int
-	// Counted is whether Players is an answer at all. False only for a
-	// broadcast said to an audience the roster could not name.
+	// Counted is whether Players is an answer at all. False for a broadcast
+	// that went out and could not be fully accounted for afterwards.
 	Counted bool
+	// Queued is true when this process sent nothing because it is not the
+	// one that speaks -- a standby, or a process still starting. The
+	// announcement is stored and the live agent delivers it, so a caller
+	// reading a zero here must not take it for "nobody was on the server".
+	Queued bool
 }
 
 // reached is a counted answer: this many players, and the count is real.
 func reached(players int) Reach { return Reach{Players: players, Counted: true} }
 
 // uncounted is a broadcast that went out to an audience this process could
-// not see.
+// not account for.
 var uncounted = Reach{}
+
+// queued is a send a process that does not speak declined to make, leaving
+// the stored row for whoever holds the lock.
+var queued = Reach{Counted: true, Queued: true}
 
 // SendNow delivers a immediately to whoever is online and matches its
 // target, and reports what that reached.
@@ -293,6 +302,14 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		// and a standby's roster never knows anything at all.
 		if len(targets) == 0 && !d.mayBroadcastBlind() {
 			d.log.Info("announce_say_skipped_no_audience", logging.Fields{"announcement_id": id, "roster_knows": d.roster.Knows(), "live": d.live()})
+			if !d.live() {
+				// Not this process's to say. The row is stored and the
+				// leader delivers it, which is a different outcome from a
+				// watched server with nobody on it -- and reporting them
+				// alike would have a caller retry a publish that is already
+				// waiting to be delivered.
+				return queued, nil
+			}
 			return reached(0), nil
 		}
 		blind := len(targets) == 0
@@ -313,10 +330,17 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		delivered := 0
 		deferred := 0
 		heard := 0
+		// Set when a recipient's fate stops being knowable -- which is not
+		// the same as their being excluded. A player who left is accounted
+		// for; a row that would not write, or a recipient the loop never
+		// reached, is not.
+		unaccounted := false
 		for _, xuid := range targets {
 			if ctx.Err() != nil {
 				// Cancelled: stop rather than attempt (and log) a store
 				// write for every remaining recipient that would fail anyway.
+				// Everyone still in the list heard the Say all the same.
+				unaccounted = true
 				break
 			}
 			if d.departed(xuid) {
@@ -343,7 +367,10 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 				continue
 			}
 			if err := d.store.MarkDelivered(ctx, id, xuid, now); err != nil {
+				// They heard it; the record of that is what failed, so they
+				// are neither delivered nor honestly excluded.
 				d.log.Error("announce_mark_delivered_failed", logging.Fields{"announcement_id": id, "xuid": xuid, "error": err.Error()})
+				unaccounted = true
 				continue
 			}
 			delivered++
@@ -351,13 +378,13 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		if deferred > 0 {
 			d.log.Info("announce_deferred_for_joining", logging.Fields{"announcement_id": id, "players": deferred})
 		}
-		if blind || !d.roster.Knows() {
-			// Said, with no roster to count from: either there was none when
+		if blind || !d.roster.Knows() || unaccounted {
+			// Said, and not fully accounted for: there was no roster when
 			// the recipients were chosen, or the connection died during the
-			// Say, which is one bridge round-trip long. Whoever was on the
-			// server heard it either way; what became impossible is naming
-			// them, and a counted zero would say the opposite -- sending a
-			// caller who retries on it to broadcast the same line twice.
+			// Say, or the loop could not finish deciding who heard it.
+			// Whoever was on the server heard it in every case, and a
+			// counted zero would say the opposite -- sending a caller who
+			// retries on it to broadcast the same line twice.
 			return uncounted, nil
 		}
 		// Counted as reached: everyone recorded, plus everyone withheld on

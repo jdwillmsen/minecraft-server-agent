@@ -759,7 +759,8 @@ curl -sS -X POST http://<agent>:8080/announcements \
        "priority": "normal",
        "expires_in_seconds": 3600}'
 # 201 {"id": 42, "reached": 3}
-# 201 {"id": 43, "reached": null}   # broadcast; the agent could not see who heard it
+# 201 {"id": 43, "reached": null}   # broadcast; the agent could not account for who heard it
+# 201 {"id": 44, "reached": 0, "queued": true}   # a standby took it; the live agent delivers it
 ```
 
 - `target.kind` is `everyone`, `player`, `permission` or `online_only`.
@@ -773,12 +774,23 @@ curl -sS -X POST http://<agent>:8080/announcements \
   queues and so takes none.
 - `201` carries the announcement id and how many players heard it
   immediately; the rest are the queue's to deliver.
-- `reached` is `null`, not `0`, when the announcement was broadcast while
-  the agent could not see who was on the server - during its reconnect gap,
-  or in the moments after a connection opens before the first roster packet.
-  It was said and heard by whoever was there; nobody could be named, so
-  nothing was recorded. `0` keeps its old meaning of "nobody heard it", so a
-  caller that retries on `0` will not broadcast the same line twice.
+- `reached` is `null`, not `0`, whenever the announcement was broadcast and
+  the recipients could not be fully accounted for: the agent could not see
+  who was on the server (its reconnect gap, or the moments after a
+  connection opens before the first roster packet), the connection died
+  during the send, or a delivery row would not write. It was said and heard
+  by whoever was there. `null` is the one value that is never safe to retry
+  on - the line has already gone out, and publishing again says it twice.
+- `reached: 0` means nothing was spoken, so retrying will not repeat
+  anything in chat. It does **not** mean nothing was stored: every target
+  except `online_only` queues, so a retry adds a second announcement and the
+  next player to join is whispered the same line twice. Retry a `0` only
+  when you mean to publish again.
+- `queued: true` accompanies a `0` from a pod that is not the live agent. It
+  said nothing because it is in no game, and the announcement it stored is
+  the live agent's to deliver on the next join - so this is the `0` least
+  worth retrying, and it is distinguishable from the one a watched, empty
+  server gives.
 - `400` for an invalid request, including unknown fields and keys that
   differ in case or appear twice (keys match exactly), `401` without the
   right bearer token, `413` past the 16 KiB request cap, `422` for an

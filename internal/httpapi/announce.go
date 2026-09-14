@@ -85,6 +85,11 @@ type announcementResponse struct {
 	// the server. Null rather than 0 on purpose: 0 means nobody heard it,
 	// and a caller retrying on that would broadcast into the server twice.
 	Reached *int `json:"reached"`
+	// Queued is present and true when the pod that took this request is not
+	// the live agent, so it said nothing itself and the stored announcement
+	// is the live agent's to deliver. Without it a caller could not tell
+	// that zero from the one an empty server gives.
+	Queued bool `json:"queued,omitempty"`
 }
 
 func announcementsHandler(token string, live func() bool, pub AnnouncementPublisher, players PlayerResolver, log *logging.Logger, now func() time.Time) http.Handler {
@@ -153,7 +158,7 @@ func announcementsHandler(token string, live func() bool, pub AnnouncementPublis
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		resp := announcementResponse{ID: id}
+		resp := announcementResponse{ID: id, Queued: sent.Queued}
 		if sent.Counted {
 			resp.Reached = &sent.Players
 		}
