@@ -1,6 +1,7 @@
 package census
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/df-mc/goleveldb/leveldb"
@@ -48,7 +49,10 @@ func (s ScanStats) Unreadable() bool {
 // The database is opened read-only: the census must never be able to modify
 // a world, and the archive it usually reads is the only copy of that day's
 // backup.
-func Scan(dbPath string) ([]Entity, ScanStats, error) {
+//
+// The walk covers several hundred megabytes, so it stops at the first
+// cancellation rather than holding a terminating pod open to the end of it.
+func Scan(ctx context.Context, dbPath string) ([]Entity, ScanStats, error) {
 	db, err := leveldb.OpenFile(dbPath, &opt.Options{ReadOnly: true})
 	if err != nil {
 		return nil, ScanStats{}, fmt.Errorf("open world %s: %w", dbPath, err)
@@ -60,7 +64,7 @@ func Scan(dbPath string) ([]Entity, ScanStats, error) {
 	// than in the actor itself, and the iteration order gives no guarantee
 	// that a chunk is seen before the actors it owns.
 	index := dimensionIndex{}
-	if err := iterate(db, []byte(digpPrefix), func(k, v []byte) {
+	if err := iterate(ctx, db, []byte(digpPrefix), func(k, v []byte) {
 		index.addDigp(k, v)
 	}); err != nil {
 		return nil, ScanStats{}, err
@@ -70,7 +74,7 @@ func Scan(dbPath string) ([]Entity, ScanStats, error) {
 		entities []Entity
 		stats    ScanStats
 	)
-	if err := iterate(db, []byte(actorPrefix), func(k, v []byte) {
+	if err := iterate(ctx, db, []byte(actorPrefix), func(k, v []byte) {
 		stats.Records++
 		var m map[string]any
 		if err := nbt.UnmarshalEncoding(v, &m, nbt.LittleEndian); err != nil {
@@ -96,10 +100,13 @@ func Scan(dbPath string) ([]Entity, ScanStats, error) {
 
 // iterate seeks the prefix range and calls fn for each key in it. The callback
 // must not retain k or v: the iterator reuses their backing arrays between steps.
-func iterate(db *leveldb.DB, prefix []byte, fn func(k, v []byte)) error {
+func iterate(ctx context.Context, db *leveldb.DB, prefix []byte, fn func(k, v []byte)) error {
 	it := db.NewIterator(util.BytesPrefix(prefix), nil)
 	defer it.Release()
 	for it.Next() {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("iterate %s: %w", prefix, err)
+		}
 		fn(it.Key(), it.Value())
 	}
 	if err := it.Error(); err != nil {

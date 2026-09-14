@@ -1,7 +1,9 @@
 package census
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"testing"
 
 	"github.com/df-mc/goleveldb/leveldb"
@@ -23,7 +25,7 @@ func TestScanReadsEntitiesWithTheirDimensions(t *testing.T) {
 		}},
 	})
 
-	entities, stats, err := Scan(path)
+	entities, stats, err := Scan(context.Background(), path)
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
@@ -53,7 +55,7 @@ func TestScanCountsUnplacedEntities(t *testing.T) {
 	path := writeFixtureWorld(t, []fixtureActor{
 		{ID: 3, NBT: map[string]any{"identifier": "minecraft:zombie", "UniqueID": int64(3)}},
 	})
-	entities, stats, err := Scan(path)
+	entities, stats, err := Scan(context.Background(), path)
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
@@ -69,7 +71,7 @@ func TestScanCountsUnplacedEntities(t *testing.T) {
 }
 
 func TestScanRejectsAMissingWorld(t *testing.T) {
-	if _, _, err := Scan(t.TempDir() + "/does-not-exist"); err == nil {
+	if _, _, err := Scan(context.Background(), t.TempDir()+"/does-not-exist"); err == nil {
 		t.Error("Scan of a missing world returned nil error")
 	}
 }
@@ -98,7 +100,7 @@ func TestScanCapturesFirstUnparsableError(t *testing.T) {
 	}
 	db.Close()
 
-	_, stats, err := Scan(path)
+	_, stats, err := Scan(context.Background(), path)
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
@@ -129,5 +131,23 @@ func TestScanStatsSeparatesTornRecordsFromAWholesaleDecodeFailure(t *testing.T) 
 		if got := tc.stats.Unreadable(); got != tc.want {
 			t.Errorf("%s: Unreadable() = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestScanStopsOnACancelledContext(t *testing.T) {
+	// The walk covers several hundred megabytes on the real world, and the
+	// CronJob's pod can be evicted part way through it.
+	path := writeFixtureWorld(t, []fixtureActor{
+		{ID: 1, NBT: map[string]any{
+			"identifier": "minecraft:zombie",
+			"Pos":        pos(10, 64, 20),
+			"UniqueID":   int64(1),
+		}},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := Scan(ctx, path); !errors.Is(err, context.Canceled) {
+		t.Errorf("Scan of a cancelled context returned %v, want context.Canceled", err)
 	}
 }

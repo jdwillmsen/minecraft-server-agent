@@ -12,12 +12,21 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/census"
 )
 
 func main() {
-	if err := run(context.Background(), os.Args[1:], os.Stdout); err != nil {
+	// A CronJob pod is terminated with SIGTERM, and the extraction and scan
+	// together run for minutes. Without this the process dies where it
+	// stands, before the deferred cleanup can remove the ~570MB it
+	// extracted.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "census: %v\n", err)
 		os.Exit(1)
 	}
@@ -58,7 +67,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) (err error) {
 		}
 	}()
 
-	entities, stats, scanErr := census.Scan(world.DBPath)
+	entities, stats, scanErr := census.Scan(ctx, world.DBPath)
 	if scanErr != nil {
 		return fmt.Errorf("scan archive %s: %w", world.Archive, scanErr)
 	}

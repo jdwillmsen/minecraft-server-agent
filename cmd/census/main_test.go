@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,6 +152,33 @@ func TestRunRefusesToReportAWorldItCouldNotDecode(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "decode") {
 		t.Errorf("error does not say records failed to decode: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("run wrote %q to stdout, want no report at all", out.String())
+	}
+}
+
+func TestRunRemovesTheExtractionWhenItIsCancelled(t *testing.T) {
+	// The pod can be terminated part way through a multi-minute extraction,
+	// and what must not survive it is the ~570MB tree on the backup volume.
+	dir := t.TempDir()
+	buildArchive(t, dir)
+	extractions := t.TempDir()
+	t.Setenv("TMPDIR", extractions)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var out bytes.Buffer
+	if err := run(ctx, []string{"-backup-dir", dir}, &out); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run of a cancelled context returned %v, want context.Canceled", err)
+	}
+	left, err := os.ReadDir(extractions)
+	if err != nil {
+		t.Fatalf("read temp directory: %v", err)
+	}
+	if len(left) != 0 {
+		t.Errorf("run left %d entries behind in the temp directory, want none", len(left))
 	}
 	if out.Len() != 0 {
 		t.Errorf("run wrote %q to stdout, want no report at all", out.String())
