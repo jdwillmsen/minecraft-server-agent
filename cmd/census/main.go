@@ -35,7 +35,7 @@ func main() {
 // run is the testable body. It writes nothing to stdout unless it produced a
 // whole report: a truncated report is worse than none, because it looks like
 // an answer.
-func run(ctx context.Context, args []string, stdout io.Writer) (err error) {
+func run(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("census", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	backupDir := fs.String("backup-dir", "/backup", "directory holding fwb-<stamp>.tar.gz backup archives")
@@ -52,7 +52,13 @@ func run(ctx context.Context, args []string, stdout io.Writer) (err error) {
 		return fmt.Errorf("parse flags: %w", parseErr)
 	}
 
-	source := census.ArchiveSource{Dir: *backupDir}
+	return reportFrom(ctx, census.ArchiveSource{Dir: *backupDir},
+		census.ReportOptions{TopRegions: *topRegions, TopTypes: *topTypes}, stdout)
+}
+
+// reportFrom takes the census from an opened source. Splitting it from flag
+// parsing is what lets a test supply a source whose cleanup fails.
+func reportFrom(ctx context.Context, source census.Source, opts census.ReportOptions, stdout io.Writer) (err error) {
 	world, cleanup, err := source.Open(ctx)
 	if err != nil {
 		return err
@@ -60,10 +66,11 @@ func run(ctx context.Context, args []string, stdout io.Writer) (err error) {
 	defer func() {
 		// A silent RemoveAll failure here repeats every scheduled run and
 		// slowly fills the volume with ~570MB extractions, so surface it -
-		// but never let a cleanup failure mask a scan or render error that
-		// already explains why the run failed.
-		if cleanupErr := cleanup(); cleanupErr != nil && err == nil {
-			err = fmt.Errorf("clean up extracted world %s: %w", world.Archive, cleanupErr)
+		// joined to whatever the run already failed with rather than
+		// replacing it, because cancellation is both the likeliest reason
+		// the run failed and the case the cleanup exists for.
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("clean up extracted world %s: %w", world.Archive, cleanupErr))
 		}
 	}()
 
@@ -86,10 +93,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) (err error) {
 		return fmt.Errorf("%w; first decode failure: %s", unusable, stats.FirstUnparsableErr)
 	}
 
-	report := census.Render(
-		census.Aggregate(entities, stats, world.TakenAt, world.Kind),
-		census.ReportOptions{TopRegions: *topRegions, TopTypes: *topTypes},
-	)
+	report := census.Render(census.Aggregate(entities, stats, world.TakenAt, world.Kind), opts)
 	if _, err := io.WriteString(stdout, report); err != nil {
 		return fmt.Errorf("write report: %w", err)
 	}

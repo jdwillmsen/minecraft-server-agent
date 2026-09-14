@@ -13,14 +13,12 @@ import (
 	"testing"
 
 	"github.com/df-mc/goleveldb/leveldb"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/census"
 	"github.com/sandertv/gophertunnel/minecraft/nbt"
 )
 
-// buildArchive writes a one-zombie world and tars it the way the backup job
-// does - `tar czf "$ARCHIVE_TMP" -C "$STAGE" .`, so "./" is member 0 and
-// every directory gets an entry ahead of its files - so the binary is
-// exercised end to end against the archive shape it actually receives.
-func buildArchive(t *testing.T, dir string) {
+// zombieRecord is the actorprefix value of a single placed, named mob.
+func zombieRecord(t *testing.T) []byte {
 	t.Helper()
 	payload, err := nbt.MarshalEncoding(map[string]any{
 		"identifier": "minecraft:zombie",
@@ -30,18 +28,42 @@ func buildArchive(t *testing.T, dir string) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	buildArchiveFromRecord(t, dir, payload)
+	return payload
+}
+
+// stageWorld writes a world holding one actor record and returns the
+// directory an archive of it would extract to.
+func stageWorld(t *testing.T, actorRecord []byte) string {
+	t.Helper()
+	stage := t.TempDir()
+	if err := os.MkdirAll(worldDB(stage), 0o755); err != nil {
+		t.Fatalf("stage world: %v", err)
+	}
+	writeWorld(t, worldDB(stage), actorRecord)
+	return stage
+}
+
+func worldDB(stage string) string { return filepath.Join(stage, "FWB", "db") }
+
+// buildArchive writes a one-zombie world and tars it the way the backup job
+// does - `tar czf "$ARCHIVE_TMP" -C "$STAGE" .`, so "./" is member 0 and
+// every directory gets an entry ahead of its files - so the binary is
+// exercised end to end against the archive shape it actually receives.
+func buildArchive(t *testing.T, dir string) {
+	t.Helper()
+	buildArchiveFromRecord(t, dir, zombieRecord(t))
 }
 
 // buildArchiveFromRecord builds that archive around a caller-supplied
 // actorprefix value, so a test can stand in bytes the decoder will refuse.
 func buildArchiveFromRecord(t *testing.T, dir string, actorRecord []byte) {
 	t.Helper()
-	stage := t.TempDir()
-	dbPath := filepath.Join(stage, "FWB", "db")
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
-		t.Fatalf("stage world: %v", err)
-	}
+	stage := stageWorld(t, actorRecord)
+	tarWorld(t, stage, dir)
+}
+
+func writeWorld(t *testing.T, dbPath string, actorRecord []byte) {
+	t.Helper()
 	db, err := leveldb.OpenFile(dbPath, nil)
 	if err != nil {
 		t.Fatalf("open world: %v", err)
@@ -58,7 +80,10 @@ func buildArchiveFromRecord(t *testing.T, dir string, actorRecord []byte) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("close world: %v", err)
 	}
+}
 
+func tarWorld(t *testing.T, stage, dir string) {
+	t.Helper()
 	out, err := os.Create(filepath.Join(dir, "fwb-20260913T203100Z.tar.gz"))
 	if err != nil {
 		t.Fatalf("create archive: %v", err)
@@ -230,5 +255,56 @@ func TestRunRemovesTheExtractionWhenItIsCancelled(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Errorf("run wrote %q to stdout, want no report at all", out.String())
+	}
+}
+
+// stubSource stands in for the archive source so a test can control what the
+// cleanup it hands back does.
+type stubSource struct {
+	world   census.World
+	cleanup func() error
+}
+
+func (s stubSource) Open(context.Context) (census.World, func() error, error) {
+	return s.world, s.cleanup, nil
+}
+
+func TestReportFromSurfacesACleanupFailureThatCancellationWouldHide(t *testing.T) {
+	// Cancellation is the case the cleanup exists for: the pod is going
+	// away and the ~570MB extraction has to go with it. Reporting the
+	// cleanup failure only when everything else succeeded stayed silent in
+	// exactly the run where it mattered.
+	stage := stageWorld(t, zombieRecord(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var out bytes.Buffer
+	err := reportFrom(ctx, stubSource{
+		world:   census.World{DBPath: worldDB(stage), Kind: "archive", Archive: "fwb-20260913T203100Z.tar.gz"},
+		cleanup: func() error { return errors.New("device or resource busy") },
+	}, census.DefaultReportOptions(), &out)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("reportFrom of a cancelled context returned %v, want it to still wrap context.Canceled", err)
+	}
+	if !strings.Contains(err.Error(), "device or resource busy") {
+		t.Errorf("error hides the cleanup failure: %v", err)
+	}
+	if !strings.Contains(err.Error(), "fwb-20260913T203100Z.tar.gz") {
+		t.Errorf("error does not name the archive left extracted: %v", err)
+	}
+}
+
+func TestReportFromSurfacesACleanupFailureAfterASuccessfulRun(t *testing.T) {
+	stage := stageWorld(t, zombieRecord(t))
+
+	var out bytes.Buffer
+	err := reportFrom(context.Background(), stubSource{
+		world:   census.World{DBPath: worldDB(stage), Kind: "archive", Archive: "fwb-20260913T203100Z.tar.gz"},
+		cleanup: func() error { return errors.New("device or resource busy") },
+	}, census.DefaultReportOptions(), &out)
+
+	if err == nil || !strings.Contains(err.Error(), "device or resource busy") {
+		t.Errorf("reportFrom returned %v, want the cleanup failure", err)
 	}
 }
