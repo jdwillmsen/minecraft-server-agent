@@ -29,12 +29,45 @@ type Welcome struct {
 	// agent must never react in the first moments of a session.
 	delay time.Duration
 	log   *logging.Logger
+	// conns tells a waiting greeting whether the connection that reported
+	// the arrival is still the one being played. Nil unless
+	// WithGreetConnections is passed, which leaves every existing caller and
+	// test greeting unconditionally.
+	conns Connections
+}
+
+// WelcomeOption configures a Welcome at construction.
+type WelcomeOption func(*Welcome)
+
+// WithGreetConnections stops a greeting whose connection ended during its
+// delay from being spoken.
+//
+// The greeting waits seconds, and the console bridge it speaks through is a
+// separate process that answers whether this one is in the game or not, so
+// nothing else stops it. The connection can end inside that wait for either
+// of the two reasons the agent ever leaves: a dropped session, whose
+// replacement reports the same player again, or the lock passing to another
+// process, which is already in the game this one would be broadcasting into.
+func WithGreetConnections(c Connections) WelcomeOption {
+	return func(w *Welcome) { w.conns = c }
 }
 
 // NewWelcome builds the welcome plugin. rootCtx should be the process
 // lifetime context (cancelled on shutdown), not a per-request one.
-func NewWelcome(rootCtx context.Context, delay time.Duration, log *logging.Logger) *Welcome {
-	return &Welcome{rootCtx: rootCtx, delay: delay, log: log}
+func NewWelcome(rootCtx context.Context, delay time.Duration, log *logging.Logger, opts ...WelcomeOption) *Welcome {
+	w := &Welcome{rootCtx: rootCtx, delay: delay, log: log}
+	for _, opt := range opts {
+		opt(w)
+	}
+	return w
+}
+
+// stale reports whether the connection that reported this arrival has ended.
+// The player is no longer this process's to greet: whoever is in the game
+// now has seen them itself, and a line spoken here lands in a server this
+// process is not playing on.
+func (w *Welcome) stale(generation uint64) bool {
+	return w.conns != nil && w.conns.Generation() != generation
 }
 
 func (*Welcome) Name() string { return "welcome" }
@@ -85,6 +118,9 @@ func (w *Welcome) greetAfterDelay(voice plugin.Voice, join roster.JoinEvent, pro
 	select {
 	case <-time.After(w.delay):
 	case <-w.rootCtx.Done():
+		return
+	}
+	if w.stale(join.Generation) {
 		return
 	}
 

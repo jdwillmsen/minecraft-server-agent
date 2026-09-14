@@ -332,7 +332,7 @@ func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer p
 		plugins.NewStats(),
 		plugins.NewKnowledge(),
 		plugins.NewWaypoints(),
-		plugins.NewWelcome(ctx, welcomeDelay, log),
+		plugins.NewWelcome(ctx, welcomeDelay, log, plugins.WithGreetConnections(conns)),
 		plugins.NewAnnounce(),
 		plugins.NewAnnounceDrain(ctx, deliverer, announceDrainDelay, log, plugins.WithConnections(conns)),
 		mod,

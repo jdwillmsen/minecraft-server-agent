@@ -260,6 +260,13 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 		return "Queued for " + displayName + ".", nil
 	case target == announce.TargetPlayer:
 		return "Told " + displayName + ".", nil
+	case sent.Queued:
+		// Nothing was spoken: this process is not the one playing the agent
+		// right now, so the row is stored for whichever one is. Reported
+		// rather than folded into "Announced." -- the operator watching
+		// chat for their own line would otherwise wait for one that this
+		// process was never going to say.
+		return "Queued - I am not the live agent right now, so the one that is will deliver it.", nil
 	case target == announce.TargetOnlineOnly && sent.Players == 0:
 		// online_only is the one target with no queue behind it, so nobody
 		// hearing it now means nobody ever will.

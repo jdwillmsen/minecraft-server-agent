@@ -510,10 +510,14 @@ pending.
 
 Only a roster that cannot answer earns that, and only for the live agent.
 "Cannot answer" is two states, not one: the gap between connections, and the
-moments after a connection opens before its first roster packet arrives -
-the agent is in the game there, but has not been told who else is, and the
-world may well be full. An empty roster the agent *has* been told is right:
-nobody is on, and nothing is spoken, exactly as before.
+moments after a connection opens before that connection has described who is
+here - the agent is in the game there, but has not been told who else is,
+and the world may well be full. The opening packet does not settle it: the
+server names this client alone first and sends the roster behind it, so a
+list holding nobody but the agent is one packet short of an answer, not an
+empty server. What settles it is a packet naming somebody else, or the
+agent's own entry a second time - which is exactly what an empty server
+sends, and there the answer really is nobody: nothing is spoken, as before.
 
 The other half is leadership. The announcement API is served by every pod,
 including a warm standby, whose roster never learns anything and whose

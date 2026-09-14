@@ -256,16 +256,17 @@ func (o *outbox) MarkDelivered(ctx context.Context, id int64, xuid string, at ti
 
 func (o *outbox) Enabled() bool { return o.store.Enabled() }
 
-// ensure creates the players row xuid's foreign keys need, when the roster
-// can still say who they are.
+// ensure creates the players row xuid's foreign keys need, for any XUID this
+// process has ever seen named -- including one who has since left, since the
+// names behind it outlive the session that taught them.
 //
 // An unresolvable name is left alone rather than filled in with the XUID:
 // current_gamertag is what every human-facing report and the rename history
 // read from, and a placeholder invented here would outlive the moment that
 // produced it. The write that follows either succeeds, because the row was
 // already there, or fails its foreign key and is logged by its caller —
-// which is what happened before this existed, for a case that needs a
-// player to have left between being chosen as a recipient and being told.
+// which is what happened before this existed, for a recipient this process
+// has never watched arrive and so has no name for at all.
 //
 // A failure is logged and not returned for the same reason: the caller's
 // own write is worth attempting regardless, and it reports its own error.

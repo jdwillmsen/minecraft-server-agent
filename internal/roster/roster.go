@@ -91,16 +91,24 @@ type Roster struct {
 	// carrying at least one usable add. snapshotEnded is false until the
 	// server has finished describing the world to this client. Between the
 	// two, every add is a player who was already online -- see Apply.
-	//
-	// snapshotStarted is also what Knows() answers from: a usable add is
-	// both the start of the burst and the first thing the server has said
-	// about who is here. A removal says who left, an empty packet says
-	// nothing at all, and an add with no XUID carries nobody this Roster can
-	// key on; none of the three answers who is here, and treating one as an
-	// answer would have the roster report an empty server it has not been
-	// told about -- swallowing a broadcast that should have been spoken.
 	snapshotStarted bool
 	snapshotEnded   bool
+	// answered is false until the server has said who is on it in a way this
+	// Roster can report, which is what Knows() reads.
+	//
+	// Not snapshotStarted, because the packet that starts the snapshot names
+	// this client alone and the roster behind it is still one packet away:
+	// answering from it would report an empty server nobody has described,
+	// swallowing a broadcast that should have been spoken. Set instead by a
+	// packet adding somebody other than the agent, or by a second
+	// add-carrying packet -- an empty server sends the agent's entry twice
+	// and nothing else, and that repeat is the whole answer, which is that
+	// nobody is here.
+	//
+	// A removal says who left, an empty packet says nothing at all, and an
+	// add with no XUID carries nobody this Roster can key on; none of the
+	// three answers who is here.
+	answered bool
 	// names is the last gamertag each XUID was seen under. Kept apart from
 	// players because presence and identity stop being true at different
 	// moments: presence ends with the connection that reported it, a name
@@ -172,6 +180,7 @@ func (r *Roster) clearPresence() {
 	r.xuidByUUID = make(map[string]string)
 	r.snapshotStarted = false
 	r.snapshotEnded = false
+	r.answered = false
 }
 
 // Since reports when the current session began watching, as given to
@@ -221,7 +230,7 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entr
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	var namesAgent, adds bool
+	var namesAgent, namesOthers, adds bool
 	for _, e := range entries {
 		if e.Remove || e.XUID == "" {
 			continue
@@ -229,9 +238,12 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entr
 		adds = true
 		// An unset agentXUID matches nobody, since a usable add always
 		// carries one: a Roster never told who it is falls back to treating
-		// the first add of the session as the whole burst.
+		// the first add of the session as the whole burst, and to reading
+		// that first add as the server's answer about who is here.
 		if e.XUID == r.agentXUID {
 			namesAgent = true
+		} else {
+			namesOthers = true
 		}
 	}
 	if r.snapshotStarted && adds && !namesAgent {
@@ -239,6 +251,9 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entr
 	}
 	snapshot := !r.snapshotEnded
 	if adds {
+		if namesOthers || r.snapshotStarted {
+			r.answered = true
+		}
 		r.snapshotStarted = true
 	}
 
@@ -301,20 +316,20 @@ func (r *Roster) NameFor(xuid string) (name string, ok bool) {
 }
 
 // Knows reports whether this Roster can currently answer who is on the
-// server: true once any PlayerList of the live connection has been applied.
-// False in the gap between connections, and false again in the moments after
-// one opens before its first PlayerList arrives -- in both, an empty
-// Online() means "not known yet" rather than "nobody is here", and a caller
-// that cannot tell those apart will act on the wrong one.
+// server. False in the gap between connections, and false again in the
+// moments after one opens until the live connection has described who is
+// here -- in both, an empty Online() means "not known yet" rather than
+// "nobody is here", and a caller that cannot tell those apart will act on
+// the wrong one.
 //
-// Answered from snapshotStarted because the two coincide by construction:
-// the server opens a session by naming this client, so the first packet that
-// carries an add this Roster can key on is both the start of the snapshot
-// and the first word on who is here.
+// False for the opening packet too, which names this client and nobody else
+// -- the population arrives in the packet behind it, and a roster holding
+// only the agent is not an empty server. See answered for what does settle
+// it, and for why a second entry for the agent alone does.
 func (r *Roster) Knows() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.snapshotStarted
+	return r.answered
 }
 
 // IsOnline reports whether xuid is on the roster the current connection is

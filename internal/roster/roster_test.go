@@ -556,15 +556,43 @@ func TestAZeroEntryPacketDoesNotMakeTheRosterKnow(t *testing.T) {
 	}
 }
 
-// The opening list names the agent itself, so a connection to a server with
-// no other players still carries an entry and still says so.
-func TestTheOpeningPacketNamingOnlyTheAgentMakesTheRosterKnow(t *testing.T) {
+// The opening packet names this client alone and the roster follows it, so
+// a list holding nobody but the agent is one packet short of an answer.
+// Reading it as "told, and the answer is nobody" suppresses a broadcast
+// published in that window on a server that may be full, and an online-only
+// one never queues, so it would be gone.
+func TestTheOpeningPacketNamingOnlyTheAgentLeavesTheRosterUntold(t *testing.T) {
 	r := New()
 	r.BeginSession(time.Now(), agentEntry.XUID)
 
 	r.Apply([]PlayerListEntry{agentEntry})
 
+	if r.Knows() {
+		t.Error("Knows() after the agent's own entry alone = true, want false — the population arrives in the packet behind it")
+	}
+
+	r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
+
 	if !r.Knows() {
-		t.Error("Knows() after the opening list = false, want true — the server has said who is here, and it is nobody but the agent")
+		t.Error("Knows() after the roster behind it = false, want true")
+	}
+}
+
+// An empty server sends the agent its own entry twice and nothing else, so
+// the repeat is the whole answer: nobody else is here. Left unanswered,
+// every broadcast to an idle server would be spoken into an empty world and
+// reported as a reach nobody could count.
+func TestTheAgentsEntryArrivingTwiceMakesTheRosterKnow(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+
+	r.Apply([]PlayerListEntry{agentEntry})
+	r.Apply([]PlayerListEntry{agentEntry})
+
+	if !r.Knows() {
+		t.Error("Knows() after the agent's entry twice = false, want true — the server has said who is here, and it is nobody but the agent")
+	}
+	if len(r.Online()) != 1 {
+		t.Errorf("Online() = %+v, want the agent alone", r.Online())
 	}
 }

@@ -48,8 +48,11 @@ type fakeAnnounceDeliverer struct {
 	// default, which is what a real deliverer reports for a target who is
 	// offline -- the case the queue exists for. uncounted overrides it with
 	// the answer a blind broadcast gives: it was said, nobody can be named.
-	sentNow        int
-	uncounted      bool
+	sentNow   int
+	uncounted bool
+	// queued is the answer a process that does not speak gives: nothing was
+	// said, and the stored row is the live agent's to deliver.
+	queued         bool
 	sendErr        error
 	drainXUID      string
 	drainCount     int
@@ -66,6 +69,9 @@ func (f *fakeAnnounceDeliverer) SendNow(_ context.Context, a announce.Announceme
 	f.sent = append(f.sent, a)
 	if f.uncounted {
 		return announce.Reach{}, nil
+	}
+	if f.queued {
+		return announce.Reach{Counted: true, Queued: true}, nil
 	}
 	return announce.Reach{Players: f.sentNow, Counted: true}, nil
 }
@@ -837,5 +843,32 @@ func TestAnnounceNowDoesNotBlameTheRosterForAWhisperItCouldNotRecord(t *testing.
 	}
 	if !strings.Contains(strings.ToLower(reply), "record") {
 		t.Errorf("reply %q should say the record is what failed", reply)
+	}
+}
+
+// A publish that lands on a process which is not the live agent says
+// nothing: the row is stored for whoever is. Answering "Announced." there
+// claims a broadcast that was never spoken, and the operator watching chat
+// waits for a line this process was never going to say.
+func TestAnnounceDoesNotClaimABroadcastItOnlyQueued(t *testing.T) {
+	cmd := announceCommand(t, "announce")
+	pctx := &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: true},
+		Deliverer:     &fakeAnnounceDeliverer{queued: true},
+	}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"server", "restarting", "in", "5"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if reply == "Announced." {
+		t.Errorf("reply %q claims a broadcast nothing spoke", reply)
+	}
+	if !strings.Contains(strings.ToLower(reply), "queued") {
+		t.Errorf("reply %q should say the announcement is queued for the live agent", reply)
 	}
 }

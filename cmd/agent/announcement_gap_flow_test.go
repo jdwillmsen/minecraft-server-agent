@@ -334,18 +334,20 @@ func (g *connectionGap) broadcastNow(t *testing.T, body string) bool {
 	return len(g.voice.spoken()) > before
 }
 
-// TestABlindBroadcastTellsNotKnownApartFromNobody walks the three states an
-// empty roster can mean, which the deliverer must not treat alike. Two of
+// TestABlindBroadcastTellsNotKnownApartFromNobody walks the four states an
+// empty roster can mean, which the deliverer must not treat alike. Three of
 // them are "who is here is not known", where the console bridge is a separate
 // process that still reaches the server and an online-only announcement has
-// no second chance; the third is a roster that has been told who is here and
+// no second chance; the fourth is a roster that has been told who is here and
 // names nobody, where the message would be a console line no player could
 // hear.
 //
 // This test fails if the not-known states are read from the connection alone.
 // The agent is connected the instant it begins watching, a full packet before
 // its first roster arrives, so a publish landing there would be suppressed as
-// an idle server while the world may be full.
+// an idle server while the world may be full. It fails again if they are read
+// from the first packet that names anyone: that packet names this client
+// alone, one short of the roster behind it.
 func TestABlindBroadcastTellsNotKnownApartFromNobody(t *testing.T) {
 	at := time.Date(2026, 9, 13, 9, 0, 0, 0, time.UTC)
 	g := newConnectionGap(t, at)
@@ -365,13 +367,25 @@ func TestABlindBroadcastTellsNotKnownApartFromNobody(t *testing.T) {
 		t.Error("silent before the opening roster arrived — the server may be full and the agent simply not told yet")
 	}
 
-	// Told, and the only name on it is the agent's own, which the audience
-	// filters out: genuinely nobody to hear it.
+	// The opening packet carries the agent's own entry alone, with the
+	// roster still behind it: a list holding nobody but the agent is not yet
+	// the server's answer, and the world may be full.
 	g.apply(t, addEntry(selfXUID, "ServerAgent"))
 	if online := g.audience.Online(); len(online) != 0 {
 		t.Fatalf("audience = %v, want nobody — this case proves nothing if someone is on", online)
 	}
-	if g.broadcastNow(t, "three: watching an empty server") {
+	if !g.broadcastNow(t, "three: the opening packet, before the roster behind it") {
+		t.Error("silent on the agent's own entry arriving alone — the roster behind it has not been read yet, and the server may be full")
+	}
+
+	// Told, and the only name on it is the agent's own, which the audience
+	// filters out: an empty server repeats that entry and sends nothing
+	// else, so now there is genuinely nobody to hear it.
+	g.apply(t, addEntry(selfXUID, "ServerAgent"))
+	if online := g.audience.Online(); len(online) != 0 {
+		t.Fatalf("audience = %v, want nobody — this case proves nothing if someone is on", online)
+	}
+	if g.broadcastNow(t, "four: watching an empty server") {
 		t.Error("spoke to an empty server the agent is watching — the roster is right, there is nobody there")
 	}
 }
