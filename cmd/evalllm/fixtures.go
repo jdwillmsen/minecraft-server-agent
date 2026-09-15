@@ -127,6 +127,13 @@ var errReadOnly = errors.New("the evaluation fixtures are read-only")
 // Generous on purpose, so a knowledge miss in the suite is a topic that is
 // genuinely absent rather than an artifact of a stricter search than
 // Postgres runs.
+//
+// Generous also means it reproduces production's over-matching, which is
+// the whole point of the knowledge_miss cases: "where is the slime farm"
+// finds the gold farm here for the same reason it does in Postgres. So it
+// must grade its hits the way Postgres grades them too -- a fixture that
+// returned every row as a confirmed hit made the hedge unmeasurable, and a
+// case that depends on it would fail no matter what production does.
 type fixtureKnowledge struct{}
 
 var _ plugin.KnowledgeStore = fixtureKnowledge{}
@@ -145,7 +152,7 @@ func (fixtureKnowledge) Lookup(_ context.Context, query string, limit int) ([]kn
 		score := 0
 		for _, w := range wanted {
 			for _, h := range have {
-				if sameStem(w, h) {
+				if knowledge.SameStem(w, h) {
 					score++
 					break
 				}
@@ -160,6 +167,7 @@ func (fixtureKnowledge) Lookup(_ context.Context, query string, limit int) ([]kn
 	for i := 0; i < len(hits) && i < limit; i++ {
 		out = append(out, hits[i].entry)
 	}
+	knowledge.MarkPartialMatches(query, out)
 	return out, nil
 }
 
@@ -167,37 +175,20 @@ func (fixtureKnowledge) Upsert(context.Context, string, string, string) error { 
 func (fixtureKnowledge) Delete(context.Context, string) (bool, error)         { return false, errReadOnly }
 func (fixtureKnowledge) List(context.Context) ([]knowledge.Entry, error)      { return fixtureEntries, nil }
 
-// searchStopwords are words that would match nearly every fact and so say
-// nothing about which one a player meant.
-var searchStopwords = map[string]bool{
-	"the": true, "and": true, "for": true, "are": true, "was": true, "how": true,
-	"can": true, "what": true, "where": true, "when": true, "who": true, "why": true,
-	"does": true, "you": true, "your": true, "with": true, "there": true, "this": true,
-	"that": true, "have": true, "has": true, "its": true, "any": true, "about": true,
-}
-
+// searchWords keeps the words that say something about which fact a player
+// meant, asking production which those are rather than keeping a list here:
+// two lists drifted once already, and a fixture that scores a word
+// production drops passes a case the agent would fail.
 func searchWords(s string) []string {
 	var out []string
 	for _, w := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	}) {
-		if len(w) >= 3 && !searchStopwords[w] {
+		if knowledge.SignificantWord(w) {
 			out = append(out, w)
 		}
 	}
 	return out
-}
-
-// sameStem stands in for Postgres's stemming closely enough for the
-// fixtures: "farms" finds "farm" and "restart" finds "restarts".
-func sameStem(a, b string) bool {
-	if a == b {
-		return true
-	}
-	if len(a) < 4 || len(b) < 4 {
-		return false
-	}
-	return strings.HasPrefix(a, b) || strings.HasPrefix(b, a)
 }
 
 type fixtureWaypointStore struct{}
