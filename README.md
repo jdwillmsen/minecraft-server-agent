@@ -433,6 +433,32 @@ is injected by the answer loop itself and never taken from the model's
 output, which is what stops one player's question from reading another
 player's waypoints.
 
+That same injection is why one question is answered without the model at
+all. Asked for saved coordinates belonging to another player - "where is
+Steve's base", or the same thing worded as "the waypoint called base for
+Alex" - the agent answers in code that only the asker's own waypoints are
+readable. No tool can answer it: `waypoint_lookup` takes a waypoint name
+and nothing else, so the owner the question named never reaches it, and
+what does come back - the asker's own coordinates, truthfully and in the
+first person - was measured being re-framed under whichever name the
+question used. Wording that result as the asker's own and forbidding the
+re-framing in the system prompt were both tried first, and neither moved
+it, because both leave the sentence for the model to write. Detection
+needs both halves, a word for saved coordinates and an owner who is not
+the asker, so a question carrying only one of them - "where is the gold
+farm", "what is Steve building" - still reaches the model with its tools.
+A question that reads as neither - "what are the coords of Steve" - does
+reach the model, and the same reading is applied a second time to the
+reply it wrote, but only where `waypoint_lookup` actually ran for that
+answer: there the model has spelled the attribution out, and a reply
+hanging the asker's own coordinates on another player's name is replaced
+with the same sentence. Either way the sentence names no coordinates, and
+it goes through the same length budget and no-question rule as any other
+reply. Caught before the loop nothing is looked up at all, so there is
+nothing to whisper; caught after it, the answer is whispered like any
+other built from the asker's own waypoints, which costs nothing, since
+the sentence that replaces it carries no coordinates to publish.
+
 An answer is broadcast, because an `@server` question is asked in public
 and an answer only the asker sees reads to everyone else as no answer at
 all. The exception is an answer the model built by calling
@@ -1236,7 +1262,11 @@ content, grounding (below), no tool-call markup or markdown, privacy
 length against the chat limit, not ending on a question, and latency.
 Markup, questions, length and grounding are judged on what the model wrote,
 before the agent's own cleanup, so the report measures the model rather
-than the cleanup. The report is markdown on stdout.
+than the cleanup. A question the agent answers in code rather than putting
+to the model - another player's waypoints, above - reaches no model at
+all, so those cases score the answer, its content and privacy, and skip
+the dimensions read off the model's own text. The report is markdown on
+stdout.
 
 Grounding fails a reply that states a server version or a player count the
 fixture world contradicts — the failure a case expecting no tool call

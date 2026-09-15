@@ -485,12 +485,41 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 		return "", nil
 	}
 
+	// Asked before the loop, so that a question already recognisable as
+	// another player's is never put to the model at all: a reply the model
+	// never wrote is the only version of this answer it cannot re-frame,
+	// and the round trip it would take to write one buys nothing here. The
+	// same question is asked again of the reply, below, for the phrasings
+	// no question-side reading catches. Everything the loop's exit
+	// applies still applies -- the reply leaves through cleanReply like any
+	// other, so the chat budget and the no-question rule hold -- and
+	// everything upstream in handleMention is untouched, since this sits
+	// inside the same call the whole answer path already makes.
+	//
+	// No tool runs on this path, so the asking player's own coordinates are
+	// never read and the answer is never marked personal. That is not a lost
+	// whisper: the reply carries no coordinates at all, so there is nothing
+	// a broadcast could publish.
+	//
+	// Gated on the tool being registered, for the reason Build omits it: a
+	// deployment with no waypoint store has no waypoints to be asked about,
+	// and a refusal naming a capability it does not have is its own wrong
+	// answer. The question is truncated first so this reads exactly the
+	// question the model would have been given, never more of it.
+	if registry.Has(waypointLookupTool) &&
+		waypointQuestionNamesAnotherPlayer(asker, text.Truncate(question, MaxQuestionChars)) {
+		return cleanReply(otherPlayerWaypointReply), nil
+	}
+
 	_, _, initial := c.BuildRequest(asker, question)
 	messages := initial.Messages
 	// A refusal written while calling a tool, which the player has not heard
 	// because only the round that answers is spoken. Kept so the round that
 	// answers can be made to carry it.
 	var unheard string
+	// Whether the asker's own coordinates reached the model on this answer,
+	// which is the only way a reply can misattribute them.
+	var readAWaypoint bool
 
 	for round := 0; ; round++ {
 		body := chatRequest{Model: c.model, MaxTokens: c.maxTokens, Messages: messages}
@@ -513,7 +542,20 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 		// its next turn.
 		calls = withNonEmptyIDs(calls)
 		if len(calls) == 0 || round >= MaxToolRounds {
-			return cleanReply(withUnheardRefusal(unheard, cutToolMarkup(messageContent(payload)))), nil
+			reply := cleanReply(withUnheardRefusal(unheard, cutToolMarkup(messageContent(payload))))
+			// The durable half of the same boundary. A question naming an
+			// owner without a possessive and without the word waypoint --
+			// "what are the coords of Steve" -- reads as any other question
+			// and reaches the model, which then has the asker's own
+			// coordinates in hand and the question's name to hang them on.
+			// Read back off the finished reply the attribution is
+			// unambiguous, because the model has written it. Gated on the
+			// lookup having actually run, so a reply built from anything
+			// else is left exactly as written.
+			if readAWaypoint && waypointQuestionNamesAnotherPlayer(asker, reply) {
+				return cleanReply(otherPlayerWaypointReply), nil
+			}
+			return reply, nil
 		}
 
 		// The text the model wrote in the same turn as its tool calls belongs
@@ -544,6 +586,9 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 			ToolCalls: calls,
 		})
 		for _, call := range calls {
+			if call.Function.Name == waypointLookupTool {
+				readAWaypoint = true
+			}
 			result, err := registry.Invoke(ctx, call.Function.Name, json.RawMessage(call.Function.Arguments), callerXUID)
 			metrics.ToolCall(toolLabel(registry, call.Function.Name), err)
 			if err != nil {
