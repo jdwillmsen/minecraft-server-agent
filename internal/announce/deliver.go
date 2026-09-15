@@ -397,6 +397,18 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		return reached(delivered + heard), nil
 	}
 
+	// The same guard the broadcast path applies above, and for the same
+	// reason: a demoted leader's roster outlives its turn by however long
+	// the connect loop takes to unwind, and the console bridge stays up for
+	// both roles. Asking the roster instead would let a Tell land in the
+	// game the next leader already owns -- and the row recording it would
+	// make that leader's join drain skip a whisper nobody ever read, which
+	// nothing else retries.
+	if !d.live() {
+		d.log.Info("announce_tell_skipped_not_live", logging.Fields{"announcement_id": id, "recipients": len(targets)})
+		return d.nothingSent(a.TargetKind), nil
+	}
+
 	if len(targets) == 0 {
 		// Nobody to whisper to and nothing to record; the announcement
 		// stays pending in the store (if it queues at all) for whoever

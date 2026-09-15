@@ -1573,3 +1573,56 @@ func TestSendNowStillBroadcastsFromTheLeaderWithPlayersOnTheRoster(t *testing.T)
 		t.Errorf("sent = %+v, want two counted players", sent)
 	}
 }
+
+// The whisper twin of the broadcast guard above. A demoted leader still names
+// the players its roster learned, and a Tell is addressed off that roster
+// rather than off the role -- so without the same guard, the process on its
+// way out of the game whispers into the one the new leader now owns. The row
+// it would write is the real damage: a delivery nothing retries, marking a
+// whisper as read by a player who never saw it.
+func TestSendNowDoesNotWhisperFromADemotedLeaderThatStillNamesPlayers(t *testing.T) {
+	a := Announcement{Body: "your waypoint is at 100 64 -200", TargetKind: TargetPlayer, TargetValue: "steve"}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice,
+		fakeRoster{online: []string{"steve", "alex"}},
+		fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: false}))
+
+	sent, err := d.SendNow(context.Background(), a, 83)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.tells) != 0 {
+		t.Errorf("Tell calls = %v, want none — this process no longer holds the lock", voice.tells)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing: nothing was whispered", store.delivered)
+	}
+	if !sent.Queued {
+		t.Errorf("sent = %+v, want it queued for whoever holds the lock", sent)
+	}
+}
+
+// The same roster on the process that does hold the lock still whispers and
+// still records, so the guard is the role and not the players.
+func TestSendNowStillWhispersFromTheLeaderWithPlayersOnTheRoster(t *testing.T) {
+	a := Announcement{Body: "your waypoint is at 100 64 -200", TargetKind: TargetPlayer, TargetValue: "steve"}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice,
+		fakeRoster{online: []string{"steve", "alex"}},
+		fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: true}))
+
+	sent, err := d.SendNow(context.Background(), a, 84)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.tells) != 1 || voice.tells[0].xuid != "steve" {
+		t.Errorf("tells = %+v, want exactly one Tell to steve", voice.tells)
+	}
+	if !sent.Counted || sent.Players != 1 {
+		t.Errorf("sent = %+v, want one counted player", sent)
+	}
+}
