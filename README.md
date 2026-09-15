@@ -475,9 +475,10 @@ that did not happen, never as a server nobody was on. Where the target still
 queues, that answer names what is owed as well as what failed, so an
 operator does not send a second copy of a message the next join will
 deliver; `!now` is the one target with no queue to fall back on, so nobody
-hearing it means nobody ever will. A broadcast to a watched server that
-nobody is on was never spoken either, and says so rather than reporting an
-announcement.
+hearing it means nobody ever will. An announcement with nobody to say it
+to - a broadcast to a watched server nobody is on, a permission nobody
+online holds - was never spoken either, and says so rather than reporting
+an announcement.
 
 `!inbox` is member level and only ever drains the caller's own queue - no
 argument names another player's, the same restriction `!wp` places on whose
@@ -551,13 +552,19 @@ player who asked for it. The next connection replaces those names as it
 reports them.
 
 A resolvable name is never taken as proof that a player is still here.
-Anything whose record would claim the player saw it asks the roster's online
-list first: the console accepts a `tellraw` matching nobody and reports
-success, so a send alone proves nothing. An announcement backlog whose drain
-was scheduled by an arrival is not whispered to someone who quit during its
-wait - and the "N more messages are waiting" trailer is not sent either,
-since everything is still owed because they left rather than because the
-per-join cap held it back. What they are owed survives for their next join.
+Anything whose record would claim the player saw it asks the roster first,
+and withholds only on a roster that says the player has gone: the console
+accepts a `tellraw` matching nobody and reports success, so a send alone
+proves nothing, while a roster that has not been told who is here has not
+said anyone left either. An announcement backlog whose drain was scheduled
+by an arrival is not whispered to someone who quit during its wait - and the
+"N more messages are waiting" trailer is not sent either, since everything is
+still owed because they left rather than because the per-join cap held it
+back. What they are owed survives for their next join. A roster that has
+merely gone quiet does not stop that drain: the player has just given
+evidence of being here - the arrival that scheduled it, or the `!inbox` they
+typed - and what bounds the drain instead is its own lifetime, a join drain
+ending with the connection and an `!inbox` one with the dispatch timeout.
 
 A moderation warning is the same question with a different record. A player
 who has left is not warned, and the flag is recorded as *logged* rather than
