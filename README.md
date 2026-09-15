@@ -839,16 +839,22 @@ curl -sS -X POST http://<agent>:8080/announcements \
   recipients could not be fully accounted for - the agent could not see who
   was on the server (its reconnect gap, or the moments after a connection
   opens before the first roster packet), nobody could be named as having
-  heard it because every recipient left or was still loading, the connection
-  died during the send, or a delivery row would not write. Whoever it reached
-  has already seen it, whether it was broadcast to the server or whispered to
-  one player. `null` is the one value that is never safe to retry on: the
-  line has already gone out, and publishing again says it twice.
-- A count excludes a broadcast recipient who left during the send or whose
-  client was still loading when it went out: they are accounted for, not
-  unknown - nothing was recorded for them, so the queue still owes them the
-  line on their next join. `reached` can therefore be smaller than the number
-  who were online a moment earlier without being `null`.
+  heard it because every recipient left or had only just arrived, the
+  connection died during the send, or a delivery row would not write.
+  Whoever it reached has already seen it, whether it was broadcast to the
+  server or whispered to one player. `null` is the one value that is never
+  safe to retry on: the line has already gone out, and publishing again says
+  it twice.
+- A count excludes a broadcast recipient who left during the send, and one
+  whose own arrival the agent watched land moments before it: they are
+  accounted for, not unknown - their client was still loading, nothing was
+  recorded for them, and the queue still owes them the line on their next
+  join. A recipient held back only because the *agent* has just connected is
+  counted as having heard it: that is a guess about who might be loading
+  rather than an arrival anyone saw, one broadcast reaches every client that
+  is up, and only their delivery row was withheld. `reached` can therefore be
+  smaller than the number who were online a moment earlier without being
+  `null`.
 - `reached: 0` means nothing was spoken, so retrying will not repeat
   anything in chat. It does **not** mean nothing was stored: every target
   except `online_only` queues, so a retry adds a second announcement and the
