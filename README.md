@@ -177,7 +177,8 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   other out of the game during a release - see "Handing over to a standby"
   below
 - `internal/httpapi` - `/healthz`, `/readyz` (the live agent's real Bedrock
-  session state, or a warm standby's deliberate wait - both are ready),
+  session state, or a standby's wait, which are the two ready answers; a pod
+  still starting is the third role and is not ready), the role itself,
   `/metrics`, and `POST /announcements` when `ANNOUNCE_API_TOKEN` is set
 - `internal/metrics` - every series the agent exports beyond the session
   gauge and reconnect counter; callers record through small functions and
@@ -240,7 +241,7 @@ breaking change.
 | Name | Type | Labels | Recorded |
 |---|---|---|---|
 | `mc_agent_connected` | gauge | none | 1 while a Bedrock session is up |
-| `mc_agent_leader` | gauge | none | 1 while this process is the live agent, 0 while it is a warm standby |
+| `mc_agent_leader` | gauge | none | 1 while this process is the live agent, 0 while it is anything else - a warm standby, or a process still starting |
 | `mc_agent_leader_unlocked` | gauge | none | 1 while this process is the live agent *without* holding the lock |
 | `mc_agent_reconnects_total` | counter | none | per reconnect attempt |
 | `mc_agent_commands_total` | counter | `command`, `outcome` | once per dispatch, beside the audit write |
@@ -466,6 +467,75 @@ re-reports everyone still online and gives them a delivery of their own -
 the same wait, from the connection that found them there - so a backlog is
 never stranded by a reconnect and never whispered twice. They are not
 greeted for it; they did not arrive.
+
+The welcome greeting waits out a delay of its own and belongs to its
+connection the same way. One whose connection ended before it was spoken is
+dropped rather than said into a game this process may no longer be playing
+in - either because the session dropped or because the lock passed to
+another pod, which owns the greetings in that game from then on.
+
+The roster stops holding anyone as present the moment the connection dies
+rather than when the next one opens. Between the two, nobody is being
+watched: an announcement published in that gap by a schedule, an event
+source or the HTTP API finds no recipients to record. Held onto, the roster
+would name whoever was online when the connection died, and one of them may
+already have left - recording a delivery against them loses that message
+for good.
+
+Gamertags are kept across the gap even though presence is not, because the
+two stop being true at different moments. A reply the model was still
+writing when the connection dropped goes out over the console bridge, which
+is a separate process and still answers, and a whisper needs a name to aim
+at - so an `@server` answer that outlives its connection still reaches the
+player who asked for it. The next connection replaces those names as it
+reports them.
+
+A resolvable name is never taken as proof that a player is still here.
+Anything whose record would claim the player saw it asks the roster's online
+list first: the console accepts a `tellraw` matching nobody and reports
+success, so a send alone proves nothing. An announcement backlog whose drain
+was scheduled by an arrival is not whispered to someone who quit during its
+wait - and the "N more messages are waiting" trailer is not sent either,
+since everything is still owed because they left rather than because the
+per-join cap held it back. What they are owed survives for their next join.
+
+A moderation warning is the same question with a different record. A player
+who has left is not warned, and the flag is recorded as *logged* rather than
+*warned*, so no row claims a warning was displayed to someone who could not
+see it. The warning itself is not spent either: their next visit still gets
+one.
+
+What the gap makes unknowable is who was online, not whether the server can
+speak. So an announcement to everyone or to whoever is online is still
+broadcast in the gap and heard by whoever is there - it simply records
+nothing, which leaves a queued one pending for the join that follows and
+gives an online-only one its only chance to be heard at all. An
+announcement addressed to a player or to a permission is whispered, and a
+whisper needs someone to send it to, so that one stays silent and stays
+pending.
+
+Only a roster that cannot answer earns that, and only for the live agent.
+"Cannot answer" is two states, not one: the gap between connections, and the
+moments after a connection opens before that connection has described who is
+here - the agent is in the game there, but has not been told who else is,
+and the world may well be full. The opening packet does not settle it: the
+server names this client alone first and sends the roster behind it, so a
+list holding nobody but the agent is one packet short of an answer, not an
+empty server. What settles it is a packet naming somebody else, or the
+agent's own entry a second time - which is exactly what an empty server
+sends, and there the answer really is nobody: nothing is spoken, as before.
+
+The other half is leadership. The announcement API is served by every pod,
+including a warm standby, whose roster never learns anything and whose
+console bridge is up like any other. Such a pod never speaks: the server
+belongs to whichever process holds the lock. What it does with a publish
+depends on whether the target queues - an announcement to everyone, to a
+named player or to a permission is stored there and delivered by the leader
+on the next join, while an `online_only` one, which never queues, is refused
+outright rather than stored for nothing to pick up. A process counts as a
+standby from startup until it actually takes the lock, and again the moment
+it loses one, so neither window can broadcast into a game it is not in. See
+"Handing over to a standby" and the API's own status codes below.
 
 A delivery already under way stops the same moment, between one message and
 the next. The connection ending cancels the drain where it stands, so the
@@ -699,6 +769,8 @@ curl -sS -X POST http://<agent>:8080/announcements \
        "priority": "normal",
        "expires_in_seconds": 3600}'
 # 201 {"id": 42, "reached": 3}
+# 201 {"id": 43, "reached": null}   # broadcast; the agent could not account for who heard it
+# 201 {"id": 44, "reached": 0, "queued": true}   # a standby took it; the live agent delivers it
 ```
 
 - `target.kind` is `everyone`, `player`, `permission` or `online_only`.
@@ -712,11 +784,46 @@ curl -sS -X POST http://<agent>:8080/announcements \
   queues and so takes none.
 - `201` carries the announcement id and how many players heard it
   immediately; the rest are the queue's to deliver.
+- `reached` is `null`, not `0`, whenever the announcement went out and the
+  recipients could not be fully accounted for - the agent could not see who
+  was on the server (its reconnect gap, or the moments after a connection
+  opens before the first roster packet), nobody could be named as having
+  heard it because every recipient left or was still loading, the connection
+  died during the send, or a delivery row would not write. Whoever it reached
+  has already seen it, whether it was broadcast to the server or whispered to
+  one player. `null` is the one value that is never safe to retry on: the
+  line has already gone out, and publishing again says it twice.
+- A count excludes a broadcast recipient who left during the send or whose
+  client was still loading when it went out: they are accounted for, not
+  unknown - nothing was recorded for them, so the queue still owes them the
+  line on their next join. `reached` can therefore be smaller than the number
+  who were online a moment earlier without being `null`.
+- `reached: 0` means nothing was spoken, so retrying will not repeat
+  anything in chat. It does **not** mean nothing was stored: every target
+  except `online_only` queues, so a retry adds a second announcement and the
+  next player to join is whispered the same line twice. Retry a `0` only
+  when you mean to publish again.
+- `queued: true` accompanies a `0` from a pod that is not the live agent, for
+  every target it accepts. It said nothing because it is in no game, and the
+  announcement it stored is the live agent's to deliver on the next join - so
+  this is the `0` least worth retrying, and it is distinguishable from the
+  one a watched, empty server gives.
 - `400` for an invalid request, including unknown fields and keys that
   differ in case or appear twice (keys match exactly), `401` without the
   right bearer token, `413` past the 16 KiB request cap, `422` for an
-  unknown player, `503` when announcements are not configured or the
-  database is not ready.
+  unknown player, `503` when announcements are not configured, when the
+  database is not ready, or when an `online_only` announcement reaches a pod
+  that is not the live agent.
+- The route is served by every pod, and a warm standby is in the Service
+  like any other, so a publish can land on one that is in no game. That
+  matters most during the live agent's own reconnect gap: its readiness
+  drops while it has no session, so the standby is the only pod left
+  answering. A target that queues - `everyone`, a named `player`, a
+  `permission` - is accepted there and stored: the pod says nothing itself,
+  and whoever holds the lock delivers it on the next join. `online_only` is
+  the one that cannot be, because it never queues, so a row stored by a pod
+  that will not speak would be picked up by nothing while the caller had
+  been told `201`. That one is refused with `503` and nothing is stored.
 
 The token is compared in constant time and checked before the body is
 read. With the variable unset the route is not mounted at all. The token is
@@ -798,6 +905,18 @@ soon as the server notices the socket is gone.
 | Live agent with no session, or dead on a respawn screen | `503` | `not ready` |
 | Warm standby waiting for the lock | `200` | `standby` |
 | Starting up, before either | `503` | `not ready` |
+
+A process runs through three states, not two: **starting** until it has paid
+the startup every role shares - the Xbox token above all - then **standby**
+while it waits for the lock, then **live** while it holds it, and standby
+again the moment it loses one. Starting is its own state because neither of
+the others is safe to assume there. Calling it live would let it act on a
+game it is not in: the announcement API is served for the whole process, so
+a publish can reach a pod that has not joined anything. Calling it standby
+would claim it can take over while it still owes an Xbox token refresh - and
+that claim is exactly what a rolling update removes the live agent on. An
+agent running without a database has no lock to wait for and goes live
+straight out of starting.
 
 A waiting standby is **ready**, which is deliberate twice over: it is a
 healthy pod doing exactly what it should, and a rolling update that waits for

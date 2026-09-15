@@ -167,6 +167,18 @@ func main() {
 	voice := adapters.NewBridgeVoice(bridgeClient, playerRoster)
 	audience := newDeliveryAudience(playerRoster, siblings)
 
+	// Built here rather than beside the routes it serves: it is where this
+	// process's role is recorded, and the Deliverer below has to read that to
+	// know whether it may speak into the game at all.
+	httpServer, err := httpapi.New(cfg.HTTPAddr)
+	if err != nil {
+		// A bind failure here (bad address, port already in use) means the
+		// agent would run with no /healthz, /readyz, or /metrics at all -
+		// worse than not starting, since nothing external would notice.
+		log.Error("http_bind_failed", logging.Fields{"error": err.Error()})
+		os.Exit(1)
+	}
+
 	// One Deliverer for the process, reached two ways: plugin.Context narrows
 	// it to what !announce and !inbox need, while the drain plugin needs
 	// DrainForJoin, which that interface deliberately does not carry. Two
@@ -184,6 +196,10 @@ func main() {
 		announcePermissions{resolver: permResolver},
 		log,
 		announce.WithFreshJoinGrace(joins, freshJoinGrace),
+		// A publish can reach any replica, because the announcement API is
+		// mounted for the process; only the one holding the lock is playing
+		// on the server a broadcast would be heard on.
+		announce.WithLeadership(httpServer),
 	)
 	// Wrapped only now: the stores above type-assert the concrete Postgres
 	// to borrow its pool, which the wrapper would hide from them.
@@ -214,14 +230,6 @@ func main() {
 	// leadership instead -- see startLiveWork.
 	startEventDispatch(ctx, eventBus, registry, pctx, log)
 
-	httpServer, err := httpapi.New(cfg.HTTPAddr)
-	if err != nil {
-		// A bind failure here (bad address, port already in use) means the
-		// agent would run with no /healthz, /readyz, or /metrics at all -
-		// worse than not starting, since nothing external would notice.
-		log.Error("http_bind_failed", logging.Fields{"error": err.Error()})
-		os.Exit(1)
-	}
 	// Same two-tier lookup !announce @player uses, so a name the API and the
 	// command resolve can never mean two different players.
 	apiOn := httpServer.MountAnnouncements(cfg.AnnounceAPIToken, deliverer, playerLookup{live: playerRoster, archive: playerStore}, log)
@@ -269,7 +277,15 @@ func main() {
 		// Ends with this turn, not with the process: the connect loop and
 		// every live-only writer below run under it, so losing the lock takes
 		// the agent out of the game without taking the process down.
-		liveCtx, endTurn := context.WithCancel(ctx)
+		//
+		// Standing down demotes the role first, so nothing that reads it acts
+		// on a game this process no longer has a claim to while the connect
+		// loop is still unwinding.
+		liveCtx, cancelTurn := context.WithCancel(ctx)
+		endTurn := func() {
+			httpServer.SetRole(httpapi.RoleStandby)
+			cancelTurn()
+		}
 		go endTermOnLockLoss(liveCtx, term, endTurn, log)
 		// A turn that began without the lock -- because whoever holds it is
 		// gone without having released it -- is a turn worth flagging for as
@@ -316,7 +332,7 @@ func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer p
 		plugins.NewStats(),
 		plugins.NewKnowledge(),
 		plugins.NewWaypoints(),
-		plugins.NewWelcome(ctx, welcomeDelay, log),
+		plugins.NewWelcome(ctx, welcomeDelay, log, plugins.WithGreetConnections(conns)),
 		plugins.NewAnnounce(),
 		plugins.NewAnnounceDrain(ctx, deliverer, announceDrainDelay, log, plugins.WithConnections(conns)),
 		mod,
@@ -400,6 +416,26 @@ func sampleOnce(ctx context.Context, pinger *adapters.ServerPinger, link func() 
 	}
 }
 
+// connectionEnded retires the session state a dead Bedrock connection left
+// behind, in the one place both halves of it are reset together.
+//
+// The connection is dead here, not merely about to be replaced, and the
+// console bridge is a separate process that still answers -- so anything
+// reading this state in the gap would speak into a server whose players are
+// reconnecting. Anything scheduled under the dead connection must abandon
+// rather than whisper to a client that is mid-load, which is what ending the
+// join clock's connection says. And nobody is being watched: held onto, the
+// roster would answer Online() with whoever was here when the connection
+// died, and an announcement published in the gap would be recorded as
+// delivered to players who may already have left, which nothing retries.
+//
+// A function rather than two statements inline so the gap is a state a test
+// can reach the way runConnectLoop reaches it.
+func connectionEnded(playerRoster *roster.Roster, joinClock *joinTimes) {
+	playerRoster.EndSession()
+	joinClock.disconnected()
+}
+
 // runConnectLoop owns the reconnect/backoff policy. Each iteration runs one
 // session to completion (or failure), then waits before trying again.
 func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, eventBus *bus.Bus, limiter *ratelimit.PerActor, httpServer *httpapi.Server, playerRoster *roster.Roster, audience *deliveryAudience, siblingXUIDs map[string]struct{}, permResolver *adapters.PermissionResolver, ans answering, playerStore store.Store, auditor audit.Store, link *linkMeter, joinClock *joinTimes) {
@@ -427,12 +463,7 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 		err := session(ctx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblingXUIDs, permResolver, ans, playerStore, auditor, link, joinClock)
 		lasted := time.Since(started)
 		httpServer.SetReady(false)
-		// The connection is dead here, not merely about to be replaced.
-		// Anything scheduled under it must abandon rather than speak into
-		// the gap: the bridge is a separate process and still answers, so a
-		// whisper sent now is accepted by a server whose players are
-		// reconnecting, and recorded against clients that are mid-load.
-		joinClock.disconnected()
+		connectionEnded(playerRoster, joinClock)
 
 		if ctx.Err() != nil {
 			return
@@ -823,6 +854,9 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 			adapters.NewMetricsClient(cfg.MCMonitorURL, cfg.BackupExporterURL, bridgeTimeout),
 		),
 		Directory: registry,
+		// The live roster again, asked the other question: not who a name
+		// belongs to, but whether they are still here to see what is sent.
+		Presence: playerRoster,
 		// store.Nop when no database is configured, never nil -- plugin.Context
 		// documents Profiles as possibly nil and the plugins guard for it, but
 		// this binary has no reason to hand them one.
@@ -1068,7 +1102,7 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 		if chat.IsSelfOrSibling(p.XUID, selfXUID, siblingXUIDs) {
 			continue
 		}
-		if _, stillHere := playerRoster.NameFor(p.XUID); !stillHere {
+		if !playerRoster.IsOnline(p.XUID) {
 			continue
 		}
 		if _, err := playerStore.ResumeSession(ctx, p.XUID, p.Username, time.Now()); err != nil {
@@ -1089,7 +1123,7 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 		if chat.IsSelfOrSibling(join.XUID, selfXUID, siblingXUIDs) {
 			continue
 		}
-		if _, stillHere := playerRoster.NameFor(join.XUID); !stillHere {
+		if !playerRoster.IsOnline(join.XUID) {
 			continue
 		}
 		log.Info("player_joined", logging.Fields{"xuid": join.XUID, "username": join.Username})
@@ -1106,7 +1140,7 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 			continue
 		}
 		log.Info("player_left", logging.Fields{"xuid": leave.XUID, "username": leave.Username})
-		if _, backAlready := playerRoster.NameFor(leave.XUID); !backAlready {
+		if !playerRoster.IsOnline(leave.XUID) {
 			// Still gone at the end of the packet, so this departure is the
 			// last word on them. When it isn't -- a removal and a re-add in
 			// one packet -- the arrival above is newer than this and must

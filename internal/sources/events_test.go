@@ -26,7 +26,7 @@ type recordingPublisher struct {
 	sent chan struct{}
 }
 
-func (p *recordingPublisher) Publish(_ context.Context, a announce.Announcement) (int64, int, error) {
+func (p *recordingPublisher) Publish(_ context.Context, a announce.Announcement) (int64, announce.Reach, error) {
 	p.mu.Lock()
 	p.got = append(p.got, a)
 	n := len(p.got)
@@ -34,7 +34,7 @@ func (p *recordingPublisher) Publish(_ context.Context, a announce.Announcement)
 	if p.sent != nil {
 		p.sent <- struct{}{}
 	}
-	return int64(n), 0, p.err
+	return int64(n), announce.Reach{Counted: true}, p.err
 }
 
 func (p *recordingPublisher) all() []announce.Announcement {

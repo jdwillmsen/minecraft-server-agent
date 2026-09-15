@@ -305,8 +305,8 @@ func TestBroadcastRecordsEveryPlayerAndOnlyPlayers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	if sent != 2 {
-		t.Errorf("delivered to %d, want 2 -- the agent counts itself an audience", sent)
+	if sent.Players != 2 || !sent.Counted {
+		t.Errorf("delivered to %+v, want 2 counted -- the agent counts itself an audience", sent)
 	}
 
 	got := store.deliveries()

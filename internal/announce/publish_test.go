@@ -48,6 +48,17 @@ type publishRoster []string
 
 func (r publishRoster) Online() []string { return r }
 
+func (r publishRoster) IsOnline(xuid string) bool {
+	for _, x := range r {
+		if x == xuid {
+			return true
+		}
+	}
+	return false
+}
+
+func (r publishRoster) Knows() bool { return true }
+
 type publishPerms map[string]string
 
 func (p publishPerms) Resolve(_ context.Context, xuid string) string { return p[xuid] }
@@ -66,8 +77,8 @@ func TestPublishStoresThenSendsAndDerivesDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
-	if id != 1 || sent != 1 {
-		t.Errorf("Publish = (id %d, sent %d), want (1, 1)", id, sent)
+	if id != 1 || sent.Players != 1 || !sent.Counted {
+		t.Errorf("Publish = (id %d, sent %+v), want (1, one counted player)", id, sent)
 	}
 	if got := s.inserted[0].Delivery; got != DeliveryWhisper {
 		t.Errorf("stored delivery = %s, want whisper", got)

@@ -23,7 +23,7 @@ import (
 // AnnouncementPublisher stores an announcement and sends it to whoever is
 // online. Satisfied by announce.Deliverer.
 type AnnouncementPublisher interface {
-	Publish(ctx context.Context, a announce.Announcement) (id int64, sent int, err error)
+	Publish(ctx context.Context, a announce.Announcement) (id int64, sent announce.Reach, err error)
 }
 
 // PlayerResolver turns a gamertag into an XUID, through the same two-tier
@@ -54,11 +54,15 @@ const (
 // With no token nothing is mounted, so the path answers the mux's own 404
 // like any path that was never there. A disabled API is indistinguishable
 // from an absent one, and there is no configuration in which it is open.
+//
+// Mounted for the process rather than for a turn as the live agent, because
+// the listener is: what changes with the role is the answer, not the route --
+// see the leadership refusal in the handler.
 func (s *Server) MountAnnouncements(token string, pub AnnouncementPublisher, players PlayerResolver, log *logging.Logger) bool {
 	if token == "" {
 		return false
 	}
-	s.mux.Handle("/announcements", announcementsHandler(token, pub, players, log, time.Now))
+	s.mux.Handle("/announcements", announcementsHandler(token, s.Live, pub, players, log, time.Now))
 	return true
 }
 
@@ -75,11 +79,20 @@ type announcementRequest struct {
 }
 
 type announcementResponse struct {
-	ID      int64 `json:"id"`
-	Reached int   `json:"reached"`
+	ID int64 `json:"id"`
+	// Reached is how many players heard it immediately, and null when the
+	// announcement was broadcast while the agent could not see who was on
+	// the server. Null rather than 0 on purpose: 0 means nobody heard it,
+	// and a caller retrying on that would broadcast into the server twice.
+	Reached *int `json:"reached"`
+	// Queued is present and true when the pod that took this request is not
+	// the live agent, so it said nothing itself and the stored announcement
+	// is the live agent's to deliver. Without it a caller could not tell
+	// that zero from the one an empty server gives.
+	Queued bool `json:"queued,omitempty"`
 }
 
-func announcementsHandler(token string, pub AnnouncementPublisher, players PlayerResolver, log *logging.Logger, now func() time.Time) http.Handler {
+func announcementsHandler(token string, live func() bool, pub AnnouncementPublisher, players PlayerResolver, log *logging.Logger, now func() time.Time) http.Handler {
 	// Compared as digests so the comparison runs over equal lengths:
 	// ConstantTimeCompare returns early on a length mismatch, which would
 	// tell a caller how long the token is.
@@ -112,8 +125,21 @@ func announcementsHandler(token string, pub AnnouncementPublisher, players Playe
 			writeError(w, status, msg)
 			return
 		}
+		// This route is mounted for the whole process and a standby answers
+		// /readyz, so it sits in the Service endpoints like any other pod --
+		// and during the live agent's own reconnect gap its readiness drops
+		// and the standby is the only pod left answering. A target that
+		// queues is still worth taking there: the row is stored, this
+		// process says nothing, and whoever holds the lock delivers it on
+		// the next join. Online-only is the one that cannot be: it never
+		// queues, so a row stored here would be picked up by nothing while
+		// the caller had been told it was created.
+		if !live() && !announce.Queues(a.TargetKind) {
+			writeError(w, http.StatusServiceUnavailable, "this process is not the live agent and an online_only announcement cannot be queued for one; retry so the request reaches the agent that is")
+			return
+		}
 
-		id, reached, err := pub.Publish(ctx, a)
+		id, sent, err := pub.Publish(ctx, a)
 		switch {
 		case errors.Is(err, announce.ErrDisabled), pgerr.NotMigrated(err):
 			writeError(w, http.StatusServiceUnavailable, "announcements are not configured")
@@ -132,7 +158,11 @@ func announcementsHandler(token string, pub AnnouncementPublisher, players Playe
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(announcementResponse{ID: id, Reached: reached})
+		resp := announcementResponse{ID: id, Queued: sent.Queued}
+		if sent.Counted {
+			resp.Reached = &sent.Players
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 }
 

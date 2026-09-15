@@ -13,18 +13,28 @@ import (
 )
 
 // Role is what this process is doing with the one game login the account
-// allows: playing, or waiting for its turn to.
+// allows: still getting ready for it, waiting its turn at it, or playing.
 type Role int32
 
 const (
-	// RoleLive is the process that holds the agent lock and the login. It is
-	// the zero value because it is what a process with no standby to hand
-	// over to has always been, and what an agent running without a database
-	// -- and so without a lock to wait for -- still is.
-	RoleLive Role = iota
+	// RoleStarting is a process that has bound this server but has not yet
+	// paid the startup every role shares -- the Xbox token above all, which
+	// can take seconds and, with an unusable auth cache, can block on a
+	// device-code login indefinitely.
+	//
+	// The zero value, because it is what a process is from the moment the
+	// listener answers, and because neither of the other two is safe to
+	// assume there. Live would let a process act on a game it is not in;
+	// standby would report a pod ready before it can take over, which is
+	// the readiness a rolling update removes the live agent on.
+	RoleStarting Role = iota
 	// RoleStandby is a process that has finished every part of its startup
-	// that does not need the login, and is waiting for the lock.
+	// that does not need the login, and is waiting for the lock. A
+	// deployment with no database has no lock to wait for and goes live
+	// straight out of starting instead -- see awaitLeadership.
 	RoleStandby
+	// RoleLive is the process that holds the agent lock and the login.
+	RoleLive
 )
 
 // Server is the agent's HTTP server.
@@ -62,19 +72,23 @@ func New(addr string) (*Server, error) {
 	// else already paid for, and calling that unready would both misreport a
 	// healthy pod and stall the rolling update that only removes the old pod
 	// once the new one is ready -- the update the standby exists to serve.
+	//
+	// A process still starting is neither, and is the one case that must not
+	// answer ready: it cannot take over yet, so a rolling update that
+	// believed it could would remove the live agent and leave the server
+	// with no agent at all until the successor finishes authenticating.
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		if Role(s.role.Load()) == RoleStandby {
+		switch role := Role(s.role.Load()); {
+		case role == RoleStandby:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("standby"))
-			return
-		}
-		if !s.ready.Load() {
+		case role == RoleLive && s.ready.Load():
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ready"))
+		default:
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte("not ready"))
-			return
 		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ready"))
 	})
 	mux.Handle("/metrics", metricsHandler())
 
@@ -103,8 +117,8 @@ func (s *Server) SetReady(ready bool) {
 	s.ready.Store(ready)
 }
 
-// SetRole records whether this process is the live agent or a standby waiting
-// for the lock.
+// SetRole records which of the three roles this process is in: still
+// starting, a standby waiting for the lock, or the live agent holding it.
 //
 // It also moves mc_agent_leader, rather than leaving that to a second call
 // from the same place: "which pod is live" is read from the metric by alerts
@@ -113,6 +127,21 @@ func (s *Server) SetReady(ready bool) {
 func (s *Server) SetRole(role Role) {
 	s.role.Store(int32(role))
 	setLeader(role == RoleLive)
+}
+
+// Live reports whether this process is the one currently holding the agent
+// lock, as last recorded by SetRole. False while it is still starting, which
+// is what keeps a process that has not won leadership from acting as though
+// it had.
+//
+// Read by anything in the process that may only act once, not once per
+// replica: the announcement API is mounted for the process rather than for a
+// turn as the live agent, so a request landing on a standby reaches code that
+// would otherwise speak into the server the live agent is playing on. This
+// answers from the same atomic /readyz and mc_agent_leader answer from, so
+// there is no second place for "which pod is live" to be decided.
+func (s *Server) Live() bool {
+	return Role(s.role.Load()) == RoleLive
 }
 
 // ListenAndServe blocks serving HTTP on the listener bound by New, until the

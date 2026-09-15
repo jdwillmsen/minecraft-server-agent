@@ -75,7 +75,7 @@ func TestEveryWhisperInAJoinDrainIsCounted(t *testing.T) {
 	}
 
 	sent := deliveryDelta(t, "whisper", "sent", func() {
-		d := NewDeliverer(&fakeStore{enabled: true, pending: pending}, &fakeVoice{}, fakeRoster{}, fakePermissions{}, testLogger())
+		d := NewDeliverer(&fakeStore{enabled: true, pending: pending}, &fakeVoice{}, fakeRoster{online: []string{"xuid-1"}}, fakePermissions{}, testLogger())
 		if _, _, err := d.DrainForJoin(context.Background(), "xuid-1", time.Now()); err != nil {
 			t.Fatalf("DrainForJoin: %v", err)
 		}
@@ -86,7 +86,7 @@ func TestEveryWhisperInAJoinDrainIsCounted(t *testing.T) {
 
 	failed := deliveryDelta(t, "whisper", "failed", func() {
 		voice := &fakeVoice{tellErr: map[string]error{"xuid-1": errors.New("bridge unreachable")}}
-		d := NewDeliverer(&fakeStore{enabled: true, pending: pending}, voice, fakeRoster{}, fakePermissions{}, testLogger())
+		d := NewDeliverer(&fakeStore{enabled: true, pending: pending}, voice, fakeRoster{online: []string{"xuid-1"}}, fakePermissions{}, testLogger())
 		if _, _, err := d.DrainForJoin(context.Background(), "xuid-1", time.Now()); err != nil {
 			t.Fatalf("DrainForJoin: %v", err)
 		}

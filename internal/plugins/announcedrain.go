@@ -261,7 +261,7 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 		if a.stale(generation) {
 			return
 		}
-		a.drain(voice, xuid, ended)
+		a.drain(pctx, voice, xuid, ended)
 	}()
 	return nil
 }
@@ -270,7 +270,7 @@ func (a *AnnounceDrain) HandleEvent(ctx context.Context, pctx *plugin.Context, e
 // something was left behind — whispers one line pointing at !inbox. A
 // summary is never added when remaining is 0: the welcome message already
 // owns this moment, and an empty inbox has nothing to add to it.
-func (a *AnnounceDrain) drain(voice plugin.Voice, xuid string, ended <-chan struct{}) {
+func (a *AnnounceDrain) drain(pctx *plugin.Context, voice plugin.Voice, xuid string, ended <-chan struct{}) {
 	// Cancelled the moment the connection ends, and every context this
 	// delivery speaks through descends from it: a backlog stops between
 	// messages instead of whispering the rest of itself at a player this
@@ -313,6 +313,12 @@ func (a *AnnounceDrain) drain(voice plugin.Voice, xuid string, ended <-chan stru
 		// still owed. A player mid-reconnect is owed no trailer either:
 		// the next connection re-reports them and its own delivery
 		// summarises whatever is still left by then.
+		return
+	}
+	if pctx.KnownOffline(xuid) {
+		// Everything is still owed because they left, not because the cap
+		// held it back. A trailer now is a console line to nobody counted
+		// as a summary they read; their next join owes them the lot.
 		return
 	}
 	if voice == nil {

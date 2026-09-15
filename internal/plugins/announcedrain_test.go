@@ -820,3 +820,61 @@ func TestAnnounceDrain_ConnectionEndingMidSendSendsNoSummary(t *testing.T) {
 	case <-time.After(250 * time.Millisecond):
 	}
 }
+
+// drainPresence answers presence from a fixed set, on a roster that has been
+// told who is here.
+type drainPresence struct{ online map[string]bool }
+
+var _ plugin.Presence = drainPresence{}
+
+func (p drainPresence) IsOnline(xuid string) bool { return p.online[xuid] }
+func (p drainPresence) Knows() bool               { return true }
+
+// A drain that delivered nothing because the player left reports the whole
+// backlog as still owed, which reads identically to the cap holding it back.
+// The trailer must not follow: the player is not there to read it, so it is
+// a console line to nobody counted as a summary they saw. Their backlog stays
+// pending either way, which is the point of the deliverer's own guard.
+func TestNoTrailerWhenTheBacklogIsOwedBecauseThePlayerLeft(t *testing.T) {
+	deliverer := &fakeJoinDeliverer{delivered: 0, remaining: 3, calls: make(chan struct{}, 1)}
+	voice := newRecordingTellVoice()
+	d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("info"))
+	pctx := &plugin.Context{Voice: voice, Presence: drainPresence{online: map[string]bool{}}}
+
+	if err := d.HandleEvent(context.Background(), pctx, joinEvent("xuid-1")); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+
+	select {
+	case <-deliverer.calls:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for DrainForJoin to be called")
+	}
+	select {
+	case msg := <-voice.told:
+		t.Errorf("Tell was called with %q, want silence for a player who is not on the server", msg)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// The same backlog, for a player who is still here: the cap held it back, so
+// the trailer is exactly what they need.
+func TestTrailerStillFollowsForAPlayerWhoIsStillOnline(t *testing.T) {
+	deliverer := &fakeJoinDeliverer{delivered: 1, remaining: 3, calls: make(chan struct{}, 1)}
+	voice := newRecordingTellVoice()
+	d := NewAnnounceDrain(context.Background(), deliverer, 0, logging.New("info"))
+	pctx := &plugin.Context{Voice: voice, Presence: drainPresence{online: map[string]bool{"xuid-1": true}}}
+
+	if err := d.HandleEvent(context.Background(), pctx, joinEvent("xuid-1")); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+
+	select {
+	case msg := <-voice.told:
+		if !strings.Contains(msg, "!inbox") {
+			t.Errorf("Tell = %q, want the trailer pointing at !inbox", msg)
+		}
+	case <-time.After(time.Second):
+		t.Error("no trailer for a player who is still online and still owed messages")
+	}
+}

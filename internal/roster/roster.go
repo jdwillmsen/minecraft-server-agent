@@ -93,6 +93,32 @@ type Roster struct {
 	// two, every add is a player who was already online -- see Apply.
 	snapshotStarted bool
 	snapshotEnded   bool
+	// answered is false until the server has said who is on it in a way this
+	// Roster can report, which is what Knows() reads.
+	//
+	// Not snapshotStarted, because the packet that starts the snapshot names
+	// this client alone and the roster behind it is still one packet away:
+	// answering from it would report an empty server nobody has described,
+	// swallowing a broadcast that should have been spoken. Set instead by a
+	// packet adding somebody other than the agent, or by a second
+	// add-carrying packet -- an empty server sends the agent's entry twice
+	// and nothing else, and that repeat is the whole answer, which is that
+	// nobody is here.
+	//
+	// A removal says who left, an empty packet says nothing at all, and an
+	// add with no XUID carries nobody this Roster can key on; none of the
+	// three answers who is here.
+	answered bool
+	// names is the last gamertag each XUID was seen under. Kept apart from
+	// players because presence and identity stop being true at different
+	// moments: presence ends with the connection that reported it, a name
+	// does not. Voice.Tell carries only an XUID and reaches a player through
+	// the console bridge, a separate process that stays up across a
+	// reconnect, so a reply whose model call outlived the connection still
+	// has to be addressable. Replaced whenever a later session reports the
+	// same XUID under a different name, and never dropped: the set is
+	// bounded by the distinct players this process has ever seen.
+	names map[string]string
 	// since is when the current session began watching; zero before the
 	// first one.
 	since time.Time
@@ -100,16 +126,17 @@ type Roster struct {
 
 // New builds an empty Roster awaiting its first session snapshot.
 func New() *Roster {
-	return &Roster{players: make(map[string]string), xuidByUUID: make(map[string]string)}
+	return &Roster{players: make(map[string]string), xuidByUUID: make(map[string]string), names: make(map[string]string)}
 }
 
-// BeginSession discards everything the Roster knows and puts it back into
-// its pre-snapshot state. Leave records only arrive while connected, so
-// across a disconnect gap the retained map is not merely incomplete but
-// wrong: it would claim players who have since left are still online (and
-// suppress a genuine rejoin as already-known). Call this at the start of
-// every session, before any packet from it is applied, with the moment it
-// began watching and the XUID this connection logged in as.
+// BeginSession puts the Roster back into its pre-snapshot state, holding
+// nobody as present. Leave records only arrive while connected, so across a
+// disconnect gap the retained presence is not merely incomplete but wrong:
+// it would claim players who have since left are still online (and suppress
+// a genuine rejoin as already-known). Call this at the start of every
+// session, before any packet from it is applied, with the moment it began
+// watching and the XUID this connection logged in as. Names outlive it --
+// see names.
 //
 // The agent's own XUID is session state rather than a constructor argument
 // because it is not known until the connection has logged in, which is
@@ -121,10 +148,39 @@ func (r *Roster) BeginSession(at time.Time, agentXUID string) {
 	defer r.mu.Unlock()
 	r.since = at
 	r.agentXUID = agentXUID
+	r.clearPresence()
+}
+
+// EndSession drops the presence a dead connection was reporting, at the
+// moment it dies rather than at the moment the next one opens. Everything
+// BeginSession says about retained presence being wrong applies from then:
+// in between, anyone reading Online() -- an announcement published by a
+// schedule, an event source or the HTTP API -- would be handed players who
+// may already have left, and recording a delivery against one of them loses
+// that message for good.
+//
+// Names are deliberately kept, because what the gap makes unknowable is who
+// is here, not who an XUID belongs to: a reply that goes out over the
+// console bridge after the connection died still needs a gamertag to target,
+// and the next session teaches new names as it reports them. The next
+// session's BeginSession still runs and still sets when it began watching.
+func (r *Roster) EndSession() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.clearPresence()
+}
+
+// clearPresence drops everything a connection reported about who is here,
+// leaving the Roster pre-snapshot. Shared by the two ends of a session so
+// that a presence field added to the Roster cannot be cleared at one of them
+// and retained at the other, which is the stale-state class both calls exist
+// to prevent. Names are not presence and are left alone. Callers hold r.mu.
+func (r *Roster) clearPresence() {
 	r.players = make(map[string]string)
 	r.xuidByUUID = make(map[string]string)
 	r.snapshotStarted = false
 	r.snapshotEnded = false
+	r.answered = false
 }
 
 // Since reports when the current session began watching, as given to
@@ -174,7 +230,7 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entr
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	var namesAgent, adds bool
+	var namesAgent, namesOthers, adds bool
 	for _, e := range entries {
 		if e.Remove || e.XUID == "" {
 			continue
@@ -182,9 +238,12 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entr
 		adds = true
 		// An unset agentXUID matches nobody, since a usable add always
 		// carries one: a Roster never told who it is falls back to treating
-		// the first add of the session as the whole burst.
+		// the first add of the session as the whole burst, and to reading
+		// that first add as the server's answer about who is here.
 		if e.XUID == r.agentXUID {
 			namesAgent = true
+		} else {
+			namesOthers = true
 		}
 	}
 	if r.snapshotStarted && adds && !namesAgent {
@@ -192,6 +251,9 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entr
 	}
 	snapshot := !r.snapshotEnded
 	if adds {
+		if namesOthers || r.snapshotStarted {
+			r.answered = true
+		}
 		r.snapshotStarted = true
 	}
 
@@ -232,18 +294,52 @@ func (r *Roster) Apply(entries []PlayerListEntry) (joins, leaves, present []Entr
 			}
 		}
 		r.players[e.XUID] = e.Username
+		r.names[e.XUID] = e.Username
 	}
 	return joins, leaves, present
 }
 
-// NameFor returns the username currently on record for xuid, so a caller
-// that only has an XUID (as Voice.Tell does) can build a tellraw target.
-// ok is false if xuid is not in the current roster (never seen, or left).
+// NameFor returns the last username recorded for xuid, so a caller that
+// only has an XUID (as Voice.Tell does) can build a tellraw target. It still
+// answers for a player the current connection is not watching -- one who
+// left, or one whose session ended with the connection itself -- because a
+// tellraw goes out over the console bridge, which does not end with the
+// Bedrock connection, and a reply with nobody to address is simply thrown
+// away. Ask IsOnline for whether they are here now.
+//
+// ok is false only for an XUID this process has never seen named.
 func (r *Roster) NameFor(xuid string) (name string, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	name, ok = r.players[xuid]
+	name, ok = r.names[xuid]
 	return name, ok
+}
+
+// Knows reports whether this Roster can currently answer who is on the
+// server. False in the gap between connections, and false again in the
+// moments after one opens until the live connection has described who is
+// here -- in both, an empty Online() means "not known yet" rather than
+// "nobody is here", and a caller that cannot tell those apart will act on
+// the wrong one.
+//
+// False for the opening packet too, which names this client and nobody else
+// -- the population arrives in the packet behind it, and a roster holding
+// only the agent is not an empty server. See answered for what does settle
+// it, and for why a second entry for the agent alone does.
+func (r *Roster) Knows() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.answered
+}
+
+// IsOnline reports whether xuid is on the roster the current connection is
+// watching. Separate from NameFor because the two stop being true at
+// different moments -- see names.
+func (r *Roster) IsOnline(xuid string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.players[xuid]
+	return ok
 }
 
 // Online returns the XUIDs currently on the roster, so a caller deciding
@@ -264,13 +360,21 @@ func (r *Roster) Online() []string {
 	return out
 }
 
-// XUIDFor is NameFor's reverse: it resolves a gamertag back to the XUID
-// currently on record for it, so a caller that only has a display name
-// (e.g. a "@PlayerName" reference typed into a command) can turn it into
-// the identity Voice.Tell and the announcement store actually key on. ok is
-// false if name isn't the current username of anyone on the roster.
+// XUIDFor resolves a gamertag back to the XUID currently on record for it,
+// so a caller that only has a display name (e.g. a "@PlayerName" reference
+// typed into a command) can turn it into the identity Voice.Tell and the
+// announcement store actually key on. ok is false if name isn't the current
+// username of anyone on the roster.
 //
-// This assumes gamertags are unique per server, same as NameFor's map
+// Not NameFor's reverse, and the asymmetry is deliberate: this scans the
+// presence map, which a session boundary empties, while NameFor answers from
+// the retained names one. After a connection dies NameFor still resolves an
+// XUID to "Steve" -- a reply already in flight has to stay addressable --
+// but XUIDFor("Steve") finds nobody, because nobody is on the server. A
+// caller that needs that round trip for an offline player wants the durable
+// record instead; see cmd/agent's playerLookup.
+//
+// This assumes gamertags are unique per server, same as the names map
 // already assumes in the other direction. If that were ever violated —
 // two entries on the roster sharing a name — whichever is encountered
 // first during the scan wins, with no significance attached to which that
@@ -279,9 +383,10 @@ func (r *Roster) Online() []string {
 //
 // This is a linear scan rather than a second index: the roster is sized to
 // a Bedrock server's concurrent player count, not a lookup table, and the
-// map already gives O(1) resolution the other direction (NameFor), which is
-// the hot path (every Tell). A reverse index would double the bookkeeping
-// Apply has to keep consistent for a lookup that isn't on that hot path.
+// maps already give O(1) resolution the other direction (NameFor, IsOnline),
+// which is the hot path (every Tell, every recipient). A reverse index would
+// double the bookkeeping Apply has to keep consistent for a lookup that
+// isn't on that hot path.
 func (r *Roster) XUIDFor(name string) (xuid string, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

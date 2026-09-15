@@ -233,6 +233,9 @@ type Context struct {
 	// XUID every other capability keys on. May be nil -- a command that
 	// needs it must refuse plainly rather than assume it can resolve one.
 	Roster Roster
+	// Presence answers whether a player is on the server right now. May be
+	// nil; ask through KnownOffline, which says what an absent one means.
+	Presence Presence
 	// Pinger may be nil; !ping then answers from the agent alone.
 	Pinger Pinger
 	// Moderation may be nil, on the same terms as Knowledge: cmd/agent
@@ -309,7 +312,7 @@ type AnnounceStore interface {
 // !inbox need -- not announce.Deliverer's full method set, since join-time
 // draining is the announce-drain event handler's job, not a chat command's.
 type AnnounceDeliverer interface {
-	SendNow(ctx context.Context, a announce.Announcement, id int64) (int, error)
+	SendNow(ctx context.Context, a announce.Announcement, id int64) (announce.Reach, error)
 	DrainAll(ctx context.Context, xuid string, now time.Time) (delivered, remaining int, err error)
 }
 
@@ -336,6 +339,42 @@ type ScheduleStore interface {
 // the same as an answer of no.
 type Roster interface {
 	XUIDFor(ctx context.Context, name string) (xuid string, ok bool, err error)
+}
+
+// Presence answers whether a player is on the server at this moment.
+//
+// Deliberately not part of Roster, which resolves a name to an XUID and is
+// meant to answer for players who are offline -- a queued announcement is
+// written for exactly those. This is the opposite question, and conflating
+// the two is how a whisper to someone who has left comes to look like one
+// they saw: a gamertag outlives the session that taught it, because a reply
+// already in flight still has to be addressable, so resolving one is no
+// evidence at all that the player is still there.
+type Presence interface {
+	// IsOnline reports whether xuid is on the roster the live connection is
+	// watching. Meaningful only while Knows is true.
+	IsOnline(xuid string) bool
+	// Knows reports whether the roster can answer who is on the server at
+	// all: false between connections, and false again after one opens until
+	// its first roster packet arrives. IsOnline says "no" about everyone in
+	// both, which is absence of knowledge rather than knowledge of absence.
+	Knows() bool
+}
+
+// KnownOffline reports whether this process can say for certain that xuid
+// has left. It is the negative form on purpose: a caller acts only on
+// positive knowledge of absence, so a Context with no Presence wired keeps
+// doing what it did before rather than silently withholding everything it
+// would otherwise send. cmd/agent always supplies one.
+//
+// A roster that has not been told who is here says nothing about anyone. In
+// the window between a connection opening and its first roster packet a
+// player can be standing in the world, chatting -- their message is itself
+// evidence they are there -- while IsOnline still answers no for everybody.
+// Reading that as departure would withhold what they are owed on the word of
+// a roster that has not looked yet.
+func (c *Context) KnownOffline(xuid string) bool {
+	return c != nil && c.Presence != nil && c.Presence.Knows() && !c.Presence.IsOnline(xuid)
 }
 
 // Registry holds every registered plugin and routes commands to them.

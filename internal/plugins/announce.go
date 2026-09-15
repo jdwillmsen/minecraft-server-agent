@@ -240,13 +240,34 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 	// agent or a sibling bot is filtered out of every audience. "Told X"
 	// in any of those cases is a report of a delivery that did not occur.
 	switch {
-	case target == announce.TargetPlayer && sent == 0:
+	case !sent.Counted && announce.DeliveryFor(target) == announce.DeliveryBroadcast:
+		// The line is in chat and the audience could not be accounted for,
+		// which happens for reasons this reply cannot tell apart -- no
+		// roster to name them, a delivery row that would not write, a loop
+		// the connection cut short. Claiming a number would be a count this
+		// agent did not have, and naming one of the three as the cause would
+		// send the operator after a fault that may not exist.
+		return "Announced, but I couldn't account for who heard it.", nil
+	case !sent.Counted:
+		// A whisper that reached someone and whose record did not survive.
+		// The roster was never in doubt here, so blaming it would be a
+		// different failure than the one that happened -- and what is worth
+		// saying is that the still-pending row will reach them again.
+		return "Sent, but I couldn't record it - it may be repeated on their next join.", nil
+	case target == announce.TargetPlayer && sent.Players == 0:
 		// The row is stored and unexpired, so this is a promise the queue
 		// can keep: their next join or their own !inbox drains it.
 		return "Queued for " + displayName + ".", nil
 	case target == announce.TargetPlayer:
 		return "Told " + displayName + ".", nil
-	case target == announce.TargetOnlineOnly && sent == 0:
+	case sent.Queued:
+		// Nothing was spoken: this process is not the one playing the agent
+		// right now, so the row is stored for whichever one is. Reported
+		// rather than folded into "Announced." -- the operator watching
+		// chat for their own line would otherwise wait for one that this
+		// process was never going to say.
+		return "Queued - I am not the live agent right now, so the one that is will deliver it.", nil
+	case target == announce.TargetOnlineOnly && sent.Players == 0:
 		// online_only is the one target with no queue behind it, so nobody
 		// hearing it now means nobody ever will.
 		return "Nobody was online to hear that.", nil

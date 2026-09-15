@@ -97,6 +97,25 @@ func (a *deliveryAudience) Online() []string {
 	return out
 }
 
+// IsOnline satisfies announce.Roster, excluding the same bots Online() does:
+// a Deliverer asking whether one recipient is still there must get the same
+// answer it would get by looking for them in the list.
+func (a *deliveryAudience) IsOnline(xuid string) bool {
+	a.mu.RLock()
+	self := a.self
+	a.mu.RUnlock()
+
+	if chat.IsSelfOrSibling(xuid, self, a.siblings) {
+		return false
+	}
+	return a.roster.IsOnline(xuid)
+}
+
+// Knows satisfies announce.Roster. Passed straight through: which players
+// this filters out has nothing to do with whether the roster behind it has
+// been told who is here.
+func (a *deliveryAudience) Knows() bool { return a.roster.Knows() }
+
 // nameArchive is the durable half of resolving a gamertag: the names this
 // server has recorded, as opposed to the names currently connected.
 // Narrowed from store.Store to the single read that needs it.
@@ -108,13 +127,14 @@ type nameArchive interface {
 // and the profile store second.
 //
 // One tier is not enough, and which one is missing decides whether the
-// feature works at all. The roster holds only who is connected and is
-// emptied at the start of every session, so a lookup that stopped there
-// could never name the player an offline announcement is for -- and being
-// able to leave a message for someone who is not here is the entire reason
-// the queue exists. The store alone would be worse in the other direction:
-// it cannot answer for a player this agent has watched arrive but never
-// written down.
+// feature works at all. The roster resolves a name only for someone who is
+// on the server right now -- Roster.XUIDFor scans presence, which every
+// session boundary empties, not the names it retains -- so a lookup that
+// stopped there could never name the player an offline announcement is for,
+// and being able to leave a message for someone who is not here is the
+// entire reason the queue exists. The store alone would be worse in the
+// other direction: it cannot answer for a player this agent has watched
+// arrive but never written down.
 //
 // Ordered roster-first for cost, not correctness. The roster is an in-memory
 // map and is by definition current, and the two only ever disagree while a
@@ -236,16 +256,17 @@ func (o *outbox) MarkDelivered(ctx context.Context, id int64, xuid string, at ti
 
 func (o *outbox) Enabled() bool { return o.store.Enabled() }
 
-// ensure creates the players row xuid's foreign keys need, when the roster
-// can still say who they are.
+// ensure creates the players row xuid's foreign keys need, for any XUID this
+// process has ever seen named -- including one who has since left, since the
+// names behind it outlive the session that taught them.
 //
 // An unresolvable name is left alone rather than filled in with the XUID:
 // current_gamertag is what every human-facing report and the rename history
 // read from, and a placeholder invented here would outlive the moment that
 // produced it. The write that follows either succeeds, because the row was
 // already there, or fails its foreign key and is logged by its caller —
-// which is what happened before this existed, for a case that needs a
-// player to have left between being chosen as a recipient and being told.
+// which is what happened before this existed, for a recipient this process
+// has never watched arrive and so has no name for at all.
 //
 // A failure is logged and not returned for the same reason: the caller's
 // own write is worth attempting regardless, and it reports its own error.

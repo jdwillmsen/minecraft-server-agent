@@ -378,8 +378,8 @@ type stubDeliverer struct{}
 
 var _ AnnounceDeliverer = stubDeliverer{}
 
-func (stubDeliverer) SendNow(context.Context, announce.Announcement, int64) (int, error) {
-	return 0, nil
+func (stubDeliverer) SendNow(context.Context, announce.Announcement, int64) (announce.Reach, error) {
+	return announce.Reach{Counted: true}, nil
 }
 func (stubDeliverer) DrainAll(context.Context, string, time.Time) (int, int, error) {
 	return 0, 0, nil

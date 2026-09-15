@@ -28,7 +28,7 @@ var (
 	// with nobody answering it.
 	leaderGauge = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "mc_agent_leader",
-		Help: "1 if this process is the live agent, 0 if it is a standby.",
+		Help: "1 if this process is the live agent, 0 if it is anything else - a standby, or a process still starting.",
 	})
 	// A second series rather than a third value of the one above, because the
 	// two questions are independent and both have to stay answerable: this

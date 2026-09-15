@@ -203,11 +203,18 @@ func (m *Moderation) work() {
 // happened. Recorded first as warned, a whisper that then failed would
 // leave a row claiming the player was told something they never saw.
 //
+// A player who has left is not warned at all, and the flag is recorded as
+// logged. Their gamertag still resolves -- it outlives the session, so a
+// reply already in flight stays addressable -- and the console accepts a
+// tellraw matching nobody, so the send would report success and produce
+// exactly the row this ordering exists to prevent. Presence is asked before
+// the warning is claimed, so their next visit can still warn them.
+//
 // Every call is bounded by the dispatch timeout, like a command's reply: a
 // hung bridge or database holds this worker for seconds, never for good.
 func (m *Moderation) act(j moderationJob) {
 	warned := false
-	if hasRule(j.flags, moderation.RuleTerm) && j.pctx.Voice != nil && m.recordable(j.pctx) && m.tracker.ClaimWarning(j.xuid, j.at) {
+	if hasRule(j.flags, moderation.RuleTerm) && j.pctx.Voice != nil && !j.pctx.KnownOffline(j.xuid) && m.recordable(j.pctx) && m.tracker.ClaimWarning(j.xuid, j.at) {
 		ctx, cancel := context.WithTimeout(m.rootCtx, plugin.DefaultDispatchTimeout)
 		err := j.pctx.Voice.Tell(ctx, j.xuid, moderationWarning)
 		cancel()

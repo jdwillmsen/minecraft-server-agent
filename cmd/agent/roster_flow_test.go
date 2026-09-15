@@ -192,8 +192,8 @@ func TestPlayerListFlow(t *testing.T) {
 		if joins := drainJoins(t, events); len(joins) != 0 {
 			t.Errorf("got %d joins after reconnecting, want 0: %+v", len(joins), joins)
 		}
-		if _, ok := playerRoster.NameFor(playerXUID); ok {
-			t.Error("NameFor for a player absent from the reconnect snapshot = ok, want not-ok — a tellraw aimed at them would reach nobody")
+		if playerRoster.IsOnline(playerXUID) {
+			t.Error("a player absent from the reconnect snapshot still counts as online — an announcement would be recorded as delivered to them")
 		}
 	})
 }

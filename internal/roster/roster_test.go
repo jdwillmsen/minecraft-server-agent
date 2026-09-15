@@ -64,7 +64,7 @@ func TestApply_RemovalCarryingOnlyAUUIDIsALeave(t *testing.T) {
 	if len(leaves) != 1 || leaves[0].XUID != "111" || leaves[0].Username != "Steve" {
 		t.Fatalf("leaves = %+v, want Steve (111)", leaves)
 	}
-	if _, ok := r.NameFor("111"); ok {
+	if r.IsOnline("111") {
 		t.Error("Steve still on the roster after a UUID-only removal")
 	}
 
@@ -81,7 +81,7 @@ func TestApply_RemovalOfAnUnknownUUIDIsIgnored(t *testing.T) {
 	if _, leaves, _ := r.Apply([]PlayerListEntry{{UUID: "u-unknown", Remove: true}}); len(leaves) != 0 {
 		t.Errorf("leaves = %+v for a UUID nobody was recorded under, want none", leaves)
 	}
-	if _, ok := r.NameFor("111"); !ok {
+	if !r.IsOnline("111") {
 		t.Error("an unrelated removal took Steve off the roster")
 	}
 }
@@ -172,8 +172,8 @@ func TestBeginSession_ForgetsThePreviousSessionsPlayers(t *testing.T) {
 
 	r.BeginSession(time.Now(), agentEntry.XUID)
 
-	if _, ok := r.NameFor("111"); ok {
-		t.Error("NameFor after BeginSession = ok, want not-ok — a player who may have left while disconnected must not still resolve")
+	if r.IsOnline("111") {
+		t.Error("IsOnline after BeginSession = true, want false — a player who may have left while disconnected must not still count as present")
 	}
 }
 
@@ -222,13 +222,19 @@ func TestNameFor_UnknownXUID(t *testing.T) {
 	}
 }
 
-func TestNameFor_KnownXUIDAfterRemove(t *testing.T) {
+// Presence and identity stop being true at different moments: a departure
+// ends the first and leaves the second alone, because a tellraw goes out over
+// the console bridge and still needs a gamertag to aim at.
+func TestNameForOutlivesPresenceAfterRemove(t *testing.T) {
 	r := New()
 	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
 	r.Apply([]PlayerListEntry{{XUID: "111", Remove: true}})
 
-	if _, ok := r.NameFor("111"); ok {
-		t.Error("NameFor after removal = ok, want not-ok")
+	if r.IsOnline("111") {
+		t.Error("IsOnline after removal = true, want false")
+	}
+	if name, ok := r.NameFor("111"); !ok || name != "Steve" {
+		t.Errorf("NameFor after removal = (%q, %v), want (Steve, true)", name, ok)
 	}
 }
 
@@ -371,5 +377,222 @@ func TestApply_DepartureDoesNotEndTheOpeningSnapshot(t *testing.T) {
 	_, _, present := r.Apply([]PlayerListEntry{agentEntry, {XUID: "222", Username: "Alex"}})
 	if len(present) != 1 || present[0].XUID != "222" {
 		t.Errorf("present = %+v, want Alex: a removal must not end the burst behind it", present)
+	}
+}
+
+// A connection that dies takes the roster's knowledge with it. Kept, it
+// would answer Online() with whoever was here when the connection died, and
+// an announcement published in the gap would be recorded as delivered to a
+// player who may already have left -- which nothing retries.
+func TestEndSessionEmptiesTheRoster(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve", UUID: "u-111"})
+	if len(r.Online()) == 0 {
+		t.Fatal("nobody online after the snapshot, so this test proves nothing")
+	}
+
+	r.EndSession()
+
+	if online := r.Online(); len(online) != 0 {
+		t.Errorf("Online() = %v after the connection ended, want nobody", online)
+	}
+	if r.IsOnline("111") {
+		t.Error("IsOnline = true after the connection ended, want false")
+	}
+}
+
+// The other half of EndSession: presence is what the gap makes unknowable,
+// not who an XUID belongs to. An @server answer whose model call outlives the
+// connection is still whispered over the console bridge, which is a separate
+// process, and a tellraw needs a gamertag to target -- so a name the dead
+// connection taught must still resolve.
+func TestEndSessionKeepsNamesSoALateReplyCanStillBeAddressed(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve", UUID: "u-111"})
+
+	r.EndSession()
+
+	name, ok := r.NameFor("111")
+	if !ok || name != "Steve" {
+		t.Errorf("NameFor(111) = (%q, %v) after the connection ended, want (Steve, true) — the answer would be logged and thrown away", name, ok)
+	}
+	if r.IsOnline("111") {
+		t.Error("IsOnline(111) = true after the connection ended, want false — nobody is being watched in the gap")
+	}
+}
+
+// A name is the last one seen, not the first: the next session teaches it
+// whatever the server reports now, so a rename between connections wins.
+func TestNameForTakesTheNextSessionsName(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "OldName"})
+	r.EndSession()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "NewName"})
+
+	if name, _ := r.NameFor("111"); name != "NewName" {
+		t.Errorf("NameFor(111) = %q, want NewName", name)
+	}
+}
+
+// The next connection's snapshot is still a snapshot: those players were
+// already here, so none of them is an arrival.
+func TestEndSessionThenSnapshotReportsNobodyAsJoining(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve", UUID: "u-111"})
+	r.EndSession()
+
+	joins, _, present := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve", UUID: "u-111"}})
+	if len(joins) != 0 {
+		t.Errorf("joins = %+v after reconnecting, want none: the snapshot is not a burst of arrivals", joins)
+	}
+	if len(present) == 0 {
+		t.Error("nobody reported as present, so their backlog would never be scheduled")
+	}
+}
+
+// An add with no XUID carries no identity this Roster can key on, so it is
+// ignored outright -- and an ignored entry cannot be the server's answer to
+// who is here either. Reading one as "told, and the answer is nobody"
+// suppresses a broadcast published in that window, and an online-only one
+// never queues, so it would be gone.
+func TestABlankXUIDOpeningPacketLeavesTheRosterUntold(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+
+	r.Apply([]PlayerListEntry{{UUID: "u-111", Username: "Steve"}})
+
+	if r.Knows() {
+		t.Error("Knows() after a blank-XUID add = true, want false — nothing usable has said who is on the server")
+	}
+	if len(r.Online()) != 0 {
+		t.Errorf("Online() = %+v, want nobody: a blank-XUID add is ignored outright", r.Online())
+	}
+
+	joins, _, present := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
+	if !r.Knows() {
+		t.Error("Knows() after the opening list = false, want true")
+	}
+	if len(joins) != 0 || len(present) != 2 {
+		t.Errorf("joins = %+v, present = %+v; want nobody joining and both present", joins, present)
+	}
+}
+
+// A removal says who left, not who is here. If the first packet of a session
+// carries only one -- a player who quit in that instant -- the roster is as
+// unanswered as it was before, and the server behind it may be full. Reading
+// it as "told, and the answer is nobody" suppresses a broadcast published in
+// that window, and an online-only one never queues, so it would be gone.
+func TestARemovalOnlyOpeningPacketLeavesTheRosterUntold(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+	if r.Knows() {
+		t.Fatal("Knows() before any packet = true, want false")
+	}
+
+	r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}})
+
+	if r.Knows() {
+		t.Error("Knows() after a removal-only packet = true, want false — nothing has said who is on the server")
+	}
+
+	// The real snapshot behind it still answers, and still reports its
+	// players as present rather than as arrivals.
+	joins, _, present := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
+	if !r.Knows() {
+		t.Error("Knows() after the opening list = false, want true")
+	}
+	if len(joins) != 0 || len(present) != 2 {
+		t.Errorf("joins = %+v, present = %+v; want nobody joining and both present", joins, present)
+	}
+}
+
+// The two flags answer different questions and must not be collapsed: being
+// told is not the same as having accounted for the players who were already
+// here, and the snapshot-versus-join classification depends on the second.
+func TestAnOpeningPacketWithNoAddStillLetsTheRealSnapshotBePresent(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+	r.Apply([]PlayerListEntry{{UUID: "u-111", Remove: true}})
+
+	joins, _, present := r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
+
+	if len(joins) != 0 {
+		t.Errorf("joins = %+v, want none: the roster behind an empty packet is still a snapshot", joins)
+	}
+	if len(present) != 2 {
+		t.Errorf("present = %+v, want both, so their backlogs are still scheduled", present)
+	}
+}
+
+// A session boundary takes it back: in the gap nobody has told this roster
+// anything about the connection that follows.
+func TestKnowsIsFalseAgainAfterTheConnectionEnds(t *testing.T) {
+	r := New()
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
+	if !r.Knows() {
+		t.Fatal("Knows() while watching = false, want true")
+	}
+
+	r.EndSession()
+
+	if r.Knows() {
+		t.Error("Knows() in the gap = true, want false — an empty roster there means nothing is known, not that nobody is on")
+	}
+}
+
+// A packet with no entries says nothing about who is here, so the roster is
+// still untold. Reading it as knowledge would have a broadcast published in
+// that instant suppressed as "nobody is on" -- and an online-only one, which
+// never queues, would be gone.
+func TestAZeroEntryPacketDoesNotMakeTheRosterKnow(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+
+	r.Apply(nil)
+
+	if r.Knows() {
+		t.Error("Knows() after an empty packet = true, want false — nothing has been said about who is here")
+	}
+}
+
+// The opening packet names this client alone and the roster follows it, so
+// a list holding nobody but the agent is one packet short of an answer.
+// Reading it as "told, and the answer is nobody" suppresses a broadcast
+// published in that window on a server that may be full, and an online-only
+// one never queues, so it would be gone.
+func TestTheOpeningPacketNamingOnlyTheAgentLeavesTheRosterUntold(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+
+	r.Apply([]PlayerListEntry{agentEntry})
+
+	if r.Knows() {
+		t.Error("Knows() after the agent's own entry alone = true, want false — the population arrives in the packet behind it")
+	}
+
+	r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
+
+	if !r.Knows() {
+		t.Error("Knows() after the roster behind it = false, want true")
+	}
+}
+
+// An empty server sends the agent its own entry twice and nothing else, so
+// the repeat is the whole answer: nobody else is here. Left unanswered,
+// every broadcast to an idle server would be spoken into an empty world and
+// reported as a reach nobody could count.
+func TestTheAgentsEntryArrivingTwiceMakesTheRosterKnow(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+
+	r.Apply([]PlayerListEntry{agentEntry})
+	r.Apply([]PlayerListEntry{agentEntry})
+
+	if !r.Knows() {
+		t.Error("Knows() after the agent's entry twice = false, want true — the server has said who is here, and it is nobody but the agent")
+	}
+	if len(r.Online()) != 1 {
+		t.Errorf("Online() = %+v, want the agent alone", r.Online())
 	}
 }
