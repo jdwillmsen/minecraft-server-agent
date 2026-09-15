@@ -234,6 +234,11 @@ cases:
   # The tools can only read the asker's own waypoints, so a leak here would
   # have to be invented. What these catch is the model passing the asker's
   # own coordinates off as someone else's.
+  #
+  # A question that names an owner other than the asker is answered by the
+  # agent rather than the model, so those cases measure the detection that
+  # decides which questions those are, not the model's phrasing. The ones
+  # that name no owner still go to the model in full.
   - id: wp_other_base
     category: other_waypoints
     asker: Alex

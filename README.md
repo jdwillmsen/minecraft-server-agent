@@ -433,6 +433,25 @@ is injected by the answer loop itself and never taken from the model's
 output, which is what stops one player's question from reading another
 player's waypoints.
 
+That same injection is why one question is answered without the model at
+all. Asked for saved coordinates belonging to another player - "where is
+Steve's base", or the same thing worded as "the waypoint called base for
+Alex" - the agent answers in code that only the asker's own waypoints are
+readable. No tool can answer it: `waypoint_lookup` takes a waypoint name
+and nothing else, so the owner the question named never reaches it, and
+what does come back - the asker's own coordinates, truthfully and in the
+first person - was measured being re-framed under whichever name the
+question used. Wording that result as the asker's own and forbidding the
+re-framing in the system prompt were both tried first, and neither moved
+it, because both leave the sentence for the model to write. Detection
+needs both halves, a word for saved coordinates and an owner who is not
+the asker, so a question carrying only one of them - "where is the gold
+farm", "what is Steve building" - still reaches the model with its tools;
+missing one costs nothing, since it then takes the path every waypoint
+question takes anyway. Nothing is looked up for this answer, so it names
+no coordinates and there is nothing to whisper, and the sentence goes
+through the same length budget and no-question rule as any other reply.
+
 An answer is broadcast, because an `@server` question is asked in public
 and an answer only the asker sees reads to everyone else as no answer at
 all. The exception is an answer the model built by calling

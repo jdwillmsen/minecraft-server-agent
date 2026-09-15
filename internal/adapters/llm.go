@@ -485,6 +485,29 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 		return "", nil
 	}
 
+	// Before the loop, not after it: a reply the model never wrote is the
+	// only version of this answer it cannot re-frame, and the round trip it
+	// would take to write one buys nothing here. Everything the loop's exit
+	// applies still applies -- the reply leaves through cleanReply like any
+	// other, so the chat budget and the no-question rule hold -- and
+	// everything upstream in handleMention is untouched, since this sits
+	// inside the same call the whole answer path already makes.
+	//
+	// No tool runs on this path, so the asking player's own coordinates are
+	// never read and the answer is never marked personal. That is not a lost
+	// whisper: the reply carries no coordinates at all, so there is nothing
+	// a broadcast could publish.
+	//
+	// Gated on the tool being registered, for the reason Build omits it: a
+	// deployment with no waypoint store has no waypoints to be asked about,
+	// and a refusal naming a capability it does not have is its own wrong
+	// answer. The question is truncated first so this reads exactly the
+	// question the model would have been given, never more of it.
+	if registry.Has(waypointLookupTool) &&
+		waypointQuestionNamesAnotherPlayer(asker, text.Truncate(question, MaxQuestionChars)) {
+		return cleanReply(otherPlayerWaypointReply), nil
+	}
+
 	_, _, initial := c.BuildRequest(asker, question)
 	messages := initial.Messages
 	// A refusal written while calling a tool, which the player has not heard
