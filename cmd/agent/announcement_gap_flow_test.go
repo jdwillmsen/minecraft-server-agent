@@ -148,8 +148,8 @@ func (g *connectionGap) stillOwed(t *testing.T) []int64 {
 	return ids
 }
 
-// TestAPublishInTheConnectionGapIsNotRecordedAgainstWhoWasThere is
-// JDWLABS-543 end to end. A player is watched through one connection, the
+// TestAPublishInTheConnectionGapIsNotRecordedAgainstWhoWasThere is the
+// connection gap end to end. A player is watched through one connection, the
 // connection dies, and a publish lands in the gap before the next one opens.
 // Nobody is being watched then, so that announcement must reach nobody and be
 // recorded against nobody: the bridge is a separate process and still
