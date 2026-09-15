@@ -595,6 +595,18 @@ func (d *Deliverer) Publish(ctx context.Context, a Announcement) (id int64, sent
 	return id, sent, err
 }
 
+// The two answers to sendPending's needPresent, named because which one a
+// drain passes is the whole difference between them and a bare boolean at
+// the call site reads as neither.
+const (
+	// presenceRequired is a drain the roster vouched for, so the roster is
+	// also the only thing that can withdraw it.
+	presenceRequired = true
+	// presenceGiven is a drain the player asked for in their own words,
+	// which no roster contradicts by going quiet.
+	presenceGiven = false
+)
+
 // sendPending whispers each of msgs to xuid in order, marking every
 // successful send delivered. A send or a mark that fails is logged and
 // simply not counted: the announcement is left pending in the store, so it
@@ -606,14 +618,26 @@ func (d *Deliverer) Publish(ctx context.Context, a Announcement) (id int64, sent
 // it recorded -- the console accepts a tellraw that matches nobody, so the
 // send reports success and the backlog is gone for good.
 //
-// Only known to have left, though: unlike the send loops above, this drain
-// belongs to one player who has just given evidence of being here -- the
-// arrival that scheduled it, or the !inbox they typed -- so a roster that
-// has merely stopped answering is no reason to withhold what they asked
-// for. What bounds a backlog whose player may be gone is this drain's own
-// context: a join drain descends from one the ending connection cancels,
-// and an !inbox drain from the timeout every dispatched command runs under.
-func (d *Deliverer) sendPending(ctx context.Context, xuid string, now time.Time, msgs []Announcement) int {
+// needPresent withholds the backlog from a roster that has merely stopped
+// answering as well, and the two drains differ on it because their evidence
+// of presence does.
+//
+// A join drain is scheduled by a roster event and takes its turn seconds
+// later, so a roster that cannot say who is here is never the healthy case
+// for it -- the connection died, its players are reconnecting, and the
+// console bridge is a separate process that accepts a tellraw matching
+// nobody with success. Its context is cancelled with that connection, but
+// by a watcher goroutine that has to be scheduled first, while the session's
+// roster goes dark in the call that ends it: a drain already in this loop
+// can read a live context and a dark roster in the same breath.
+//
+// An !inbox drain is the player's own command, which is the evidence the
+// roster is missing, and it must still be answered in the window before the
+// first roster packet lands. Nor can it race a roster going dark: it runs
+// synchronously on the packet read loop, which has to return before the
+// connection can be retired -- and what bounds it instead is the timeout
+// every dispatched command runs under.
+func (d *Deliverer) sendPending(ctx context.Context, xuid string, needPresent bool, now time.Time, msgs []Announcement) int {
 	delivered := 0
 	for _, a := range msgs {
 		if ctx.Err() != nil {
@@ -621,7 +645,7 @@ func (d *Deliverer) sendPending(ctx context.Context, xuid string, now time.Time,
 			// into that many more failed bridge attempts and error lines.
 			break
 		}
-		if d.departed(xuid) {
+		if d.departed(xuid) || (needPresent && !d.roster.Knows()) {
 			d.log.Info("announce_drain_stopped_player_left", logging.Fields{"announcement_id": a.ID, "xuid": xuid})
 			break
 		}
@@ -713,7 +737,7 @@ func (d *Deliverer) DrainForJoin(ctx context.Context, xuid string, now time.Time
 	toSend = append(toSend, expedited...)
 	toSend = append(toSend, normal[:limit]...)
 
-	delivered = d.sendPending(ctx, xuid, now, toSend)
+	delivered = d.sendPending(ctx, xuid, presenceRequired, now, toSend)
 	remaining = len(pending) - delivered
 	return delivered, remaining, nil
 }
@@ -746,6 +770,6 @@ func (d *Deliverer) DrainAll(ctx context.Context, xuid string, now time.Time) (d
 	if limit > MaxPerInbox {
 		limit = MaxPerInbox
 	}
-	delivered = d.sendPending(ctx, xuid, now, pending[:limit])
+	delivered = d.sendPending(ctx, xuid, presenceGiven, now, pending[:limit])
 	return delivered, len(pending) - delivered, nil
 }

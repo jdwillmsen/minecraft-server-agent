@@ -552,19 +552,26 @@ player who asked for it. The next connection replaces those names as it
 reports them.
 
 A resolvable name is never taken as proof that a player is still here.
-Anything whose record would claim the player saw it asks the roster first,
-and withholds only on a roster that says the player has gone: the console
-accepts a `tellraw` matching nobody and reports success, so a send alone
-proves nothing, while a roster that has not been told who is here has not
-said anyone left either. An announcement backlog whose drain was scheduled
-by an arrival is not whispered to someone who quit during its wait - and the
-"N more messages are waiting" trailer is not sent either, since everything is
-still owed because they left rather than because the per-join cap held it
-back. What they are owed survives for their next join. A roster that has
-merely gone quiet does not stop that drain: the player has just given
-evidence of being here - the arrival that scheduled it, or the `!inbox` they
-typed - and what bounds the drain instead is its own lifetime, a join drain
-ending with the connection and an `!inbox` one with the dispatch timeout.
+Anything whose record would claim the player saw it asks the roster and
+never the name: the console accepts a `tellraw` matching nobody and reports
+success, so a send alone proves nothing, while a roster that has not been
+told who is here has not said anyone left either. An announcement backlog
+whose drain was scheduled by an arrival is not whispered to someone who quit
+during its wait - and the "N more messages are waiting" trailer is not sent
+either, since everything is still owed because they left rather than because
+the per-join cap held it back. What they are owed survives for their next
+join.
+
+A roster that has gone quiet is a second question, and the two drains answer
+it differently. A join drain was scheduled by an arrival the roster itself
+reported and takes its turn seconds later, so a roster that can no longer
+say who is here means the connection has ended and its players are
+reconnecting: the backlog waits for the next one rather than being whispered
+at a connection nobody is on and recorded as read. An `!inbox` drain is the
+player's own words, which no silence contradicts, so it is answered in the
+window before the first roster packet lands - it cannot outlive its
+connection in any case, being served on the read loop that took the command,
+and the dispatch timeout is what bounds it.
 
 A moderation warning is the same question with a different record. A player
 who has left is not warned, and the flag is recorded as *logged* rather than
@@ -611,6 +618,12 @@ against someone who is no longer on the server, and the `!inbox` trailer
 that would have followed it is not spoken either - a player mid-reconnect
 is owed no pointer at a list they are not there to read. Whatever is still
 owed is summarised by the delivery the next connection schedules for them.
+
+It does not wait for that cancellation to arrive, though. The roster is
+retired in the same breath as the connection, while the cancel reaches a
+delivery already under way a moment later, so what stops a join backlog at
+the message it is on is the roster having gone quiet - which is the point of
+asking the roster rather than the clock or the context.
 
 Those snapshot deliveries would otherwise all come due in the same
 millisecond, so each is spread by a random fraction of the wait, never more

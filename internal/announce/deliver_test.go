@@ -1752,6 +1752,38 @@ func TestDrainAllDeliversWhileTheRosterHasNotBeenToldWhoIsHere(t *testing.T) {
 	}
 }
 
+// The join drain has to answer the other way, and this is why the two ask
+// different questions of the same roster. Nobody typed anything here: the
+// drain was scheduled by an arrival and takes its turn seconds later, so a
+// roster that cannot say who is here is not a connection still opening --
+// it is one that has ended, with its players reconnecting. The bridge is a
+// separate process that accepts a tellraw matching nobody with success, so
+// the backlog would be whispered into the dark and recorded, and a recorded
+// delivery is retried by nothing.
+//
+// Cancellation eventually says the same, which is why this is a fixed test
+// and not a flaky one: it reaches a drain through a watcher goroutine, and
+// the roster goes dark first.
+func TestDrainForJoinWithholdsWhileTheRosterCannotSayWhoIsHere(t *testing.T) {
+	store := &fakeStore{enabled: true, pending: []Announcement{{ID: 1, Body: "one", TargetKind: TargetPlayer}}}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+
+	delivered, remaining, err := d.DrainForJoin(context.Background(), "xuid-1", time.Now())
+	if err != nil {
+		t.Fatalf("DrainForJoin: %v", err)
+	}
+	if delivered != 0 || remaining != 1 {
+		t.Errorf("DrainForJoin = (%d, %d), want (0, 1) — the backlog is still owed to whoever the next connection reports", delivered, remaining)
+	}
+	if len(voice.tells) != 0 {
+		t.Errorf("whispered %v into a roster that cannot say anyone is there", voice.tells)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("rows = %v, want none — a row here suppresses that announcement for good", store.delivered)
+	}
+}
+
 // A connection can die part-way through a permission-targeted send, which
 // whispers one recipient at a time. Whoever is left in the list cannot be
 // confirmed present by a roster that has stopped answering, and a whisper
