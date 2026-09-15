@@ -3,6 +3,8 @@ package adapters
 import (
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // A question about someone else's waypoint is answered here rather than by
@@ -59,11 +61,15 @@ var possessedWaypoint = regexp.MustCompile(
 // through to the model, which is where it goes today.
 var onBehalfOf = regexp.MustCompile(`\b(?:for|of)\s+(\p{Lu}[\p{L}\p{N}_]*)`)
 
-// namesAWaypoint gates onBehalfOf on the one unambiguous term. "coords for
-// Spawn" is a question about a landmark; "the waypoint for Spawn" is the
-// same question in the rarer wording, and only the word waypoint makes an
-// owner the likelier reading of the name that follows.
-var namesAWaypoint = regexp.MustCompile(`(?i)\bwaypoints?\b`)
+// waypointAlreadyNamed gates onBehalfOf on the question having already said
+// which waypoint it means. That is what makes the name after "for" an owner
+// rather than the waypoint itself: a waypoint is looked up by name, so "a
+// waypoint for Ocean Monument" names the waypoint, while "the waypoint
+// called base for Alex" has named it already and can only be naming a
+// second party. Without this the capitalised-word rule below reads every
+// named landmark -- Ocean Monument, Stronghold, Mesa -- as a gamertag and
+// answers a question about the asker's own waypoint with a refusal.
+var waypointAlreadyNamed = regexp.MustCompile(`(?i)\bwaypoints?\s+(?:called|named)\s+[\p{L}\p{N}_]+`)
 
 // notPossessors are words whose "'s" is "is", never possession: "where's
 // the waypoint" names no owner. The last two possess things but are not
@@ -71,7 +77,7 @@ var namesAWaypoint = regexp.MustCompile(`(?i)\bwaypoints?\b`)
 var notPossessors = map[string]bool{
 	"where": true, "what": true, "when": true, "who": true, "how": true,
 	"why": true, "that": true, "there": true, "here": true, "it": true,
-	"this": true, "he": true, "she": true,
+	"this": true, "he": true, "she": true, "let": true,
 	"server": true, "world": true,
 }
 
@@ -109,28 +115,68 @@ func waypointQuestionNamesAnotherPlayer(asker, question string) bool {
 	normalized := strings.ToLower(strings.ReplaceAll(question, "’", "'"))
 	askerName := strings.ToLower(strings.TrimSpace(asker))
 
-	for _, m := range possessedWaypoint.FindAllStringSubmatch(normalized, -1) {
-		possessor, between := m[1], m[2]
+	for _, loc := range possessedWaypoint.FindAllStringSubmatchIndex(normalized, -1) {
+		possessor, between := submatch(normalized, loc, 1), submatch(normalized, loc, 2)
 		if firstPerson[between] {
 			continue
 		}
 		// An empty possessor is one of the pronouns, which name a third
-		// person by construction.
-		if possessor != "" && (possessor == askerName || notPossessors[possessor] || firstPerson[possessor]) {
+		// person by construction. A gamertag may carry a space, so the
+		// asker is recognised against the text running up to the
+		// possessive rather than against its last word alone.
+		if possessor != "" && (endsWithName(normalized[:loc[3]], askerName) || notPossessors[possessor] || firstPerson[possessor]) {
 			continue
 		}
 		return true
 	}
 
-	if !namesAWaypoint.MatchString(question) {
+	if !waypointAlreadyNamed.MatchString(question) {
 		return false
 	}
-	for _, m := range onBehalfOf.FindAllStringSubmatch(question, -1) {
-		name := strings.ToLower(m[1])
-		if name == askerName || firstPerson[name] || places[name] {
+	for _, loc := range onBehalfOf.FindAllStringSubmatchIndex(question, -1) {
+		name := strings.ToLower(question[loc[2]:loc[3]])
+		if startsWithName(strings.ToLower(question[loc[2]:]), askerName) || firstPerson[name] || places[name] {
 			continue
 		}
 		return true
 	}
 	return false
+}
+
+// submatch reads capture group n, which may not have participated.
+func submatch(s string, loc []int, n int) string {
+	if loc[2*n] < 0 {
+		return ""
+	}
+	return s[loc[2*n]:loc[2*n+1]]
+}
+
+func wordRune(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+// endsWithName reports whether s ends in name on a word boundary, so that
+// "where is jake w" is Jake W naming himself while "where is alex" is not
+// Lex naming herself.
+func endsWithName(s, name string) bool {
+	if name == "" || !strings.HasSuffix(s, name) {
+		return false
+	}
+	if len(s) == len(name) {
+		return true
+	}
+	r, _ := utf8.DecodeLastRuneInString(s[:len(s)-len(name)])
+	return !wordRune(r)
+}
+
+// startsWithName is endsWithName for a name the question puts after "for".
+func startsWithName(s, name string) bool {
+	if name == "" || !strings.HasPrefix(s, name) {
+		return false
+	}
+	if len(s) == len(name) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(s[len(name):])
+	return !wordRune(r)
 }

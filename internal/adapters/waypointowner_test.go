@@ -48,6 +48,10 @@ func TestWhichWaypointQuestionsNameAnotherPlayer(t *testing.T) {
 		{"Steve", "where is Steve's base", false},
 		{"Steve", "look up the waypoint called base for Steve", false},
 		{"alex", "where is Alex's base", false},
+		// A gamertag carrying a space is still the asker naming himself,
+		// in both shapes.
+		{"Jake W", "where is Jake W's base", false},
+		{"Jake W", "look up the waypoint called base for Jake W", false},
 
 		// Half a match is not a match. Each of these carries one of the two
 		// signals and not the other, and each is a question the model
@@ -61,6 +65,17 @@ func TestWhichWaypointQuestionsNameAnotherPlayer(t *testing.T) {
 		{"Alex", "what is the waypoint for Spawn", false},
 		{"Alex", "what are the server's coordinates", false},
 		{"Alex", "where's the waypoint for the gold farm", false},
+		// A waypoint's name is whatever its owner typed, and players name
+		// them after places. Capitalisation alone does not make one a
+		// gamertag: the question has to have named the waypoint already
+		// before the name after "for" can be reading as an owner.
+		{"Alex", "do you have a waypoint for Ocean Monument", false},
+		{"Alex", "do you have a waypoint for Stronghold", false},
+		{"Alex", "can you save a waypoint for Diamond Cave", false},
+		{"Alex", "look up the waypoint named base for Steve", true},
+		// "let's" is "let us", not a player called let.
+		{"Alex", "let's check coords", false},
+		{"Alex", "let's see my base coords", false},
 	} {
 		if got := waypointQuestionNamesAnotherPlayer(tc.asker, tc.question); got != tc.want {
 			t.Errorf("%s asked %q: names another player = %v, want %v", tc.asker, tc.question, got, tc.want)
@@ -191,5 +206,99 @@ func TestTheDeflectionObeysTheChatRules(t *testing.T) {
 	// that could be read as a coordinate may appear in the sentence.
 	if strings.ContainsAny(otherPlayerWaypointReply, "0123456789") {
 		t.Errorf("deflection reply %q carries a number", otherPlayerWaypointReply)
+	}
+}
+
+// The phrasings no reading of the question catches: no possessive, no word
+// for a waypoint, just a name. The question reaches the model with the
+// asker's own coordinates in hand, and the reattribution is caught where
+// the model has spelled it out.
+func TestAReattributedReplyIsReplacedAfterTheLookupRan(t *testing.T) {
+	srv, _ := toolBackend(t, []string{
+		toolCallReply(waypointLookupTool, `{"name":"base"}`),
+		`{"choices":[{"message":{"content":"Steve's base is at 1843 64 -2291 in the overworld."},"finish_reason":"stop"}]}`,
+	})
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
+
+	registry := tools.NewRegistry(tools.Tool{
+		Name:   waypointLookupTool,
+		Schema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}}}`),
+		Invoke: func(context.Context, json.RawMessage, string) (string, error) {
+			return "your waypoint base is at 1843 64 -2291 in the overworld", nil
+		},
+	})
+
+	got, err := client.AnswerWithTools(context.Background(), "Alex", "2535400000000001",
+		"what are the coords of Steve", registry)
+	if err != nil {
+		t.Fatalf("AnswerWithTools: %v", err)
+	}
+	if got != otherPlayerWaypointReply {
+		t.Errorf("answer = %q, want the asker's own coordinates not handed to another player", got)
+	}
+}
+
+// The same guard must keep its hands off the answer it is there to protect:
+// the asker's own waypoint, read and reported back to them.
+func TestTheAskersOwnWaypointReplySurvivesTheGuard(t *testing.T) {
+	srv, _ := toolBackend(t, []string{
+		toolCallReply(waypointLookupTool, `{"name":"base"}`),
+		`{"choices":[{"message":{"content":"Alex's base is at 1843 64 -2291 in the overworld."},"finish_reason":"stop"}]}`,
+	})
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
+
+	registry := tools.NewRegistry(tools.Tool{
+		Name:   waypointLookupTool,
+		Schema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}}}`),
+		Invoke: func(context.Context, json.RawMessage, string) (string, error) {
+			return "your waypoint base is at 1843 64 -2291 in the overworld", nil
+		},
+	})
+
+	got, err := client.AnswerWithTools(context.Background(), "Alex", "2535400000000001",
+		"where is my base", registry)
+	if err != nil {
+		t.Fatalf("AnswerWithTools: %v", err)
+	}
+	if got != "Alex's base is at 1843 64 -2291 in the overworld." {
+		t.Errorf("answer = %q, want the model's own reply about the asker's waypoint", got)
+	}
+}
+
+// Without a waypoint read for it, a reply is whatever the model wrote about
+// whatever tool it did use, and rewriting one would be this path answering
+// a question nobody routed to it.
+func TestAReplyBuiltWithoutAWaypointLookupIsLeftAlone(t *testing.T) {
+	srv, _ := toolBackend(t, []string{
+		toolCallReply("knowledge_lookup", `{"query":"steve"}`),
+		`{"choices":[{"message":{"content":"Steve's base is in the badlands, per the wiki."},"finish_reason":"stop"}]}`,
+	})
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
+
+	registry := tools.NewRegistry(
+		tools.Tool{
+			Name:   waypointLookupTool,
+			Schema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}}}`),
+			Invoke: func(context.Context, json.RawMessage, string) (string, error) {
+				t.Error("waypoint_lookup ran for a question that did not ask for one")
+				return "", nil
+			},
+		},
+		tools.Tool{
+			Name:   "knowledge_lookup",
+			Schema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+			Invoke: func(context.Context, json.RawMessage, string) (string, error) {
+				return "steve: builds in the badlands", nil
+			},
+		},
+	)
+
+	got, err := client.AnswerWithTools(context.Background(), "Alex", "2535400000000001",
+		"what is Steve building", registry)
+	if err != nil {
+		t.Fatalf("AnswerWithTools: %v", err)
+	}
+	if got != "Steve's base is in the badlands, per the wiki." {
+		t.Errorf("answer = %q, want the model's own reply", got)
 	}
 }

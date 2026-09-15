@@ -446,11 +446,18 @@ re-framing in the system prompt were both tried first, and neither moved
 it, because both leave the sentence for the model to write. Detection
 needs both halves, a word for saved coordinates and an owner who is not
 the asker, so a question carrying only one of them - "where is the gold
-farm", "what is Steve building" - still reaches the model with its tools;
-missing one costs nothing, since it then takes the path every waypoint
-question takes anyway. Nothing is looked up for this answer, so it names
-no coordinates and there is nothing to whisper, and the sentence goes
-through the same length budget and no-question rule as any other reply.
+farm", "what is Steve building" - still reaches the model with its tools.
+A question that reads as neither - "what are the coords of Steve" - does
+reach the model, and the same reading is applied a second time to the
+reply it wrote, but only where `waypoint_lookup` actually ran for that
+answer: there the model has spelled the attribution out, and a reply
+hanging the asker's own coordinates on another player's name is replaced
+with the same sentence. Either way the sentence names no coordinates, and
+it goes through the same length budget and no-question rule as any other
+reply. Caught before the loop nothing is looked up at all, so there is
+nothing to whisper; caught after it, the answer is whispered like any
+other built from the asker's own waypoints, which costs nothing, since
+the sentence that replaces it carries no coordinates to publish.
 
 An answer is broadcast, because an `@server` question is asked in public
 and an answer only the asker sees reads to everyone else as no answer at
