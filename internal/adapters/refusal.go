@@ -120,6 +120,12 @@ func afterDecline(s string) (string, bool) {
 // stitched on in that case. The caller runs the result through cleanReply,
 // which is what keeps a carried sentence inside the same chat budget and
 // no-question rule as any other reply.
+//
+// The refusal goes in front of the model's words or, with nothing to answer,
+// stands as the whole line -- never behind them. The evaluation harness
+// scores whether a reply ends on a question against the model's own text on
+// the strength of that, so words added after the model's here would have it
+// measuring a sentence the player never heard the end of.
 func withUnheardRefusal(refusal, reply string) string {
 	if refusal == "" || refusalSentence(reply) != "" {
 		return reply
