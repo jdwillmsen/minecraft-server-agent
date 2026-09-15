@@ -1731,6 +1731,20 @@ func TestSendNowDoesNotReportARosterGapAsAnEmptyServer(t *testing.T) {
 	}
 }
 
+// No path returns a counted zero today, which is the reason to enforce that
+// rather than write it down: the zero Outcome is "spoken", so a future
+// caller doing nothing worse than arithmetic would hand the reply switch a
+// send that reached nobody and claims to be in chat -- and every arm of it
+// falls through to "Announced.", which is the bug this all exists to close.
+func TestAReachOfNobodyIsNeverReportedAsSpoken(t *testing.T) {
+	if got := reached(0); got.Outcome == OutcomeSpoken {
+		t.Errorf("reached(0) = %+v, want a silence rather than a line that went into the game", got)
+	}
+	if got := reached(2); !got.Counted || got.Players != 2 || got.Outcome != OutcomeSpoken {
+		t.Errorf("reached(2) = %+v, want two counted players and a spoken outcome", got)
+	}
+}
+
 // A player typing !inbox is standing in the world; their message is itself
 // evidence of it. A roster that has not been told who is here yet says
 // nothing about anyone, and reading its silence as departure answers them

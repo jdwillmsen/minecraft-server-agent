@@ -245,10 +245,18 @@ const (
 	// OutcomeSpoken is a line that went into the game. Whether anyone can
 	// be named as having heard it is Counted's question, not this one.
 	OutcomeSpoken Outcome = iota
-	// OutcomeSilent is nothing said because there was nobody to say it to:
-	// a roster that has been told who is here and names nobody, or a
-	// whisper whose recipients are all offline. Whatever the target queues
-	// for is still owed.
+	// OutcomeSilent is nothing said because this process had nobody to say
+	// it to: a roster that has been told who is here and names nobody, a
+	// whisper whose recipients are all offline, or a whisper whose
+	// recipients a roster that has not looked yet could not name at all.
+	// Whatever the target queues for is still owed.
+	//
+	// It is therefore a claim about who this process could reach, and only
+	// sometimes about who is on the server. A caller that wants to assert
+	// an empty server needs the stronger fact, and the broadcast path is
+	// where it is established: a broadcast speaks into a roster that cannot
+	// say who is here rather than reporting silence, so it is silent only
+	// once the roster has looked.
 	OutcomeSilent
 	// OutcomeQueued is nothing said because this process is not the one
 	// that speaks -- a standby, or a process still starting. The row is
@@ -283,16 +291,27 @@ type Reach struct {
 }
 
 // reached is a counted answer: this many players heard it, and the count is
-// real. Only ever called with a player who was actually spoken to -- an
-// unspoken send has its own answer below.
-func reached(players int) Reach { return Reach{Players: players, Counted: true} }
+// real.
+//
+// A count of nobody is not one of those answers, and is refused rather than
+// documented as impossible. It would carry OutcomeSpoken by being the zero
+// value, which every caller reads as "the line went into the game" -- the
+// one claim that stops an operator saying it again -- so a zero is answered
+// as the silence it describes, and every send with something to report on
+// says which of the silences it was for itself.
+func reached(players int) Reach {
+	if players <= 0 {
+		return silent
+	}
+	return Reach{Players: players, Counted: true}
+}
 
 // uncounted is a broadcast that went out to an audience this process could
 // not account for.
 var uncounted = Reach{}
 
 // silent is a send with nobody to make: the line was rightly never spoken,
-// and the zero beside it is the truth about the server.
+// and the zero beside it is the truth about who this process could reach.
 var silent = Reach{Counted: true, Outcome: OutcomeSilent}
 
 // queued is a send a process that does not speak declined to make, leaving
@@ -304,6 +323,12 @@ var unsaid = Reach{Counted: true, Outcome: OutcomeFailed}
 
 // nothingSent is what an immediate send this process made no attempt at
 // achieved.
+//
+// On the live agent it is silence: this process is in the game and found
+// nobody in it this send could go to. For a whisper that is whoever the
+// roster named, which is nobody at all while the roster has not looked --
+// see OutcomeSilent for why that is still the honest answer and what it
+// does not license a caller to say.
 //
 // On a process that is not the one that speaks it is queued for any target
 // that queues: the row is stored and the live agent owes the delivery, which
