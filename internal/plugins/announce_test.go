@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
 // fakeAnnounceStore is a small in-memory stand-in for plugin.AnnounceStore:
@@ -50,9 +52,10 @@ type fakeAnnounceDeliverer struct {
 	// the answer a blind broadcast gives: it was said, nobody can be named.
 	sentNow   int
 	uncounted bool
-	// queued is the answer a process that does not speak gives: nothing was
-	// said, and the stored row is the live agent's to deliver.
-	queued         bool
+	// outcome is what became of the line. The zero value is the ordinary
+	// spoken one, so a test that cares only about a count says nothing
+	// about it.
+	outcome        announce.Outcome
 	sendErr        error
 	drainXUID      string
 	drainCount     int
@@ -70,10 +73,7 @@ func (f *fakeAnnounceDeliverer) SendNow(_ context.Context, a announce.Announceme
 	if f.uncounted {
 		return announce.Reach{}, nil
 	}
-	if f.queued {
-		return announce.Reach{Counted: true, Queued: true}, nil
-	}
-	return announce.Reach{Players: f.sentNow, Counted: true}, nil
+	return announce.Reach{Players: f.sentNow, Counted: true, Outcome: f.outcome}, nil
 }
 
 func (f *fakeAnnounceDeliverer) DrainAll(_ context.Context, xuid string, _ time.Time) (int, int, error) {
@@ -269,7 +269,7 @@ func TestAnnounceNowWithNobodyOnlineSaysNobodyHeardIt(t *testing.T) {
 	cmd := announceCommand(t, "announce")
 	pctx := &plugin.Context{
 		Announcements: &fakeAnnounceStore{enabled: true},
-		Deliverer:     &fakeAnnounceDeliverer{sentNow: 0},
+		Deliverer:     &fakeAnnounceDeliverer{outcome: announce.OutcomeSilent},
 	}
 
 	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
@@ -282,6 +282,58 @@ func TestAnnounceNowWithNobodyOnlineSaysNobodyHeardIt(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(reply), "nobody") {
 		t.Errorf("reply %q should say nobody heard it", reply)
+	}
+}
+
+// A broadcast to a watched, empty server is never spoken: there is nobody
+// in chat to speak to. "Announced." would have an operator believe their
+// restart warning went out, when everyone this target queues for is still
+// owed it.
+func TestAnnounceToEveryoneOnAnEmptyServerDoesNotClaimItWasAnnounced(t *testing.T) {
+	cmd := announceCommand(t, "announce")
+	pctx := &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: true},
+		Deliverer:     &fakeAnnounceDeliverer{outcome: announce.OutcomeSilent},
+	}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"server", "restarting", "in", "5", "minutes"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if reply == "Announced." {
+		t.Errorf("reply = %q, want it not to report a broadcast that was never spoken", reply)
+	}
+	if !strings.Contains(strings.ToLower(reply), "queued") {
+		t.Errorf("reply = %q, want it to say the message is still owed", reply)
+	}
+}
+
+// A whisper the bridge refused is not a message that was lost: the stored
+// row is still pending, so the player's own !inbox or their next join
+// delivers it. An operator told only that nothing went out runs the command
+// again, and the queue then hands the player both copies.
+func TestAnnounceToAPlayerWhoseWhisperFailedKeepsTheQueuePromise(t *testing.T) {
+	cmd := announceCommand(t, "announce")
+	pctx := &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: true},
+		Deliverer:     &fakeAnnounceDeliverer{outcome: announce.OutcomeFailed},
+		Roster:        fakeAnnounceRoster{online: map[string]string{"Dotablaze": "xuid-live"}},
+	}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"@Dotablaze", "the", "farm", "moved"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(reply, "Dotablaze") || !strings.Contains(strings.ToLower(reply), "queued") {
+		t.Errorf("reply = %q, want both halves — the send that failed and the queue still standing behind it", reply)
 	}
 }
 
@@ -854,7 +906,7 @@ func TestAnnounceDoesNotClaimABroadcastItOnlyQueued(t *testing.T) {
 	cmd := announceCommand(t, "announce")
 	pctx := &plugin.Context{
 		Announcements: &fakeAnnounceStore{enabled: true},
-		Deliverer:     &fakeAnnounceDeliverer{queued: true},
+		Deliverer:     &fakeAnnounceDeliverer{outcome: announce.OutcomeQueued},
 	}
 
 	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
@@ -870,5 +922,201 @@ func TestAnnounceDoesNotClaimABroadcastItOnlyQueued(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(reply), "queued") {
 		t.Errorf("reply %q should say the announcement is queued for the live agent", reply)
+	}
+}
+
+// outbox is an announce.Store that holds what it is given, so a test can
+// put a real Deliverer behind the command and read the reply the operator
+// would actually see -- the fake deliverer above can only report a Reach a
+// test made up, which is the thing under test here.
+type outbox struct {
+	nextID    int64
+	pending   []announce.Announcement
+	delivered []int64
+}
+
+var _ announce.Store = (*outbox)(nil)
+
+func (o *outbox) Enabled() bool { return true }
+
+func (o *outbox) Insert(context.Context, announce.Announcement) (int64, error) {
+	o.nextID++
+	return o.nextID, nil
+}
+
+// PendingFor reports only what has no delivery row yet, which is what makes
+// a row here the suppression it is in Postgres.
+func (o *outbox) PendingFor(context.Context, string, string, time.Time) ([]announce.Announcement, error) {
+	var out []announce.Announcement
+	for _, a := range o.pending {
+		if !slices.Contains(o.delivered, a.ID) {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
+func (o *outbox) MarkDelivered(_ context.Context, id int64, _ string, _ time.Time) error {
+	o.delivered = append(o.delivered, id)
+	return nil
+}
+
+// bridge is the console bridge as a Deliverer sees it, able to refuse a
+// broadcast the way an allowlist rejection, a 5xx or a timeout does.
+type bridge struct{ sayErr error }
+
+var _ announce.Voice = bridge{}
+
+func (b bridge) Say(context.Context, string) error { return b.sayErr }
+
+func (bridge) Tell(context.Context, string, string) error { return nil }
+
+// watchedRoster is a roster that has been told who is here and names them.
+type watchedRoster []string
+
+var _ announce.Roster = watchedRoster{}
+
+func (r watchedRoster) Online() []string { return r }
+func (r watchedRoster) Knows() bool      { return true }
+func (r watchedRoster) IsOnline(xuid string) bool {
+	for _, x := range r {
+		if x == xuid {
+			return true
+		}
+	}
+	return false
+}
+
+// openingRoster is the roster in the moments after a connection opens: it
+// has not been told who is here, so it names nobody and says so.
+type openingRoster struct{}
+
+var _ announce.Roster = openingRoster{}
+
+func (openingRoster) Online() []string     { return nil }
+func (openingRoster) Knows() bool          { return false }
+func (openingRoster) IsOnline(string) bool { return false }
+
+// flatPermissions resolves everyone to the same level, which is all a
+// broadcast target ever asks.
+type flatPermissions struct{}
+
+var _ announce.Permissions = flatPermissions{}
+
+func (flatPermissions) Resolve(context.Context, string) string { return "member" }
+
+type standby struct{ live bool }
+
+var _ announce.Leadership = standby{}
+
+func (s standby) Live() bool { return s.live }
+
+// announceThrough runs !announce against a real Deliverer and returns what
+// the operator was told.
+func announceThrough(t *testing.T, d *announce.Deliverer, args ...string) string {
+	t.Helper()
+	cmd := announceCommand(t, "announce")
+	pctx := &plugin.Context{Announcements: &fakeAnnounceStore{enabled: true}, Deliverer: d}
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            args,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	return reply
+}
+
+// A Say the bridge refused reached nobody, and the operator has to hear
+// that: "Announced." sends them away believing a restart warning is in
+// chat, and the server was never told.
+func TestAnnounceReportsABroadcastTheBridgeRefused(t *testing.T) {
+	d := announce.NewDeliverer(&outbox{}, bridge{sayErr: errors.New("bridge refused it")},
+		watchedRoster{"xuid-1"}, flatPermissions{}, logging.New("error"))
+
+	reply := announceThrough(t, d, "server", "restarting", "in", "5", "minutes")
+
+	if reply == "Announced." {
+		t.Errorf("reply %q claims a broadcast the bridge refused", reply)
+	}
+	if !strings.Contains(strings.ToLower(reply), "couldn't send") {
+		t.Errorf("reply %q should say the send failed", reply)
+	}
+}
+
+// The same failure under !now, where the zero reaches the arm that reports
+// an empty server: the operator is told nobody was on to hear a countdown
+// that was never spoken, with players standing on the server.
+func TestAnnounceNowDoesNotReportAFailedSendAsAnEmptyServer(t *testing.T) {
+	d := announce.NewDeliverer(&outbox{}, bridge{sayErr: errors.New("bridge refused it")},
+		watchedRoster{"xuid-1"}, flatPermissions{}, logging.New("error"))
+
+	reply := announceThrough(t, d, "!now", "restarting", "in", "five")
+
+	if strings.Contains(strings.ToLower(reply), "nobody") {
+		t.Errorf("reply %q reports an empty server for a send that failed", reply)
+	}
+	if !strings.Contains(strings.ToLower(reply), "couldn't send") {
+		t.Errorf("reply %q should say the send failed", reply)
+	}
+}
+
+// !now on a process that is not the live agent speaks nothing and stores
+// nothing anybody will pick up -- online-only is excluded from PendingFor
+// by construction. Reported as an empty server, the operator goes on
+// believing the countdown simply had no audience.
+func TestAnnounceNowOffTheLeaderDoesNotReportAnEmptyServer(t *testing.T) {
+	d := announce.NewDeliverer(&outbox{}, bridge{}, watchedRoster{"xuid-1"}, flatPermissions{}, logging.New("error"),
+		announce.WithLeadership(standby{live: false}))
+
+	reply := announceThrough(t, d, "!now", "restarting", "in", "five")
+
+	if strings.Contains(strings.ToLower(reply), "nobody") {
+		t.Errorf("reply %q reports an empty server for an announcement this process declined to say", reply)
+	}
+	if reply == "Announced." {
+		t.Errorf("reply %q claims a broadcast nothing spoke", reply)
+	}
+}
+
+// The reply that must stay: a watched server with nobody on it really did
+// hear nothing, and !now has no queue to keep it in.
+func TestAnnounceNowStillReportsAGenuinelyEmptyServer(t *testing.T) {
+	d := announce.NewDeliverer(&outbox{}, bridge{}, watchedRoster{}, flatPermissions{}, logging.New("error"))
+
+	reply := announceThrough(t, d, "!now", "restarting", "in", "five")
+
+	if !strings.Contains(strings.ToLower(reply), "nobody") {
+		t.Errorf("reply %q should say nobody was online to hear it", reply)
+	}
+}
+
+// !inbox is typed by a player standing in the world, and their message is
+// itself evidence of it. Answered in the moments before the opening roster
+// packet lands, the drain used to read a roster that had not been told as
+// the player having left: nothing was sent, and they were told something
+// had gone wrong with messages that were never attempted.
+func TestInboxDeliversWhileTheRosterHasNotBeenToldWhoIsHere(t *testing.T) {
+	cmd := announceCommand(t, "inbox")
+	store := &outbox{pending: []announce.Announcement{
+		{ID: 1, Body: "the nether hub is open", TargetKind: announce.TargetPlayer, TargetValue: "xuid-1"},
+		{ID: 2, Body: "back up your builds", TargetKind: announce.TargetPlayer, TargetValue: "xuid-1"},
+	}}
+	d := announce.NewDeliverer(store, bridge{}, openingRoster{}, flatPermissions{}, logging.New("error"))
+	pctx := &plugin.Context{Announcements: &fakeAnnounceStore{enabled: true}, Deliverer: d}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "xuid-1",
+		ActorPermission: plugin.PermissionMember,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.Contains(strings.ToLower(reply), "went wrong") {
+		t.Errorf("reply %q reports a failure for messages nothing failed to send", reply)
+	}
+	if !strings.Contains(reply, "2") {
+		t.Errorf("reply %q should report both messages delivered", reply)
 	}
 }

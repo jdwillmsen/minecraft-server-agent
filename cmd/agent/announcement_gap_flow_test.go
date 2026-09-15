@@ -73,9 +73,9 @@ func newConnectionGap(t *testing.T, at time.Time) *connectionGap {
 	playerRoster := roster.New()
 	audience := newDeliveryAudience(playerRoster, siblingBotXUIDs())
 	audience.beginSession(selfXUID)
-	backlog := &backlogStore{pending: []announce.Announcement{
+	backlog := newBacklogStore([]announce.Announcement{
 		{ID: gapAnnouncementID, Body: "announcement 9: the nether hub is open", TargetKind: announce.TargetPlayer, TargetValue: playerXUID, Priority: announce.PriorityNormal},
-	}}
+	})
 	log := logging.New("info")
 
 	deliverer := announce.NewDeliverer(backlog, voice, audience, announcePermissions{resolver: fakePermResolver(t, nil)}, log,
@@ -148,8 +148,8 @@ func (g *connectionGap) stillOwed(t *testing.T) []int64 {
 	return ids
 }
 
-// TestAPublishInTheConnectionGapIsNotRecordedAgainstWhoWasThere is
-// JDWLABS-543 end to end. A player is watched through one connection, the
+// TestAPublishInTheConnectionGapIsNotRecordedAgainstWhoWasThere is the
+// connection gap end to end. A player is watched through one connection, the
 // connection dies, and a publish lands in the gap before the next one opens.
 // Nobody is being watched then, so that announcement must reach nobody and be
 // recorded against nobody: the bridge is a separate process and still
@@ -265,6 +265,76 @@ func TestADrainForAPlayerWhoQuitIsNotWhisperedOrRecorded(t *testing.T) {
 	}
 }
 
+// TestAJoinDrainThatWakesAfterTheConnectionDiedIsNotWhisperedOrRecorded is
+// the drain's half of the connection gap, and the half no cancellation
+// closes in time. A player is watched through a connection and owed a
+// message; the connection dies and connectionEnded retires the session, so
+// the roster answers nothing about anybody. A drain scheduled by the
+// arrival that is already taking its turn must stop there: mc-console-bridge
+// is a separate process that accepts a tellraw matching nobody with success,
+// and the delivery row it would write is the permanent loss, because nothing
+// retries a recorded delivery.
+//
+// The context is deliberately live. A dead connection reaches a drain as a
+// cancel raised by a watcher goroutine that has to be scheduled first, and
+// runConnectLoop retires the roster before it ever gets there -- so the
+// cancel is a race the drain can win, while the roster going dark is
+// synchronous with the end of the session and cannot be outrun.
+//
+// It fails if a join drain reads a roster that has stopped answering as
+// permission to whisper: that roster names nobody, and its silence is what
+// the players reconnecting behind it look like from here.
+func TestAJoinDrainThatWakesAfterTheConnectionDiedIsNotWhisperedOrRecorded(t *testing.T) {
+	at := time.Date(2026, 9, 13, 9, 0, 0, 0, time.UTC)
+	g := newConnectionGap(t, at)
+
+	g.arrive(t, "LightKing0221")
+	// Their drain is scheduled by that arrival, and the grace it waits out
+	// is paid here -- so nothing but the dead connection is left to hold
+	// the backlog back.
+	g.clock.advance(freshJoinGrace + time.Minute)
+
+	connectionEnded(g.roster, g.joins)
+
+	delivered, remaining, err := g.drainer.DrainForJoin(context.Background(), playerXUID, g.clock.now())
+	if err != nil {
+		t.Fatalf("DrainForJoin: %v", err)
+	}
+	if lines := g.voice.spoken(); len(lines) != 0 {
+		t.Errorf("whispered into a connection that has ended:%s", formatTimeline(lines, at))
+	}
+	if rows := g.backlog.deliveryRows(); len(rows) != 0 {
+		t.Errorf("delivery rows = %+v, want none — a row written in the gap suppresses that announcement for good", rows)
+	}
+	if delivered != 0 || remaining != 1 {
+		t.Errorf("DrainForJoin = (%d, %d), want (0, 1) — the announcement is still owed", delivered, remaining)
+	}
+	if owed := g.stillOwed(t); len(owed) != 1 || owed[0] != gapAnnouncementID {
+		t.Fatalf("still owed = %v, want announcement %d kept for the connection that follows", owed, gapAnnouncementID)
+	}
+
+	// The point of holding it: the next connection finds the player in its
+	// opening snapshot, and its drain pays what the gap withheld.
+	g.reconnectFinding(t, "LightKing0221")
+	g.clock.advance(announceDrainDelay + time.Second)
+	delivered, remaining, err = g.drainer.DrainForJoin(context.Background(), playerXUID, g.clock.now())
+	if err != nil {
+		t.Fatalf("DrainForJoin after the reconnect: %v", err)
+	}
+	if delivered != 1 || remaining != 0 {
+		t.Fatalf("drain delivered %d with %d remaining, want 1 and 0 — the announcement the gap withheld must be paid by the next connection", delivered, remaining)
+	}
+	lines := g.voice.spoken()
+	t.Logf("what LightKing0221's client received across the gap:%s", formatTimeline(lines, at))
+	want := "whisper to " + playerXUID + ": announcement 9: the nether hub is open"
+	if len(lines) != 1 || lines[0].text != want {
+		t.Errorf("transcript = %+v, want exactly one line %q", lines, want)
+	}
+	if got := recordedIDs(g.backlog.deliveryRows()); len(got) != 1 || got[0] != gapAnnouncementID {
+		t.Errorf("delivery rows = %v, want one for announcement %d, written only once it was actually seen", got, gapAnnouncementID)
+	}
+}
+
 // TestAProcessThatHasNotTakenTheLockDoesNotBroadcast wires the Deliverer's
 // leadership signal to a real HTTP server the way main does, and publishes
 // through both states that are not leadership -- still starting, then
@@ -284,7 +354,7 @@ func TestAProcessThatHasNotTakenTheLockDoesNotBroadcast(t *testing.T) {
 
 	at := time.Date(2026, 9, 13, 9, 0, 0, 0, time.UTC)
 	voice := newTimelineVoice(newScaledClock(at))
-	backlog := &backlogStore{}
+	backlog := newBacklogStore(nil)
 	playerRoster := roster.New()
 	joins := newJoinTimes()
 	d := announce.NewDeliverer(backlog, voice,

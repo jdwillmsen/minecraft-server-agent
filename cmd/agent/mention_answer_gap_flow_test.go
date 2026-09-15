@@ -51,7 +51,7 @@ func (b *consoleBridge) ran() []string {
 }
 
 // TestALateAnswerIsStillWhisperedAfterTheConnectionDies is the other half of
-// JDWLABS-543's gap. handleMention answers on the process context
+// the connection gap. handleMention answers on the process context
 // deliberately -- the reply goes out over the console bridge, which is a
 // separate service, so a reconnect mid-answer does not invalidate it. That
 // only holds while the agent can still turn the asker's XUID into a

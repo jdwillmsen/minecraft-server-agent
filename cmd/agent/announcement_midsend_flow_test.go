@@ -25,23 +25,28 @@ import (
 // which is why nothing else about a dead connection stops the rest of a
 // backlog on its own.
 //
-// The held call returns as soon as its context ends, which is what makes
-// the test deterministic: the connection end reaches a delivery through a
-// watcher goroutine, so releasing the whisper on a timer instead would
-// sometimes let the next message out before the cancel landed.
+// The held call returns when its context ends, and that is the whole of the
+// test's timing: the connection end reaches a delivery through a watcher
+// goroutine, so a release on any other schedule would sometimes let the next
+// message out before the cancel landed. resume exists only so a test that
+// fails before the cancel arrives cannot leave the whisper parked forever.
 type gatedVoice struct {
 	*timelineVoice
-	held   chan struct{}
-	resume chan struct{}
-	once   sync.Once
+	held     chan struct{}
+	released chan struct{}
+	resume   chan struct{}
+	once     sync.Once
 }
 
-func newGatedVoice(clock *scaledClock) *gatedVoice {
-	return &gatedVoice{
+func newGatedVoice(t *testing.T, clock *scaledClock) *gatedVoice {
+	v := &gatedVoice{
 		timelineVoice: newTimelineVoice(clock),
 		held:          make(chan struct{}),
+		released:      make(chan struct{}),
 		resume:        make(chan struct{}),
 	}
+	t.Cleanup(func() { close(v.resume) })
+	return v
 }
 
 func (v *gatedVoice) Tell(ctx context.Context, xuid, message string) error {
@@ -55,6 +60,7 @@ func (v *gatedVoice) Tell(ctx context.Context, xuid, message string) error {
 		case <-ctx.Done():
 		case <-v.resume:
 		}
+		close(v.released)
 	})
 	return err
 }
@@ -68,6 +74,19 @@ func (v *gatedVoice) waitHeld(t *testing.T) {
 	case <-v.held:
 	case <-time.After(10 * time.Second):
 		t.Fatalf("no whisper was ever attempted: %s", formatTimeline(v.spoken(), time.Time{}))
+	}
+}
+
+// waitReleased blocks until the held whisper has returned, which nothing but
+// the connection ending does while the test is running. Once it has, the
+// cancel the drain reads is already in effect, so whether the rest of the
+// backlog is spoken stops being a question of how fast this machine is.
+func (v *gatedVoice) waitReleased(t *testing.T) {
+	t.Helper()
+	select {
+	case <-v.released:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the end of the connection never reached the whisper in flight: %s", formatTimeline(v.spoken(), time.Time{}))
 	}
 }
 
@@ -94,15 +113,15 @@ func newInterruption(t *testing.T, ctx context.Context, joinedAt time.Time) *int
 	clock := newScaledClock(joinedAt)
 	joins := newJoinTimes()
 	joins.now = clock.now
-	voice := newGatedVoice(clock)
+	voice := newGatedVoice(t, clock)
 	playerRoster := roster.New()
 	audience := newDeliveryAudience(playerRoster, siblingBotXUIDs())
 	audience.beginSession(selfXUID)
-	backlog := &backlogStore{pending: []announce.Announcement{
+	backlog := newBacklogStore([]announce.Announcement{
 		{ID: 2, Body: "announcement 2: the nether hub is open", TargetKind: announce.TargetPlayer, TargetValue: playerXUID, Priority: announce.PriorityNormal},
 		{ID: 3, Body: "announcement 3: back up your builds", TargetKind: announce.TargetPlayer, TargetValue: playerXUID, Priority: announce.PriorityNormal},
 		{ID: 4, Body: "announcement 4: spawn is being rebuilt", TargetKind: announce.TargetPlayer, TargetValue: playerXUID, Priority: announce.PriorityNormal},
-	}}
+	})
 	log := logging.New("info")
 
 	deliverer := announce.NewDeliverer(backlog, voice, audience, announcePermissions{resolver: fakePermResolver(t, nil)}, log,
@@ -213,17 +232,18 @@ func TestABacklogInterruptedByADroppedConnectionIsNotLost(t *testing.T) {
 	in.voice.waitHeld(t)
 
 	// The Bedrock connection dies here, exactly as runConnectLoop reports
-	// it when session returns. The cancel that follows frees the held
-	// whisper within microseconds; the timer frees it when no cancel ever
-	// arrives, so a missing one lets the rest of the backlog out and fails
-	// this test rather than hanging it.
+	// it when session returns, and the held whisper is freed by that and
+	// nothing else -- so it returning is this test's proof the drain has
+	// already read a cancelled context. Everything the drain does next, the
+	// two unsent announcements and the !inbox trailer alike, is decided
+	// behind that answer rather than by how fast this machine got there.
 	in.joins.disconnected()
-	time.AfterFunc(200*time.Millisecond, func() { close(in.voice.resume) })
+	in.voice.waitReleased(t)
 
-	// Well past that release, so the two unsent announcements and the
-	// !inbox trailer have had their chance: the drain's next bridge call
-	// is immediate once the held one returns.
-	time.Sleep(time.Second)
+	// The drain's last act on the message that did get out: a row is what
+	// stops it being sent again, so the books are only closed once it is
+	// written.
+	in.backlog.waitForRows(t, 1, "the whisper that went out before the drop was never recorded")
 
 	lines := in.voice.spoken()
 	t.Logf("what LightKing0221's client received before the connection dropped:%s", formatTimeline(lines, joinedAt))

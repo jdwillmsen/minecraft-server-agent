@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
@@ -77,7 +78,7 @@ type Permissions interface {
 
 // Deliverer decides who actually hears an announcement, sends it, and
 // records that it was heard. Every method tolerates a disabled store
-// (Store.Enabled false) by returning a zero value and no error: a
+// (Store.Enabled false) by reporting that nothing was sent, and no error: a
 // deployment with no announcements table configured yet must still be able
 // to run join/command handling that calls into a Deliverer unconditionally.
 type Deliverer struct {
@@ -162,8 +163,12 @@ func (d *Deliverer) live() bool {
 // no evidence at all that the player is still there. A whisper recorded
 // against someone who has gone is the permanent loss this package exists to
 // avoid -- nothing retries a delivery that has a row.
+//
+// The same predicate a plugin asks through Context.KnownOffline, so the two
+// layers cannot disagree about what a roster's silence means: a roster that
+// has not been told who is here has not said anyone left.
 func (d *Deliverer) departed(xuid string) bool {
-	return !d.roster.IsOnline(xuid)
+	return roster.KnownOffline(d.roster, xuid)
 }
 
 // stillLoading reports whether xuid's client may be too freshly loaded to
@@ -225,6 +230,46 @@ func (d *Deliverer) recipients(ctx context.Context, a Announcement) []string {
 	}
 }
 
+// Outcome is what became of the line a send was supposed to put into the
+// game. It is what separates the zeros: an empty server, a standby that may
+// not speak and a bridge that refused the command all reach nobody, and only
+// this says which of them happened.
+//
+// Spoken is the zero value on purpose. A Reach nobody filled in -- a stub, a
+// caller's own struct literal -- must not read as "the server was never
+// told", because that is the one answer that invites saying it all over
+// again.
+type Outcome uint8
+
+const (
+	// OutcomeSpoken is a line that went into the game. Whether anyone can
+	// be named as having heard it is Counted's question, not this one.
+	OutcomeSpoken Outcome = iota
+	// OutcomeSilent is nothing said because this process had nobody to say
+	// it to: a roster that has been told who is here and names nobody, a
+	// whisper whose recipients are all offline, or a whisper whose
+	// recipients a roster that has not looked yet could not name at all.
+	// Whatever the target queues for is still owed.
+	//
+	// It is therefore a claim about who this process could reach, and only
+	// sometimes about who is on the server. A caller that wants to assert
+	// an empty server needs the stronger fact, and the broadcast path is
+	// where it is established: a broadcast speaks into a roster that cannot
+	// say who is here rather than reporting silence, so it is silent only
+	// once the roster has looked.
+	OutcomeSilent
+	// OutcomeQueued is nothing said because this process is not the one
+	// that speaks -- a standby, or a process still starting. The row is
+	// stored and the live agent delivers it.
+	OutcomeQueued
+	// OutcomeFailed is nothing said when something was there to say it to:
+	// the send itself failed, or this process may not speak and no queue
+	// stands behind the target for anything else to pick up. A caller that
+	// reports this as a delivery tells an operator their restart warning is
+	// in chat when the server was never told.
+	OutcomeFailed
+)
+
 // Reach is what one immediate send actually achieved.
 //
 // Players alone could not say it: a broadcast that goes out while the roster
@@ -239,46 +284,80 @@ type Reach struct {
 	// Counted is whether Players is an answer at all. False for a broadcast
 	// that went out and could not be fully accounted for afterwards.
 	Counted bool
-	// Queued is true when this process sent nothing because it is not the
-	// one that speaks -- a standby, or a process still starting. The
-	// announcement is stored and the live agent delivers it, so a caller
-	// reading a zero here must not take it for "nobody was on the server".
-	Queued bool
+	// Outcome is whether the line was spoken at all, and if not, why. Every
+	// unspoken send counts zero players, so this is the only thing that
+	// tells them apart.
+	Outcome Outcome
 }
 
-// reached is a counted answer: this many players, and the count is real.
-func reached(players int) Reach { return Reach{Players: players, Counted: true} }
+// reached is a counted answer: this many players heard it, and the count is
+// real.
+//
+// A count of nobody is not one of those answers, and is refused rather than
+// documented as impossible. It would carry OutcomeSpoken by being the zero
+// value, which every caller reads as "the line went into the game" -- the
+// one claim that stops an operator saying it again -- so a zero is answered
+// as the silence it describes, and every send with something to report on
+// says which of the silences it was for itself.
+func reached(players int) Reach {
+	if players <= 0 {
+		return silent
+	}
+	return Reach{Players: players, Counted: true}
+}
 
 // uncounted is a broadcast that went out to an audience this process could
 // not account for.
 var uncounted = Reach{}
 
+// silent is a send with nobody to make: the line was rightly never spoken,
+// and the zero beside it is the truth about who this process could reach.
+var silent = Reach{Counted: true, Outcome: OutcomeSilent}
+
 // queued is a send a process that does not speak declined to make, leaving
 // the stored row for whoever holds the lock.
-var queued = Reach{Counted: true, Queued: true}
+var queued = Reach{Counted: true, Outcome: OutcomeQueued}
 
-// nothingSent is what an immediate send that spoke to nobody achieved. On a
-// process that is not the one that speaks it is queued for any target that
-// queues: the row is stored and the live agent owes the delivery, which a
-// caller must be able to tell from the zero a watched, empty server gives.
+// unsaid is a send that should have happened and did not.
+var unsaid = Reach{Counted: true, Outcome: OutcomeFailed}
+
+// nothingSent is what an immediate send this process made no attempt at
+// achieved.
+//
+// On the live agent it is silence: this process is in the game and found
+// nobody in it this send could go to. For a whisper that is whoever the
+// roster named, which is nobody at all while the roster has not looked --
+// see OutcomeSilent for why that is still the honest answer and what it
+// does not license a caller to say.
+//
+// On a process that is not the one that speaks it is queued for any target
+// that queues: the row is stored and the live agent owes the delivery, which
+// a caller must be able to tell from the zero a watched, empty server gives.
 //
 // Online-only is the exception, because nothing will ever pick its row up --
 // PendingFor excludes it by construction. The HTTP API refuses one off the
 // leader before it gets here, but that check is read-then-act and the role
-// can change under it, so the honest answer for a target with no queue
-// behind it is the zero, never a queued promise nobody owes.
+// can change under it, so a target with no queue behind it is a send that
+// did not happen, never a queued promise nobody owes and never an empty
+// server.
 func (d *Deliverer) nothingSent(t Target) Reach {
-	if !d.live() && Queues(t) {
+	if d.live() {
+		return silent
+	}
+	if Queues(t) {
 		return queued
 	}
-	return reached(0)
+	return unsaid
 }
 
 // SendNow delivers a immediately to whoever is online and matches its
 // target, and reports what that reached.
 func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reach, error) {
 	if !d.store.Enabled() {
-		return reached(0), nil
+		// No store is no announcement: nothing was said and nothing is
+		// waiting to be. A caller that needs to know why asks Publish,
+		// which answers ErrDisabled.
+		return silent, nil
 	}
 	targets := d.recipients(ctx, a)
 	now := time.Now()
@@ -314,7 +393,7 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		// would be a console line no player could hear.
 		if len(targets) == 0 && d.roster.Knows() {
 			d.log.Info("announce_say_skipped_no_audience", logging.Fields{"announcement_id": id})
-			return reached(0), nil
+			return silent, nil
 		}
 		err := d.voice.Say(ctx, a.Body)
 		metrics.AnnounceDelivery(metrics.DeliveryBroadcast, err)
@@ -323,7 +402,7 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 			// delivery here would make an online player's next join
 			// silently skip a message they never actually received.
 			d.log.Error("announce_say_failed", logging.Fields{"announcement_id": id, "error": err.Error()})
-			return reached(0), nil
+			return unsaid, nil
 		}
 		// Say is one console command with no per-recipient receipt, so
 		// "who heard this" has to come from the roster snapshot taken at
@@ -344,6 +423,15 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 				// write for every remaining recipient that would fail anyway.
 				// Everyone still in the list heard the Say all the same.
 				unaccounted = true
+				break
+			}
+			if !d.roster.Knows() {
+				// The connection died inside the Say. There is no roster
+				// left to record from -- a row written on the strength of a
+				// snapshot that has since evaporated would suppress the
+				// redelivery of a message a player who went with it never
+				// saw. Everyone still unrecorded stays owed, and the Knows
+				// check below reports the whole send as unaccounted for.
 				break
 			}
 			if d.departed(xuid) {
@@ -424,15 +512,33 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 	// nothing else retries it.
 	delivered := 0
 	deferred := 0
+	// Counted so a whisper nobody read can say why: a Tell that failed is
+	// not the same fact as there having been nobody to tell, and both end
+	// this loop with nothing delivered.
+	refused := 0
 	// Set when a recipient has read the whisper and no row survived to say
 	// so, the same question the broadcast loop asks: a recipient who was
 	// never sent to is excluded honestly, one who was sent to and not
 	// recorded is not accounted for at all.
 	unaccounted := false
+	// Set when the loop stopped before it had an answer for every
+	// recipient. Those left behind were neither told nor established as
+	// absent, so the zero this ends on is not the empty roster silent
+	// claims -- it is a send that should have happened and did not.
+	interrupted := false
 	for _, xuid := range targets {
 		if ctx.Err() != nil {
 			// Cancelled: stop rather than run up a failed bridge attempt
 			// (and an error line) for every recipient still left to try.
+			interrupted = true
+			break
+		}
+		if !d.roster.Knows() {
+			// The connection died part-way through the list. Nobody left in
+			// it can be confirmed present, and a whisper recorded against
+			// someone who went with the connection is retried by nothing.
+			// They stay pending for a roster that can answer.
+			interrupted = true
 			break
 		}
 		if d.departed(xuid) {
@@ -451,6 +557,7 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		err := d.voice.Tell(ctx, xuid, a.Body)
 		metrics.AnnounceDelivery(metrics.DeliveryWhisper, err)
 		if err != nil {
+			refused++
 			d.log.Error("announce_tell_failed", logging.Fields{"announcement_id": id, "xuid": xuid, "error": err.Error()})
 			continue
 		}
@@ -472,6 +579,16 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		// and a zero would say the line was never sent at all.
 		return uncounted, nil
 	}
+	if delivered == 0 {
+		// Nobody read it, and which of the reasons decides what the caller
+		// may claim: a Tell the bridge refused, or a list this loop never
+		// finished, is a send that did not happen, while a recipient who
+		// had gone or was still loading simply was not there to be told.
+		if refused > 0 || interrupted {
+			return unsaid, nil
+		}
+		return silent, nil
+	}
 	return reached(delivered), nil
 }
 
@@ -491,29 +608,61 @@ var ErrDisabled = errors.New("announce: no announcement store configured")
 // row is stored and the queue owns it from here.
 func (d *Deliverer) Publish(ctx context.Context, a Announcement) (id int64, sent Reach, err error) {
 	if !d.store.Enabled() {
-		return 0, reached(0), ErrDisabled
+		return 0, silent, ErrDisabled
 	}
 	a.Delivery = DeliveryFor(a.TargetKind)
 	id, err = d.store.Insert(ctx, a)
 	if err != nil {
-		return 0, reached(0), err
+		return 0, silent, err
 	}
 	a.ID = id
 	sent, err = d.SendNow(ctx, a, id)
 	return id, sent, err
 }
 
+// The two answers to sendPending's needPresent, named because which one a
+// drain passes is the whole difference between them and a bare boolean at
+// the call site reads as neither.
+const (
+	// presenceRequired is a drain the roster vouched for, so the roster is
+	// also the only thing that can withdraw it.
+	presenceRequired = true
+	// presenceGiven is a drain the player asked for in their own words,
+	// which no roster contradicts by going quiet.
+	presenceGiven = false
+)
+
 // sendPending whispers each of msgs to xuid in order, marking every
 // successful send delivered. A send or a mark that fails is logged and
 // simply not counted: the announcement is left pending in the store, so it
 // is retried on this player's next join or !inbox rather than lost.
 //
-// A player who is no longer online is not whispered to at all. This drain
-// was scheduled seconds ago by their arrival, and a player who quits inside
-// that wait would otherwise be sent their whole backlog and have every
-// message of it recorded -- the console accepts a tellraw that matches
-// nobody, so the send reports success and the backlog is gone for good.
-func (d *Deliverer) sendPending(ctx context.Context, xuid string, now time.Time, msgs []Announcement) int {
+// A player known to have left is not whispered to at all. This drain was
+// scheduled seconds ago by their arrival, and a player who quits inside that
+// wait would otherwise be sent their whole backlog and have every message of
+// it recorded -- the console accepts a tellraw that matches nobody, so the
+// send reports success and the backlog is gone for good.
+//
+// needPresent withholds the backlog from a roster that has merely stopped
+// answering as well, and the two drains differ on it because their evidence
+// of presence does.
+//
+// A join drain is scheduled by a roster event and takes its turn seconds
+// later, so a roster that cannot say who is here is never the healthy case
+// for it -- the connection died, its players are reconnecting, and the
+// console bridge is a separate process that accepts a tellraw matching
+// nobody with success. Its context is cancelled with that connection, but
+// by a watcher goroutine that has to be scheduled first, while the session's
+// roster goes dark in the call that ends it: a drain already in this loop
+// can read a live context and a dark roster in the same breath.
+//
+// An !inbox drain is the player's own command, which is the evidence the
+// roster is missing, and it must still be answered in the window before the
+// first roster packet lands. Nor can it race a roster going dark: it runs
+// synchronously on the packet read loop, which has to return before the
+// connection can be retired -- and what bounds it instead is the timeout
+// every dispatched command runs under.
+func (d *Deliverer) sendPending(ctx context.Context, xuid string, needPresent bool, now time.Time, msgs []Announcement) int {
 	delivered := 0
 	for _, a := range msgs {
 		if ctx.Err() != nil {
@@ -521,7 +670,7 @@ func (d *Deliverer) sendPending(ctx context.Context, xuid string, now time.Time,
 			// into that many more failed bridge attempts and error lines.
 			break
 		}
-		if d.departed(xuid) {
+		if d.departed(xuid) || (needPresent && !d.roster.Knows()) {
 			d.log.Info("announce_drain_stopped_player_left", logging.Fields{"announcement_id": a.ID, "xuid": xuid})
 			break
 		}
@@ -613,7 +762,7 @@ func (d *Deliverer) DrainForJoin(ctx context.Context, xuid string, now time.Time
 	toSend = append(toSend, expedited...)
 	toSend = append(toSend, normal[:limit]...)
 
-	delivered = d.sendPending(ctx, xuid, now, toSend)
+	delivered = d.sendPending(ctx, xuid, presenceRequired, now, toSend)
 	remaining = len(pending) - delivered
 	return delivered, remaining, nil
 }
@@ -646,6 +795,6 @@ func (d *Deliverer) DrainAll(ctx context.Context, xuid string, now time.Time) (d
 	if limit > MaxPerInbox {
 		limit = MaxPerInbox
 	}
-	delivered = d.sendPending(ctx, xuid, now, pending[:limit])
+	delivered = d.sendPending(ctx, xuid, presenceGiven, now, pending[:limit])
 	return delivered, len(pending) - delivered, nil
 }

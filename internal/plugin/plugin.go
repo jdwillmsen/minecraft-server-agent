@@ -22,6 +22,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/moderation"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
 )
@@ -362,19 +363,17 @@ type Presence interface {
 }
 
 // KnownOffline reports whether this process can say for certain that xuid
-// has left. It is the negative form on purpose: a caller acts only on
-// positive knowledge of absence, so a Context with no Presence wired keeps
-// doing what it did before rather than silently withholding everything it
-// would otherwise send. cmd/agent always supplies one.
+// has left. A Context with no Presence wired keeps doing what it did before
+// rather than silently withholding everything it would otherwise send;
+// cmd/agent always supplies one.
 //
-// A roster that has not been told who is here says nothing about anyone. In
-// the window between a connection opening and its first roster packet a
-// player can be standing in the world, chatting -- their message is itself
-// evidence they are there -- while IsOnline still answers no for everybody.
-// Reading that as departure would withhold what they are owed on the word of
-// a roster that has not looked yet.
+// The predicate itself lives in the roster package, because a deliverer
+// deciding whether to whisper asks exactly the same question of its own
+// audience filter. Two spellings of it went one step apart -- a player was
+// owed their inbox by one and written off as gone by the other -- and the
+// answer had to be the same in both.
 func (c *Context) KnownOffline(xuid string) bool {
-	return c != nil && c.Presence != nil && c.Presence.Knows() && !c.Presence.IsOnline(xuid)
+	return c != nil && roster.KnownOffline(c.Presence, xuid)
 }
 
 // Registry holds every registered plugin and routes commands to them.

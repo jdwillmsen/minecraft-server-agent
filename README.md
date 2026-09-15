@@ -494,7 +494,17 @@ has ever seen is refused, because an announcement aimed at an XUID nobody
 holds could never be delivered or drained. A gamertag freed by a rename can
 be taken by another account, so whoever answers to it now wins over whoever
 used to. The reply says what actually happened: `Told X.` only when the
-whisper went out, `Queued for X.` when it is waiting for them instead.
+whisper went out, `Queued for X.` when it is waiting for them instead. An
+announcement that never reached the server at all - the console bridge
+refused it, or this process is not the live agent - is answered as a send
+that did not happen, never as a server nobody was on. Where the target still
+queues, that answer names what is owed as well as what failed, so an
+operator does not send a second copy of a message the next join will
+deliver; `!now` is the one target with no queue to fall back on, so nobody
+hearing it means nobody ever will. An announcement with nobody to say it
+to - a broadcast to a watched server nobody is on, a permission nobody
+online holds - was never spoken either, and says so rather than reporting
+an announcement.
 
 `!inbox` is member level and only ever drains the caller's own queue - no
 argument names another player's, the same restriction `!wp` places on whose
@@ -568,13 +578,26 @@ player who asked for it. The next connection replaces those names as it
 reports them.
 
 A resolvable name is never taken as proof that a player is still here.
-Anything whose record would claim the player saw it asks the roster's online
-list first: the console accepts a `tellraw` matching nobody and reports
-success, so a send alone proves nothing. An announcement backlog whose drain
-was scheduled by an arrival is not whispered to someone who quit during its
-wait - and the "N more messages are waiting" trailer is not sent either,
-since everything is still owed because they left rather than because the
-per-join cap held it back. What they are owed survives for their next join.
+Anything whose record would claim the player saw it asks the roster and
+never the name: the console accepts a `tellraw` matching nobody and reports
+success, so a send alone proves nothing, while a roster that has not been
+told who is here has not said anyone left either. An announcement backlog
+whose drain was scheduled by an arrival is not whispered to someone who quit
+during its wait - and the "N more messages are waiting" trailer is not sent
+either, since everything is still owed because they left rather than because
+the per-join cap held it back. What they are owed survives for their next
+join.
+
+A roster that has gone quiet is a second question, and the two drains answer
+it differently. A join drain was scheduled by an arrival the roster itself
+reported and takes its turn seconds later, so a roster that can no longer
+say who is here means the connection has ended and its players are
+reconnecting: the backlog waits for the next one rather than being whispered
+at a connection nobody is on and recorded as read. An `!inbox` drain is the
+player's own words, which no silence contradicts, so it is answered in the
+window before the first roster packet lands - it cannot outlive its
+connection in any case, being served on the read loop that took the command,
+and the dispatch timeout is what bounds it.
 
 A moderation warning is the same question with a different record. A player
 who has left is not warned, and the flag is recorded as *logged* rather than
@@ -621,6 +644,12 @@ against someone who is no longer on the server, and the `!inbox` trailer
 that would have followed it is not spoken either - a player mid-reconnect
 is owed no pointer at a list they are not there to read. Whatever is still
 owed is summarised by the delivery the next connection schedules for them.
+
+It does not wait for that cancellation to arrive, though. The roster is
+retired in the same breath as the connection, while the cancel reaches a
+delivery already under way a moment later, so what stops a join backlog at
+the message it is on is the roster having gone quiet - which is the point of
+asking the roster rather than the clock or the context.
 
 Those snapshot deliveries would otherwise all come due in the same
 millisecond, so each is spread by a random fraction of the wait, never more
@@ -865,16 +894,22 @@ curl -sS -X POST http://<agent>:8080/announcements \
   recipients could not be fully accounted for - the agent could not see who
   was on the server (its reconnect gap, or the moments after a connection
   opens before the first roster packet), nobody could be named as having
-  heard it because every recipient left or was still loading, the connection
-  died during the send, or a delivery row would not write. Whoever it reached
-  has already seen it, whether it was broadcast to the server or whispered to
-  one player. `null` is the one value that is never safe to retry on: the
-  line has already gone out, and publishing again says it twice.
-- A count excludes a broadcast recipient who left during the send or whose
-  client was still loading when it went out: they are accounted for, not
-  unknown - nothing was recorded for them, so the queue still owes them the
-  line on their next join. `reached` can therefore be smaller than the number
-  who were online a moment earlier without being `null`.
+  heard it because every recipient left or had only just arrived, the
+  connection died during the send, or a delivery row would not write.
+  Whoever it reached has already seen it, whether it was broadcast to the
+  server or whispered to one player. `null` is the one value that is never
+  safe to retry on: the line has already gone out, and publishing again says
+  it twice.
+- A count excludes a broadcast recipient who left during the send, and one
+  whose own arrival the agent watched land moments before it: they are
+  accounted for, not unknown - their client was still loading, nothing was
+  recorded for them, and the queue still owes them the line on their next
+  join. A recipient held back only because the *agent* has just connected is
+  counted as having heard it: that is a guess about who might be loading
+  rather than an arrival anyone saw, one broadcast reaches every client that
+  is up, and only their delivery row was withheld. `reached` can therefore be
+  smaller than the number who were online a moment earlier without being
+  `null`.
 - `reached: 0` means nothing was spoken, so retrying will not repeat
   anything in chat. It does **not** mean nothing was stored: every target
   except `online_only` queues, so a retry adds a second announcement and the

@@ -596,3 +596,53 @@ func TestTheAgentsEntryArrivingTwiceMakesTheRosterKnow(t *testing.T) {
 		t.Errorf("Online() = %+v, want the agent alone", r.Online())
 	}
 }
+
+// KnownOffline is asked by everything that decides whether to send a player
+// something, so the window before the first roster packet has to answer
+// "nothing known" rather than "gone": a player chatting in it is standing in
+// the world, and writing them off withholds what they are owed.
+//
+// Which makes it a one-sided predicate, and the last case here is the side
+// that catches callers out: its false is "not known to have left", never
+// "known to be here".
+func TestKnownOfflineNeedsARosterThatHasBeenTold(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Now(), agentEntry.XUID)
+
+	if KnownOffline(r, "111") {
+		t.Error("KnownOffline before the first roster packet = true, want false — the roster has not looked yet")
+	}
+
+	r.Apply([]PlayerListEntry{agentEntry, {XUID: "111", Username: "Steve"}})
+
+	if KnownOffline(r, "111") {
+		t.Error("KnownOffline for a player the roster names = true, want false")
+	}
+	if !KnownOffline(r, "222") {
+		t.Error("KnownOffline for a player a watching roster does not name = false, want true")
+	}
+
+	// Half an answer, and the half that is missing is why it is not enough
+	// on its own: the roster stopped knowing rather than the player
+	// leaving, so this says nothing about them -- including nothing that
+	// makes them safe to send to. A caller that must not speak into a
+	// connection that has ended asks the question below as well, and the
+	// pair is the contract: no positive knowledge of absence, and no
+	// knowledge at all.
+	r.EndSession()
+
+	if KnownOffline(r, "111") {
+		t.Error("KnownOffline once the connection ended = true, want false — the roster stopped knowing, not the player leaving")
+	}
+	if r.Knows() {
+		t.Error("Knows() once the connection ended = true, want false — KnownOffline's silence here is ignorance, and a caller that needs presence has to see that")
+	}
+}
+
+// A caller with no presence wired keeps doing what it did before rather than
+// silently withholding everything it would otherwise send.
+func TestKnownOfflineOfNothingKnowsNothing(t *testing.T) {
+	if KnownOffline(nil, "111") {
+		t.Error("KnownOffline(nil) = true, want false")
+	}
+}
