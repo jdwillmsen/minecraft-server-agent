@@ -87,7 +87,7 @@ func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
 		return World{}, nil, err
 	}
 
-	dbPath, err := findDB(root, newest)
+	dbPath, err := findDB(ctx, root, newest)
 	if err != nil {
 		_ = cleanup()
 		return World{}, nil, err
@@ -125,6 +125,18 @@ func (s DirectorySource) Open(ctx context.Context) (World, func() error, error) 
 	// would destroy a snapshot this process did not extract.
 	noCleanup := func() error { return nil }
 
+	// A directory that is not there at all is not a snapshotter declining to
+	// take a hold: it is a volume that never mounted, a renamed path or a
+	// typo. Reading the marker first would report that as an absent
+	// snapshot, fall back to the archive, and stay green forever.
+	info, err := os.Stat(s.Dir)
+	switch {
+	case err != nil:
+		return World{}, nil, fmt.Errorf("stat snapshot directory %s: %w", s.Dir, err)
+	case !info.IsDir():
+		return World{}, nil, fmt.Errorf("snapshot path %s is not a directory", s.Dir)
+	}
+
 	marker := filepath.Join(s.Dir, snapshotTakenAtFile)
 	raw, err := os.ReadFile(marker)
 	switch {
@@ -142,7 +154,7 @@ func (s DirectorySource) Open(ctx context.Context) (World, func() error, error) 
 		return World{}, nil, fmt.Errorf("parse %s: %w", marker, err)
 	}
 
-	dbPath, err := findDB(s.Dir, s.Dir)
+	dbPath, err := findDB(ctx, s.Dir, s.Dir)
 	if err != nil {
 		return World{}, nil, err
 	}
@@ -219,25 +231,42 @@ func extract(ctx context.Context, archive, root string) error {
 	}
 }
 
-// findDB locates the LevelDB directory inside an extracted archive. The
-// archive's internal layout has changed before, so this searches rather than
-// assuming a fixed path.
-func findDB(root string, archive string) (string, error) {
-	var found string
+// findDB locates the LevelDB directory inside a world tree. The layout has
+// changed before, so this searches rather than assuming a fixed path.
+//
+// More than one is a refusal rather than a choice. An extraction root holds
+// exactly one world because this process just built it, but a snapshot
+// directory is a volume another process owns: a leftover world can sit beside
+// the fresh one, and taking the first by name order would report the
+// leftover's mobs under the fresh snapshot's timestamp.
+//
+// The walk is over a directory whose size this process does not know, so it
+// stops at the first cancellation like every other traversal here.
+func findDB(ctx context.Context, root string, source string) (string, error) {
+	var found []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() && d.Name() == "db" && found == "" {
-			found = path
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if d.IsDir() && d.Name() == "db" {
+			found = append(found, path)
+			return filepath.SkipDir
 		}
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("search extracted archive: %w", err)
+		return "", fmt.Errorf("search %s: %w", source, err)
 	}
-	if found == "" {
-		return "", fmt.Errorf("no db directory inside archive %s", archive)
+	switch len(found) {
+	case 0:
+		return "", fmt.Errorf("no db directory inside %s", source)
+	case 1:
+		return found[0], nil
+	default:
+		return "", fmt.Errorf("%s holds %d db directories (%s); exactly one world is required",
+			source, len(found), strings.Join(found, ", "))
 	}
-	return found, nil
 }

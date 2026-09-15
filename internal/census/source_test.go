@@ -321,3 +321,88 @@ func TestDirectorySourceRefusesASnapshotWithNoWorldInIt(t *testing.T) {
 		t.Error("a marked snapshot with no world reported as ErrNoSnapshot; it would silently fall back")
 	}
 }
+
+func TestDirectorySourceTreatsAMissingDirectoryAsMalformed(t *testing.T) {
+	// A volume that never mounted, a renamed path or a typo in the chart is
+	// not a snapshotter declining to take a hold. Reported as absent it
+	// would fall back to the archive and stay green forever.
+	missing := filepath.Join(t.TempDir(), "never-mounted")
+
+	_, _, err := DirectorySource{Dir: missing}.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open succeeded on a directory that does not exist")
+	}
+	if errors.Is(err, ErrNoSnapshot) {
+		t.Error("a missing directory reported as ErrNoSnapshot; it is indistinguishable from a routine missed hold")
+	}
+}
+
+func TestDirectorySourceTreatsAFileInPlaceOfTheDirectoryAsMalformed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "world")
+	if err := os.WriteFile(path, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	_, _, err := DirectorySource{Dir: path}.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open succeeded on a path that is not a directory")
+	}
+	if errors.Is(err, ErrNoSnapshot) {
+		t.Error("a non-directory reported as ErrNoSnapshot; it would silently fall back")
+	}
+}
+
+func TestDirectorySourceReportsAnUnreadableMarkerDistinguishably(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: file modes do not deny access")
+	}
+	dir := writeSnapshot(t, "2026-09-15T06:00:00Z")
+	if err := os.Chmod(filepath.Join(dir, snapshotTakenAtFile), 0); err != nil {
+		t.Fatalf("chmod marker: %v", err)
+	}
+
+	_, _, err := DirectorySource{Dir: dir}.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open succeeded on a marker it could not read")
+	}
+	if errors.Is(err, ErrNoSnapshot) {
+		t.Error("an unreadable marker reported as ErrNoSnapshot; a broken volume would fall back silently")
+	}
+}
+
+func TestDirectorySourceRefusesASnapshotHoldingMoreThanOneWorld(t *testing.T) {
+	// The snapshot directory is a volume another process owns, not a tree
+	// this process just built, so a leftover world can sit beside the fresh
+	// one. Taking the first by name order would report the leftover's mobs
+	// under the fresh marker's timestamp.
+	dir := writeSnapshot(t, "2026-09-15T06:00:00Z")
+	if err := os.MkdirAll(filepath.Join(dir, "AAA-stale", "db"), 0o755); err != nil {
+		t.Fatalf("create leftover world: %v", err)
+	}
+
+	_, _, err := DirectorySource{Dir: dir}.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open chose one of two worlds instead of refusing")
+	}
+	if errors.Is(err, ErrNoSnapshot) {
+		t.Error("two worlds reported as ErrNoSnapshot; it would silently fall back")
+	}
+	for _, want := range []string{"AAA-stale", "FWB"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not name the %s world: %v", want, err)
+		}
+	}
+}
+
+func TestDirectorySourceStopsOnACancelledContext(t *testing.T) {
+	// The walk for the world is over an operator-supplied directory of
+	// unknown size, and it is the one unbounded step on this path.
+	dir := writeSnapshot(t, "2026-09-15T06:00:00Z")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err := DirectorySource{Dir: dir}.Open(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Open of a cancelled context returned %v, want it to wrap context.Canceled", err)
+	}
+}

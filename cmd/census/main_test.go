@@ -426,3 +426,24 @@ func TestReportFromSurfacesACleanupFailureAfterASuccessfulRun(t *testing.T) {
 		t.Errorf("reportFrom returned %v, want the cleanup failure", err)
 	}
 }
+
+func TestRunFailsWhenTheWorldDirectoryIsMissingRatherThanFallingBack(t *testing.T) {
+	// A -world-dir that never mounted looks exactly like a routine missed
+	// hold, so the fallback would keep the job green while no snapshot is
+	// ever read again. The CronJob's stderr is only read when a job goes
+	// red, which on that path it never does.
+	backupDir := t.TempDir()
+	buildArchive(t, backupDir)
+
+	var out, errOut bytes.Buffer
+	err := run(context.Background(), []string{
+		"-world-dir", filepath.Join(t.TempDir(), "never-mounted"),
+		"-backup-dir", backupDir,
+	}, &out, &errOut)
+	if err == nil {
+		t.Fatal("run fell back to the archive for a -world-dir that does not exist")
+	}
+	if out.Len() != 0 {
+		t.Errorf("run wrote a report despite failing: %q", out.String())
+	}
+}
