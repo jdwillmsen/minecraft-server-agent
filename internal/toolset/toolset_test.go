@@ -197,11 +197,27 @@ func (stubServerInfo) BackupStatus(context.Context) (string, error) { return "",
 func (stubServerInfo) StatusEnabled() bool                          { return true }
 func (stubServerInfo) BackupEnabled() bool                          { return false }
 
-// Asked whether an older client can join, the model answers from this tool's
-// result or from its training data, and the training data says yes. The
-// version on its own is not enough to displace that; the rule has to be in
-// the result, and the version has to survive alongside it.
-func TestServerVersionStatesThatAnOlderClientMustUpdate(t *testing.T) {
+// Asked whether an older client can join, the model answers from a tool
+// result or from its training data, and the training data says yes. Every
+// tool that reports the build has to displace that: server_status names the
+// build as well, so a single status round reaches the same question.
+func TestBuildReportingToolsStateThatAnOlderClientMustUpdate(t *testing.T) {
+	registry, _ := Build(&plugin.Context{ServerInfo: stubServerInfo{version: "Bedrock 1.21.100.7."}})
+
+	for _, name := range []string{"server_version", "server_status"} {
+		out, err := registry.Invoke(t.Context(), name, noArgs, "2535411111111111")
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !strings.Contains(out, "update") {
+			t.Errorf("%s = %q, want the rule that an older client has to update", name, out)
+		}
+	}
+}
+
+// The version the adapter reported has to survive the rule being appended
+// to it, or the reply loses the one fact the asker needs to compare against.
+func TestServerVersionStillReportsTheBuild(t *testing.T) {
 	registry, _ := Build(&plugin.Context{ServerInfo: stubServerInfo{version: "Bedrock 1.21.100.7."}})
 
 	out, err := registry.Invoke(t.Context(), "server_version", noArgs, "2535411111111111")
@@ -211,17 +227,24 @@ func TestServerVersionStatesThatAnOlderClientMustUpdate(t *testing.T) {
 	if !strings.Contains(out, "1.21.100.7") {
 		t.Errorf("output = %q, want the version the adapter reported", out)
 	}
-	if !strings.Contains(out, "update") {
-		t.Errorf("output = %q, want the rule that an older client has to update", out)
-	}
 }
 
 // The evaluation harness derives the versions a reply is allowed to state
-// from the adapter answers alone, never from this suffix, so a version
-// number here would be shown to the model but withheld from the scorer --
-// which would then read an accurate reply as an invented one.
-func TestTheUpdateRuleNamesNoVersion(t *testing.T) {
-	if strings.ContainsAny(olderClientsMustUpdate, "0123456789") {
-		t.Errorf("update rule %q names a version", olderClientsMustUpdate)
+// from the adapter answers alone, never from the rule, so a version number
+// added on the way to the model would be shown to it but withheld from the
+// scorer -- which would then read an accurate reply as an invented one.
+// Asked with adapter answers carrying no digit at all, no tool result may
+// carry one either.
+func TestVersionReportingToolsAddNoVersionOfTheirOwn(t *testing.T) {
+	registry, _ := Build(&plugin.Context{ServerInfo: stubServerInfo{version: "an unreleased build"}})
+
+	for _, name := range []string{"server_version", "server_status"} {
+		out, err := registry.Invoke(t.Context(), name, noArgs, "2535411111111111")
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if strings.ContainsAny(out, "0123456789") {
+			t.Errorf("%s = %q, want no version the adapter did not report", name, out)
+		}
 	}
 }

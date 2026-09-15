@@ -48,6 +48,11 @@ var noArgs = json.RawMessage(`{"type":"object","properties":{}}`)
 // and with no tool result saying so the model fell back on its training and
 // told players an older client would connect fine.
 //
+// It rides on every tool result that reports the build, not only
+// server_version: server_status names the build too, so a single status
+// round is a route to the same question, and a version reaching the model
+// without this rule is what the fallback needs.
+//
 // Restated here rather than imported from pkg/mcproto, which relies on the
 // same fact for the headless clients: that package drags in the whole
 // gophertunnel and Xbox-auth dependency tree, which the offline evaluation
@@ -57,7 +62,7 @@ var noArgs = json.RawMessage(`{"type":"object","properties":{}}`)
 // reply may state from the canned adapter answers alone, so a version named
 // here would be shown to the model but not to the scorer, which would then
 // read an accurate reply as an invented one.
-const olderClientsMustUpdate = " A client older than this is refused before login, so a player on an older version has to update."
+const olderClientsMustUpdate = " A client older than the version this server runs is refused before login, so a player on an older version has to update."
 
 // Build assembles the read-only tools for one answer.
 //
@@ -193,10 +198,14 @@ func Build(pctx *plugin.Context) (*tools.Registry, *CallerScoped) {
 		list = append(list,
 			tools.Tool{
 				Name:        "server_status",
-				Description: "Server health, player count and responsiveness.",
+				Description: "Server health, player count and responsiveness, and whether a client on an older version can join it.",
 				Schema:      noArgs,
 				Invoke: func(ctx context.Context, _ json.RawMessage, _ string) (string, error) {
-					return pctx.ServerInfo.ServerStatus(ctx)
+					status, err := pctx.ServerInfo.ServerStatus(ctx)
+					if err != nil {
+						return "", err
+					}
+					return status + olderClientsMustUpdate, nil
 				},
 			},
 			tools.Tool{
