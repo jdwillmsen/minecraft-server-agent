@@ -1295,13 +1295,18 @@ category. Each case is scored on whether it got an answer, tool selection,
 content, grounding (below), no tool-call markup or markdown, privacy
 (whispered when it should be, never carrying another player's coordinates),
 length against the chat limit, not ending on a question, and latency.
-Markup, questions, length and grounding are judged on what the model wrote,
-before the agent's own cleanup, so the report measures the model rather
-than the cleanup. A question the agent answers in code rather than putting
-to the model - another player's waypoints, above - reaches no model at
-all, so those cases score the answer, its content and privacy, and skip
-the dimensions read off the model's own text. The report is markdown on
-stdout.
+Questions and length are judged on what the model wrote, before the agent's
+own cleanup, so the report measures the model rather than the cleanup.
+Markup and grounding are judged on that text and on the line the player
+heard, because each hides half of the same fault: the cleanup takes a claim
+that ran past the chat limit out of the line, and the line is the only
+place text the agent stitched on ever appears — a refusal the model wrote
+while calling a tool, or a whole reply written in code. A question the
+agent answers in code rather than putting to the model — another player's
+waypoints, above — reaches no model at all; those cases are scored on the
+line the agent sent, and skip only the check on ending with a question,
+which nothing but the model's own text can answer. The report is markdown
+on stdout.
 
 Grounding fails a reply that states a server version or a player count the
 fixture world contradicts — the failure a case expecting no tool call
