@@ -253,7 +253,8 @@ func longestVersions(stated []string) []string {
 // the chat limit; the heard line is judged because a refusal carried out of
 // a tool round is a sentence the model wrote, states whatever it states --
 // "I can't announce that to the 47 players online" is one sentence that
-// declines and invents -- and appears in no round that became the reply.
+// declines and invents -- and is absent from the round that became the
+// reply.
 func scoreGrounded(c Case, o Observation, lim Limits) Check {
 	written, wroteIt := modelText(o)
 	heard, spoke := heardText(o)
@@ -262,15 +263,51 @@ func scoreGrounded(c Case, o Observation, lim Limits) Check {
 	}
 	told, wrote, said := statedFacts(c.Question), statedFacts(written), statedFacts(heard)
 	// The chat limit cuts on a byte, so a reply at the cap can end
-	// mid-version: "1.21.100.7" reads back out of the line as "1.21.10".
+	// mid-version: "1.21.100.7" reads back out of the line as "1.21.10…".
 	// That is the claim above with its tail missing, judged already, not a
-	// second one. A count needs the word after its number, which the same
-	// cut takes with it, so none of those survives to be misread.
+	// second one.
+	//
+	// Only the fragment the cut actually left is forgiven: last in the
+	// line, against the ellipsis that marks the cut, and the start of
+	// something the model wrote. A whole version anywhere else in the line
+	// is the model's to answer for even when it is a prefix of the one it
+	// got right -- "I can't restart the server to 1.21.10" in front of a
+	// correct 1.21.100.7 is the near miss this dimension exists to name,
+	// and forgiving it would blind the check on its most plausible
+	// fabrication whenever the answer behind it was correct.
+	//
+	// A count needs the word after its number, which the same cut takes
+	// with it, so none of those survives to be misread.
 	said.Versions = slices.DeleteFunc(said.Versions, func(v string) bool {
-		return slices.ContainsFunc(wrote.Versions, func(w string) bool { return strings.HasPrefix(w, v) })
+		return strings.HasSuffix(heard, v+chatEllipsis) &&
+			slices.ContainsFunc(wrote.Versions, func(w string) bool { return strings.HasPrefix(w, v) })
 	})
-	problems := append(inventions(wrote, told, lim), inventions(said, told, lim)...)
-	return verdict(DimGrounded, uniq(problems))
+	return verdict(DimGrounded, attribute(inventions(wrote, told, lim), inventions(said, told, lim)))
+}
+
+// chatEllipsis is what the production cut leaves where it took bytes out of
+// a reply. Spelled again rather than imported: internal/text keeps the
+// constant unexported, and this is a harness reading a finished line back
+// rather than the cut itself.
+const chatEllipsis = "…"
+
+// attribute names the text each problem came from, because the two have
+// different owners and a report row that did not say which left the reader
+// unable to act on it: "wrote" is the model's own words, fixed in the
+// prompt or the model, and "said" is a fault only the delivered line holds,
+// fixed in whatever the agent stitched on. A fault in both texts came from
+// the model and is reported once.
+func attribute(wrote, said []string) []string {
+	var out []string
+	for _, p := range uniq(wrote) {
+		out = append(out, "wrote: "+p)
+	}
+	for _, p := range uniq(said) {
+		if !slices.Contains(wrote, p) {
+			out = append(out, "said: "+p)
+		}
+	}
+	return out
 }
 
 // inventions names every fact said states that neither the question nor the
@@ -321,17 +358,22 @@ var chatMarkup = []string{"<tool_call", "</tool_call", "<function=", "</function
 // heardText answers "is what the player heard acceptable". It is the only
 // input that sees text the agent supplies itself: a refusal carried out of
 // a tool round, or a whole reply written in code with no model round behind
-// it at all. None of that appears in any round's content, so a scorer on
-// modelText alone is blind to it -- and blind to whatever the next such
-// mechanism stitches on, silently.
+// it at all. The carried refusal is written in an earlier round, which the
+// recorder keeps, and never in the round modelText reads; the reply written
+// in code is in no round at all. Scanning every round instead would reach
+// the first and still miss the second, and would object to text the agent
+// deliberately kept out of chat, so what was delivered is what is read --
+// which also covers whatever the next such mechanism stitches on.
 //
 // clean and grounded read both, because their faults come from both sides:
 // the cleanup hides markup and a claim past the chat limit in the reply,
 // and lets markdown and an invented fact through from text no round wrote.
-// no_question reads the model's text alone -- the agent stitches in front
-// of the reply and never behind it, so nothing it adds can change what the
-// reply ends on. content reads the heard text alone, because a case's
-// expectations are about the answer the player actually got.
+// no_question reads the model's text alone, on the strength of an
+// invariant internal/adapters keeps: the agent puts its own words in front
+// of the model's or says them alone, never behind them, so nothing it adds
+// can change what the model's reply ends on. content reads the heard text
+// alone, because a case's expectations are about the answer the player
+// actually got.
 func modelText(o Observation) (string, bool) {
 	if o.Err != nil {
 		return "", false
@@ -357,15 +399,18 @@ func scoreClean(o Observation) Check {
 	if !wroteIt && !spoke {
 		return Check{Dim: DimClean}
 	}
+	return verdict(DimClean, attribute(markup(written), markup(heard)))
+}
+
+// markup names every machine-facing marker s carries.
+func markup(s string) []string {
 	var problems []string
-	for _, src := range []string{written, heard} {
-		for _, m := range chatMarkup {
-			if strings.Contains(src, m) {
-				problems = append(problems, fmt.Sprintf("contains %q", m))
-			}
+	for _, m := range chatMarkup {
+		if strings.Contains(s, m) {
+			problems = append(problems, fmt.Sprintf("contains %q", m))
 		}
 	}
-	return verdict(DimClean, uniq(problems))
+	return problems
 }
 
 var numberToken = regexp.MustCompile(`\d+`)
