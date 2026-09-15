@@ -117,11 +117,11 @@ func newInterruption(t *testing.T, ctx context.Context, joinedAt time.Time) *int
 	playerRoster := roster.New()
 	audience := newDeliveryAudience(playerRoster, siblingBotXUIDs())
 	audience.beginSession(selfXUID)
-	backlog := &backlogStore{wrote: make(chan struct{}, 32), pending: []announce.Announcement{
+	backlog := newBacklogStore([]announce.Announcement{
 		{ID: 2, Body: "announcement 2: the nether hub is open", TargetKind: announce.TargetPlayer, TargetValue: playerXUID, Priority: announce.PriorityNormal},
 		{ID: 3, Body: "announcement 3: back up your builds", TargetKind: announce.TargetPlayer, TargetValue: playerXUID, Priority: announce.PriorityNormal},
 		{ID: 4, Body: "announcement 4: spawn is being rebuilt", TargetKind: announce.TargetPlayer, TargetValue: playerXUID, Priority: announce.PriorityNormal},
-	}}
+	})
 	log := logging.New("info")
 
 	deliverer := announce.NewDeliverer(backlog, voice, audience, announcePermissions{resolver: fakePermResolver(t, nil)}, log,

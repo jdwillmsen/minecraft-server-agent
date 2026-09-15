@@ -880,7 +880,7 @@ func TestAnnounceDoesNotClaimABroadcastItOnlyQueued(t *testing.T) {
 type outbox struct {
 	nextID    int64
 	pending   []announce.Announcement
-	delivered []string
+	delivered []int64
 }
 
 var _ announce.Store = (*outbox)(nil)
@@ -892,46 +892,32 @@ func (o *outbox) Insert(context.Context, announce.Announcement) (int64, error) {
 	return o.nextID, nil
 }
 
+// PendingFor reports only what has no delivery row yet, which is what makes
+// a row here the suppression it is in Postgres.
 func (o *outbox) PendingFor(context.Context, string, string, time.Time) ([]announce.Announcement, error) {
 	var out []announce.Announcement
 	for _, a := range o.pending {
-		if !slices.Contains(o.delivered, a.TargetValue) {
+		if !slices.Contains(o.delivered, a.ID) {
 			out = append(out, a)
 		}
 	}
 	return out, nil
 }
 
-func (o *outbox) MarkDelivered(_ context.Context, _ int64, xuid string, _ time.Time) error {
-	o.delivered = append(o.delivered, xuid)
+func (o *outbox) MarkDelivered(_ context.Context, id int64, _ string, _ time.Time) error {
+	o.delivered = append(o.delivered, id)
 	return nil
 }
 
-// bridge is the console bridge as a Deliverer sees it, with each direction
-// able to fail the way a rejected command, a 5xx or a timeout does.
-type bridge struct {
-	sayErr  error
-	tellErr error
-	said    []string
-}
+// bridge is the console bridge as a Deliverer sees it, able to refuse a
+// broadcast the way an allowlist rejection, a 5xx or a timeout does.
+type bridge struct{ sayErr error }
 
-var _ announce.Voice = (*bridge)(nil)
+var _ announce.Voice = bridge{}
 
-func (b *bridge) Say(_ context.Context, message string) error {
-	if b.sayErr != nil {
-		return b.sayErr
-	}
-	b.said = append(b.said, message)
-	return nil
-}
+func (b bridge) Say(context.Context, string) error { return b.sayErr }
 
-func (b *bridge) Tell(_ context.Context, _, message string) error {
-	if b.tellErr != nil {
-		return b.tellErr
-	}
-	b.said = append(b.said, message)
-	return nil
-}
+func (bridge) Tell(context.Context, string, string) error { return nil }
 
 // watchedRoster is a roster that has been told who is here and names them.
 type watchedRoster []string
@@ -994,7 +980,7 @@ func announceThrough(t *testing.T, d *announce.Deliverer, args ...string) string
 // that: "Announced." sends them away believing a restart warning is in
 // chat, and the server was never told.
 func TestAnnounceReportsABroadcastTheBridgeRefused(t *testing.T) {
-	d := announce.NewDeliverer(&outbox{}, &bridge{sayErr: errors.New("bridge refused it")},
+	d := announce.NewDeliverer(&outbox{}, bridge{sayErr: errors.New("bridge refused it")},
 		watchedRoster{"xuid-1"}, flatPermissions{}, logging.New("error"))
 
 	reply := announceThrough(t, d, "server", "restarting", "in", "5", "minutes")
@@ -1011,7 +997,7 @@ func TestAnnounceReportsABroadcastTheBridgeRefused(t *testing.T) {
 // an empty server: the operator is told nobody was on to hear a countdown
 // that was never spoken, with players standing on the server.
 func TestAnnounceNowDoesNotReportAFailedSendAsAnEmptyServer(t *testing.T) {
-	d := announce.NewDeliverer(&outbox{}, &bridge{sayErr: errors.New("bridge refused it")},
+	d := announce.NewDeliverer(&outbox{}, bridge{sayErr: errors.New("bridge refused it")},
 		watchedRoster{"xuid-1"}, flatPermissions{}, logging.New("error"))
 
 	reply := announceThrough(t, d, "!now", "restarting", "in", "five")
@@ -1029,7 +1015,7 @@ func TestAnnounceNowDoesNotReportAFailedSendAsAnEmptyServer(t *testing.T) {
 // by construction. Reported as an empty server, the operator goes on
 // believing the countdown simply had no audience.
 func TestAnnounceNowOffTheLeaderDoesNotReportAnEmptyServer(t *testing.T) {
-	d := announce.NewDeliverer(&outbox{}, &bridge{}, watchedRoster{"xuid-1"}, flatPermissions{}, logging.New("error"),
+	d := announce.NewDeliverer(&outbox{}, bridge{}, watchedRoster{"xuid-1"}, flatPermissions{}, logging.New("error"),
 		announce.WithLeadership(standby{live: false}))
 
 	reply := announceThrough(t, d, "!now", "restarting", "in", "five")
@@ -1045,7 +1031,7 @@ func TestAnnounceNowOffTheLeaderDoesNotReportAnEmptyServer(t *testing.T) {
 // The reply that must stay: a watched server with nobody on it really did
 // hear nothing, and !now has no queue to keep it in.
 func TestAnnounceNowStillReportsAGenuinelyEmptyServer(t *testing.T) {
-	d := announce.NewDeliverer(&outbox{}, &bridge{}, watchedRoster{}, flatPermissions{}, logging.New("error"))
+	d := announce.NewDeliverer(&outbox{}, bridge{}, watchedRoster{}, flatPermissions{}, logging.New("error"))
 
 	reply := announceThrough(t, d, "!now", "restarting", "in", "five")
 
@@ -1065,7 +1051,7 @@ func TestInboxDeliversWhileTheRosterHasNotBeenToldWhoIsHere(t *testing.T) {
 		{ID: 1, Body: "the nether hub is open", TargetKind: announce.TargetPlayer, TargetValue: "xuid-1"},
 		{ID: 2, Body: "back up your builds", TargetKind: announce.TargetPlayer, TargetValue: "xuid-1"},
 	}}
-	d := announce.NewDeliverer(store, &bridge{}, openingRoster{}, flatPermissions{}, logging.New("error"))
+	d := announce.NewDeliverer(store, bridge{}, openingRoster{}, flatPermissions{}, logging.New("error"))
 	pctx := &plugin.Context{Announcements: &fakeAnnounceStore{enabled: true}, Deliverer: d}
 
 	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{

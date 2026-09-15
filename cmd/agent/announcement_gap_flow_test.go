@@ -73,9 +73,9 @@ func newConnectionGap(t *testing.T, at time.Time) *connectionGap {
 	playerRoster := roster.New()
 	audience := newDeliveryAudience(playerRoster, siblingBotXUIDs())
 	audience.beginSession(selfXUID)
-	backlog := &backlogStore{wrote: make(chan struct{}, 32), pending: []announce.Announcement{
+	backlog := newBacklogStore([]announce.Announcement{
 		{ID: gapAnnouncementID, Body: "announcement 9: the nether hub is open", TargetKind: announce.TargetPlayer, TargetValue: playerXUID, Priority: announce.PriorityNormal},
-	}}
+	})
 	log := logging.New("info")
 
 	deliverer := announce.NewDeliverer(backlog, voice, audience, announcePermissions{resolver: fakePermResolver(t, nil)}, log,
@@ -284,7 +284,7 @@ func TestAProcessThatHasNotTakenTheLockDoesNotBroadcast(t *testing.T) {
 
 	at := time.Date(2026, 9, 13, 9, 0, 0, 0, time.UTC)
 	voice := newTimelineVoice(newScaledClock(at))
-	backlog := &backlogStore{wrote: make(chan struct{}, 32)}
+	backlog := newBacklogStore(nil)
 	playerRoster := roster.New()
 	joins := newJoinTimes()
 	d := announce.NewDeliverer(backlog, voice,

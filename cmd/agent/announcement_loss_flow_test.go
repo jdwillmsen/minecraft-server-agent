@@ -61,8 +61,14 @@ type backlogStore struct {
 	rows    []deliveryRow
 	// wrote signals each recorded delivery, so a test waits for the
 	// bookkeeping of a send it has watched go out instead of sleeping past
-	// it. Buffered and offered without blocking, like the voice's own.
+	// it. Buffered and offered without blocking, like the voice's own --
+	// and built rather than left to a struct literal, since a store missing
+	// it would wait out every deadline instead of being told.
 	wrote chan struct{}
+}
+
+func newBacklogStore(pending []announce.Announcement) *backlogStore {
+	return &backlogStore{pending: pending, wrote: make(chan struct{}, 32)}
 }
 
 type deliveryRow struct {
@@ -121,7 +127,7 @@ func (s *backlogStore) waitForRows(t *testing.T, n int, why string) {
 		select {
 		case <-s.wrote:
 		case <-deadline:
-			t.Fatalf("%s: %d delivery rows were ever written, want %d", why, len(s.deliveryRows()), n)
+			t.Fatalf("%s: only %d delivery rows were ever written, want %d", why, len(s.deliveryRows()), n)
 		}
 	}
 }
@@ -236,10 +242,10 @@ func newIncident(t *testing.T, ctx context.Context, joinedAt time.Time, grace ti
 	playerRoster := roster.New()
 	audience := newDeliveryAudience(playerRoster, siblingBotXUIDs())
 	audience.beginSession(selfXUID)
-	backlog := &backlogStore{wrote: make(chan struct{}, 32), pending: []announce.Announcement{
+	backlog := newBacklogStore([]announce.Announcement{
 		{ID: 2, Body: "announcement 2: the nether hub is open", TargetKind: announce.TargetPlayer, TargetValue: playerXUID, Priority: announce.PriorityNormal},
 		{ID: 3, Body: "announcement 3: back up your builds", TargetKind: announce.TargetPlayer, TargetValue: playerXUID, Priority: announce.PriorityNormal},
-	}}
+	})
 	log := logging.New("info")
 
 	var opts []announce.Option
