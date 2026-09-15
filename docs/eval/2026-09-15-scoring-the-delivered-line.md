@@ -14,7 +14,7 @@ that was not read off the code or off an earlier report.
 
 | | |
 |---|---|
-| Tree | `fix/JDWLABS-554-scorer-inputs`, two commits on the production code at `3855061` |
+| Tree | `fix/JDWLABS-554-scorer-inputs`, three commits on the production code at `3855061` |
 | Runs | none |
 | Comparison | unavailable until a run is taken, before and after, on the same endpoint |
 | Cases | 39 in `eval/cases.yaml`, unchanged by this |
@@ -28,12 +28,18 @@ that was not read off the code or off an earlier report.
 2. **A version fragment the chat cut left is not read as a second claim.**
    A reply at the cap can end mid-version, and `1.21.100.7` reads back out
    of the line as `1.21.10…`. That is forgiven only where the cut left it:
-   last in the line, against the ellipsis, and the start of something the
-   model wrote. A whole version anywhere else in the line is judged, even
-   when it is a prefix of the one the model got right.
+   last in the line, against the ellipsis, stated nowhere else in the line,
+   and the start of something the model wrote. A whole version anywhere
+   else in the line is judged, even when it is a prefix of the one the
+   model got right, and even when the cut left that same version at the end
+   — the facts a line states are deduplicated, so counting the line's
+   claims is what keeps the earlier one answerable.
 3. **Each problem names the text it came from**, `wrote` or `said`, because
-   a markdown leak the model wrote is the system prompt's to answer for and
-   one only the delivered line carries is the agent's.
+   the two have different owners. `wrote` is the model's own words, fixed
+   in the prompt or the model. `said` is a fault only the delivered line
+   holds: usually a refusal the model wrote in a round that did not become
+   the reply, fixed in the prompt or the model too, and otherwise a line
+   the agent answered with in code, fixed there.
 
 ## Which dimensions this moves
 
