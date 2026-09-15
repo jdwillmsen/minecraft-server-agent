@@ -364,7 +364,8 @@ out of chat. The full surface, as wired in `internal/toolset/toolset.go`:
 - `waypoint_list` - the names of the asker's own saved waypoints
 - `players_online` - who is currently connected
 - `server_status` - health, player count, and responsiveness
-- `server_version` - the Bedrock build the server runs
+- `server_version` - the Bedrock build the server runs, and that a client
+  older than it is refused before login and has to update
 - `backup_status` - how recently the world was backed up and how large
   that backup was
 

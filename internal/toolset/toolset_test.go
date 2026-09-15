@@ -185,3 +185,43 @@ func TestKnowledgeLookupToolDoesNotFlagAConfirmedMatch(t *testing.T) {
 		t.Errorf("output = %q, a confirmed match should not be flagged", out)
 	}
 }
+
+// stubServerInfo reports a version without an exporter behind it, which the
+// metrics adapter cannot do: pointed at a real URL it fails the fetch, and
+// pointed at none it disables the tool.
+type stubServerInfo struct{ version string }
+
+func (stubServerInfo) ServerStatus(context.Context) (string, error) { return "server healthy.", nil }
+func (s stubServerInfo) Version(context.Context) (string, error)    { return s.version, nil }
+func (stubServerInfo) BackupStatus(context.Context) (string, error) { return "", nil }
+func (stubServerInfo) StatusEnabled() bool                          { return true }
+func (stubServerInfo) BackupEnabled() bool                          { return false }
+
+// Asked whether an older client can join, the model answers from this tool's
+// result or from its training data, and the training data says yes. The
+// version on its own is not enough to displace that; the rule has to be in
+// the result, and the version has to survive alongside it.
+func TestServerVersionStatesThatAnOlderClientMustUpdate(t *testing.T) {
+	registry, _ := Build(&plugin.Context{ServerInfo: stubServerInfo{version: "Bedrock 1.21.100.7."}})
+
+	out, err := registry.Invoke(t.Context(), "server_version", noArgs, "2535411111111111")
+	if err != nil {
+		t.Fatalf("server_version: %v", err)
+	}
+	if !strings.Contains(out, "1.21.100.7") {
+		t.Errorf("output = %q, want the version the adapter reported", out)
+	}
+	if !strings.Contains(out, "update") {
+		t.Errorf("output = %q, want the rule that an older client has to update", out)
+	}
+}
+
+// The evaluation harness derives the versions a reply is allowed to state
+// from the adapter answers alone, never from this suffix, so a version
+// number here would be shown to the model but withheld from the scorer --
+// which would then read an accurate reply as an invented one.
+func TestTheUpdateRuleNamesNoVersion(t *testing.T) {
+	if strings.ContainsAny(olderClientsMustUpdate, "0123456789") {
+		t.Errorf("update rule %q names a version", olderClientsMustUpdate)
+	}
+}
