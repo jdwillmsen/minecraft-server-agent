@@ -69,19 +69,23 @@ type fakeVoice struct {
 	// onSay runs after the broadcast is recorded, so a test can model the
 	// world changing during the bridge round-trip the Say really is.
 	onSay func()
+	// onTell is the same hook for a whisper, which a per-recipient loop
+	// makes one of many round-trips the world can change inside.
+	onTell func()
 }
 
 var _ Voice = (*fakeVoice)(nil)
 
 func (v *fakeVoice) Tell(_ context.Context, xuid, message string) error {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	v.tells = append(v.tells, delivery{xuid: xuid})
 	v.tellMsg = append(v.tellMsg, message)
-	if err, ok := v.tellErr[xuid]; ok {
-		return err
+	onTell, err := v.onTell, v.tellErr[xuid]
+	v.mu.Unlock()
+	if onTell != nil {
+		onTell()
 	}
-	return nil
+	return err
 }
 
 func (v *fakeVoice) Say(_ context.Context, message string) error {
@@ -988,11 +992,11 @@ type partedRoster struct {
 	forgot bool
 }
 
-var _ Roster = partedRoster{}
+var _ Roster = (*partedRoster)(nil)
 
-func (r partedRoster) Online() []string          { return r.named }
-func (r partedRoster) IsOnline(xuid string) bool { return !r.forgot && r.still[xuid] }
-func (r partedRoster) Knows() bool               { return !r.forgot }
+func (r *partedRoster) Online() []string          { return r.named }
+func (r *partedRoster) IsOnline(xuid string) bool { return !r.forgot && r.still[xuid] }
+func (r *partedRoster) Knows() bool               { return !r.forgot }
 
 // A drain is scheduled by an arrival and fires seconds later. A player who
 // quits inside that wait is gone, but the console accepts a tellraw that
@@ -1006,8 +1010,10 @@ func TestDrainForJoinSendsNothingToAPlayerWhoLeftBeforeItFired(t *testing.T) {
 	}
 	store := &fakeStore{enabled: true, pending: pending}
 	voice := &fakeVoice{}
-	// Nobody on the roster: the player this drain belongs to has quit.
-	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+	// A roster that has been told who is here and does not name them: the
+	// player this drain belongs to has quit, rather than being someone a
+	// roster that has not looked yet cannot vouch for.
+	d := NewDeliverer(store, voice, fakeRoster{knows: true}, fakePermissions{}, testLogger())
 
 	delivered, remaining, err := d.DrainForJoin(context.Background(), "xuid-1", time.Now())
 	if err != nil {
@@ -1029,7 +1035,7 @@ func TestDrainAllSendsNothingToAPlayerWhoLeft(t *testing.T) {
 	// typing it and the store answering.
 	store := &fakeStore{enabled: true, pending: []Announcement{{ID: 1, Body: "one", TargetKind: TargetPlayer}}}
 	voice := &fakeVoice{}
-	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+	d := NewDeliverer(store, voice, fakeRoster{knows: true}, fakePermissions{}, testLogger())
 
 	delivered, remaining, err := d.DrainAll(context.Background(), "xuid-1", time.Now())
 	if err != nil {
@@ -1051,7 +1057,7 @@ func TestSendNowSkipsAWhisperRecipientWhoLeftMidLoop(t *testing.T) {
 	store := &fakeStore{enabled: true}
 	voice := &fakeVoice{}
 	d := NewDeliverer(store, voice,
-		partedRoster{named: []string{"op-1", "op-2"}, still: map[string]bool{"op-1": true}},
+		&partedRoster{named: []string{"op-1", "op-2"}, still: map[string]bool{"op-1": true}},
 		fakePermissions{levels: map[string]string{"op-1": "operator", "op-2": "operator"}},
 		testLogger())
 
@@ -1121,7 +1127,7 @@ func TestSendNowDoesNotRecordABroadcastForAPlayerWhoLeftDuringTheSay(t *testing.
 	store := &fakeStore{enabled: true}
 	voice := &fakeVoice{}
 	d := NewDeliverer(store, voice,
-		partedRoster{named: []string{"stayed", "left"}, still: map[string]bool{"stayed": true}},
+		&partedRoster{named: []string{"stayed", "left"}, still: map[string]bool{"stayed": true}},
 		fakePermissions{}, testLogger())
 
 	sent, err := d.SendNow(context.Background(), a, 31)
@@ -1195,7 +1201,7 @@ func TestSendNowStillCountsWhenTheRosterOutlivesTheSay(t *testing.T) {
 	store := &fakeStore{enabled: true}
 	voice := &fakeVoice{}
 	d := NewDeliverer(store, voice,
-		partedRoster{named: []string{"stayed", "left"}, still: map[string]bool{"stayed": true}},
+		&partedRoster{named: []string{"stayed", "left"}, still: map[string]bool{"stayed": true}},
 		fakePermissions{}, testLogger())
 
 	sent, err := d.SendNow(context.Background(), a, 42)
@@ -1340,7 +1346,7 @@ func TestSendNowDoesNotCountABroadcastWhoseOnlyRecipientLeftDuringTheSay(t *test
 	store := &fakeStore{enabled: true}
 	voice := &fakeVoice{}
 	d := NewDeliverer(store, voice,
-		partedRoster{named: []string{"steve"}, still: map[string]bool{}},
+		&partedRoster{named: []string{"steve"}, still: map[string]bool{}},
 		fakePermissions{}, testLogger())
 
 	sent, err := d.SendNow(context.Background(), a, 61)
@@ -1700,5 +1706,56 @@ func TestSendNowReportsAWatchedEmptyServerAsSilent(t *testing.T) {
 	}
 	if sent.Outcome != OutcomeSilent {
 		t.Errorf("sent = %+v, want a silent outcome — nobody was there to hear it", sent)
+	}
+}
+
+// A player typing !inbox is standing in the world; their message is itself
+// evidence of it. A roster that has not been told who is here yet says
+// nothing about anyone, and reading its silence as departure answers them
+// with a failure that did not happen.
+func TestDrainAllDeliversWhileTheRosterHasNotBeenToldWhoIsHere(t *testing.T) {
+	store := &fakeStore{enabled: true, pending: []Announcement{{ID: 1, Body: "one", TargetKind: TargetPlayer}}}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger())
+
+	delivered, remaining, err := d.DrainAll(context.Background(), "xuid-1", time.Now())
+	if err != nil {
+		t.Fatalf("DrainAll: %v", err)
+	}
+	if delivered != 1 || remaining != 0 {
+		t.Errorf("DrainAll = (%d, %d), want (1, 0) — absence of knowledge is not knowledge of absence", delivered, remaining)
+	}
+	if len(voice.tells) != 1 {
+		t.Errorf("whispered %v, want the one message they asked for", voice.tells)
+	}
+}
+
+// A connection can die part-way through a permission-targeted send, which
+// whispers one recipient at a time. Whoever is left in the list cannot be
+// confirmed present by a roster that has stopped answering, and a whisper
+// recorded against someone who went with the connection is retried by
+// nothing -- so the rest stay pending rather than being spoken into the
+// dark. Stopping is the roster's own silence, not a claim that anyone left.
+func TestSendNowStopsWhisperingWhenTheConnectionDiesMidLoop(t *testing.T) {
+	a := Announcement{Body: "the nether hub is open", TargetKind: TargetPermission, TargetValue: "operator"}
+	store := &fakeStore{enabled: true}
+	roster := &partedRoster{named: []string{"op-1", "op-2"}, still: map[string]bool{"op-1": true, "op-2": true}}
+	voice := &fakeVoice{}
+	voice.onTell = func() { roster.forgot = true }
+	d := NewDeliverer(store, voice, roster,
+		fakePermissions{levels: map[string]string{"op-1": "operator", "op-2": "operator"}}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 94)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if len(voice.tells) != 1 || voice.tells[0].xuid != "op-1" {
+		t.Errorf("whispered %v, want only op-1 — the connection died before op-2's turn", voice.tells)
+	}
+	if len(store.delivered) != 1 || store.delivered[0].xuid != "op-1" {
+		t.Errorf("rows = %v, want one for op-1 — op-2 is still owed the message", store.delivered)
+	}
+	if !sent.Counted || sent.Players != 1 {
+		t.Errorf("sent = %+v, want a counted 1: op-1 read it, and nobody else was told", sent)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -878,6 +879,7 @@ func TestAnnounceDoesNotClaimABroadcastItOnlyQueued(t *testing.T) {
 // test made up, which is the thing under test here.
 type outbox struct {
 	nextID    int64
+	pending   []announce.Announcement
 	delivered []string
 }
 
@@ -891,7 +893,13 @@ func (o *outbox) Insert(context.Context, announce.Announcement) (int64, error) {
 }
 
 func (o *outbox) PendingFor(context.Context, string, string, time.Time) ([]announce.Announcement, error) {
-	return nil, nil
+	var out []announce.Announcement
+	for _, a := range o.pending {
+		if !slices.Contains(o.delivered, a.TargetValue) {
+			out = append(out, a)
+		}
+	}
+	return out, nil
 }
 
 func (o *outbox) MarkDelivered(_ context.Context, _ int64, xuid string, _ time.Time) error {
@@ -940,6 +948,16 @@ func (r watchedRoster) IsOnline(xuid string) bool {
 	}
 	return false
 }
+
+// openingRoster is the roster in the moments after a connection opens: it
+// has not been told who is here, so it names nobody and says so.
+type openingRoster struct{}
+
+var _ announce.Roster = openingRoster{}
+
+func (openingRoster) Online() []string     { return nil }
+func (openingRoster) Knows() bool          { return false }
+func (openingRoster) IsOnline(string) bool { return false }
 
 // flatPermissions resolves everyone to the same level, which is all a
 // broadcast target ever asks.
@@ -1033,5 +1051,34 @@ func TestAnnounceNowStillReportsAGenuinelyEmptyServer(t *testing.T) {
 
 	if !strings.Contains(strings.ToLower(reply), "nobody") {
 		t.Errorf("reply %q should say nobody was online to hear it", reply)
+	}
+}
+
+// !inbox is typed by a player standing in the world, and their message is
+// itself evidence of it. Answered in the moments before the opening roster
+// packet lands, the drain used to read a roster that had not been told as
+// the player having left: nothing was sent, and they were told something
+// had gone wrong with messages that were never attempted.
+func TestInboxDeliversWhileTheRosterHasNotBeenToldWhoIsHere(t *testing.T) {
+	cmd := announceCommand(t, "inbox")
+	store := &outbox{pending: []announce.Announcement{
+		{ID: 1, Body: "the nether hub is open", TargetKind: announce.TargetPlayer, TargetValue: "xuid-1"},
+		{ID: 2, Body: "back up your builds", TargetKind: announce.TargetPlayer, TargetValue: "xuid-1"},
+	}}
+	d := announce.NewDeliverer(store, &bridge{}, openingRoster{}, flatPermissions{}, logging.New("error"))
+	pctx := &plugin.Context{Announcements: &fakeAnnounceStore{enabled: true}, Deliverer: d}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "xuid-1",
+		ActorPermission: plugin.PermissionMember,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.Contains(strings.ToLower(reply), "went wrong") {
+		t.Errorf("reply %q reports a failure for messages nothing failed to send", reply)
+	}
+	if !strings.Contains(reply, "2") {
+		t.Errorf("reply %q should report both messages delivered", reply)
 	}
 }

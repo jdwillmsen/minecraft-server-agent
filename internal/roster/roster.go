@@ -332,6 +332,34 @@ func (r *Roster) Knows() bool {
 	return r.answered
 }
 
+// Presence is the pair of questions asked about one player: is xuid here,
+// and can this process answer that at all. An interface so the predicate
+// below serves every layer holding something roster-shaped -- a deliverer's
+// filtered audience, a plugin context -- and not only a *Roster.
+type Presence interface {
+	IsOnline(xuid string) bool
+	Knows() bool
+}
+
+// KnownOffline reports whether p can say for certain that xuid has left.
+//
+// The negative form is the whole point: absence of knowledge is not
+// knowledge of absence, and every caller deciding whether to send a player
+// something acts on positive knowledge of absence only. A roster that has
+// not been told who is here answers no about everybody -- between
+// connections, and again until the first roster packet of a new one lands --
+// so reading that as departure withholds what a player is owed on the word
+// of a roster that has not looked yet. Someone chatting in that window is
+// standing in the world; their message is the evidence the roster is still
+// missing.
+//
+// A nil p knows nothing and so says nothing: a caller with no presence wired
+// keeps doing what it did before rather than silently withholding
+// everything.
+func KnownOffline(p Presence, xuid string) bool {
+	return p != nil && p.Knows() && !p.IsOnline(xuid)
+}
+
 // IsOnline reports whether xuid is on the roster the current connection is
 // watching. Separate from NameFor because the two stop being true at
 // different moments -- see names.

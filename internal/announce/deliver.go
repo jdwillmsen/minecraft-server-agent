@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
@@ -162,8 +163,12 @@ func (d *Deliverer) live() bool {
 // no evidence at all that the player is still there. A whisper recorded
 // against someone who has gone is the permanent loss this package exists to
 // avoid -- nothing retries a delivery that has a row.
+//
+// The same predicate a plugin asks through Context.KnownOffline, so the two
+// layers cannot disagree about what a roster's silence means: a roster that
+// has not been told who is here has not said anyone left.
 func (d *Deliverer) departed(xuid string) bool {
-	return !d.roster.IsOnline(xuid)
+	return roster.KnownOffline(d.roster, xuid)
 }
 
 // stillLoading reports whether xuid's client may be too freshly loaded to
@@ -395,6 +400,15 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 				unaccounted = true
 				break
 			}
+			if !d.roster.Knows() {
+				// The connection died inside the Say. There is no roster
+				// left to record from -- a row written on the strength of a
+				// snapshot that has since evaporated would suppress the
+				// redelivery of a message a player who went with it never
+				// saw. Everyone still unrecorded stays owed, and the Knows
+				// check below reports the whole send as unaccounted for.
+				break
+			}
 			if d.departed(xuid) {
 				// Left during the Say, which is one bridge round-trip long.
 				// They are gone, so a row for them would suppress the
@@ -486,6 +500,13 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		if ctx.Err() != nil {
 			// Cancelled: stop rather than run up a failed bridge attempt
 			// (and an error line) for every recipient still left to try.
+			break
+		}
+		if !d.roster.Knows() {
+			// The connection died part-way through the list. Nobody left in
+			// it can be confirmed present, and a whisper recorded against
+			// someone who went with the connection is retried by nothing.
+			// They stay pending for a roster that can answer.
 			break
 		}
 		if d.departed(xuid) {
