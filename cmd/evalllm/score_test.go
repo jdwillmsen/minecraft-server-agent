@@ -278,6 +278,62 @@ func TestCleanAndNoQuestionSkipAnAnswerThatFailed(t *testing.T) {
 	}
 }
 
+// A refusal carried out of a tool round is a sentence the player hears that
+// no round's content holds, so a check reading the model's own text alone
+// never sees it. The cleanup it passes through cuts tool markup and trims a
+// closing question; markdown and a stated fact it leaves, so those are what
+// arrive in chat unexamined.
+func TestCleanAndGroundedJudgeWhatTheAgentStitchedOn(t *testing.T) {
+	o := answered("The server is up.")
+	o.Reply = "**I can't run that command.** The server is up."
+	if check(t, Score(testCase(t, nil), o, testLimits()), DimClean).Pass {
+		t.Error("markdown in a carried refusal passed because no round wrote it")
+	}
+
+	o = answered("The server is up.")
+	o.Reply = "I can't announce that to the 47 players online. The server is up."
+	if check(t, Score(testCase(t, nil), o, testLimits()), DimGrounded).Pass {
+		t.Error("a count invented in a carried refusal passed because no round wrote it")
+	}
+
+	// no_question stays on the model's own text: a refusal goes in front of
+	// the reply and never behind it, so nothing stitched on can change what
+	// the reply ends on.
+	o = answered("The server is up.")
+	o.Reply = "Anything else?"
+	if !check(t, Score(testCase(t, nil), o, testLimits()), DimNoQuestion).Pass {
+		t.Error("no_question judged the delivered line instead of the model's own text")
+	}
+}
+
+// A deflection the agent writes in code reaches the player with no model
+// round behind it at all. Judging it is the point: a line nobody scored is
+// not a line that passed, and the next mechanism to answer without the
+// model inherits the same treatment.
+func TestCleanAndGroundedJudgeAReplyNoRoundWrote(t *testing.T) {
+	o := Observation{Reply: "I can only look up your own waypoints, not another player's.", Latency: time.Second}
+	r := Score(testCase(t, nil), o, testLimits())
+	for _, d := range []Dimension{DimClean, DimGrounded} {
+		if got := check(t, r, d); !got.Scored || !got.Pass {
+			t.Errorf("%s: scored = %v, pass = %v, want a scored pass", d, got.Scored, got.Pass)
+		}
+	}
+	if check(t, r, DimNoQuestion).Scored {
+		t.Error("no_question was scored on a line the model did not write")
+	}
+}
+
+// The chat limit cuts on a byte, so a reply at the cap can end mid-version.
+// The whole of it was judged on the model's own text; the fragment left in
+// the line is the same claim, not a second one.
+func TestGroundedIgnoresAVersionTheChatCutHalved(t *testing.T) {
+	o := answered("The server is running 1.21.100.7.")
+	o.Reply = "The server is running 1.21.10…"
+	if got := check(t, Score(testCase(t, nil), o, testLimits()), DimGrounded); !got.Pass {
+		t.Errorf("a version the cut halved was reported as invented: %s", got.Detail)
+	}
+}
+
 // The three replies that motivated this check were real: each passed the
 // whole suite by calling no tool, while telling the asker a version and a
 // player count the fixture world contradicts.

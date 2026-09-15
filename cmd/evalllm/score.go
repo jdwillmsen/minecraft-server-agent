@@ -25,9 +25,9 @@ const (
 	// player count reads as a perfectly good answer: it satisfies every
 	// other dimension while telling the asker something untrue.
 	DimGrounded Dimension = "grounded"
-	// DimClean: the model wrote nothing meant for a machine -- tool-call
-	// markup the backend failed to parse into a structured call, or the
-	// markdown the system prompt forbids. Scored apart from content
+	// DimClean: nothing meant for a machine was written or said --
+	// tool-call markup the backend failed to parse into a structured call,
+	// or the markdown the system prompt forbids. Scored apart from content
 	// because the same leak can hide inside an otherwise correct answer.
 	DimClean Dimension = "clean"
 	// DimPrivacy: whispered when it should be, and never carrying another
@@ -247,14 +247,35 @@ func longestVersions(stated []string) []string {
 // a source -- "can i join from bedrock 1.20.80" puts that version in play
 // -- and so is the fixture world, whose own version stays right whether or
 // not a tool fetched it. Only a value neither of them holds is invented.
+//
+// Both texts are judged, for the two halves of the same fault. The model's
+// own is judged because the production cut would hide a claim that ran past
+// the chat limit; the heard line is judged because a refusal carried out of
+// a tool round is a sentence the model wrote, states whatever it states --
+// "I can't announce that to the 47 players online" is one sentence that
+// declines and invents -- and appears in no round that became the reply.
 func scoreGrounded(c Case, o Observation, lim Limits) Check {
-	// Judged on the model's own text for the reason scoreClean is: the
-	// production cut would hide a claim that ran past the chat limit.
-	written, ok := modelText(o)
-	if !ok {
+	written, wroteIt := modelText(o)
+	heard, spoke := heardText(o)
+	if !wroteIt && !spoke {
 		return Check{Dim: DimGrounded}
 	}
-	said, told := statedFacts(written), statedFacts(c.Question)
+	told, wrote, said := statedFacts(c.Question), statedFacts(written), statedFacts(heard)
+	// The chat limit cuts on a byte, so a reply at the cap can end
+	// mid-version: "1.21.100.7" reads back out of the line as "1.21.10".
+	// That is the claim above with its tail missing, judged already, not a
+	// second one. A count needs the word after its number, which the same
+	// cut takes with it, so none of those survives to be misread.
+	said.Versions = slices.DeleteFunc(said.Versions, func(v string) bool {
+		return slices.ContainsFunc(wrote.Versions, func(w string) bool { return strings.HasPrefix(w, v) })
+	})
+	problems := append(inventions(wrote, told, lim), inventions(said, told, lim)...)
+	return verdict(DimGrounded, uniq(problems))
+}
+
+// inventions names every fact said states that neither the question nor the
+// fixture world holds.
+func inventions(said, told ServerFacts, lim Limits) []string {
 	var problems []string
 	for _, v := range said.Versions {
 		if abbreviates(v, told.Versions) || abbreviates(v, lim.Facts.Versions) {
@@ -268,7 +289,7 @@ func scoreGrounded(c Case, o Observation, lim Limits) Check {
 		}
 		problems = append(problems, fmt.Sprintf("stated %s players, a count no tool returned", n))
 	}
-	return verdict(DimGrounded, problems)
+	return problems
 }
 
 // abbreviates reports whether a stated version is a known one or a truthful
@@ -288,11 +309,29 @@ func abbreviates(stated string, known []string) bool {
 // prompt forbids. Bedrock chat shows every one of these literally.
 var chatMarkup = []string{"<tool_call", "</tool_call", "<function=", "</function", "<parameter=", "```", "**"}
 
-// modelText is what the model itself wrote in the round that became the
-// reply, before production's cleanup. clean and no_question judge it rather
-// than the reply: the client cuts markup and closing questions, so the reply
-// would pass by construction and hide a model that still writes them. A
-// reply the cleanup emptied is still scored here.
+// A scorer reads one of the two texts below, and which one it reads is
+// which question it is asking.
+//
+// modelText answers "did the model behave". It is what the model itself
+// wrote in the round that became the reply, before production's cleanup --
+// which cuts tool markup, trims closing questions and enforces the chat
+// budget, so a check for any of those against the delivered line would pass
+// by construction and hide a model that still writes them.
+//
+// heardText answers "is what the player heard acceptable". It is the only
+// input that sees text the agent supplies itself: a refusal carried out of
+// a tool round, or a whole reply written in code with no model round behind
+// it at all. None of that appears in any round's content, so a scorer on
+// modelText alone is blind to it -- and blind to whatever the next such
+// mechanism stitches on, silently.
+//
+// clean and grounded read both, because their faults come from both sides:
+// the cleanup hides markup and a claim past the chat limit in the reply,
+// and lets markdown and an invented fact through from text no round wrote.
+// no_question reads the model's text alone -- the agent stitches in front
+// of the reply and never behind it, so nothing it adds can change what the
+// reply ends on. content reads the heard text alone, because a case's
+// expectations are about the answer the player actually got.
 func modelText(o Observation) (string, bool) {
 	if o.Err != nil {
 		return "", false
@@ -302,18 +341,31 @@ func modelText(o Observation) (string, bool) {
 	return written, ok && written != ""
 }
 
+// heardText is the line production would have sent. Empty when the answer
+// failed or the cleanup left nothing to say, which scoreAnswered reports
+// and which leaves the rest nothing to judge.
+func heardText(o Observation) (string, bool) {
+	if o.Err != nil {
+		return "", false
+	}
+	return o.Reply, o.Reply != ""
+}
+
 func scoreClean(o Observation) Check {
-	written, ok := modelText(o)
-	if !ok {
+	written, wroteIt := modelText(o)
+	heard, spoke := heardText(o)
+	if !wroteIt && !spoke {
 		return Check{Dim: DimClean}
 	}
 	var problems []string
-	for _, m := range chatMarkup {
-		if strings.Contains(written, m) {
-			problems = append(problems, fmt.Sprintf("contains %q", m))
+	for _, src := range []string{written, heard} {
+		for _, m := range chatMarkup {
+			if strings.Contains(src, m) {
+				problems = append(problems, fmt.Sprintf("contains %q", m))
+			}
 		}
 	}
-	return verdict(DimClean, problems)
+	return verdict(DimClean, uniq(problems))
 }
 
 var numberToken = regexp.MustCompile(`\d+`)
