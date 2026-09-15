@@ -42,6 +42,28 @@ func (c *CallerScoped) Happened() bool { return c != nil && c.used.Load() }
 // parameters object at all.
 var noArgs = json.RawMessage(`{"type":"object","properties":{}}`)
 
+// olderClientsMustUpdate is the compatibility rule nothing else in the
+// answer path states. Bedrock refuses a client announcing an older protocol
+// number outright -- play_status: failed_client, before login even starts --
+// and with no tool result saying so the model fell back on its training and
+// told players an older client would connect fine.
+//
+// It rides on every tool result that reports the build, not only
+// server_version: server_status names the build too, so a single status
+// round is a route to the same question, and a version reaching the model
+// without this rule is what the fallback needs.
+//
+// Restated here rather than imported from pkg/mcproto, which relies on the
+// same fact for the headless clients: that package drags in the whole
+// gophertunnel and Xbox-auth dependency tree, which the offline evaluation
+// harness would then have to build to read one sentence.
+//
+// Deliberately free of version numbers. The harness derives the versions a
+// reply may state from the canned adapter answers alone, so a version named
+// here would be shown to the model but not to the scorer, which would then
+// read an accurate reply as an invented one.
+const olderClientsMustUpdate = " A client older than the version this server runs is refused before login, so a player on an older version has to update."
+
 // Build assembles the read-only tools for one answer.
 //
 // A capability that is not configured contributes no tool. That is the
@@ -176,18 +198,26 @@ func Build(pctx *plugin.Context) (*tools.Registry, *CallerScoped) {
 		list = append(list,
 			tools.Tool{
 				Name:        "server_status",
-				Description: "Server health, player count and responsiveness.",
+				Description: "Server health, player count and responsiveness, and whether a client on an older version can join it.",
 				Schema:      noArgs,
 				Invoke: func(ctx context.Context, _ json.RawMessage, _ string) (string, error) {
-					return pctx.ServerInfo.ServerStatus(ctx)
+					status, err := pctx.ServerInfo.ServerStatus(ctx)
+					if err != nil {
+						return "", err
+					}
+					return status + olderClientsMustUpdate, nil
 				},
 			},
 			tools.Tool{
 				Name:        "server_version",
-				Description: "Which Bedrock version this server runs.",
+				Description: "Which Bedrock version this server runs, and whether a client on an older version can join it.",
 				Schema:      noArgs,
 				Invoke: func(ctx context.Context, _ json.RawMessage, _ string) (string, error) {
-					return pctx.ServerInfo.Version(ctx)
+					version, err := pctx.ServerInfo.Version(ctx)
+					if err != nil {
+						return "", err
+					}
+					return version + olderClientsMustUpdate, nil
 				},
 			},
 		)

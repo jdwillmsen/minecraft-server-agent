@@ -185,3 +185,66 @@ func TestKnowledgeLookupToolDoesNotFlagAConfirmedMatch(t *testing.T) {
 		t.Errorf("output = %q, a confirmed match should not be flagged", out)
 	}
 }
+
+// stubServerInfo reports a version without an exporter behind it, which the
+// metrics adapter cannot do: pointed at a real URL it fails the fetch, and
+// pointed at none it disables the tool.
+type stubServerInfo struct{ version string }
+
+func (stubServerInfo) ServerStatus(context.Context) (string, error) { return "server healthy.", nil }
+func (s stubServerInfo) Version(context.Context) (string, error)    { return s.version, nil }
+func (stubServerInfo) BackupStatus(context.Context) (string, error) { return "", nil }
+func (stubServerInfo) StatusEnabled() bool                          { return true }
+func (stubServerInfo) BackupEnabled() bool                          { return false }
+
+// Asked whether an older client can join, the model answers from a tool
+// result or from its training data, and the training data says yes. Every
+// tool that reports the build has to displace that: server_status names the
+// build as well, so a single status round reaches the same question.
+func TestBuildReportingToolsStateThatAnOlderClientMustUpdate(t *testing.T) {
+	registry, _ := Build(&plugin.Context{ServerInfo: stubServerInfo{version: "Bedrock 1.21.100.7."}})
+
+	for _, name := range []string{"server_version", "server_status"} {
+		out, err := registry.Invoke(t.Context(), name, noArgs, "2535411111111111")
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !strings.Contains(out, "update") {
+			t.Errorf("%s = %q, want the rule that an older client has to update", name, out)
+		}
+	}
+}
+
+// The version the adapter reported has to survive the rule being appended
+// to it, or the reply loses the one fact the asker needs to compare against.
+func TestServerVersionStillReportsTheBuild(t *testing.T) {
+	registry, _ := Build(&plugin.Context{ServerInfo: stubServerInfo{version: "Bedrock 1.21.100.7."}})
+
+	out, err := registry.Invoke(t.Context(), "server_version", noArgs, "2535411111111111")
+	if err != nil {
+		t.Fatalf("server_version: %v", err)
+	}
+	if !strings.Contains(out, "1.21.100.7") {
+		t.Errorf("output = %q, want the version the adapter reported", out)
+	}
+}
+
+// The evaluation harness derives the versions a reply is allowed to state
+// from the adapter answers alone, never from the rule, so a version number
+// added on the way to the model would be shown to it but withheld from the
+// scorer -- which would then read an accurate reply as an invented one.
+// Asked with adapter answers carrying no digit at all, no tool result may
+// carry one either.
+func TestVersionReportingToolsAddNoVersionOfTheirOwn(t *testing.T) {
+	registry, _ := Build(&plugin.Context{ServerInfo: stubServerInfo{version: "an unreleased build"}})
+
+	for _, name := range []string{"server_version", "server_status"} {
+		out, err := registry.Invoke(t.Context(), name, noArgs, "2535411111111111")
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if strings.ContainsAny(out, "0123456789") {
+			t.Errorf("%s = %q, want no version the adapter did not report", name, out)
+		}
+	}
+}
