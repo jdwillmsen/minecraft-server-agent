@@ -78,7 +78,7 @@ type Permissions interface {
 
 // Deliverer decides who actually hears an announcement, sends it, and
 // records that it was heard. Every method tolerates a disabled store
-// (Store.Enabled false) by returning a zero value and no error: a
+// (Store.Enabled false) by reporting that nothing was sent, and no error: a
 // deployment with no announcements table configured yet must still be able
 // to run join/command handling that calls into a Deliverer unconditionally.
 type Deliverer struct {
@@ -593,11 +593,18 @@ func (d *Deliverer) Publish(ctx context.Context, a Announcement) (id int64, sent
 // simply not counted: the announcement is left pending in the store, so it
 // is retried on this player's next join or !inbox rather than lost.
 //
-// A player who is no longer online is not whispered to at all. This drain
-// was scheduled seconds ago by their arrival, and a player who quits inside
-// that wait would otherwise be sent their whole backlog and have every
-// message of it recorded -- the console accepts a tellraw that matches
-// nobody, so the send reports success and the backlog is gone for good.
+// A player known to have left is not whispered to at all. This drain was
+// scheduled seconds ago by their arrival, and a player who quits inside that
+// wait would otherwise be sent their whole backlog and have every message of
+// it recorded -- the console accepts a tellraw that matches nobody, so the
+// send reports success and the backlog is gone for good.
+//
+// Only known to have left, though: unlike the send loops above, this drain
+// belongs to one player who has just given evidence of being here -- the
+// arrival that scheduled it, or the !inbox they typed -- so a roster that
+// has merely stopped answering is no reason to withhold what they asked
+// for. A connection that ends takes the drain's context with it, which is
+// what stops a backlog whose player may be gone.
 func (d *Deliverer) sendPending(ctx context.Context, xuid string, now time.Time, msgs []Announcement) int {
 	delivered := 0
 	for _, a := range msgs {
