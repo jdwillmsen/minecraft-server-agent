@@ -203,10 +203,7 @@ var (
 // the reply, so the truth a reply is held to cannot drift from the world
 // the model was shown.
 func statedFacts(text string) ServerFacts {
-	versions := versionClaim.FindAllString(text, -1)
-	for _, m := range labelledVersion.FindAllStringSubmatch(text, -1) {
-		versions = append(versions, m[1])
-	}
+	versions := statedVersions(text)
 	var counts []string
 	for _, m := range playerCount.FindAllStringSubmatchIndex(text, -1) {
 		// A number inside a dotted version is not a player count: the "7"
@@ -221,6 +218,18 @@ func statedFacts(text string) ServerFacts {
 		}
 	}
 	return ServerFacts{Versions: longestVersions(uniq(versions)), Counts: uniq(counts)}
+}
+
+// statedVersions is every version a text states, in the order stated and
+// with repeats kept: two claims of the same version are two claims, which
+// the facts a text states collapse to one but a reader asking where in the
+// line a version sits still needs apart.
+func statedVersions(text string) []string {
+	versions := versionClaim.FindAllString(text, -1)
+	for _, m := range labelledVersion.FindAllStringSubmatch(text, -1) {
+		versions = append(versions, m[1])
+	}
+	return versions
 }
 
 // longestVersions drops a version that is only the prefix of another in the
@@ -268,18 +277,23 @@ func scoreGrounded(c Case, o Observation, lim Limits) Check {
 	// second one.
 	//
 	// Only the fragment the cut actually left is forgiven: last in the
-	// line, against the ellipsis that marks the cut, and the start of
-	// something the model wrote. A whole version anywhere else in the line
-	// is the model's to answer for even when it is a prefix of the one it
-	// got right -- "I can't restart the server to 1.21.10" in front of a
-	// correct 1.21.100.7 is the near miss this dimension exists to name,
-	// and forgiving it would blind the check on its most plausible
-	// fabrication whenever the answer behind it was correct.
+	// line, against the ellipsis that marks the cut, stated nowhere else in
+	// the line, and the start of something the model wrote. A whole version
+	// anywhere else in the line is the model's to answer for even when it
+	// is a prefix of the one it got right -- "I can't restart the server to
+	// 1.21.10" in front of a correct 1.21.100.7 is the near miss this
+	// dimension exists to name, and forgiving it would blind the check on
+	// its most plausible fabrication whenever the answer behind it was
+	// correct. The facts a line states are deduplicated, so that same
+	// version invented earlier and cut off at the end arrives as one entry;
+	// counting the line's claims is what keeps the earlier one answerable.
 	//
 	// A count needs the word after its number, which the same cut takes
 	// with it, so none of those survives to be misread.
+	heardVersions := statedVersions(heard)
 	said.Versions = slices.DeleteFunc(said.Versions, func(v string) bool {
 		return strings.HasSuffix(heard, v+chatEllipsis) &&
+			timesStated(heardVersions, v) == 1 &&
 			slices.ContainsFunc(wrote.Versions, func(w string) bool { return strings.HasPrefix(w, v) })
 	})
 	return verdict(DimGrounded, attribute(inventions(wrote, told, lim), inventions(said, told, lim)))
@@ -294,8 +308,10 @@ const chatEllipsis = "…"
 // attribute names the text each problem came from, because the two have
 // different owners and a report row that did not say which left the reader
 // unable to act on it: "wrote" is the model's own words, fixed in the
-// prompt or the model, and "said" is a fault only the delivered line holds,
-// fixed in whatever the agent stitched on. A fault in both texts came from
+// prompt or the model, and "said" is a fault only the delivered line holds
+// -- usually a refusal the model wrote in a round that did not become the
+// reply, fixed in the prompt or the model too, and otherwise a line the
+// agent answered with in code, fixed there. A fault in both texts came from
 // the model and is reported once.
 func attribute(wrote, said []string) []string {
 	var out []string
@@ -496,3 +512,13 @@ func uniq(in []string) []string {
 }
 
 func seconds(d time.Duration) string { return fmt.Sprintf("%.1fs", d.Seconds()) }
+
+func timesStated(versions []string, v string) int {
+	n := 0
+	for _, stated := range versions {
+		if stated == v {
+			n++
+		}
+	}
+	return n
+}

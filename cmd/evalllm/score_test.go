@@ -366,6 +366,29 @@ func TestGroundedCatchesAnInventedVersionInFrontOfACorrectOne(t *testing.T) {
 	}
 }
 
+// The same invention, with the cut landing on a second statement of it. The
+// facts a line states are deduplicated, so both occurrences arrive as one
+// entry: forgiving the tail would take the invented one in front of it with
+// it and report nothing at all.
+func TestGroundedCatchesAnInventedVersionTheCutRepeats(t *testing.T) {
+	o := answered("The server is running 1.21.100.7 and everything is fine.")
+	o.Reply = "I can't restart the server to 1.21.10. The server is running 1.21.10…"
+	if got := check(t, Score(testCase(t, nil), o, testLimits()), DimGrounded); got.Pass {
+		t.Error("a version invented in a carried refusal passed because the cut left the same fragment at the end")
+	}
+}
+
+// The forgiveness still holds when the cut fragment also appears inside the
+// whole version earlier in the same line: one claim stated once, ending
+// halfway through its repeat.
+func TestGroundedIgnoresACutTailThatEchoesTheVersionAbove(t *testing.T) {
+	o := answered("The server is running 1.21.100.7.")
+	o.Reply = "The server is running 1.21.100.7. To be clear, the version is 1.21.10…"
+	if got := check(t, Score(testCase(t, nil), o, testLimits()), DimGrounded); !got.Pass {
+		t.Errorf("a version the cut halved was reported as invented: %s", got.Detail)
+	}
+}
+
 // The three replies that motivated this check were real: each passed the
 // whole suite by calling no tool, while telling the asker a version and a
 // player count the fixture world contradicts.
