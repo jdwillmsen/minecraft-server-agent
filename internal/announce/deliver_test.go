@@ -1709,6 +1709,28 @@ func TestSendNowReportsAWatchedEmptyServerAsSilent(t *testing.T) {
 	}
 }
 
+// A whisper list the dying connection cut short is not the empty server
+// above. Nobody left in it was told, and nobody left in it was established
+// as absent either, so silent would have a caller report a roster gap as a
+// fact about who was here.
+func TestSendNowDoesNotReportARosterGapAsAnEmptyServer(t *testing.T) {
+	a := Announcement{Body: "your waypoint is at 100 64 -200", TargetKind: TargetPlayer, TargetValue: "xuid-1"}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, &forgettingRoster{named: []string{"xuid-1"}}, fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 94)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if sent.Outcome == OutcomeSilent {
+		t.Errorf("sent = %+v, want anything but silent — the recipient was never told and never seen to leave", sent)
+	}
+	if len(voice.tells) != 0 {
+		t.Errorf("tells = %+v, want none — the roster stopped answering before the first one", voice.tells)
+	}
+}
+
 // A player typing !inbox is standing in the world; their message is itself
 // evidence of it. A roster that has not been told who is here yet says
 // nothing about anyone, and reading its silence as departure answers them

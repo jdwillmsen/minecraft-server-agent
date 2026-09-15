@@ -470,9 +470,14 @@ be taken by another account, so whoever answers to it now wins over whoever
 used to. The reply says what actually happened: `Told X.` only when the
 whisper went out, `Queued for X.` when it is waiting for them instead. An
 announcement that never reached the server at all - the console bridge
-refused it, or this process is not the live agent and `!now` has no queue to
-fall back on - is answered as a send that did not happen, never as a server
-nobody was on.
+refused it, or this process is not the live agent - is answered as a send
+that did not happen, never as a server nobody was on. Where the target still
+queues, that answer names what is owed as well as what failed, so an
+operator does not send a second copy of a message the next join will
+deliver; `!now` is the one target with no queue to fall back on, so nobody
+hearing it means nobody ever will. A broadcast to a watched server that
+nobody is on was never spoken either, and says so rather than reporting an
+announcement.
 
 `!inbox` is member level and only ever drains the caller's own queue - no
 argument names another player's, the same restriction `!wp` places on whose

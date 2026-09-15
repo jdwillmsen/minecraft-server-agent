@@ -496,10 +496,16 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 	// never sent to is excluded honestly, one who was sent to and not
 	// recorded is not accounted for at all.
 	unaccounted := false
+	// Set when the loop stopped before it had an answer for every
+	// recipient. Those left behind were neither told nor established as
+	// absent, so the zero this ends on is not the empty roster silent
+	// claims -- it is a send that should have happened and did not.
+	interrupted := false
 	for _, xuid := range targets {
 		if ctx.Err() != nil {
 			// Cancelled: stop rather than run up a failed bridge attempt
 			// (and an error line) for every recipient still left to try.
+			interrupted = true
 			break
 		}
 		if !d.roster.Knows() {
@@ -507,6 +513,7 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 			// it can be confirmed present, and a whisper recorded against
 			// someone who went with the connection is retried by nothing.
 			// They stay pending for a roster that can answer.
+			interrupted = true
 			break
 		}
 		if d.departed(xuid) {
@@ -548,11 +555,11 @@ func (d *Deliverer) SendNow(ctx context.Context, a Announcement, id int64) (Reac
 		return uncounted, nil
 	}
 	if delivered == 0 {
-		// Nobody read it, and which of the two reasons decides what the
-		// caller may claim: a Tell the bridge refused is a send that did
-		// not happen, while a recipient who had gone or was still loading
-		// simply was not there to be told.
-		if refused > 0 {
+		// Nobody read it, and which of the reasons decides what the caller
+		// may claim: a Tell the bridge refused, or a list this loop never
+		// finished, is a send that did not happen, while a recipient who
+		// had gone or was still loading simply was not there to be told.
+		if refused > 0 || interrupted {
 			return unsaid, nil
 		}
 		return silent, nil
@@ -603,8 +610,9 @@ func (d *Deliverer) Publish(ctx context.Context, a Announcement) (id int64, sent
 // belongs to one player who has just given evidence of being here -- the
 // arrival that scheduled it, or the !inbox they typed -- so a roster that
 // has merely stopped answering is no reason to withhold what they asked
-// for. A connection that ends takes the drain's context with it, which is
-// what stops a backlog whose player may be gone.
+// for. What bounds a backlog whose player may be gone is this drain's own
+// context: a join drain descends from one the ending connection cancels,
+// and an !inbox drain from the timeout every dispatched command runs under.
 func (d *Deliverer) sendPending(ctx context.Context, xuid string, now time.Time, msgs []Announcement) int {
 	delivered := 0
 	for _, a := range msgs {

@@ -240,14 +240,24 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 	// agent or a sibling bot is filtered out of every audience. "Told X"
 	// in any of those cases is a report of a delivery that did not occur.
 	switch {
-	case sent.Outcome == announce.OutcomeFailed:
-		// The line never reached the server: the bridge refused it, or this
-		// process may not speak and a !now announcement has no queue behind
-		// it to be picked up from. Both of the zeros below -- "Announced."
-		// and an empty server -- read as the message having been dealt
-		// with, and an operator warning of a restart would walk away
-		// believing the server had been told.
+	case sent.Outcome == announce.OutcomeFailed && !announce.Queues(target):
+		// The line never reached the server and nothing stands behind it to
+		// try again: online-only is the one target PendingFor excludes, so
+		// an audience that missed it has missed it for good. Both of the
+		// zeros below -- "Announced." and an empty server -- read as the
+		// message having been dealt with, and an operator warning of a
+		// restart would walk away believing the server had been told.
 		return "I couldn't send that - nothing went out.", nil
+	case sent.Outcome == announce.OutcomeFailed && target == announce.TargetPlayer:
+		// The send failed and the stored row outlived it, so the reply says
+		// both halves. An operator told only that nothing went out runs the
+		// command again, and the queue then hands the player two copies of
+		// a message that was never actually lost.
+		return "I couldn't send that now - it is still queued for " + displayName + ".", nil
+	case sent.Outcome == announce.OutcomeFailed:
+		// Same two halves for a target that queues for whoever it matches,
+		// with nobody to name: what went wrong, and what is still owed.
+		return "I couldn't send that now - it is still queued for the next join.", nil
 	case !sent.Counted && announce.DeliveryFor(target) == announce.DeliveryBroadcast:
 		// The line is in chat and the audience could not be accounted for,
 		// which happens for reasons this reply cannot tell apart -- no
@@ -281,6 +291,12 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 		// rather than of a zero count: every unspoken send counts zero, and
 		// only this one of them is a fact about the server.
 		return "Nobody was online to hear that.", nil
+	case sent.Outcome == announce.OutcomeSilent:
+		// Nothing was spoken because there was nobody to speak to, and
+		// every target that reaches here still owes the delivery. Reported
+		// rather than falling through to "Announced.", which would put an
+		// operator's restart warning in a chat no player was in to read.
+		return "Nobody heard that - it is still queued for the next join.", nil
 	}
 	return "Announced.", nil
 }

@@ -285,6 +285,58 @@ func TestAnnounceNowWithNobodyOnlineSaysNobodyHeardIt(t *testing.T) {
 	}
 }
 
+// A broadcast to a watched, empty server is never spoken: there is nobody
+// in chat to speak to. "Announced." would have an operator believe their
+// restart warning went out, when everyone this target queues for is still
+// owed it.
+func TestAnnounceToEveryoneOnAnEmptyServerDoesNotClaimItWasAnnounced(t *testing.T) {
+	cmd := announceCommand(t, "announce")
+	pctx := &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: true},
+		Deliverer:     &fakeAnnounceDeliverer{outcome: announce.OutcomeSilent},
+	}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"server", "restarting", "in", "5", "minutes"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if reply == "Announced." {
+		t.Errorf("reply = %q, want it not to report a broadcast that was never spoken", reply)
+	}
+	if !strings.Contains(strings.ToLower(reply), "queued") {
+		t.Errorf("reply = %q, want it to say the message is still owed", reply)
+	}
+}
+
+// A whisper the bridge refused is not a message that was lost: the stored
+// row is still pending, so the player's own !inbox or their next join
+// delivers it. An operator told only that nothing went out runs the command
+// again, and the queue then hands the player both copies.
+func TestAnnounceToAPlayerWhoseWhisperFailedKeepsTheQueuePromise(t *testing.T) {
+	cmd := announceCommand(t, "announce")
+	pctx := &plugin.Context{
+		Announcements: &fakeAnnounceStore{enabled: true},
+		Deliverer:     &fakeAnnounceDeliverer{outcome: announce.OutcomeFailed},
+		Roster:        fakeAnnounceRoster{online: map[string]string{"Dotablaze": "xuid-live"}},
+	}
+
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID:       "op",
+		ActorPermission: plugin.PermissionOperator,
+		Args:            []string{"@Dotablaze", "the", "farm", "moved"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(reply, "Dotablaze") || !strings.Contains(strings.ToLower(reply), "queued") {
+		t.Errorf("reply = %q, want both halves — the send that failed and the queue still standing behind it", reply)
+	}
+}
+
 // "Nobody heard that" is a claim about the server, and the agent can only
 // make it when it can see who is on one. Broadcasting while the roster
 // cannot answer -- the reconnect gap, or the moments before the first roster
