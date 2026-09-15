@@ -38,7 +38,11 @@ func (f *fakePublisher) Publish(_ context.Context, a announce.Announcement) (int
 	if f.uncounted {
 		return 42, announce.Reach{}, nil
 	}
-	return 42, announce.Reach{Players: f.reached, Counted: true, Queued: f.queued}, nil
+	sent := announce.Reach{Players: f.reached, Counted: true}
+	if f.queued {
+		sent.Outcome = announce.OutcomeQueued
+	}
+	return 42, sent, nil
 }
 
 type fakePlayers struct {

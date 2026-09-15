@@ -158,7 +158,7 @@ func announcementsHandler(token string, live func() bool, pub AnnouncementPublis
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		resp := announcementResponse{ID: id, Queued: sent.Queued}
+		resp := announcementResponse{ID: id, Queued: sent.Outcome == announce.OutcomeQueued}
 		if sent.Counted {
 			resp.Reached = &sent.Players
 		}

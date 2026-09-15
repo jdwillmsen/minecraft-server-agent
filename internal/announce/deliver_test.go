@@ -1275,7 +1275,7 @@ func TestSendNowReportsAStandbysPublishAsQueued(t *testing.T) {
 	if len(voice.says) != 0 {
 		t.Errorf("Say calls = %v, want none from a process that is in no game", voice.says)
 	}
-	if !sent.Queued {
+	if sent.Outcome != OutcomeQueued {
 		t.Errorf("sent = %+v, want it reported as queued for the live agent", sent)
 	}
 	if !sent.Counted || sent.Players != 0 {
@@ -1301,7 +1301,7 @@ func TestSendNowDoesNotReportAnOnlineOnlyPublishOffTheLeaderAsQueued(t *testing.
 	if len(voice.says) != 0 {
 		t.Errorf("Say calls = %v, want none from a process that is in no game", voice.says)
 	}
-	if sent.Queued {
+	if sent.Outcome == OutcomeQueued {
 		t.Errorf("sent = %+v, want it not reported as queued: an online-only row is delivered by nobody", sent)
 	}
 	if !sent.Counted || sent.Players != 0 {
@@ -1323,7 +1323,7 @@ func TestSendNowDoesNotReportAnIdleServerAsQueued(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendNow: %v", err)
 	}
-	if sent.Queued {
+	if sent.Outcome == OutcomeQueued {
 		t.Errorf("sent = %+v, want it not reported as queued: this process is the one that speaks", sent)
 	}
 	if !sent.Counted || sent.Players != 0 {
@@ -1403,7 +1403,7 @@ func TestSendNowReportsAStandbysWhisperPublishAsQueued(t *testing.T) {
 	if len(voice.tells) != 0 || len(voice.says) != 0 {
 		t.Errorf("Tell = %v and Say = %v, want both empty from a process in no game", voice.tells, voice.says)
 	}
-	if !sent.Queued {
+	if sent.Outcome != OutcomeQueued {
 		t.Errorf("sent = %+v, want it reported as queued for the live agent, the same as a broadcast target", sent)
 	}
 }
@@ -1421,7 +1421,7 @@ func TestSendNowDoesNotReportTheLiveAgentsWhisperToNobodyAsQueued(t *testing.T) 
 	if err != nil {
 		t.Fatalf("SendNow: %v", err)
 	}
-	if sent.Queued {
+	if sent.Outcome == OutcomeQueued {
 		t.Errorf("sent = %+v, want it not reported as queued: this process is the one that speaks", sent)
 	}
 	if !sent.Counted || sent.Players != 0 {
@@ -1546,7 +1546,7 @@ func TestSendNowDoesNotBroadcastFromADemotedLeaderThatStillNamesPlayers(t *testi
 	if len(store.delivered) != 0 {
 		t.Errorf("store recorded %v, want nothing: it said nothing", store.delivered)
 	}
-	if !sent.Queued {
+	if sent.Outcome != OutcomeQueued {
 		t.Errorf("sent = %+v, want it reported as queued for whoever holds the lock", sent)
 	}
 }
@@ -1599,7 +1599,7 @@ func TestSendNowDoesNotWhisperFromADemotedLeaderThatStillNamesPlayers(t *testing
 	if len(store.delivered) != 0 {
 		t.Errorf("store recorded %v, want nothing: nothing was whispered", store.delivered)
 	}
-	if !sent.Queued {
+	if sent.Outcome != OutcomeQueued {
 		t.Errorf("sent = %+v, want it queued for whoever holds the lock", sent)
 	}
 }
@@ -1624,5 +1624,81 @@ func TestSendNowStillWhispersFromTheLeaderWithPlayersOnTheRoster(t *testing.T) {
 	}
 	if !sent.Counted || sent.Players != 1 {
 		t.Errorf("sent = %+v, want one counted player", sent)
+	}
+}
+
+// A Say that never went out is not an empty server, and the two are the
+// same zero. An operator warning of a restart against a bridge rejection, a
+// 5xx or a timeout is told the message was handled, and the server is never
+// warned at all.
+func TestSendNowReportsABroadcastThatWasNeverSaid(t *testing.T) {
+	a := Announcement{Body: "server restarting in 5 minutes", TargetKind: TargetOnlineOnly}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{sayErr: errors.New("bridge rejected the command")}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"xuid-1"}}, fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 90)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if sent.Outcome != OutcomeFailed {
+		t.Errorf("sent = %+v, want a failed outcome — nothing was said, which a bare zero reads as an empty server", sent)
+	}
+	if len(store.delivered) != 0 {
+		t.Errorf("store recorded %v, want nothing — the line never reached the server", store.delivered)
+	}
+}
+
+// The same distinction for a whisper: every Tell failed, so nobody read it,
+// and that is not the same fact as nobody having been there to read it.
+func TestSendNowReportsAWhisperThatWasNeverTold(t *testing.T) {
+	a := Announcement{Body: "your waypoint is at 100 64 -200", TargetKind: TargetPlayer, TargetValue: "xuid-1"}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{tellErr: map[string]error{"xuid-1": errors.New("bridge unreachable")}}
+	d := NewDeliverer(store, voice, fakeRoster{online: []string{"xuid-1"}}, fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 91)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if sent.Outcome != OutcomeFailed {
+		t.Errorf("sent = %+v, want a failed outcome — the whisper was attempted and did not go out", sent)
+	}
+}
+
+// Nothing spoken and nobody owed it: PendingFor excludes online-only, so
+// the row this standby stored is picked up by nothing. Reported as the zero
+// a watched server gives, the operator is told nobody was on to hear a
+// countdown that was never said.
+func TestSendNowReportsAnOnlineOnlyPublishOffTheLeaderAsUnsaid(t *testing.T) {
+	a := Announcement{Body: "restarting in five", TargetKind: TargetOnlineOnly}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{}, fakePermissions{}, testLogger(),
+		WithLeadership(fakeLeadership{live: false}))
+
+	sent, err := d.SendNow(context.Background(), a, 92)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if sent.Outcome != OutcomeFailed {
+		t.Errorf("sent = %+v, want a failed outcome — nothing was said here and nothing will say it", sent)
+	}
+}
+
+// The empty server the two above must stay distinct from: the roster is
+// watching, it names nobody, and the line was rightly never spoken.
+func TestSendNowReportsAWatchedEmptyServerAsSilent(t *testing.T) {
+	a := Announcement{Body: "restarting in five", TargetKind: TargetOnlineOnly}
+	store := &fakeStore{enabled: true}
+	voice := &fakeVoice{}
+	d := NewDeliverer(store, voice, fakeRoster{knows: true}, fakePermissions{}, testLogger())
+
+	sent, err := d.SendNow(context.Background(), a, 93)
+	if err != nil {
+		t.Fatalf("SendNow: %v", err)
+	}
+	if sent.Outcome != OutcomeSilent {
+		t.Errorf("sent = %+v, want a silent outcome — nobody was there to hear it", sent)
 	}
 }

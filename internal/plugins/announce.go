@@ -240,6 +240,14 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 	// agent or a sibling bot is filtered out of every audience. "Told X"
 	// in any of those cases is a report of a delivery that did not occur.
 	switch {
+	case sent.Outcome == announce.OutcomeFailed:
+		// The line never reached the server: the bridge refused it, or this
+		// process may not speak and a !now announcement has no queue behind
+		// it to be picked up from. Both of the zeros below -- "Announced."
+		// and an empty server -- read as the message having been dealt
+		// with, and an operator warning of a restart would walk away
+		// believing the server had been told.
+		return "I couldn't send that - nothing went out.", nil
 	case !sent.Counted && announce.DeliveryFor(target) == announce.DeliveryBroadcast:
 		// The line is in chat and the audience could not be accounted for,
 		// which happens for reasons this reply cannot tell apart -- no
@@ -260,16 +268,18 @@ func runAnnounce(ctx context.Context, pctx *plugin.Context, inv plugin.Invocatio
 		return "Queued for " + displayName + ".", nil
 	case target == announce.TargetPlayer:
 		return "Told " + displayName + ".", nil
-	case sent.Queued:
+	case sent.Outcome == announce.OutcomeQueued:
 		// Nothing was spoken: this process is not the one playing the agent
 		// right now, so the row is stored for whichever one is. Reported
 		// rather than folded into "Announced." -- the operator watching
 		// chat for their own line would otherwise wait for one that this
 		// process was never going to say.
 		return "Queued - I am not the live agent right now, so the one that is will deliver it.", nil
-	case target == announce.TargetOnlineOnly && sent.Players == 0:
+	case target == announce.TargetOnlineOnly && sent.Outcome == announce.OutcomeSilent:
 		// online_only is the one target with no queue behind it, so nobody
-		// hearing it now means nobody ever will.
+		// hearing it now means nobody ever will. Asked of the outcome
+		// rather than of a zero count: every unspoken send counts zero, and
+		// only this one of them is a fact about the server.
 		return "Nobody was online to hear that.", nil
 	}
 	return "Announced.", nil
