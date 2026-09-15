@@ -192,15 +192,50 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   gauge and reconnect counter; callers record through small functions and
   never touch a Prometheus type - see "Metrics" below
 - `internal/ratelimit` - per-actor sliding-window command rate limiting
-- `internal/census` - reads a Bedrock world save from a backup archive and
-  produces a reproducible population report: entity totals, 144-block
-  regions graded against Bedrock's spawn caps, name-tagged mobs, and located
-  entity concentrations. Reproducibility is the point, not a nicety - every
-  ordering the report depends on is a total order over ties, down to the
-  cluster bounds, so the same world bytes always produce the same report
+- `internal/census` - reads a Bedrock world save and produces a reproducible
+  population report: entity totals, 144-block regions graded against
+  Bedrock's spawn caps, name-tagged mobs, and located entity concentrations.
+  Reproducibility is the point, not a nicety - every ordering the report
+  depends on is a total order over ties, down to the cluster bounds, so the
+  same world bytes always produce the same report. Two sources can supply
+  the world, and the report always names which one it read - see "Where the
+  census reads its world" below
 - `cmd/census` - the binary; runs as a Kubernetes CronJob beside the server
   rather than inside the agent, since the scan is a batch job over hundreds
   of megabytes and the agent's own pod is the one answering players in chat
+
+### Where the census reads its world
+
+`cmd/census` takes two directory flags and reads whichever holds the newer
+world. Both are normally set.
+
+| Flag | Default | What it holds |
+|---|---|---|
+| `-world-dir` | *(unset)* | a directory another process copied a live world into, marked with a `snapshot-taken-at` file holding an RFC3339 time |
+| `-backup-dir` | `/backup` | the nightly `fwb-<stamp>.tar.gz` backup archives; the stamp in the name is when the world was captured |
+
+Every report carries a provenance line - `world taken at <time> via snapshot`
+or `via archive` - so a green run always says which of the two it read and how
+old that world was. The scan itself is identical either way.
+
+The snapshot is only preferred while it is the fresher of the two. These are
+the outcomes:
+
+| In `-world-dir` | What happens |
+|---|---|
+| a world newer than the newest archive | read it, `via snapshot` |
+| no `snapshot-taken-at` file | routine - the snapshotter could not get a save hold; read the archive, `via archive`, and say so on stderr |
+| a world older than the newest archive | read the archive instead, and say so on stderr |
+| the directory itself is missing | **fail the run** - a volume that never mounted is not a missed save hold |
+| an unparsable or future `snapshot-taken-at` | **fail the run** |
+| more than one world in it | **fail the run** - which one is fresh is not guessable |
+| a half-copied world (no journal, no manifest, or no records at all) | **fail the run** |
+
+A broken snapshotter fails the run rather than falling back, because reading
+last night's archive instead would let it publish plausible reports
+indefinitely. The snapshotter's own half of that bargain is to copy the world
+first and create the marker last, by renaming it onto its final name; nothing
+on this side can check the ordering, only its coarser consequences.
 
 ## Environment variables
 

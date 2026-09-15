@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,14 @@ import (
 	"time"
 )
 
+// KindArchive and KindSnapshot name where a world came from. The report
+// prints the kind as its provenance, and the census holds a world copied out
+// from under a running server to a stricter standard than a sealed archive.
+const (
+	KindArchive  = "archive"
+	KindSnapshot = "snapshot"
+)
+
 // World is an extracted, readable world plus where it came from.
 type World struct {
 	// DBPath is the directory holding the LevelDB files.
@@ -22,9 +31,11 @@ type World struct {
 	TakenAt time.Time
 	// Kind names the source, for the report's provenance line.
 	Kind string
-	// Archive names the backup file the world came from, so an operator
-	// looking at a Scan failure over an extracted temp path can tell which
-	// fwb-<stamp>.tar.gz to go pull apart by hand.
+	// Archive names where the world came from, so an operator looking at a
+	// Scan failure over a path this process chose can tell which
+	// fwb-<stamp>.tar.gz to go pull apart by hand - or, for a snapshot,
+	// which directory to go and look in. Read it with Kind: it is a file
+	// name for one source and a directory for the other.
 	Archive string
 }
 
@@ -51,10 +62,15 @@ type ArchiveSource struct {
 // is the only record of when the world was captured.
 var archiveName = regexp.MustCompile(`^fwb-(\d{8}T\d{6}Z)\.tar\.gz$`)
 
-func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
-	entries, err := os.ReadDir(s.Dir)
+// NewestArchive names the most recent backup archive in dir and says when it
+// was taken, without reading a byte of it. A caller holding two sources needs
+// the archive's age to know whether a snapshot is actually the fresher of
+// them, and extracting half a gigabyte to find that out would cost more than
+// the comparison saves.
+func NewestArchive(dir string) (string, time.Time, error) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return World{}, nil, fmt.Errorf("read backup directory %s: %w", s.Dir, err)
+		return "", time.Time{}, fmt.Errorf("read backup directory %s: %w", dir, err)
 	}
 	var names []string
 	for _, e := range entries {
@@ -63,7 +79,7 @@ func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
 		}
 	}
 	if len(names) == 0 {
-		return World{}, nil, fmt.Errorf("no fwb-<stamp>.tar.gz archive in %s", s.Dir)
+		return "", time.Time{}, fmt.Errorf("no fwb-<stamp>.tar.gz archive in %s", dir)
 	}
 	// The stamp is fixed-width and zero-padded, so lexical order is
 	// chronological order.
@@ -72,7 +88,15 @@ func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
 
 	stamp, err := time.Parse("20060102T150405Z", archiveName.FindStringSubmatch(newest)[1])
 	if err != nil {
-		return World{}, nil, fmt.Errorf("parse timestamp from %s: %w", newest, err)
+		return "", time.Time{}, fmt.Errorf("parse timestamp from %s: %w", newest, err)
+	}
+	return newest, stamp, nil
+}
+
+func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
+	newest, stamp, err := NewestArchive(s.Dir)
+	if err != nil {
+		return World{}, nil, err
 	}
 
 	root, err := os.MkdirTemp("", "census-world-")
@@ -86,12 +110,155 @@ func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
 		return World{}, nil, err
 	}
 
-	dbPath, err := findDB(root, newest)
+	dbPath, err := findDB(ctx, root, newest)
 	if err != nil {
 		_ = cleanup()
 		return World{}, nil, err
 	}
-	return World{DBPath: dbPath, TakenAt: stamp, Kind: "archive", Archive: newest}, cleanup, nil
+	return World{DBPath: dbPath, TakenAt: stamp, Kind: KindArchive, Archive: newest}, cleanup, nil
+}
+
+// snapshotTakenAtFile is the provenance marker an external snapshotter writes
+// beside the world it copied, holding an RFC3339 time.
+const snapshotTakenAtFile = "snapshot-taken-at"
+
+// currentFile and journalSuffix are LevelDB's own names for the two members
+// whose absence marks a copy that stopped early.
+const (
+	currentFile   = "CURRENT"
+	journalSuffix = ".log"
+)
+
+// maxSnapshotSkew is how far ahead of this process's clock a marker may sit
+// and still be read as provenance. The marker is written seconds before it is
+// read and both clocks are synchronised, so a few minutes is generous for
+// drift and far short of the months a broken writer produces.
+const maxSnapshotSkew = 5 * time.Minute
+
+// ErrNoSnapshot reports that a directory exists but holds no snapshot.
+//
+// It is distinguishable because it is the one failure a caller should recover
+// from: a snapshotter writes nothing when it cannot get a save hold, which is
+// routine, and the caller then reads the nightly archive instead. Every other
+// failure means the snapshot is broken, and falling back would hide that
+// behind a stale report.
+var ErrNoSnapshot = errors.New("no snapshot present")
+
+// DirectorySource reads a world that something else has already snapshotted.
+//
+// Bedrock's save hold / save query / save resume sequence belongs to the
+// process that takes the snapshot, alongside the backup job that has run it
+// for months. A second implementation of that protocol would be a second
+// thing capable of leaving a live server unable to persist, so this reads
+// what that shell left rather than speaking to the server itself.
+//
+// The snapshotter's half of the contract, which lives in another repository
+// and cannot be enforced from here: copy the whole world first, then create
+// the marker last and atomically, by renaming it onto its final name. The
+// marker's presence is what makes a copy readable, so a marker that appears
+// beside a copy still in flight publishes a half-written world as a finished
+// one. That ordering is the only thing that rules out a journal truncated
+// part way through, which is indistinguishable in the bytes from a journal a
+// live server had only just begun. The checks below catch the half-copies
+// that are visible in the file set, and nothing catches the rest.
+type DirectorySource struct {
+	Dir string
+}
+
+func (s DirectorySource) Open(ctx context.Context) (World, func() error, error) {
+	// Nothing to clean up: this world belongs to whoever wrote it, and it
+	// reaches us through a volume shared with that process. Removing it
+	// would destroy a snapshot this process did not extract.
+	noCleanup := func() error { return nil }
+
+	// A directory that is not there at all is not a snapshotter declining to
+	// take a hold: it is a volume that never mounted, a renamed path or a
+	// typo. Reading the marker first would report that as an absent
+	// snapshot, fall back to the archive, and stay green forever.
+	info, err := os.Stat(s.Dir)
+	switch {
+	case err != nil:
+		return World{}, nil, fmt.Errorf("stat snapshot directory %s: %w", s.Dir, err)
+	case !info.IsDir():
+		return World{}, nil, fmt.Errorf("snapshot path %s is not a directory", s.Dir)
+	}
+
+	marker := filepath.Join(s.Dir, snapshotTakenAtFile)
+	raw, err := os.ReadFile(marker)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return World{}, nil, fmt.Errorf("%w: %s", ErrNoSnapshot, marker)
+	case err != nil:
+		return World{}, nil, fmt.Errorf("read %s: %w", marker, err)
+	}
+
+	// The marker is the only record of when this world was captured, and the
+	// report's provenance line is what stops a stale census being believed.
+	// Substituting the current time would forge exactly that.
+	takenAt, err := time.Parse(time.RFC3339, strings.TrimSpace(string(raw)))
+	if err != nil {
+		return World{}, nil, fmt.Errorf("parse %s: %w", marker, err)
+	}
+	// Transcribing provenance faithfully is not the same as trusting it. A
+	// marker ahead of this process's clock describes a capture that has not
+	// happened, which is a skewed or broken writer rather than a world. How
+	// old is too old, by contrast, is a question only something holding the
+	// alternative source can answer, so this bounds one end and leaves the
+	// other to the caller.
+	if time.Until(takenAt) > maxSnapshotSkew {
+		return World{}, nil, fmt.Errorf("%s reads %s, which is ahead of this clock: the snapshotter's clock or its marker is wrong",
+			marker, takenAt.UTC().Format(time.RFC3339))
+	}
+
+	dbPath, err := findDB(ctx, s.Dir, s.Dir)
+	if err != nil {
+		return World{}, nil, err
+	}
+	if err := verifyWholeWorld(dbPath); err != nil {
+		return World{}, nil, err
+	}
+	return World{DBPath: dbPath, TakenAt: takenAt, Kind: KindSnapshot, Archive: s.Dir}, noCleanup, nil
+}
+
+// verifyWholeWorld refuses the half-copies a marker alone cannot rule out.
+//
+// A world copied out of a running server always holds a CURRENT naming a
+// manifest beside it and at least one journal. LevelDB reports a damaged
+// table, but it treats a missing or short journal as an ordinary end of the
+// log, so a copy that stopped before the journal opens cleanly and reads as a
+// smaller world rather than as a failure - and the journal is where a live
+// server's newest writes are.
+//
+// This is a file-set check, not a proof. It is worth having because the
+// states it names are the ones a stalled copy actually leaves behind, and it
+// turns them into a red job with a reason instead of a confident short count.
+func verifyWholeWorld(dbPath string) error {
+	current, err := os.ReadFile(filepath.Join(dbPath, currentFile))
+	if err != nil {
+		return fmt.Errorf("incomplete world %s: read %s: %w", dbPath, currentFile, err)
+	}
+	// CURRENT names a manifest sitting beside it, never a path. Anything
+	// else is not a LevelDB, and joining it would reach outside the world.
+	manifest := strings.TrimSpace(string(current))
+	if manifest == "" || strings.ContainsAny(manifest, `/\`) {
+		return fmt.Errorf("incomplete world %s: %s does not name a manifest beside it: %q", dbPath, currentFile, manifest)
+	}
+	info, err := os.Stat(filepath.Join(dbPath, manifest))
+	switch {
+	case err != nil:
+		return fmt.Errorf("incomplete world %s: %s names %s: %w", dbPath, currentFile, manifest, err)
+	case info.Size() == 0:
+		return fmt.Errorf("incomplete world %s: manifest %s is empty", dbPath, manifest)
+	}
+
+	journals, err := filepath.Glob(filepath.Join(dbPath, "*"+journalSuffix))
+	if err != nil {
+		return fmt.Errorf("search world %s for a journal: %w", dbPath, err)
+	}
+	if len(journals) == 0 {
+		return fmt.Errorf("incomplete world %s: no %s journal, so the newest writes never arrived", dbPath, journalSuffix)
+	}
+	return nil
 }
 
 func extract(ctx context.Context, archive, root string) error {
@@ -164,25 +331,42 @@ func extract(ctx context.Context, archive, root string) error {
 	}
 }
 
-// findDB locates the LevelDB directory inside an extracted archive. The
-// archive's internal layout has changed before, so this searches rather than
-// assuming a fixed path.
-func findDB(root string, archive string) (string, error) {
-	var found string
+// findDB locates the LevelDB directory inside a world tree. The layout has
+// changed before, so this searches rather than assuming a fixed path.
+//
+// More than one is a refusal rather than a choice. An extraction root holds
+// exactly one world because this process just built it, but a snapshot
+// directory is a volume another process owns: a leftover world can sit beside
+// the fresh one, and taking the first by name order would report the
+// leftover's mobs under the fresh snapshot's timestamp.
+//
+// The walk is over a directory whose size this process does not know, so it
+// stops at the first cancellation like every other traversal here.
+func findDB(ctx context.Context, root string, source string) (string, error) {
+	var found []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() && d.Name() == "db" && found == "" {
-			found = path
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if d.IsDir() && d.Name() == "db" {
+			found = append(found, path)
+			return filepath.SkipDir
 		}
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("search extracted archive: %w", err)
+		return "", fmt.Errorf("search %s: %w", source, err)
 	}
-	if found == "" {
-		return "", fmt.Errorf("no db directory inside archive %s", archive)
+	switch len(found) {
+	case 0:
+		return "", fmt.Errorf("no db directory inside %s", source)
+	case 1:
+		return found[0], nil
+	default:
+		return "", fmt.Errorf("%s holds %d db directories (%s); exactly one world is required",
+			source, len(found), strings.Join(found, ", "))
 	}
-	return found, nil
 }
