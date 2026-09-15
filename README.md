@@ -874,13 +874,13 @@ standby therefore rotates nothing.
 
 What a standby does instead is read. It reads the store once at start-up, so
 the token is in hand rather than being fetched between winning the lock and
-joining the game. Past the point where what it loaded expires it re-reads,
-because the live agent persists every rotation - the round trip the handover
-would have paid is paid against the database instead of against Microsoft.
-And the first thing a promoted standby does is read again and take whatever
-the last live agent left there, *before* refreshing anything: by then what it
+joining the game, and it does not poll after that: it has nothing to do with
+the token until it is live, and the live agent goes on rotating meanwhile. So
+the first thing a promoted standby does is read again and take whatever the
+last live agent left there, *before* refreshing anything - by then what it
 holds may be a token Microsoft has already retired, and both refreshing from
-it and writing it back cost the account its login.
+it and writing it back cost the account its login. That read is a database
+round trip; the one it replaces was a fresh login.
 
 `auth_token_written`, `auth_token_standby_reloaded` and
 `auth_token_adopted_from_store` in the pod logs are how you tell the two roles
@@ -900,6 +900,10 @@ alert may key on it.
 `updated_at` still being what that process last read, so a write that would
 replace a token written since is refused (`auth_token_write_superseded`) and
 the writer re-reads and takes the winner's token instead. Last-writer-wins
+would make an older token silently replace a newer one, and two processes
+writing this row is a designed state rather than a fault: leadership can be
+forced when the lock holder is gone without having released it - see "When
+nobody releases the lock".
 
 The file cache stays behind the database one as a **read-through fallback**.
 It is written only when the database cannot answer at all - the write falls

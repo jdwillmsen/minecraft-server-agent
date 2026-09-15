@@ -27,9 +27,11 @@ import (
 // store that has gone away costs a refresh rather than the connection.
 const storeTimeout = 5 * time.Second
 
-// ErrStandbyUnwarmed means this process is not the live agent, what it
-// loaded has expired, and the store holds nothing newer -- so it holds no
-// usable token and may not refresh one into existence.
+// ErrStandbyUnwarmed means this process is not the live agent and has no
+// usable token it may refresh into existence: what it loaded has expired and
+// the store holds nothing newer, or nothing has ever been stored at all. The
+// two collapse here deliberately -- neither is something a standby may act
+// on, and only the live agent's first-run login tells them apart.
 //
 // The ordinary state of a standby that started more than an access token's
 // lifetime after the live agent last rotated, not a failure: the live agent
