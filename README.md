@@ -468,7 +468,11 @@ has ever seen is refused, because an announcement aimed at an XUID nobody
 holds could never be delivered or drained. A gamertag freed by a rename can
 be taken by another account, so whoever answers to it now wins over whoever
 used to. The reply says what actually happened: `Told X.` only when the
-whisper went out, `Queued for X.` when it is waiting for them instead.
+whisper went out, `Queued for X.` when it is waiting for them instead. An
+announcement that never reached the server at all - the console bridge
+refused it, or this process is not the live agent and `!now` has no queue to
+fall back on - is answered as a send that did not happen, never as a server
+nobody was on.
 
 `!inbox` is member level and only ever drains the caller's own queue - no
 argument names another player's, the same restriction `!wp` places on whose
