@@ -159,6 +159,56 @@ func TestLookupMatchesQueryContainingEqualsSign(t *testing.T) {
 	}
 }
 
+// TestLookupFlagsAMatchOnTheHeadOfAnotherCompound reproduces the bug a
+// player hit in production: asked where the slime farm is, full-text search
+// matched the gold farm row on "farm" alone, and because search did match,
+// the row came back ranked and unflagged -- the answer path then read out
+// the gold farm's coordinates as the slime farm's. The row is still the
+// nearest thing on file, so it must be returned, but as MatchPartial.
+func TestLookupFlagsAMatchOnTheHeadOfAnotherCompound(t *testing.T) {
+	ctx := context.Background()
+	s := NewPostgres(livePool(t))
+	topic := "__test gold farm"
+	t.Cleanup(func() { _, _ = s.Delete(ctx, topic) })
+
+	if err := s.Upsert(ctx, topic, "In the nether at 120 64 -340.", ""); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	entries, err := s.Lookup(ctx, "where is the slime farm", 3)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	got, found := findTopic(entries, topic)
+	if !found {
+		t.Fatalf("Lookup did not return %q at all, so there is nothing to hedge", topic)
+	}
+	if got.Matched != MatchPartial {
+		t.Errorf("Matched = %v, want MatchPartial", got.Matched)
+	}
+
+	entries, err = s.Lookup(ctx, "where is the gold farm", 3)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	got, found = findTopic(entries, topic)
+	if !found {
+		t.Fatalf("Lookup did not find %q by its own name", topic)
+	}
+	if got.Matched != MatchExact {
+		t.Errorf("Matched = %v for the topic asked about by name, want MatchExact", got.Matched)
+	}
+}
+
+func findTopic(entries []Entry, topic string) (Entry, bool) {
+	for _, e := range entries {
+		if e.Topic == topic {
+			return e, true
+		}
+	}
+	return Entry{}, false
+}
+
 func containsTopic(entries []Entry, topic string) bool {
 	for _, e := range entries {
 		if e.Topic == topic {

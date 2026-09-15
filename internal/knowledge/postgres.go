@@ -42,9 +42,10 @@ func (p *Postgres) Enabled() bool { return p != nil && p.pool != nil }
 // caller that joined multiple arguments into a topic the way !kb set joins
 // them into a body would silently lose this half of the fallback for it.
 //
-// Each returned Entry also carries whether it matched full-text or only the
-// substring fallback (see MatchKind) -- ts_rank is 0 for a fallback-only
-// row, so with limit=1 a caller has no other way to tell a confirmed answer
+// Each returned Entry also carries how well it answers the query (see
+// MatchKind) -- ts_rank is 0 for a fallback-only row, and a row that
+// matched only on the head of someone else's compound ranks like any other
+// hit, so with limit=1 a caller has no other way to tell a confirmed answer
 // from a guess.
 func (p *Postgres) Lookup(ctx context.Context, query string, limit int) ([]Entry, error) {
 	if limit <= 0 {
@@ -91,7 +92,11 @@ func (p *Postgres) Lookup(ctx context.Context, query string, limit int) ([]Entry
 		}
 		out = append(out, e)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	MarkPartialMatches(query, out)
+	return out, nil
 }
 
 func (p *Postgres) Get(ctx context.Context, topic string) (Entry, bool, error) {

@@ -248,3 +248,32 @@ func TestVersionReportingToolsAddNoVersionOfTheirOwn(t *testing.T) {
 		}
 	}
 }
+
+// partialKnowledge returns a row full-text search did match, on a word the
+// query only used as the head of a different compound -- the gold farm
+// answering "where is the slime farm". The model has to be told this is an
+// answer to another question, not a hit with a soft edge.
+type partialKnowledge struct{ knowledge.Nop }
+
+func (partialKnowledge) Enabled() bool { return true }
+
+func (partialKnowledge) Lookup(context.Context, string, int) ([]knowledge.Entry, error) {
+	return []knowledge.Entry{
+		{Topic: "gold farm", Body: "in the nether at 120 64 -340", Matched: knowledge.MatchPartial},
+	}, nil
+}
+
+func TestKnowledgeLookupToolFlagsAPartialMatch(t *testing.T) {
+	registry, _ := Build(&plugin.Context{Knowledge: partialKnowledge{}})
+
+	out, err := registry.Invoke(t.Context(), "knowledge_lookup", json.RawMessage(`{"query":"where is the slime farm"}`), "2535411111111111")
+	if err != nil {
+		t.Fatalf("knowledge_lookup: %v", err)
+	}
+	if !strings.Contains(out, "no entry for what was asked") {
+		t.Errorf("output = %q, want it to say the topic asked about is not recorded", out)
+	}
+	if !strings.Contains(out, "gold farm") {
+		t.Errorf("output = %q, want the nearest topic still offered", out)
+	}
+}

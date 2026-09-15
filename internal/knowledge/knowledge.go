@@ -22,7 +22,7 @@ type Entry struct {
 	UpdatedAt  time.Time
 	// Matched records how this entry answered the query it came from. Its
 	// zero value, MatchExact, is correct for Get and List, which never
-	// guess; only Lookup's substring fallback ever sets MatchFallback.
+	// guess; only a Lookup sets anything weaker.
 	Matched MatchKind
 }
 
@@ -32,11 +32,11 @@ type Entry struct {
 type MatchKind int
 
 const (
-	// MatchExact covers every result except a Lookup row found only
-	// through the substring fallback: Get by its exact topic, every row
-	// from List, and any Lookup row Postgres full-text search itself
-	// matched. It is the zero value on purpose, so Get and List need not
-	// set it.
+	// MatchExact covers every result the two weaker kinds below do not:
+	// Get by its exact topic, every row from List, and a Lookup row
+	// Postgres full-text search matched on a word that was not merely the
+	// head of someone else's compound. It is the zero value on purpose, so
+	// Get and List need not set it.
 	MatchExact MatchKind = iota
 	// MatchFallback is a Lookup row that satisfied only the substring
 	// fallback -- some query token happened to appear inside the topic, or
@@ -45,6 +45,15 @@ const (
 	// is 0 for it and a caller with limit=1 has no other way to tell it
 	// apart from a real hit.
 	MatchFallback
+	// MatchPartial is a Lookup row that full-text search did match, on a
+	// word the query only used as the head of a different compound: asked
+	// "where is the slime farm", the gold farm row matches on "farm" and
+	// answers a question nobody asked. Full-text search cannot see this on
+	// its own -- to it a matched term is a matched term -- so the row
+	// arrives ranked and indistinguishable from a confirmed hit, which is
+	// how a player came to be told the gold farm's coordinates as the
+	// slime farm's. See MarkPartialMatches for exactly what counts.
+	MatchPartial
 )
 
 // Store reads and writes curated facts. Every method must tolerate being

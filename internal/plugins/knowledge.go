@@ -118,14 +118,18 @@ func runKB(ctx context.Context, pctx *plugin.Context, inv plugin.Invocation) (st
 		if len(entries) == 0 {
 			return "I don't know anything about " + query + ".", nil
 		}
-		// A fallback-only match (ts_rank 0, found by substring alone) is a
-		// guess, not a lookup by the topic the player actually meant --
-		// stating it as fact the way an exact or full-text hit deserves
-		// would hand a player an unrelated fact with the same confidence as
-		// a real answer.
+		// Neither weak match is a lookup of the topic the player actually
+		// meant -- a fallback-only row (ts_rank 0, found by substring
+		// alone) is a guess, and a partial row answers a different compound
+		// that happens to share its head word. Stating either as fact the
+		// way a full-text hit deserves hands a player an unrelated fact
+		// with the same confidence as a real answer.
 		e := entries[0]
-		if e.Matched == knowledge.MatchFallback {
+		switch e.Matched {
+		case knowledge.MatchFallback:
 			return "Closest I have is " + e.Topic + ": " + e.Body, nil
+		case knowledge.MatchPartial:
+			return "I have nothing on that. Closest I have is " + e.Topic + ": " + e.Body, nil
 		}
 		return e.Topic + ": " + e.Body, nil
 	}

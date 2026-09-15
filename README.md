@@ -123,7 +123,12 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 - `internal/knowledge` - the curated fact store behind `!kb`. Kept separate
   from `internal/store`, which owns presence, so the code path the LLM reads
   from can never also reach a player's session; a `Nop` implementation makes
-  every lookup and write safe to call with no database configured
+  every lookup and write safe to call with no database configured. A lookup
+  also grades how well each row answers the question, and both readers
+  (`!kb` and `knowledge_lookup`) hedge the weak two: a row found only by
+  substring, and a row that matched on the head word of a different
+  compound - the gold farm answering "where is the slime farm" - which is
+  offered as the nearest topic on file rather than read out as the answer
 - `internal/waypoints` - each player's own named coordinates behind `!wp`,
   keyed per-XUID by design: a shared namespace would both collide on names
   and hand every player everyone else's coordinates. Same `Nop` fallback as
@@ -1278,6 +1283,20 @@ copy of it here would be a second source of truth that drifts silently — a
 green CI run against a stale copy is worse than no run at all. Connect these
 to a database whose schema came from the real migrations, which is what the
 setup above does.
+
+`internal/knowledge` and `internal/waypoints` have one each, against
+`minecraft.knowledge` and `minecraft.waypoints` from
+`V3__minecraft_knowledge.sql`. Apply it after V1 and V2 and run
+`go test -tags livedb ./internal/knowledge/ ./internal/waypoints/`. The
+knowledge suite is the only place the full-text lookup runs at all - the
+`websearch_to_tsquery` search, its substring fallback, and the grading that
+hedges a row matched only on another compound's head word are all unexercised
+without it. The waypoint suite pins the row-scoping claim that one player's
+lookup never returns another's row, which only a real database can settle; it
+reuses the two most recently seen `minecraft.players` rows, because
+`minecraft.waypoints` has a NOT NULL foreign key to them, and skips when the
+table holds fewer than two. Both write and delete rows keyed to the test that
+wrote them, so point them at a disposable database.
 
 `internal/announce` and `internal/audit` follow the same pattern - a
 `livedb`-tagged test in each package. Their tables come from two further

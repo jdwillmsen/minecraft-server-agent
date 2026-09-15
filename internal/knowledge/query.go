@@ -38,7 +38,20 @@ var fallbackStopwords = map[string]bool{
 	"did": true, "been": true, "being": true, "into": true, "than": true,
 	"then": true, "they": true, "them": true, "their": true, "there": true,
 	"here": true, "its": true, "our": true, "out": true, "you": true,
-	"your": true,
+	"your": true, "have": true, "about": true,
+}
+
+// SignificantWord reports whether a word says anything about which fact a
+// player meant: long enough to clear minFallbackTokenLen and not a
+// stopword.
+//
+// Exported because the eval fixtures search the same way offline. They kept
+// a second copy of both the floor and the word list, the two drifted --
+// "here" was a stopword in production and a search term in the fixtures --
+// and a suite that scores different words from the ones production scores
+// measures the fixtures rather than the agent.
+func SignificantWord(w string) bool {
+	return len(w) >= minFallbackTokenLen && !fallbackStopwords[w]
 }
 
 // queryTokens breaks a normalized lookup query into the words used to build
@@ -87,7 +100,7 @@ func searchQuery(tokens []string) string {
 func fallbackTokens(tokens []string) []string {
 	out := make([]string, 0, len(tokens))
 	for _, t := range tokens {
-		if len(t) >= minFallbackTokenLen && !fallbackStopwords[t] {
+		if SignificantWord(t) {
 			out = append(out, t)
 		}
 	}
