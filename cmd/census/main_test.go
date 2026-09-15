@@ -553,3 +553,48 @@ func TestRunKeepsTheSnapshotWhenNoArchiveIsThereToCompare(t *testing.T) {
 		t.Errorf("report does not name the snapshot as its source\n---\n%s", out.String())
 	}
 }
+
+func TestReportFromNamesTheKindOfSourceAScanFailed(t *testing.T) {
+	// World.Archive is a directory when the world came from a snapshot, so
+	// calling it an archive sends an operator to the backup volume to look
+	// for a file that was never there.
+	var out bytes.Buffer
+	err := reportFrom(context.Background(), stubSource{
+		world: census.World{
+			DBPath:  filepath.Join(t.TempDir(), "never-copied"),
+			Kind:    census.KindSnapshot,
+			Archive: "/snap/world",
+		},
+		cleanup: func() error { return nil },
+	}, census.DefaultReportOptions(), &out)
+
+	if err == nil {
+		t.Fatal("reportFrom succeeded over a world that is not there")
+	}
+	if strings.Contains(err.Error(), "archive") {
+		t.Errorf("error calls a snapshot an archive: %v", err)
+	}
+	if !strings.Contains(err.Error(), census.KindSnapshot) {
+		t.Errorf("error does not name the kind of source it read: %v", err)
+	}
+}
+
+func TestReportFromNamesTheKindOfSourceInTheUnusableRecordsError(t *testing.T) {
+	stage := stageWorld(t, []byte{0xff, 0xff, 0xff})
+
+	var out bytes.Buffer
+	err := reportFrom(context.Background(), stubSource{
+		world:   census.World{DBPath: worldDB(stage), Kind: census.KindSnapshot, Archive: "/snap/world"},
+		cleanup: func() error { return nil },
+	}, census.DefaultReportOptions(), &out)
+
+	if err == nil {
+		t.Fatal("reportFrom reported a world whose every record failed to decode")
+	}
+	if strings.Contains(err.Error(), "archive") {
+		t.Errorf("error calls a snapshot an archive: %v", err)
+	}
+	if !strings.Contains(err.Error(), census.KindSnapshot) {
+		t.Errorf("error does not name the kind of source it read: %v", err)
+	}
+}

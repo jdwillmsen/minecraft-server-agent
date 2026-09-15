@@ -31,9 +31,11 @@ type World struct {
 	TakenAt time.Time
 	// Kind names the source, for the report's provenance line.
 	Kind string
-	// Archive names the backup file the world came from, so an operator
-	// looking at a Scan failure over an extracted temp path can tell which
-	// fwb-<stamp>.tar.gz to go pull apart by hand.
+	// Archive names where the world came from, so an operator looking at a
+	// Scan failure over a path this process chose can tell which
+	// fwb-<stamp>.tar.gz to go pull apart by hand - or, for a snapshot,
+	// which directory to go and look in. Read it with Kind: it is a file
+	// name for one source and a directory for the other.
 	Archive string
 }
 
@@ -133,13 +135,13 @@ const (
 // drift and far short of the months a broken writer produces.
 const maxSnapshotSkew = 5 * time.Minute
 
-// ErrNoSnapshot reports that a directory holds no snapshot at all.
+// ErrNoSnapshot reports that a directory exists but holds no snapshot.
 //
 // It is distinguishable because it is the one failure a caller should recover
-// from: the census job's init container writes nothing when it cannot get a
-// save hold, which is routine, and the caller then reads the nightly archive
-// instead. Every other failure means the snapshot is broken, and falling back
-// would hide that behind a stale report.
+// from: a snapshotter writes nothing when it cannot get a save hold, which is
+// routine, and the caller then reads the nightly archive instead. Every other
+// failure means the snapshot is broken, and falling back would hide that
+// behind a stale report.
 var ErrNoSnapshot = errors.New("no snapshot present")
 
 // DirectorySource reads a world that something else has already snapshotted.
@@ -203,9 +205,9 @@ func (s DirectorySource) Open(ctx context.Context) (World, func() error, error) 
 	// old is too old, by contrast, is a question only something holding the
 	// alternative source can answer, so this bounds one end and leaves the
 	// other to the caller.
-	if ahead := time.Until(takenAt); ahead > maxSnapshotSkew {
-		return World{}, nil, fmt.Errorf("%s is %s ahead of this clock: the snapshotter's clock or its marker is wrong",
-			marker, ahead.Round(time.Second))
+	if time.Until(takenAt) > maxSnapshotSkew {
+		return World{}, nil, fmt.Errorf("%s reads %s, which is ahead of this clock: the snapshotter's clock or its marker is wrong",
+			marker, takenAt.UTC().Format(time.RFC3339))
 	}
 
 	dbPath, err := findDB(ctx, s.Dir, s.Dir)

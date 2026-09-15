@@ -39,8 +39,8 @@ func main() {
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("census", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	worldDir := fs.String("world-dir", "", "directory holding a snapshot written by the census job's init container; preferred over -backup-dir when it holds one")
-	backupDir := fs.String("backup-dir", "/backup", "directory holding fwb-<stamp>.tar.gz backup archives; read when -world-dir holds no snapshot")
+	worldDir := fs.String("world-dir", "", "directory another process snapshotted a world into, marked with a snapshot-taken-at file; read in preference to -backup-dir when it holds a world newer than the newest archive")
+	backupDir := fs.String("backup-dir", "/backup", "directory holding fwb-<stamp>.tar.gz backup archives; read when -world-dir holds no snapshot or holds an older one")
 	topRegions := fs.Int("top-regions", census.DefaultReportOptions().TopRegions, "how many regions to list")
 	topTypes := fs.Int("top-types", census.DefaultReportOptions().TopTypes, "how many entity types to list")
 	if parseErr := fs.Parse(args); parseErr != nil {
@@ -64,9 +64,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 // chooseSource assembles where the world comes from.
 //
-// The CronJob supplies both flags on every run: its init container writes a
-// snapshot when it can get a save hold and writes nothing when it cannot, so
-// having both set is the normal operating mode rather than a mistake.
+// Both flags set is the normal operating mode rather than a mistake: a
+// snapshotter that writes a world when it can get a save hold and nothing
+// when it cannot leaves the caller needing somewhere to fall back to. Either
+// one alone is a complete configuration too, so all four combinations are
+// answered here.
 func chooseSource(worldDir, backupDir string, stderr io.Writer) (census.Source, error) {
 	switch {
 	case worldDir == "" && backupDir == "":
@@ -165,8 +167,8 @@ func reportFrom(ctx context.Context, source census.Source, opts census.ReportOpt
 	// Exit non-zero with the counts instead, so the CronJob goes red rather
 	// than publishing a world with no mobs in it.
 	if stats.Unreadable() {
-		unusable := fmt.Errorf("archive %s: %d of %d actor records did not decode into a usable entity (%d unparsable, %d unplaced, %d unidentified), over the %.0f%% limit",
-			world.Archive, stats.Unusable(), stats.Records,
+		unusable := fmt.Errorf("%s %s: %d of %d actor records did not decode into a usable entity (%d unparsable, %d unplaced, %d unidentified), over the %.0f%% limit",
+			world.Kind, world.Archive, stats.Unusable(), stats.Records,
 			stats.Unparsable, stats.Unplaced, stats.Unidentified, census.MaxUnusableRatio*100)
 		if stats.FirstUnparsableErr == "" {
 			return unusable
