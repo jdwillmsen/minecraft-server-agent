@@ -111,13 +111,17 @@ func Build(pctx *plugin.Context) (*tools.Registry, *CallerScoped) {
 				parts := make([]string, 0, len(entries))
 				for _, e := range entries {
 					line := e.Topic + ": " + e.Body
-					// A fallback-only match has no full-text overlap with
-					// the query at all -- flagged here rather than left
-					// looking identical to a confirmed hit, so the model
-					// doesn't state someone else's fact as a settled answer
-					// to this question.
-					if e.Matched == knowledge.MatchFallback {
+					// A weak match is flagged rather than left looking
+					// identical to a confirmed hit, so the model doesn't
+					// state someone else's fact as a settled answer to this
+					// question. The partial wording is the blunter of the
+					// two because the row is not a weak answer to what was
+					// asked, it is a confident answer to something else.
+					switch e.Matched {
+					case knowledge.MatchFallback:
 						line = "possible match, " + line
+					case knowledge.MatchPartial:
+						line = "no entry for what was asked; nearest recorded topic, " + line
 					}
 					parts = append(parts, line)
 				}

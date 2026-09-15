@@ -306,3 +306,32 @@ func TestCommandsSurviveAZeroContext(t *testing.T) {
 		}
 	}
 }
+
+// A partial match answers a different compound that shares its head word
+// with the query, so !kb has to open by saying it has nothing on what was
+// asked before offering the nearest topic it does have.
+func TestKBHedgesAPartialMatch(t *testing.T) {
+	cmd := kbCommand(t)
+	fake := newFakeKnowledge()
+	fake.entries["gold farm"] = knowledge.Entry{
+		Topic: "gold farm", Body: "in the nether at 120 64 -340", Matched: knowledge.MatchPartial,
+	}
+	pctx := &plugin.Context{Knowledge: fake}
+
+	// The store decides the kind of match; this command only renders it, so
+	// the query here just has to reach the row through the fake's substring
+	// search.
+	reply, err := cmd.Run(context.Background(), pctx, plugin.Invocation{
+		ActorXUID: "visitor", ActorPermission: plugin.PermissionVisitor,
+		Args: []string{"farm"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(reply, "I have nothing on that") {
+		t.Errorf("reply = %q, want it to deny the topic asked about", reply)
+	}
+	if !strings.Contains(reply, "gold farm") {
+		t.Errorf("reply = %q, want the nearest topic still offered", reply)
+	}
+}

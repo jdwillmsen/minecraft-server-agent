@@ -123,7 +123,12 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 - `internal/knowledge` - the curated fact store behind `!kb`. Kept separate
   from `internal/store`, which owns presence, so the code path the LLM reads
   from can never also reach a player's session; a `Nop` implementation makes
-  every lookup and write safe to call with no database configured
+  every lookup and write safe to call with no database configured. A lookup
+  also grades how well each row answers the question, and both readers
+  (`!kb` and `knowledge_lookup`) hedge the weak two: a row found only by
+  substring, and a row that matched on the head word of a different
+  compound - the gold farm answering "where is the slime farm" - which is
+  offered as the nearest topic on file rather than read out as the answer
 - `internal/waypoints` - each player's own named coordinates behind `!wp`,
   keyed per-XUID by design: a shared namespace would both collide on names
   and hand every player everyone else's coordinates. Same `Nop` fallback as
