@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -213,5 +214,110 @@ func TestArchiveSourceAcceptsTheShapeTheBackupJobWrites(t *testing.T) {
 	}
 	if string(body) != "valid" {
 		t.Errorf("extracted %q, want %q", body, "valid")
+	}
+}
+
+// writeSnapshot builds the directory shape the census CronJob's init
+// container leaves behind: a world under the directory plus the provenance
+// marker naming when the hold was taken.
+func writeSnapshot(t *testing.T, takenAt string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "FWB", "db"), 0o755); err != nil {
+		t.Fatalf("create snapshot world: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "FWB", "db", "CURRENT"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write CURRENT: %v", err)
+	}
+	if takenAt != "" {
+		if err := os.WriteFile(filepath.Join(dir, snapshotTakenAtFile), []byte(takenAt), 0o644); err != nil {
+			t.Fatalf("write marker: %v", err)
+		}
+	}
+	return dir
+}
+
+func TestDirectorySourceOpensASnapshotWithItsOwnProvenance(t *testing.T) {
+	dir := writeSnapshot(t, "2026-09-15T06:00:00Z\n")
+
+	world, cleanup, err := DirectorySource{Dir: dir}.Open(context.Background())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cleanup()
+
+	if world.Kind != "snapshot" {
+		t.Errorf("Kind = %q, want %q", world.Kind, "snapshot")
+	}
+	want := time.Date(2026, 9, 15, 6, 0, 0, 0, time.UTC)
+	if !world.TakenAt.Equal(want) {
+		t.Errorf("TakenAt = %v, want %v read from the marker", world.TakenAt, want)
+	}
+	if filepath.Base(world.DBPath) != "db" {
+		t.Errorf("DBPath = %q, want it to point at the db directory", world.DBPath)
+	}
+	if world.Archive == "" {
+		t.Error("Archive is empty; an operator reading a Scan failure cannot tell which snapshot it was")
+	}
+}
+
+func TestDirectorySourceCleanupDoesNotDeleteTheSnapshot(t *testing.T) {
+	// The snapshot belongs to the init container that wrote it and is shared
+	// through an emptyDir. Removing it would destroy a world this process
+	// did not extract.
+	dir := writeSnapshot(t, "2026-09-15T06:00:00Z")
+
+	_, cleanup, err := DirectorySource{Dir: dir}.Open(context.Background())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := cleanup(); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "FWB", "db", "CURRENT")); err != nil {
+		t.Errorf("cleanup removed the snapshot it did not create: %v", err)
+	}
+}
+
+func TestDirectorySourceReportsAnAbsentSnapshotDistinguishably(t *testing.T) {
+	// No marker means the snapshotter could not get a hold. That is routine,
+	// and the caller falls back to an archive — so it must be tellable apart
+	// from every other failure.
+	dir := writeSnapshot(t, "")
+
+	_, _, err := DirectorySource{Dir: dir}.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open succeeded with no snapshot-taken-at marker")
+	}
+	if !errors.Is(err, ErrNoSnapshot) {
+		t.Errorf("err = %v, want it to wrap ErrNoSnapshot", err)
+	}
+}
+
+func TestDirectorySourceRefusesAnUnparsableTimestamp(t *testing.T) {
+	// Present but wrong is not the same as absent. Falling back here would
+	// bury a broken snapshotter behind a stale report.
+	dir := writeSnapshot(t, "yesterday afternoon")
+
+	_, _, err := DirectorySource{Dir: dir}.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open accepted an unparsable snapshot-taken-at")
+	}
+	if errors.Is(err, ErrNoSnapshot) {
+		t.Error("an unparsable marker reported as ErrNoSnapshot; it would silently fall back to an archive")
+	}
+}
+
+func TestDirectorySourceRefusesASnapshotWithNoWorldInIt(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, snapshotTakenAtFile), []byte("2026-09-15T06:00:00Z"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	_, _, err := DirectorySource{Dir: dir}.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open accepted a snapshot containing no db directory")
+	}
+	if errors.Is(err, ErrNoSnapshot) {
+		t.Error("a marked snapshot with no world reported as ErrNoSnapshot; it would silently fall back")
 	}
 }

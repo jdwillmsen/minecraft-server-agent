@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -92,6 +93,60 @@ func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
 		return World{}, nil, err
 	}
 	return World{DBPath: dbPath, TakenAt: stamp, Kind: "archive", Archive: newest}, cleanup, nil
+}
+
+// snapshotTakenAtFile is the provenance marker an external snapshotter writes
+// beside the world it copied, holding an RFC3339 time.
+const snapshotTakenAtFile = "snapshot-taken-at"
+
+// ErrNoSnapshot reports that a directory holds no snapshot at all.
+//
+// It is distinguishable because it is the one failure a caller should recover
+// from: the census job's init container writes nothing when it cannot get a
+// save hold, which is routine, and the caller then reads the nightly archive
+// instead. Every other failure means the snapshot is broken, and falling back
+// would hide that behind a stale report.
+var ErrNoSnapshot = errors.New("no snapshot present")
+
+// DirectorySource reads a world that something else has already snapshotted.
+//
+// Bedrock's save hold / save query / save resume sequence stays in the census
+// job's init container, alongside the backup job that has run it for months.
+// A second implementation of that protocol would be a second thing capable of
+// leaving a live server unable to persist, so this reads what the shell left
+// rather than speaking to the server itself.
+type DirectorySource struct {
+	Dir string
+}
+
+func (s DirectorySource) Open(ctx context.Context) (World, func() error, error) {
+	// Nothing to clean up: this world belongs to whoever wrote it, and it
+	// reaches us through a volume shared with that process. Removing it
+	// would destroy a snapshot this process did not extract.
+	noCleanup := func() error { return nil }
+
+	marker := filepath.Join(s.Dir, snapshotTakenAtFile)
+	raw, err := os.ReadFile(marker)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return World{}, nil, fmt.Errorf("%w: %s", ErrNoSnapshot, marker)
+	case err != nil:
+		return World{}, nil, fmt.Errorf("read %s: %w", marker, err)
+	}
+
+	// The marker is the only record of when this world was captured, and the
+	// report's provenance line is what stops a stale census being believed.
+	// Substituting the current time would forge exactly that.
+	takenAt, err := time.Parse(time.RFC3339, strings.TrimSpace(string(raw)))
+	if err != nil {
+		return World{}, nil, fmt.Errorf("parse %s: %w", marker, err)
+	}
+
+	dbPath, err := findDB(s.Dir, s.Dir)
+	if err != nil {
+		return World{}, nil, err
+	}
+	return World{DBPath: dbPath, TakenAt: takenAt, Kind: "snapshot", Archive: s.Dir}, noCleanup, nil
 }
 
 func extract(ctx context.Context, archive, root string) error {
