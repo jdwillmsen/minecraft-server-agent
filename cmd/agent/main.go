@@ -29,6 +29,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/announce"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/audit"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/authcache"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/bus"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/config"
@@ -149,8 +150,14 @@ func main() {
 	// lives on the profile store's pool, so it exists exactly when
 	// persistence does -- see newElection and awaitLeadership.
 	var election campaigner
+	// Nil until there is a database to hold it. Unlike the stores above there
+	// is no Nop for it: a token cache that silently forgets would send the
+	// agent back to a device-code login on every restart, so the file cache
+	// is the degraded case instead -- see openTokenStore.
+	var sharedTokens mcauth.Store
 	if pg, ok := playerStore.(*store.Postgres); ok && pg.Pool() != nil {
 		election = newElection(cfg, pg.Pool(), log)
+		sharedTokens = authcache.NewPostgres(pg.Pool(), cfg.MCUsername)
 		knowledgeStore = knowledge.NewPostgres(pg.Pool())
 		moderationStore = newModerationLog(moderation.NewPostgres(pg.Pool()), log)
 		waypointStore = waypoints.NewPostgres(pg.Pool())
@@ -246,17 +253,31 @@ func main() {
 		}
 	}()
 
+	tokenStore, err := openTokenStore(cfg, sharedTokens, log)
+	if err != nil {
+		log.Error("auth_store_failed", logging.Fields{"error": err.Error()})
+		os.Exit(1)
+	}
+
 	// Built once, outside the reconnect loop: the refresh token is kept in
-	// memory across reconnects instead of being re-derived from disk (and,
-	// on a load failure, potentially re-triggering an interactive
+	// memory across reconnects instead of being re-derived from the store
+	// (and, on a load failure, potentially re-triggering an interactive
 	// device-code login) on every single attempt.
-	ts, err := mcauth.TokenSource(ctx, cfg.AuthCacheDir, cfg.MCUsername, os.Stdout)
+	//
+	// The gate is closed until this process wins a turn, so the warm-up
+	// below reads what the live agent stored rather than rotating the
+	// account's refresh token out from under it.
+	tokenGate := &tokenLiveGate{}
+	ts, err := newTokenSource(ctx, tokenStore, os.Stdout, log,
+		mcauth.WithLiveGate(tokenGate.isOpen),
+		mcauth.WithLogger(log),
+	)
 	if err != nil {
 		log.Error("auth_failed", logging.Fields{"error": err.Error()})
 		os.Exit(1)
 	}
 
-	// Refreshed here, before the wait below rather than after it: every cost
+	// Warmed here, before the wait below rather than after it: every cost
 	// paid while this process is still a standby is a cost the handover does
 	// not pay.
 	warmXboxToken(ts, log)
@@ -273,18 +294,19 @@ func main() {
 		if !live {
 			break
 		}
-
-		// Ends with this turn, not with the process: the connect loop and
-		// every live-only writer below run under it, so losing the lock takes
-		// the agent out of the game without taking the process down.
+		// liveCtx ends with this turn, not with the process: the connect
+		// loop and every live-only writer below run under it, so losing the
+		// lock takes the agent out of the game without taking the process
+		// down. The claim on the Xbox Live login is opened and closed with
+		// it -- see beginTurn.
 		//
-		// Standing down demotes the role first, so nothing that reads it acts
-		// on a game this process no longer has a claim to while the connect
-		// loop is still unwinding.
-		liveCtx, cancelTurn := context.WithCancel(ctx)
+		// Standing down demotes the role ahead of both, so nothing that
+		// reads it acts on a game this process no longer has a claim to
+		// while the connect loop is still unwinding.
+		liveCtx, endClaim := beginTurn(ctx, tokenGate)
 		endTurn := func() {
 			httpServer.SetRole(httpapi.RoleStandby)
-			cancelTurn()
+			endClaim()
 		}
 		go endTermOnLockLoss(liveCtx, term, endTurn, log)
 		// A turn that began without the lock -- because whoever holds it is

@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +18,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics/metricstest"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/mcauth"
 )
 
 // fakeTerm is the leadership a live agent holds, with the two facts the
@@ -443,6 +449,31 @@ func TestTheXboxTokenIsRefreshedBeforeTheAgentIsNeeded(t *testing.T) {
 	}
 }
 
+// A standby that reads back a token whose access half has expired is the
+// ordinary case, not a broken one: the live agent writes when the credential
+// rotates, and a stable connection can go hours without rotating. Errors go
+// to stderr and informational lines to stdout, so a line appearing here is
+// the assertion that a routine standby boot cannot trip an alert keyed on the
+// agent's errors.
+func TestAnUnwarmedStandbyIsNotReportedAsAFailure(t *testing.T) {
+	ts := &tokenSource{err: mcauth.ErrStandbyUnwarmed}
+
+	out := captureAgentStdout(t, func() {
+		warmXboxToken(ts, logging.New("info"))
+	})
+
+	line := map[string]any{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &line); err != nil {
+		t.Fatalf("an unwarmed standby logged nothing to stdout, so it went to stderr as an error: %q", out)
+	}
+	if line["event"] != "auth_token_standby_unwarmed" {
+		t.Errorf("event = %v, want auth_token_standby_unwarmed", line["event"])
+	}
+	if line["level"] != "info" {
+		t.Errorf("level = %v, want info: an unwarmed standby is a state, not a failure", line["level"])
+	}
+}
+
 func TestAFailedTokenRefreshIsNotFatal(t *testing.T) {
 	// The connect loop makes the same call through the dialer and already
 	// knows how to back off from an account-level rejection. Exiting here
@@ -451,6 +482,57 @@ func TestAFailedTokenRefreshIsNotFatal(t *testing.T) {
 	ts := &tokenSource{err: errors.New("invalid_grant")}
 
 	warmXboxToken(ts, quiet())
+}
+
+// captureStderr returns everything fn writes to stderr, which is where the
+// logger puts error-level events. A logger captures its writers at
+// construction, so any logger whose output matters must be built inside fn.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("read pipe: %v", err)
+	}
+	return buf.String()
+}
+
+// A standby whose stored token was written more than one access-token
+// lifetime ago finds nothing it can use, and may not refresh its way out of
+// that. It is the ordinary state of a standby, so it must not reach the
+// stream alerts are keyed on.
+func TestAnUnwarmedStandbyLogsNothingAtErrorLevel(t *testing.T) {
+	ts := &tokenSource{err: mcauth.ErrStandbyUnwarmed}
+
+	stderr := captureStderr(t, func() { warmXboxToken(ts, logging.New("error")) })
+
+	if stderr != "" {
+		t.Errorf("a standby with nothing fresh to read logged at error level: %s", stderr)
+	}
+}
+
+// And the quiet is only for that one state: a store or an account that is
+// actually broken still says so where an alert can see it.
+func TestATokenFailureThatIsNotOrdinaryStillLogsAtErrorLevel(t *testing.T) {
+	ts := &tokenSource{err: errors.New("cached token is not valid JSON")}
+
+	stderr := captureStderr(t, func() { warmXboxToken(ts, logging.New("error")) })
+
+	if !strings.Contains(stderr, "auth_token_refresh_failed") {
+		t.Errorf("a broken store logged %q, want auth_token_refresh_failed at error level", stderr)
+	}
 }
 
 // An agent that is live without the lock has given up the one guarantee the
@@ -514,5 +596,56 @@ func TestTheUnlockedReportClearsWhenTheTurnEnds(t *testing.T) {
 	<-done
 	if got := metricstest.Value(t, "mc_agent_leader_unlocked"); got != 0 {
 		t.Errorf("mc_agent_leader_unlocked = %v after the turn ended, want 0", got)
+	}
+}
+
+// A lost lock is a lock a successor may already hold, and it refreshes from
+// the same row this process would. Microsoft retires a refresh token as it
+// issues the replacement, so the claim has to be gone before anything else
+// reacts to the turn ending -- not after the connect loop has finished
+// draining, which is minutes of a disconnect the successor does not wait for.
+func TestLosingTheLockEndsTheClaimOnTheLoginBeforeTheTurnUnwinds(t *testing.T) {
+	var gate tokenLiveGate
+	term := newFakeTerm(&steps{})
+
+	liveCtx, endTurn := beginTurn(t.Context(), &gate)
+	if !gate.isOpen() {
+		t.Fatal("the live agent may not refresh the token it is playing on")
+	}
+	go endTermOnLockLoss(liveCtx, term, endTurn, quiet())
+
+	close(term.lost)
+
+	<-liveCtx.Done()
+	// Ordered, not merely eventual: liveCtx is what every live-only worker
+	// watches, so anything still open here is open while a successor plays.
+	if gate.isOpen() {
+		t.Error("the turn ended with this process still entitled to rotate the stored token")
+	}
+}
+
+func TestAGracefulTurnEndAlsoEndsTheClaim(t *testing.T) {
+	var gate tokenLiveGate
+
+	_, endTurn := beginTurn(t.Context(), &gate)
+	endTurn()
+
+	if gate.isOpen() {
+		t.Error("a process that handed over is still entitled to rotate the stored token")
+	}
+}
+
+// Each turn is a fresh claim: a process that lost the lock becomes a standby
+// and campaigns again, and taking the lock back is what re-entitles it.
+func TestTheClaimIsReopenedByTheNextTurn(t *testing.T) {
+	var gate tokenLiveGate
+
+	_, endTurn := beginTurn(t.Context(), &gate)
+	endTurn()
+	_, endSecond := beginTurn(t.Context(), &gate)
+	defer endSecond()
+
+	if !gate.isOpen() {
+		t.Error("winning the lock back did not restore the right to refresh")
 	}
 }

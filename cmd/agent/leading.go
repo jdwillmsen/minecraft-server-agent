@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/moderation"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/mcauth"
 )
 
 // leaveGrace is how long the process waits, after closing the Bedrock
@@ -157,6 +159,26 @@ func watchForcedLeadership(ctx context.Context, term leadership, log *logging.Lo
 	}
 }
 
+// beginTurn starts a turn as the live agent: it opens this process's claim on
+// the account's Xbox Live login and returns the context that turn runs under,
+// with the one way to end it.
+//
+// The two are returned together because they have to end together. A turn
+// ends on two paths -- the lock is lost, or the process is shutting down --
+// and on the first of them a successor may take the lock the moment this one
+// drops it, refreshing from the same row. Microsoft retires a refresh token
+// as it issues the replacement, so a process that is still rotating after its
+// term revokes the credential its successor is playing on. Ending the turn
+// without closing the gate is deliberately not something a caller can say.
+func beginTurn(ctx context.Context, gate *tokenLiveGate) (context.Context, func()) {
+	gate.open()
+	liveCtx, cancel := context.WithCancel(ctx)
+	return liveCtx, func() {
+		gate.close()
+		cancel()
+	}
+}
+
 // endTermOnLockLoss ends this process's turn as the live agent as soon as the
 // lock is gone.
 //
@@ -263,19 +285,37 @@ func startLiveWork(
 	go runScheduler(ctx, scheduleStore, deliverer, log)
 }
 
-// warmXboxToken spends the Xbox Live token refresh before the campaign rather
-// than after it.
+// warmXboxToken gets this process a usable Xbox Live token before the
+// campaign rather than after it.
 //
-// The refresh is a network round trip to Microsoft, and it is the one startup
-// cost that would otherwise land between taking the lock and joining the game
-// -- the single interval this whole design exists to keep short. A failure
-// here is not fatal: the connect loop makes the same call through the dialer
-// and already knows how to back off from an account-level rejection, which
-// exiting here would turn into a crash loop instead.
+// Obtaining one is a network round trip, and it is the one startup cost that
+// would otherwise land between taking the lock and joining the game -- the
+// single interval this whole design exists to keep short. What it costs
+// depends on the role, and the token source decides that, not this: the live
+// agent refreshes, while a standby reads what the live agent stored, because
+// a refresh from a standby revokes the credential the live agent is playing
+// on.
+//
+// A failure here is not fatal. The connect loop makes the same call through
+// the dialer once this process is live, and already knows how to back off
+// from an account-level rejection -- which exiting here would turn into a
+// crash loop instead.
+//
+// A standby that finds nothing unexpired to read is the one outcome that is
+// not a failure at all: the live agent writes when the credential rotates,
+// and a stable connection goes hours without rotating, so a standby started
+// well after the last one loads a token whose access half has expired. That
+// is the ordinary case rather than the exception, and logging it at the same
+// level as a broken store would have every routine standby boot trip an
+// alert keyed on the agent's errors.
 func warmXboxToken(ts oauth2.TokenSource, log *logging.Logger) {
-	if _, err := ts.Token(); err != nil {
+	_, err := ts.Token()
+	switch {
+	case err == nil:
+		log.Info("auth_token_ready", nil)
+	case errors.Is(err, mcauth.ErrStandbyUnwarmed):
+		log.Info("auth_token_standby_unwarmed", logging.Fields{"error": err.Error()})
+	default:
 		log.Error("auth_token_refresh_failed", logging.Fields{"error": err.Error()})
-		return
 	}
-	log.Info("auth_token_ready", nil)
 }

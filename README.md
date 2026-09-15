@@ -146,11 +146,14 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   memory the flood rule and the notice and warning throttles need, and the
   store behind `minecraft.moderation_events`. Only flagged messages are
   stored, for 90 days
-- `internal/pgerr` - recognises the two ways a configured database refuses a
+- `internal/pgerr` - recognises the ways a configured database refuses a
   statement for a reason a deploy is responsible for: the tables are not
   migrated yet, or the role was never granted access to them. Both are
   states a command can answer for and an operator can fix, so neither
-  reaches a player as silence
+  reaches a player as silence. It also tells a database that never answered
+  at all from a statement that is wrong, which is what lets the token cache
+  report a blip as unavailable rather than empty - see "Where the token is
+  cached" below
 - `internal/tools` - the read-only capability surface the `@server` answer
   path may call. Every tool answers a question; none of them change
   anything, so a prompt-injection attempt sitting in player chat has nothing
@@ -169,8 +172,13 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
   Bedrock connection); `NoopVoice` remains for tests. `!ping` never times
   the bridge call itself - the bridge collects console output for a fixed
   800ms window, so that number would be the same every time
-- `internal/mcauth` - Xbox Live device-code login with on-disk token
-  caching, so a restart doesn't require a fresh interactive login
+- `pkg/mcauth` - Xbox Live device-code login, and the `Store` seam the
+  resulting token is cached behind, so a restart doesn't require a fresh
+  interactive login
+- `internal/authcache` - the Postgres implementation of that seam: one row
+  per account on the pool the agent already holds, so a standby on another
+  node can read the token while the live agent still holds the game - see
+  "Where the token is cached" below
 - `internal/leader` - the lock that makes exactly one process the live
   agent, and the warm standby that waits for it. One Xbox Live account holds
   one connection, so this is what stops two pods taking turns kicking each
@@ -205,7 +213,7 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 | `RECONNECT_MAX_MS` | `300000` | Reconnect backoff ceiling |
 | `AUTH_RETRY_DELAY_MS` | `900000` | Flat wait before retrying after Xbox Live rejects the account itself (e.g. `invalid_grant`), instead of the reconnect ladder above |
 | `HTTP_ADDR` | `:8080` | `/healthz` + `/readyz` + `/metrics` listen address |
-| `AUTH_CACHE_DIR` | `/data/auth` | Where the Xbox Live token is cached, one file per `MC_USERNAME` |
+| `AUTH_CACHE_DIR` | `/data/auth` | File token cache, one file per `MC_USERNAME`. Used on its own when `PG_HOST` is unset, and read-through only when it is - see "Where the token is cached" |
 | `COMMAND_RATE_LIMIT_PER_MINUTE` | `10` | Max `!` commands a single actor (XUID) may trigger per rolling minute |
 | `CONSOLE_BRIDGE_URL` | *(required)* | Base URL of `mc-console-bridge`'s HTTP API |
 | `CONSOLE_BRIDGE_TOKEN` | *(required)* | Bearer token the bridge authenticates every request against |
@@ -841,25 +849,154 @@ not a bare name token, which `mc-console-bridge`'s allowlist deliberately
 keeps whitespace-free and which a gamertag containing a space (Xbox
 gamertags may) couldn't satisfy anyway.
 
+## Where the token is cached
+
+The Xbox Live refresh token outlives the process, so it has to be written
+somewhere. Where is a `mcauth.Store`, chosen at startup:
+
+| `PG_HOST` | Store | Why |
+|---|---|---|
+| unset | the file under `AUTH_CACHE_DIR` | local development; there is no database to use |
+| set | `minecraft.auth_tokens`, falling back to the file for reads | two agent pods coexist during a release and both need the token |
+
+The database is what makes a warm standby possible at all. A file cache lives
+on a `ReadWriteOnce` volume, which one pod at a time may mount: a standby
+scheduled onto another node waits in `ContainerCreating` until the pod it is
+replacing lets the volume go, which is the absence the handover exists to
+remove. A row both pods can read costs no new Kubernetes object - the pool is
+already open for profiles and for the leader lock.
+
+**Only the live agent refreshes.** Microsoft retires the refresh token as it
+issues the replacement, so the damage a second process does is done by the
+refresh itself and not by storing the result - suppressing the write would
+leave the live agent holding a credential that has already been revoked. A
+standby therefore rotates nothing.
+
+What a standby does instead is read. It reads the store once at start-up, so
+the token is in hand rather than being fetched between winning the lock and
+joining the game, and it does not poll after that: it has nothing to do with
+the token until it is live, and the live agent goes on rotating meanwhile. So
+the first thing a promoted standby does is read again and take whatever the
+last live agent left there, *before* refreshing anything - by then what it
+holds may be a token Microsoft has already retired, and both refreshing from
+it and writing it back cost the account its login. That read is a database
+round trip; the one it replaces was a fresh login.
+
+`auth_token_written`, `auth_token_standby_reloaded` and
+`auth_token_adopted_from_store` in the pod logs are how you tell the two roles
+apart.
+
+The live agent only writes when the credential *rotates*, though, and a stable
+connection can go hours without rotating - so a standby that started long after
+the last rotation reads back a token whose access half has already expired.
+That is an ordinary state and not an error: the standby stays unwarmed, says so
+(`auth_token_standby_unwarmed`, at info), and goes on waiting. It costs the
+handover the one refresh the warm-up hoped to save, where refreshing as a
+standby would cost the account its login. `auth_token_refresh_failed` stays
+what it says it is - a store or an account that is actually broken - so an
+alert may key on it.
+
+**One writer at a time, enforced by the row.** Every write is conditional on
+`updated_at` still being what that process last read, so a write that would
+replace a token written since is refused (`auth_token_write_superseded`) and
+the writer re-reads and takes the winner's token instead. Last-writer-wins
+would make an older token silently replace a newer one, and two processes
+writing this row is a designed state rather than a fault: leadership can be
+forced when the lock holder is gone without having released it - see "When
+nobody releases the lock".
+
+The file cache stays behind the database one as a **read-through fallback**.
+It is written only when the database cannot answer at all - the write falls
+back exactly where the read does, and nowhere else. A database that answers is
+the only truth, so a write it *rejects* is reported rather than copied
+elsewhere: the next load would prefer its older row anyway. But a database
+that cannot answer may be one the next load will not read either, and
+refreshing rotates the credential at Microsoft whether or not anything stores
+the result - so a rotated token written nowhere is not a missing copy, it is
+the account locked out until someone logs in by hand.
+
+A write that went to the file says so (`auth_token_written_to_fallback`)
+rather than reporting a write to the row, because "cannot answer" covers a
+database that is not migrated yet and one whose connection dropped for two
+seconds. The second comes back holding the token that write superseded, so
+the agent keeps trying the row - once per dial - until one lands there.
+
+That gives the move off the volume for free - the row starts empty, the first
+load comes from the file, and the first refresh the live agent persists lands
+in the database. From then on the file is never read again.
+
+Reaching past the database is not a decision the process is then stuck with.
+The file's copy is only current while the database has never been written, so
+a load that fell through because the database was *unreachable* - rather than
+unmigrated - can answer with a credential the live agent rotated away months
+ago. The refresh that credential is rejected for sends the process back to the
+store, and by then the database is usually answering: a blip costs a reconnect
+instead of leaving the process retrying a dead token until someone logs in by
+hand (`auth_token_reloaded_after_failed_refresh`).
+
+The table is migrated by `jdwlabs/platform`'s `jdwillmsen-schemas` service,
+not by the agent:
+
+```sql
+CREATE TABLE minecraft.auth_tokens (
+    account    TEXT PRIMARY KEY,
+    token      TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+A file cache was protected by its `0600` mode. A row has no equivalent, and
+the replacement is the **grant**: only the agent's runtime role may select
+from or write to this table. Nothing else in the schema references it, and
+nothing joins to it.
+
+Until that migration and its grant land, the agent reports the store as
+unavailable and falls through to the file, which is why the fallback is not
+removed with the volume. A database that is simply *down* reads the same way -
+the pool connects lazily, so it surfaces as the first statement never being
+answered - and for the same reason: a blip must not cost the server its agent.
+At start-up, where there is no file left to fall through to, the load is
+retried a few seconds apart (`auth_store_unavailable_retrying`) before the
+process gives up, so a database that is still coming up costs the pod a wait
+rather than a crash loop. It is bounded: a release that landed ahead of its
+migration does not clear on its own, and has to end as a failure an operator
+can see.
+
 ## First-run login
 
-The device-code login runs in exactly one case: no cache file exists yet for
-`MC_USERNAME` under `AUTH_CACHE_DIR`. The agent then prints a Microsoft
-device-code login URL and code to stdout - in a container, that means the pod
-logs. Complete the login once; the resulting token is cached under
-`AUTH_CACHE_DIR` (a persistent volume in production) and refreshed
-automatically on subsequent runs.
+The device-code login runs in exactly one case: the store holds no token for
+`MC_USERNAME` yet. The agent then prints a Microsoft device-code login URL
+and code to stdout - in a container, that means the pod logs. Complete the
+login once; the resulting token is written to whichever store was chosen
+above and refreshed automatically on subsequent runs.
+
+With the database store that path no longer needs the volume: a pod started
+with an empty table prints the code, and the completed login is written
+straight to the row. Only the pod holding the leader lock prints one - a
+standby that found the store empty waits instead, because a code printed into
+a log nobody is watching blocks that pod for as long as it lasts, and a code
+that *is* answered creates a second grant the pod in the game knows nothing
+about.
 
 Any other cache problem is deliberately *not* an interactive re-login, since
 a container would otherwise block on a device code nobody is watching for:
 
-- **Corrupt, unreadable, or refresh-token-less cache file** - startup fails
-  loudly and the process exits non-zero. Recover by deleting the
-  `token-*.json` file for that username under `AUTH_CACHE_DIR` and
-  restarting, which takes the first-run path above.
-- **Expired or revoked refresh token** - surfaces as a dial failure and the
-  connect loop retries with backoff indefinitely; no login prompt is ever
-  printed. Recover the same way: delete the cache file and restart.
+- **Corrupt cached token** - one that is not JSON, or that carries no refresh
+  token to rotate with or no expiry to rotate at, since oauth2 reads a missing
+  expiry as "never expires" and neither role would ever refresh it. Startup
+  fails loudly and the process exits non-zero. Recover by deleting the stored
+  token - the row for that account, or the `token-*.json` file under
+  `AUTH_CACHE_DIR` - and restarting, which takes the first-run path above.
+- **Store unreachable, or released ahead of its migration** - reported as
+  unavailable, never as empty, so no device code is printed for what is a
+  database problem. The file fallback answers if it can, and startup fails if
+  it cannot: an unreadable store is never downgraded to an empty one on the
+  way through the fallback.
+- **Expired or revoked refresh token** - the store is read once more first, in
+  case what this process holds has been superseded by what the live agent
+  wrote; if that is no better, it surfaces as a dial failure and the connect
+  loop retries with backoff indefinitely, and no login prompt is ever printed.
+  Recover the same way: delete the stored token and restart.
 
 ## Handing over to a standby
 
@@ -1014,8 +1151,10 @@ connection under the same probe a lock held from the start gets.
 **What the chart still has to do.** The agent side of this is only half the
 fix, and the heartbeat above is what makes the other half safe: with
 `Recreate`, two agent pods never coexist and nothing can reach the bound, while
-a rolling update makes coexisting pods the normal case. Until the Helm chart
-moves from `Recreate` to `RollingUpdate` with
+a rolling update makes coexisting pods the normal case. The token cache no
+longer stands in the way of that - see "Where the token is cached" - so what
+is left is the chart itself and the token volume it can now drop. Until the
+Helm chart moves from `Recreate` to `RollingUpdate` with
 `maxSurge: 1` and `maxUnavailable: 0`, the old pod is still stopped before
 the new one starts and there is never a standby to hand over to - so the
 lock is always free when the new pod asks for it, and a release costs what it
@@ -1118,6 +1257,18 @@ never production: these tests write rows.
 from `V6__minecraft_moderation.sql`: `go test -tags livedb
 ./internal/moderation/`. It inserts and deletes rows, so point it at a
 disposable database built from the migrations, never at production.
+
+`internal/authcache` has one against `minecraft.auth_tokens` - the table
+`jdwillmsen-schemas` migrates for the token cache, see "Where the token is
+cached" above: `MC_TEST_DSN=... go test -tags livedb ./internal/authcache/`.
+Two things are pinned only here. It is the one place the standby half of the
+cache is exercised at all, since what it asserts is two connections reading
+and writing a single row the way a live agent and its standby do. And it is
+where the compare-and-swap on `updated_at` is pinned - that a write which
+would replace a token stored since is refused rather than applied - which no
+unit test can say, because the guard is in the statement. It writes and
+deletes rows keyed to the test that wrote them, so point it at a disposable
+database.
 
 `internal/leader` has one as well, and it needs no table at all - advisory
 locks and `LISTEN`/`NOTIFY` are both server state, not schema - so the same
