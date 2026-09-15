@@ -500,3 +500,74 @@ func TestDirectorySourceRefusesACurrentNamingSomethingOtherThanAFileBesideIt(t *
 		t.Fatal("Open accepted a CURRENT naming a path rather than a file beside it")
 	}
 }
+
+func TestDirectorySourceRefusesAMarkerFromTheFuture(t *testing.T) {
+	// Provenance is transcribed rather than invented, which is right, but a
+	// time transcribed from a skewed or broken writer is not thereby true. A
+	// marker ahead of this process's clock describes a capture that has not
+	// happened.
+	dir := writeSnapshot(t, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+
+	_, _, err := DirectorySource{Dir: dir}.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open accepted a snapshot claiming to have been taken in the future")
+	}
+	if errors.Is(err, ErrNoSnapshot) {
+		t.Error("a marker from the future reported as ErrNoSnapshot; it would silently fall back")
+	}
+}
+
+func TestDirectorySourceAcceptsAMarkerWithinClockSkew(t *testing.T) {
+	// The snapshotter's clock is not this process's clock, and the marker is
+	// written seconds before it is read. A little skew is not a broken
+	// writer, and failing the nightly job over it would only teach operators
+	// to ignore the job.
+	dir := writeSnapshot(t, time.Now().Add(time.Minute).UTC().Format(time.RFC3339))
+
+	if _, _, err := (DirectorySource{Dir: dir}).Open(context.Background()); err != nil {
+		t.Fatalf("Open refused a marker a minute ahead of the local clock: %v", err)
+	}
+}
+
+func TestDirectorySourceTranscribesAnOldMarkerFaithfully(t *testing.T) {
+	// How old is too old is a question only something that knows the
+	// alternative can answer, so this source states what the marker says and
+	// leaves the comparison to the caller holding both sources.
+	dir := writeSnapshot(t, "1970-01-01T00:00:00Z")
+
+	world, _, err := DirectorySource{Dir: dir}.Open(context.Background())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	want := time.Unix(0, 0).UTC()
+	if !world.TakenAt.Equal(want) {
+		t.Errorf("TakenAt = %v, want %v exactly as the marker reads it", world.TakenAt, want)
+	}
+}
+
+func TestNewestArchiveNamesTheNewestWithoutExtractingIt(t *testing.T) {
+	// The chain needs the archive's age to know whether a snapshot is
+	// actually fresher, and extracting half a gigabyte to find out would
+	// cost more than the comparison saves.
+	dir := t.TempDir()
+	writeArchive(t, dir, "fwb-20260901T000000Z.tar.gz", map[string]string{"FWB/db/CURRENT": "old"})
+	writeArchive(t, dir, "fwb-20260913T000000Z.tar.gz", map[string]string{"FWB/db/CURRENT": "new"})
+
+	name, takenAt, err := NewestArchive(dir)
+	if err != nil {
+		t.Fatalf("NewestArchive: %v", err)
+	}
+	if name != "fwb-20260913T000000Z.tar.gz" {
+		t.Errorf("name = %q, want the newest archive", name)
+	}
+	want := time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC)
+	if !takenAt.Equal(want) {
+		t.Errorf("takenAt = %v, want %v", takenAt, want)
+	}
+}
+
+func TestNewestArchiveReportsAnEmptyDirectory(t *testing.T) {
+	if _, _, err := NewestArchive(t.TempDir()); err == nil {
+		t.Error("NewestArchive of a directory with no archives returned nil error")
+	}
+}

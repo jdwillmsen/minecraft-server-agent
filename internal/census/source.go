@@ -60,10 +60,15 @@ type ArchiveSource struct {
 // is the only record of when the world was captured.
 var archiveName = regexp.MustCompile(`^fwb-(\d{8}T\d{6}Z)\.tar\.gz$`)
 
-func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
-	entries, err := os.ReadDir(s.Dir)
+// NewestArchive names the most recent backup archive in dir and says when it
+// was taken, without reading a byte of it. A caller holding two sources needs
+// the archive's age to know whether a snapshot is actually the fresher of
+// them, and extracting half a gigabyte to find that out would cost more than
+// the comparison saves.
+func NewestArchive(dir string) (string, time.Time, error) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return World{}, nil, fmt.Errorf("read backup directory %s: %w", s.Dir, err)
+		return "", time.Time{}, fmt.Errorf("read backup directory %s: %w", dir, err)
 	}
 	var names []string
 	for _, e := range entries {
@@ -72,7 +77,7 @@ func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
 		}
 	}
 	if len(names) == 0 {
-		return World{}, nil, fmt.Errorf("no fwb-<stamp>.tar.gz archive in %s", s.Dir)
+		return "", time.Time{}, fmt.Errorf("no fwb-<stamp>.tar.gz archive in %s", dir)
 	}
 	// The stamp is fixed-width and zero-padded, so lexical order is
 	// chronological order.
@@ -81,7 +86,15 @@ func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
 
 	stamp, err := time.Parse("20060102T150405Z", archiveName.FindStringSubmatch(newest)[1])
 	if err != nil {
-		return World{}, nil, fmt.Errorf("parse timestamp from %s: %w", newest, err)
+		return "", time.Time{}, fmt.Errorf("parse timestamp from %s: %w", newest, err)
+	}
+	return newest, stamp, nil
+}
+
+func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
+	newest, stamp, err := NewestArchive(s.Dir)
+	if err != nil {
+		return World{}, nil, err
 	}
 
 	root, err := os.MkdirTemp("", "census-world-")
@@ -113,6 +126,12 @@ const (
 	currentFile   = "CURRENT"
 	journalSuffix = ".log"
 )
+
+// maxSnapshotSkew is how far ahead of this process's clock a marker may sit
+// and still be read as provenance. The marker is written seconds before it is
+// read and both clocks are synchronised, so a few minutes is generous for
+// drift and far short of the months a broken writer produces.
+const maxSnapshotSkew = 5 * time.Minute
 
 // ErrNoSnapshot reports that a directory holds no snapshot at all.
 //
@@ -177,6 +196,16 @@ func (s DirectorySource) Open(ctx context.Context) (World, func() error, error) 
 	takenAt, err := time.Parse(time.RFC3339, strings.TrimSpace(string(raw)))
 	if err != nil {
 		return World{}, nil, fmt.Errorf("parse %s: %w", marker, err)
+	}
+	// Transcribing provenance faithfully is not the same as trusting it. A
+	// marker ahead of this process's clock describes a capture that has not
+	// happened, which is a skewed or broken writer rather than a world. How
+	// old is too old, by contrast, is a question only something holding the
+	// alternative source can answer, so this bounds one end and leaves the
+	// other to the caller.
+	if ahead := time.Until(takenAt); ahead > maxSnapshotSkew {
+		return World{}, nil, fmt.Errorf("%s is %s ahead of this clock: the snapshotter's clock or its marker is wrong",
+			marker, ahead.Round(time.Second))
 	}
 
 	dbPath, err := findDB(ctx, s.Dir, s.Dir)

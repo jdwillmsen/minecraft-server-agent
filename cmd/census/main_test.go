@@ -510,3 +510,46 @@ func TestRunReportsAnArchiveThatHoldsNoActorRecords(t *testing.T) {
 		t.Error("run wrote no report for an archive world that is merely quiet")
 	}
 }
+
+func TestRunPrefersTheArchiveWhenTheSnapshotIsOlderThanIt(t *testing.T) {
+	// A snapshot is only worth preferring while it is the fresher of the
+	// two. A leftover one on a volume that outlived the process that wrote
+	// it would otherwise beat last night's backup indefinitely, which is the
+	// stale report this source exists to avoid.
+	backupDir := t.TempDir()
+	buildArchive(t, backupDir) // fwb-20260913T203100Z
+	snapshotDir := writeSnapshotDir(t, "2026-03-01T00:00:00Z")
+
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{
+		"-world-dir", snapshotDir, "-backup-dir", backupDir,
+	}, &out, &errOut); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := out.String()
+	if strings.Contains(got, "2026-03-01") {
+		t.Errorf("report carries the stale snapshot's timestamp\n---\n%s", got)
+	}
+	if !strings.Contains(got, "2026-09-13T20:31:00Z") {
+		t.Errorf("report does not carry the newer archive's timestamp\n---\n%s", got)
+	}
+	if errOut.Len() == 0 {
+		t.Error("nothing on stderr; the run's log does not record that a stale snapshot was passed over")
+	}
+}
+
+func TestRunKeepsTheSnapshotWhenNoArchiveIsThereToCompare(t *testing.T) {
+	// Nothing to compare against is not evidence the snapshot is stale, and
+	// the snapshot has already proved itself readable.
+	snapshotDir := writeSnapshotDir(t, "2026-09-15T06:00:00Z")
+
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{
+		"-world-dir", snapshotDir, "-backup-dir", t.TempDir(),
+	}, &out, &errOut); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out.String(), "snapshot") {
+		t.Errorf("report does not name the snapshot as its source\n---\n%s", out.String())
+	}
+}

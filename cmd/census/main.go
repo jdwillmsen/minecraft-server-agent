@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/census"
 )
@@ -83,8 +84,7 @@ func chooseSource(worldDir, backupDir string, stderr io.Writer) (census.Source, 
 	}
 }
 
-// sourceChain reads the fresh snapshot when there is one and last night's
-// archive when there is not.
+// sourceChain reads whichever of the two holds the newer world.
 //
 // Only an absent snapshot falls through. A snapshot that is present but
 // malformed fails the run: reading the archive instead would leave a broken
@@ -97,16 +97,33 @@ type sourceChain struct {
 
 func (c sourceChain) Open(ctx context.Context) (census.World, func() error, error) {
 	world, cleanup, err := c.snapshot.Open(ctx)
-	if err == nil {
+	if err != nil {
+		if !errors.Is(err, census.ErrNoSnapshot) {
+			return census.World{}, nil, err
+		}
+		// The report's provenance line will say it read an archive, but not
+		// that a fresh snapshot was attempted and missed. That difference is
+		// what tells an operator the snapshotter is failing rather than
+		// disabled.
+		fmt.Fprintf(c.stderr, "census: %v; reading the newest archive instead\n", err)
+		return c.archive.Open(ctx)
+	}
+
+	// A snapshot is worth preferring only while it is the fresher of the
+	// two. One left on a volume that outlived the process that wrote it
+	// would otherwise beat last night's backup forever, which is the stale
+	// report this source exists to avoid. No archive to compare against is
+	// not evidence the snapshot is stale, and the snapshot has already
+	// proved itself readable, so the comparison is simply skipped.
+	newest, archiveTakenAt, archiveErr := census.NewestArchive(c.archive.Dir)
+	if archiveErr != nil || !archiveTakenAt.After(world.TakenAt) {
 		return world, cleanup, nil
 	}
-	if !errors.Is(err, census.ErrNoSnapshot) {
-		return census.World{}, nil, err
+	if cleanupErr := cleanup(); cleanupErr != nil {
+		return census.World{}, nil, fmt.Errorf("release snapshot %s: %w", world.Archive, cleanupErr)
 	}
-	// The report's provenance line will say it read an archive, but not that
-	// a fresh snapshot was attempted and missed. That difference is what
-	// tells an operator the snapshotter is failing rather than disabled.
-	fmt.Fprintf(c.stderr, "census: %v; reading the newest archive instead\n", err)
+	fmt.Fprintf(c.stderr, "census: snapshot %s is older than archive %s; reading the archive instead\n",
+		world.TakenAt.UTC().Format(time.RFC3339), newest)
 	return c.archive.Open(ctx)
 }
 
