@@ -1262,7 +1262,11 @@ content, grounding (below), no tool-call markup or markdown, privacy
 length against the chat limit, not ending on a question, and latency.
 Markup, questions, length and grounding are judged on what the model wrote,
 before the agent's own cleanup, so the report measures the model rather
-than the cleanup. The report is markdown on stdout.
+than the cleanup. A question the agent answers in code rather than putting
+to the model - another player's waypoints, above - reaches no model at
+all, so those cases score the answer, its content and privacy, and skip
+the dimensions read off the model's own text. The report is markdown on
+stdout.
 
 Grounding fails a reply that states a server version or a player count the
 fixture world contradicts — the failure a case expecting no tool call
