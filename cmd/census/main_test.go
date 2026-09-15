@@ -134,8 +134,8 @@ func TestRunPrintsAReportFromAnArchive(t *testing.T) {
 	dir := t.TempDir()
 	buildArchive(t, dir)
 
-	var out bytes.Buffer
-	if err := run(context.Background(), []string{"-backup-dir", dir}, &out); err != nil {
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{"-backup-dir", dir}, &out, &errOut); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	got := out.String()
@@ -147,8 +147,8 @@ func TestRunPrintsAReportFromAnArchive(t *testing.T) {
 }
 
 func TestRunFailsLoudlyWhenThereIsNoArchive(t *testing.T) {
-	var out bytes.Buffer
-	err := run(context.Background(), []string{"-backup-dir", t.TempDir()}, &out)
+	var out, errOut bytes.Buffer
+	err := run(context.Background(), []string{"-backup-dir", t.TempDir()}, &out, &errOut)
 	if err == nil {
 		t.Fatal("run returned nil error with no archive present")
 	}
@@ -158,8 +158,8 @@ func TestRunFailsLoudlyWhenThereIsNoArchive(t *testing.T) {
 }
 
 func TestRunRejectsUnknownFlags(t *testing.T) {
-	var out bytes.Buffer
-	if err := run(context.Background(), []string{"-nonsense"}, &out); err == nil {
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{"-nonsense"}, &out, &errOut); err == nil {
 		t.Error("run accepted an unknown flag")
 	}
 }
@@ -170,8 +170,8 @@ func TestRunRefusesToReportAWorldItCouldNotDecode(t *testing.T) {
 	dir := t.TempDir()
 	buildArchiveFromRecord(t, dir, []byte{0xff, 0xff, 0xff})
 
-	var out bytes.Buffer
-	err := run(context.Background(), []string{"-backup-dir", dir}, &out)
+	var out, errOut bytes.Buffer
+	err := run(context.Background(), []string{"-backup-dir", dir}, &out, &errOut)
 	if err == nil {
 		t.Fatal("run returned nil error for a world whose every record failed to decode")
 	}
@@ -199,8 +199,8 @@ func TestRunRefusesToReportAWorldWhosePositionsMoved(t *testing.T) {
 	dir := t.TempDir()
 	buildArchiveFromRecord(t, dir, payload)
 
-	var out bytes.Buffer
-	if err := run(context.Background(), []string{"-backup-dir", dir}, &out); err == nil {
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{"-backup-dir", dir}, &out, &errOut); err == nil {
 		t.Fatal("run returned nil error for a world where no record could be placed")
 	}
 	if out.Len() != 0 {
@@ -222,8 +222,8 @@ func TestRunRefusesToReportAWorldWhoseRecordsNameNothing(t *testing.T) {
 	dir := t.TempDir()
 	buildArchiveFromRecord(t, dir, payload)
 
-	var out bytes.Buffer
-	if err := run(context.Background(), []string{"-backup-dir", dir}, &out); err == nil {
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{"-backup-dir", dir}, &out, &errOut); err == nil {
 		t.Fatal("run returned nil error for a world where no record named an entity")
 	}
 	if out.Len() != 0 {
@@ -242,8 +242,8 @@ func TestRunRemovesTheExtractionWhenItIsCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	var out bytes.Buffer
-	if err := run(ctx, []string{"-backup-dir", dir}, &out); !errors.Is(err, context.Canceled) {
+	var out, errOut bytes.Buffer
+	if err := run(ctx, []string{"-backup-dir", dir}, &out, &errOut); !errors.Is(err, context.Canceled) {
 		t.Fatalf("run of a cancelled context returned %v, want context.Canceled", err)
 	}
 	left, err := os.ReadDir(extractions)
@@ -255,6 +255,124 @@ func TestRunRemovesTheExtractionWhenItIsCancelled(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Errorf("run wrote %q to stdout, want no report at all", out.String())
+	}
+}
+
+// writeSnapshotDir builds the shape the census job's init container leaves:
+// a world plus the provenance marker. An empty takenAt writes no marker,
+// which is how the init container reports that it could not get a hold.
+func writeSnapshotDir(t *testing.T, takenAt string) string {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "FWB", "db")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		t.Fatalf("stage snapshot: %v", err)
+	}
+	db, err := leveldb.OpenFile(dbPath, nil)
+	if err != nil {
+		t.Fatalf("open snapshot world: %v", err)
+	}
+	id := make([]byte, 8)
+	binary.LittleEndian.PutUint64(id, 1)
+	payload, err := nbt.MarshalEncoding(map[string]any{
+		"identifier": "minecraft:zombie",
+		"Pos":        []any{float32(1), float32(64), float32(2)},
+		"UniqueID":   int64(1),
+	}, nbt.LittleEndian)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := db.Put(append([]byte("actorprefix"), id...), payload, nil); err != nil {
+		t.Fatalf("put actor: %v", err)
+	}
+	if err := db.Put(append([]byte("digp"), make([]byte, 8)...), id, nil); err != nil {
+		t.Fatalf("put digp: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close snapshot world: %v", err)
+	}
+	if takenAt != "" {
+		if err := os.WriteFile(filepath.Join(dir, "snapshot-taken-at"), []byte(takenAt), 0o644); err != nil {
+			t.Fatalf("write marker: %v", err)
+		}
+	}
+	return dir
+}
+
+func TestRunPrefersTheSnapshotOverTheArchive(t *testing.T) {
+	backupDir := t.TempDir()
+	buildArchive(t, backupDir)
+	snapshotDir := writeSnapshotDir(t, "2026-09-15T06:00:00Z")
+
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{
+		"-world-dir", snapshotDir, "-backup-dir", backupDir,
+	}, &out, &errOut); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "snapshot") {
+		t.Errorf("report does not name the snapshot as its source\n---\n%s", got)
+	}
+	if !strings.Contains(got, "2026-09-15T06:00:00Z") {
+		t.Errorf("report does not carry the snapshot's own timestamp\n---\n%s", got)
+	}
+}
+
+func TestRunFallsBackToTheArchiveWhenNoSnapshotWasTaken(t *testing.T) {
+	backupDir := t.TempDir()
+	buildArchive(t, backupDir)
+	snapshotDir := writeSnapshotDir(t, "") // no marker: the hold never happened
+
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{
+		"-world-dir", snapshotDir, "-backup-dir", backupDir,
+	}, &out, &errOut); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out.String(), "archive") {
+		t.Errorf("report does not name the archive as its source\n---\n%s", out.String())
+	}
+	if errOut.Len() == 0 {
+		t.Error("nothing on stderr; the run's log does not record that the fresh path was attempted and missed")
+	}
+}
+
+func TestRunFailsOnAMalformedSnapshotRatherThanFallingBack(t *testing.T) {
+	backupDir := t.TempDir()
+	buildArchive(t, backupDir)
+	snapshotDir := writeSnapshotDir(t, "yesterday afternoon")
+
+	var out, errOut bytes.Buffer
+	err := run(context.Background(), []string{
+		"-world-dir", snapshotDir, "-backup-dir", backupDir,
+	}, &out, &errOut)
+	if err == nil {
+		t.Fatal("run succeeded on a snapshot with an unparsable timestamp; a broken snapshotter would go unnoticed")
+	}
+	if out.Len() != 0 {
+		t.Errorf("run wrote a report despite failing: %q", out.String())
+	}
+}
+
+func TestRunRefusesWhenNeitherSourceIsGiven(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{"-backup-dir", ""}, &out, &errOut); err == nil {
+		t.Fatal("run accepted having no world to read")
+	}
+}
+
+func TestRunReadsTheSnapshotWithNoArchiveConfigured(t *testing.T) {
+	snapshotDir := writeSnapshotDir(t, "2026-09-15T06:00:00Z")
+
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{
+		"-world-dir", snapshotDir, "-backup-dir", "",
+	}, &out, &errOut); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out.String(), "snapshot") {
+		t.Errorf("report does not name the snapshot as its source\n---\n%s", out.String())
 	}
 }
 
