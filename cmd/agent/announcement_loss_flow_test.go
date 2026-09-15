@@ -59,6 +59,10 @@ type backlogStore struct {
 	mu      sync.Mutex
 	pending []announce.Announcement
 	rows    []deliveryRow
+	// wrote signals each recorded delivery, so a test waits for the
+	// bookkeeping of a send it has watched go out instead of sleeping past
+	// it. Buffered and offered without blocking, like the voice's own.
+	wrote chan struct{}
 }
 
 type deliveryRow struct {
@@ -95,9 +99,31 @@ func (s *backlogStore) PendingFor(_ context.Context, xuid, _ string, _ time.Time
 
 func (s *backlogStore) MarkDelivered(_ context.Context, id int64, xuid string, at time.Time) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.rows = append(s.rows, deliveryRow{id: id, xuid: xuid, at: at})
+	s.mu.Unlock()
+	select {
+	case s.wrote <- struct{}{}:
+	default:
+	}
 	return nil
+}
+
+// waitForRows blocks until the store holds at least n delivery rows, the
+// bookkeeping half of waitForLines: a message is not fully sent until the
+// row that stops it being sent again exists.
+func (s *backlogStore) waitForRows(t *testing.T, n int, why string) {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		if len(s.deliveryRows()) >= n {
+			return
+		}
+		select {
+		case <-s.wrote:
+		case <-deadline:
+			t.Fatalf("%s: %d delivery rows were ever written, want %d", why, len(s.deliveryRows()), n)
+		}
+	}
 }
 
 func (s *backlogStore) deliveryRows() []deliveryRow {
@@ -210,7 +236,7 @@ func newIncident(t *testing.T, ctx context.Context, joinedAt time.Time, grace ti
 	playerRoster := roster.New()
 	audience := newDeliveryAudience(playerRoster, siblingBotXUIDs())
 	audience.beginSession(selfXUID)
-	backlog := &backlogStore{pending: []announce.Announcement{
+	backlog := &backlogStore{wrote: make(chan struct{}, 32), pending: []announce.Announcement{
 		{ID: 2, Body: "announcement 2: the nether hub is open", TargetKind: announce.TargetPlayer, TargetValue: playerXUID, Priority: announce.PriorityNormal},
 		{ID: 3, Body: "announcement 3: back up your builds", TargetKind: announce.TargetPlayer, TargetValue: playerXUID, Priority: announce.PriorityNormal},
 	}}
