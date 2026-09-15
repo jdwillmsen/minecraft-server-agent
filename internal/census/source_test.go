@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/df-mc/goleveldb/leveldb"
 )
 
 func writeArchive(t *testing.T, dir, name string, files map[string]string) string {
@@ -217,24 +219,59 @@ func TestArchiveSourceAcceptsTheShapeTheBackupJobWrites(t *testing.T) {
 	}
 }
 
-// writeSnapshot builds the directory shape the census CronJob's init
-// container leaves behind: a world under the directory plus the provenance
-// marker naming when the hold was taken.
+// writeSnapshot builds the directory shape a snapshotter leaves behind: a
+// world under the directory plus the provenance marker naming when the hold
+// was taken.
+//
+// The world is a real LevelDB because what tells a complete copy from a
+// half-finished one is the file set LevelDB itself writes, and a stand-in
+// file named CURRENT has none of it.
 func writeSnapshot(t *testing.T, takenAt string) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "FWB", "db"), 0o755); err != nil {
-		t.Fatalf("create snapshot world: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "FWB", "db", "CURRENT"), []byte("x"), 0o644); err != nil {
-		t.Fatalf("write CURRENT: %v", err)
-	}
+	writeWorldAt(t, filepath.Join(dir, "FWB", "db"))
 	if takenAt != "" {
 		if err := os.WriteFile(filepath.Join(dir, snapshotTakenAtFile), []byte(takenAt), 0o644); err != nil {
 			t.Fatalf("write marker: %v", err)
 		}
 	}
 	return dir
+}
+
+func writeWorldAt(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create %s: %v", filepath.Dir(path), err)
+	}
+	db, err := leveldb.OpenFile(path, nil)
+	if err != nil {
+		t.Fatalf("open world %s: %v", path, err)
+	}
+	if err := db.Put([]byte("actorprefix00000000"), []byte("x"), nil); err != nil {
+		t.Fatalf("put into world %s: %v", path, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close world %s: %v", path, err)
+	}
+}
+
+// removeFiles deletes everything matching pattern and fails if nothing did,
+// so a test that means to take a file away from a world cannot quietly stop
+// taking anything away.
+func removeFiles(t *testing.T, pattern string) {
+	t.Helper()
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatalf("glob %s: %v", pattern, err)
+	}
+	if len(matches) == 0 {
+		t.Fatalf("nothing matched %s; the fixture is not the world it claims to be", pattern)
+	}
+	for _, m := range matches {
+		if err := os.Remove(m); err != nil {
+			t.Fatalf("remove %s: %v", m, err)
+		}
+	}
 }
 
 func TestDirectorySourceOpensASnapshotWithItsOwnProvenance(t *testing.T) {
@@ -404,5 +441,62 @@ func TestDirectorySourceStopsOnACancelledContext(t *testing.T) {
 	_, _, err := DirectorySource{Dir: dir}.Open(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Open of a cancelled context returned %v, want it to wrap context.Canceled", err)
+	}
+}
+
+func TestDirectorySourceRefusesAWorldWhoseJournalNeverArrived(t *testing.T) {
+	// The marker says the copy finished; the file set says it stopped before
+	// the journal. A short or missing journal is an ordinary end of the log
+	// to LevelDB, so this is the half-copy that otherwise reports a confident
+	// short count - and the journal is exactly where a live server's newest
+	// writes are.
+	dir := writeSnapshot(t, "2026-09-15T06:00:00Z")
+	removeFiles(t, filepath.Join(dir, "FWB", "db", "*.log"))
+
+	_, _, err := DirectorySource{Dir: dir}.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open accepted a world holding no journal at all")
+	}
+	if errors.Is(err, ErrNoSnapshot) {
+		t.Error("an incomplete world reported as ErrNoSnapshot; it would silently fall back")
+	}
+}
+
+func TestDirectorySourceRefusesAWorldWhoseManifestNeverArrived(t *testing.T) {
+	dir := writeSnapshot(t, "2026-09-15T06:00:00Z")
+	removeFiles(t, filepath.Join(dir, "FWB", "db", "MANIFEST-*"))
+
+	_, _, err := DirectorySource{Dir: dir}.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open accepted a world whose CURRENT names a manifest that is not there")
+	}
+	if errors.Is(err, ErrNoSnapshot) {
+		t.Error("an incomplete world reported as ErrNoSnapshot; it would silently fall back")
+	}
+}
+
+func TestDirectorySourceRefusesAWorldWithNoManifestPointer(t *testing.T) {
+	dir := writeSnapshot(t, "2026-09-15T06:00:00Z")
+	removeFiles(t, filepath.Join(dir, "FWB", "db", "CURRENT"))
+
+	_, _, err := DirectorySource{Dir: dir}.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open accepted a world with no CURRENT in it")
+	}
+	if errors.Is(err, ErrNoSnapshot) {
+		t.Error("an incomplete world reported as ErrNoSnapshot; it would silently fall back")
+	}
+}
+
+func TestDirectorySourceRefusesACurrentNamingSomethingOtherThanAFileBesideIt(t *testing.T) {
+	dir := writeSnapshot(t, "2026-09-15T06:00:00Z")
+	current := filepath.Join(dir, "FWB", "db", "CURRENT")
+	if err := os.WriteFile(current, []byte("../../MANIFEST-000000\n"), 0o644); err != nil {
+		t.Fatalf("write CURRENT: %v", err)
+	}
+
+	_, _, err := DirectorySource{Dir: dir}.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open accepted a CURRENT naming a path rather than a file beside it")
 	}
 }

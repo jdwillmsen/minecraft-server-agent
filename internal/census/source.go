@@ -15,6 +15,14 @@ import (
 	"time"
 )
 
+// KindArchive and KindSnapshot name where a world came from. The report
+// prints the kind as its provenance, and the census holds a world copied out
+// from under a running server to a stricter standard than a sealed archive.
+const (
+	KindArchive  = "archive"
+	KindSnapshot = "snapshot"
+)
+
 // World is an extracted, readable world plus where it came from.
 type World struct {
 	// DBPath is the directory holding the LevelDB files.
@@ -92,12 +100,19 @@ func (s ArchiveSource) Open(ctx context.Context) (World, func() error, error) {
 		_ = cleanup()
 		return World{}, nil, err
 	}
-	return World{DBPath: dbPath, TakenAt: stamp, Kind: "archive", Archive: newest}, cleanup, nil
+	return World{DBPath: dbPath, TakenAt: stamp, Kind: KindArchive, Archive: newest}, cleanup, nil
 }
 
 // snapshotTakenAtFile is the provenance marker an external snapshotter writes
 // beside the world it copied, holding an RFC3339 time.
 const snapshotTakenAtFile = "snapshot-taken-at"
+
+// currentFile and journalSuffix are LevelDB's own names for the two members
+// whose absence marks a copy that stopped early.
+const (
+	currentFile   = "CURRENT"
+	journalSuffix = ".log"
+)
 
 // ErrNoSnapshot reports that a directory holds no snapshot at all.
 //
@@ -110,11 +125,21 @@ var ErrNoSnapshot = errors.New("no snapshot present")
 
 // DirectorySource reads a world that something else has already snapshotted.
 //
-// Bedrock's save hold / save query / save resume sequence stays in the census
-// job's init container, alongside the backup job that has run it for months.
-// A second implementation of that protocol would be a second thing capable of
-// leaving a live server unable to persist, so this reads what the shell left
-// rather than speaking to the server itself.
+// Bedrock's save hold / save query / save resume sequence belongs to the
+// process that takes the snapshot, alongside the backup job that has run it
+// for months. A second implementation of that protocol would be a second
+// thing capable of leaving a live server unable to persist, so this reads
+// what that shell left rather than speaking to the server itself.
+//
+// The snapshotter's half of the contract, which lives in another repository
+// and cannot be enforced from here: copy the whole world first, then create
+// the marker last and atomically, by renaming it onto its final name. The
+// marker's presence is what makes a copy readable, so a marker that appears
+// beside a copy still in flight publishes a half-written world as a finished
+// one. That ordering is the only thing that rules out a journal truncated
+// part way through, which is indistinguishable in the bytes from a journal a
+// live server had only just begun. The checks below catch the half-copies
+// that are visible in the file set, and nothing catches the rest.
 type DirectorySource struct {
 	Dir string
 }
@@ -158,7 +183,51 @@ func (s DirectorySource) Open(ctx context.Context) (World, func() error, error) 
 	if err != nil {
 		return World{}, nil, err
 	}
-	return World{DBPath: dbPath, TakenAt: takenAt, Kind: "snapshot", Archive: s.Dir}, noCleanup, nil
+	if err := verifyWholeWorld(dbPath); err != nil {
+		return World{}, nil, err
+	}
+	return World{DBPath: dbPath, TakenAt: takenAt, Kind: KindSnapshot, Archive: s.Dir}, noCleanup, nil
+}
+
+// verifyWholeWorld refuses the half-copies a marker alone cannot rule out.
+//
+// A world copied out of a running server always holds a CURRENT naming a
+// manifest beside it and at least one journal. LevelDB reports a damaged
+// table, but it treats a missing or short journal as an ordinary end of the
+// log, so a copy that stopped before the journal opens cleanly and reads as a
+// smaller world rather than as a failure - and the journal is where a live
+// server's newest writes are.
+//
+// This is a file-set check, not a proof. It is worth having because the
+// states it names are the ones a stalled copy actually leaves behind, and it
+// turns them into a red job with a reason instead of a confident short count.
+func verifyWholeWorld(dbPath string) error {
+	current, err := os.ReadFile(filepath.Join(dbPath, currentFile))
+	if err != nil {
+		return fmt.Errorf("incomplete world %s: read %s: %w", dbPath, currentFile, err)
+	}
+	// CURRENT names a manifest sitting beside it, never a path. Anything
+	// else is not a LevelDB, and joining it would reach outside the world.
+	manifest := strings.TrimSpace(string(current))
+	if manifest == "" || strings.ContainsAny(manifest, `/\`) {
+		return fmt.Errorf("incomplete world %s: %s does not name a manifest beside it: %q", dbPath, currentFile, manifest)
+	}
+	info, err := os.Stat(filepath.Join(dbPath, manifest))
+	switch {
+	case err != nil:
+		return fmt.Errorf("incomplete world %s: %s names %s: %w", dbPath, currentFile, manifest, err)
+	case info.Size() == 0:
+		return fmt.Errorf("incomplete world %s: manifest %s is empty", dbPath, manifest)
+	}
+
+	journals, err := filepath.Glob(filepath.Join(dbPath, "*"+journalSuffix))
+	if err != nil {
+		return fmt.Errorf("search world %s for a journal: %w", dbPath, err)
+	}
+	if len(journals) == 0 {
+		return fmt.Errorf("incomplete world %s: no %s journal, so the newest writes never arrived", dbPath, journalSuffix)
+	}
+	return nil
 }
 
 func extract(ctx context.Context, archive, root string) error {

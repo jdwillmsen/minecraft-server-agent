@@ -130,7 +130,17 @@ func reportFrom(ctx context.Context, source census.Source, opts census.ReportOpt
 
 	entities, stats, scanErr := census.Scan(ctx, world.DBPath)
 	if scanErr != nil {
-		return fmt.Errorf("scan archive %s: %w", world.Archive, scanErr)
+		return fmt.Errorf("scan %s %s: %w", world.Kind, world.Archive, scanErr)
+	}
+
+	// An archive holding no actor records is a quiet world, which is a fact a
+	// census may report. A snapshot holding none is not: it is a copy of a
+	// live server's save, taken while that server was running, and a copy
+	// that yielded nothing at all stopped before the data did. The ratio
+	// check below cannot see this - it weighs records that decoded badly
+	// against records seen, and neither exists here.
+	if world.Kind == census.KindSnapshot && stats.Records == 0 {
+		return fmt.Errorf("snapshot %s holds no actor records at all, which a copy of a live world cannot; it is incomplete", world.Archive)
 	}
 
 	// Every section of a report built from records that yielded no entity

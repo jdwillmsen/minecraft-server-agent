@@ -292,11 +292,16 @@ func writeSnapshotDir(t *testing.T, takenAt string) string {
 		t.Fatalf("close snapshot world: %v", err)
 	}
 	if takenAt != "" {
-		if err := os.WriteFile(filepath.Join(dir, "snapshot-taken-at"), []byte(takenAt), 0o644); err != nil {
-			t.Fatalf("write marker: %v", err)
-		}
+		markSnapshot(t, dir, takenAt)
 	}
 	return dir
+}
+
+func markSnapshot(t *testing.T, dir, takenAt string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "snapshot-taken-at"), []byte(takenAt), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
 }
 
 func TestRunPrefersTheSnapshotOverTheArchive(t *testing.T) {
@@ -445,5 +450,63 @@ func TestRunFailsWhenTheWorldDirectoryIsMissingRatherThanFallingBack(t *testing.
 	}
 	if out.Len() != 0 {
 		t.Errorf("run wrote a report despite failing: %q", out.String())
+	}
+}
+
+// stageEmptyWorld writes a world holding no actor records at all: a real
+// LevelDB with the chunk index and nothing in it to index.
+func stageEmptyWorld(t *testing.T) string {
+	t.Helper()
+	stage := t.TempDir()
+	if err := os.MkdirAll(worldDB(stage), 0o755); err != nil {
+		t.Fatalf("stage world: %v", err)
+	}
+	db, err := leveldb.OpenFile(worldDB(stage), nil)
+	if err != nil {
+		t.Fatalf("open world: %v", err)
+	}
+	if err := db.Put(append([]byte("digp"), make([]byte, 8)...), nil, nil); err != nil {
+		t.Fatalf("put digp: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close world: %v", err)
+	}
+	return stage
+}
+
+func TestRunRefusesASnapshotThatYieldedNoActorRecordsAtAll(t *testing.T) {
+	// A copy taken out from under a running server cannot legitimately hold
+	// no actors: the marker is written last and only after the world, so a
+	// scan that finds nothing means the copy stopped before the data did.
+	// Reported as a quiet world it would be a confident, wrong census.
+	backupDir := t.TempDir()
+	buildArchive(t, backupDir)
+	snapshotDir := stageEmptyWorld(t)
+	markSnapshot(t, snapshotDir, "2026-09-15T06:00:00Z")
+
+	var out, errOut bytes.Buffer
+	err := run(context.Background(), []string{
+		"-world-dir", snapshotDir, "-backup-dir", backupDir,
+	}, &out, &errOut)
+	if err == nil {
+		t.Fatal("run reported a live-server snapshot that held no actor records at all")
+	}
+	if out.Len() != 0 {
+		t.Errorf("run wrote a report despite failing: %q", out.String())
+	}
+}
+
+func TestRunReportsAnArchiveThatHoldsNoActorRecords(t *testing.T) {
+	// The other half of that asymmetry: a sealed archive holding no actors
+	// is a quiet world, and a quiet world is a fact a census may report.
+	dir := t.TempDir()
+	tarWorld(t, stageEmptyWorld(t), dir)
+
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{"-backup-dir", dir}, &out, &errOut); err != nil {
+		t.Fatalf("run refused to report an empty archive world: %v", err)
+	}
+	if out.Len() == 0 {
+		t.Error("run wrote no report for an archive world that is merely quiet")
 	}
 }
