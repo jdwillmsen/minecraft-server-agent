@@ -278,6 +278,117 @@ func TestCleanAndNoQuestionSkipAnAnswerThatFailed(t *testing.T) {
 	}
 }
 
+// A refusal carried out of a tool round is a sentence the player hears that
+// the round becoming the reply does not hold. The model wrote it in an
+// earlier round and the recorder keeps that round, but a check reading the
+// round that answered never sees it. Reading the delivered line rather than
+// every round is the deliberate choice: the earlier rounds also hold text
+// nobody heard, and flagging that would fail the agent for words it
+// suppressed. The cleanup the line passes through cuts tool markup and
+// trims a closing question; markdown and a stated fact it leaves, so those
+// are what arrive in chat unexamined.
+func TestCleanAndGroundedJudgeWhatTheAgentStitchedOn(t *testing.T) {
+	o := answered("The server is up.")
+	o.Reply = "**I can't run that command.** The server is up."
+	if check(t, Score(testCase(t, nil), o, testLimits()), DimClean).Pass {
+		t.Error("markdown in a carried refusal passed because no round wrote it")
+	}
+
+	o = answered("The server is up.")
+	o.Reply = "I can't announce that to the 47 players online. The server is up."
+	if check(t, Score(testCase(t, nil), o, testLimits()), DimGrounded).Pass {
+		t.Error("a count invented in a carried refusal passed because no round wrote it")
+	}
+
+	// no_question stays on the model's own text: the agent puts a refusal
+	// in front of the model's words or, when there are none, says it alone,
+	// so nothing it stitches on lands behind them to change what the reply
+	// ends on.
+	o = answered("The server is up.")
+	o.Reply = "Anything else?"
+	if !check(t, Score(testCase(t, nil), o, testLimits()), DimNoQuestion).Pass {
+		t.Error("no_question judged the delivered line instead of the model's own text")
+	}
+}
+
+// A deflection the agent writes in code reaches the player with no model
+// round behind it at all. Judging it is the point: a line nobody scored is
+// not a line that passed, and the next mechanism to answer without the
+// model inherits the same treatment.
+//
+// The production deflection is the weaker half of this. It carries no
+// markup, no version and no count, so neither dimension could fail it
+// whatever the scorer did, and its pass says only that the dimensions are
+// scored rather than skipped. The invented line is what pins that the
+// scorer is reading the text.
+func TestCleanAndGroundedScoreAReplyNoRoundWrote(t *testing.T) {
+	o := Observation{Reply: "I can only look up your own waypoints, not another player's.", Latency: time.Second}
+	r := Score(testCase(t, nil), o, testLimits())
+	for _, d := range []Dimension{DimClean, DimGrounded} {
+		if got := check(t, r, d); !got.Scored || !got.Pass {
+			t.Errorf("%s: scored = %v, pass = %v, want a scored pass", d, got.Scored, got.Pass)
+		}
+	}
+	if check(t, r, DimNoQuestion).Scored {
+		t.Error("no_question was scored on a line the model did not write")
+	}
+
+	invented := Observation{Reply: "**I can only see the 47 players online.**", Latency: time.Second}
+	r = Score(testCase(t, nil), invented, testLimits())
+	for _, d := range []Dimension{DimClean, DimGrounded} {
+		if got := check(t, r, d); got.Pass {
+			t.Errorf("%s passed a line no round wrote", d)
+		}
+	}
+}
+
+// The chat limit cuts on a byte, so a reply at the cap can end mid-version.
+// The whole of it was judged on the model's own text; the fragment left in
+// the line is the same claim, not a second one.
+func TestGroundedIgnoresAVersionTheChatCutHalved(t *testing.T) {
+	o := answered("The server is running 1.21.100.7.")
+	o.Reply = "The server is running 1.21.10…"
+	if got := check(t, Score(testCase(t, nil), o, testLimits()), DimGrounded); !got.Pass {
+		t.Errorf("a version the cut halved was reported as invented: %s", got.Detail)
+	}
+}
+
+// The allowance above is for a tail the cut removed and nothing else. A
+// refusal carried in front of a correct answer states a whole version of
+// its own, which happens to be a prefix of the right one -- the shape a
+// test on prefixes alone waves through, and the near miss the check exists
+// to name.
+func TestGroundedCatchesAnInventedVersionInFrontOfACorrectOne(t *testing.T) {
+	o := answered("The server is up, running 1.21.100.7 with 3 players online.")
+	o.Reply = "I can't restart the server to 1.21.10 for you. " + o.Reply
+	if got := check(t, Score(testCase(t, nil), o, testLimits()), DimGrounded); got.Pass {
+		t.Error("a version invented in a carried refusal passed as the cut tail of the correct one")
+	}
+}
+
+// The same invention, with the cut landing on a second statement of it. The
+// facts a line states are deduplicated, so both occurrences arrive as one
+// entry: forgiving the tail would take the invented one in front of it with
+// it and report nothing at all.
+func TestGroundedCatchesAnInventedVersionTheCutRepeats(t *testing.T) {
+	o := answered("The server is running 1.21.100.7 and everything is fine.")
+	o.Reply = "I can't restart the server to 1.21.10. The server is running 1.21.10…"
+	if got := check(t, Score(testCase(t, nil), o, testLimits()), DimGrounded); got.Pass {
+		t.Error("a version invented in a carried refusal passed because the cut left the same fragment at the end")
+	}
+}
+
+// The forgiveness still holds when the cut fragment also appears inside the
+// whole version earlier in the same line: one claim stated once, ending
+// halfway through its repeat.
+func TestGroundedIgnoresACutTailThatEchoesTheVersionAbove(t *testing.T) {
+	o := answered("The server is running 1.21.100.7.")
+	o.Reply = "The server is running 1.21.100.7. To be clear, the version is 1.21.10…"
+	if got := check(t, Score(testCase(t, nil), o, testLimits()), DimGrounded); !got.Pass {
+		t.Errorf("a version the cut halved was reported as invented: %s", got.Detail)
+	}
+}
+
 // The three replies that motivated this check were real: each passed the
 // whole suite by calling no tool, while telling the asker a version and a
 // player count the fixture world contradicts.

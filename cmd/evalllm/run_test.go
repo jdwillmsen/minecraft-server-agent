@@ -44,6 +44,13 @@ func toolCallPayload(name, args string) string {
 	return fmt.Sprintf(`{"choices":[{"finish_reason":"tool_calls","message":{"content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":%q,"arguments":%q}}]}}]}`, name, args)
 }
 
+// toolCallWithTextPayload is the round a model writes prose in while asking
+// for a tool, which is where a refusal the player never hears comes from.
+func toolCallWithTextPayload(content, name, args string) string {
+	encoded, _ := json.Marshal(content)
+	return fmt.Sprintf(`{"choices":[{"finish_reason":"tool_calls","message":{"content":%s,"tool_calls":[{"id":"c1","type":"function","function":{"name":%q,"arguments":%q}}]}}]}`, encoded, name, args)
+}
+
 func textPayload(content string) string {
 	encoded, _ := json.Marshal(content)
 	return fmt.Sprintf(`{"choices":[{"finish_reason":"stop","message":{"content":%s}}],"usage":{"completion_tokens":12}}`, encoded)
@@ -105,6 +112,34 @@ func TestRunnerObservesToolsWhisperAndReply(t *testing.T) {
 	}
 	if res := Score(c, obs, testLimits()); !res.Passed() {
 		t.Errorf("failed: %+v", res.Failed())
+	}
+}
+
+// The empirical claim the scorer's inputs rest on, driven through the
+// production client rather than assumed: the agent carries a refusal out of
+// a tool round, so the line the player hears holds a sentence the round
+// that answered never wrote, and a fact invented in that sentence is
+// invisible to any check reading the answering round alone.
+func TestRunnerDeliversARefusalTheAnsweringRoundNeverWrote(t *testing.T) {
+	backend := &scriptedBackend{replies: []string{
+		toolCallWithTextPayload("I can't announce that to the 47 players online.", "server_status", `{}`),
+		textPayload("The server is up with 3 players online."),
+	}}
+	r := newTestRunner(t, backend)
+	c := testCase(t, nil)
+
+	obs := r.run(t.Context(), c)
+	if obs.Err != nil {
+		t.Fatal(obs.Err)
+	}
+	if !strings.Contains(obs.Reply, "47 players online") {
+		t.Fatalf("no refusal was carried into the delivered line: %q", obs.Reply)
+	}
+	if written, _ := modelText(obs); strings.Contains(written, "47") {
+		t.Fatalf("the round that answered wrote the refusal itself: %q", written)
+	}
+	if got := check(t, Score(c, obs, testLimits()), DimGrounded); got.Pass {
+		t.Error("a count invented in a carried refusal passed")
 	}
 }
 
