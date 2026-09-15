@@ -65,6 +65,13 @@ that neither the fixture world nor the question holds.
 - It is scored on what the model wrote, before the agent's cleanup, for the
   same reason markup and closing questions are: the chat limit would cut a
   long enough claim out of the reply and out of the score with it.
+  **No longer true.** Grounding now reads the delivered line as well as the
+  model's own text, so that it sees a refusal the agent carried out of a
+  tool round and a reply written in code. It changes no verdict in these
+  six runs, for the reason given in
+  `2026-09-15-scoring-the-delivered-line.md`, but it does change what the
+  rule above describes, and it changes the denominator on any run taken
+  after it.
 
 One detail of the rule was added after these runs: a shortening of a
 version the question named passes, as a shortening of the fixture version

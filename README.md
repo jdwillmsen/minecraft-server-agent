@@ -1299,14 +1299,24 @@ Questions and length are judged on what the model wrote, before the agent's
 own cleanup, so the report measures the model rather than the cleanup.
 Markup and grounding are judged on that text and on the line the player
 heard, because each hides half of the same fault: the cleanup takes a claim
-that ran past the chat limit out of the line, and the line is the only
-place text the agent stitched on ever appears — a refusal the model wrote
-while calling a tool, or a whole reply written in code. A question the
-agent answers in code rather than putting to the model — another player's
-waypoints, above — reaches no model at all; those cases are scored on the
-line the agent sent, and skip only the check on ending with a question,
-which nothing but the model's own text can answer. The report is markdown
-on stdout.
+that ran past the chat limit out of the line, and the line is where text
+the agent stitched on is heard — a refusal the model wrote while calling a
+tool, which the round it was written in records but the round that answered
+does not, or a whole reply written in code, which no round holds at all.
+The delivered line is read rather than every round because the earlier
+rounds also hold text the agent deliberately kept out of chat, and failing
+the agent for words nobody heard would measure the wrong thing. Each
+problem names the text it came from — `wrote` for the model's own words,
+`said` for a fault only the delivered line carries — because the two have
+different owners.
+
+A question the agent answers in code rather than putting to the model —
+another player's waypoints, above — reaches no model at all. Those cases
+are scored on the line the agent sent. The check on ending with a question
+is skipped, since nothing but the model's own text can answer it; length
+has no model text to measure either, but passes rather than skipping, so
+its rate counts those cases without having judged them. The report is
+markdown on stdout.
 
 Grounding fails a reply that states a server version or a player count the
 fixture world contradicts — the failure a case expecting no tool call
@@ -1323,7 +1333,10 @@ closes.
 Cases run one at a time, never in parallel: the endpoint also answers live
 players. Not wired into CI, because it needs a GPU endpoint and takes
 minutes. Run it by hand before changing the model, the prompt or the LLM
-settings, and commit the report under `docs/eval/`. The scorer's own tests
+settings, and commit the report under `docs/eval/`. A change to the scorer
+gets a record there too, since it moves what every earlier number means:
+`docs/eval/2026-09-15-scoring-the-delivered-line.md` is the latest, and no
+run has yet been taken with the inputs it describes. The scorer's own tests
 need no endpoint and run with `go test ./...`.
 
 ### Testing the store against a real database
