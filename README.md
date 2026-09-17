@@ -1,5 +1,7 @@
 # minecraft-server-agent
 
+[![License](https://img.shields.io/badge/License-PolyForm%20NonCommercial%201.0-blue)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
+
 Minecraft Bedrock server chat agent: tool-calling LLM assistant, welcomes, stats, knowledge lookup.
 
 The chat "ear" and brain for the FWB Bedrock server. Connects as a headless
