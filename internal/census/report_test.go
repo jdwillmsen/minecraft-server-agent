@@ -178,3 +178,49 @@ func TestCapBoundsPrintsNoCeilingRatherThanMinusOne(t *testing.T) {
 		t.Errorf("capBounds(no spawnable environment) = %q, want %q", got, "none")
 	}
 }
+
+func TestRenderGivesConcentrationExtentNotJustItsCentre(t *testing.T) {
+	// A transitively chained cluster can be a trail rather than a pile, and
+	// its centre can sit where no entity is. Reported live on 2026-09-18: an
+	// operator flew to the printed coordinate of a 4,147-item "pile" twice
+	// and found nothing, because the items were strung along ~970 blocks of
+	// tunnel and the centre was empty corridor.
+	var trail []Entity
+	for i := 0; i < 30; i++ {
+		trail = append(trail, Entity{
+			Identifier: "item", Dimension: Nether,
+			X: -24, Y: 14, Z: float64(i * 20),
+		})
+	}
+	c := Aggregate(trail, ScanStats{Records: 30, Decoded: 30}, time.Time{}, "archive")
+	out := Render(c, DefaultReportOptions())
+
+	if !strings.Contains(out, "z=0..580") {
+		t.Errorf("report does not give the cluster's z extent\n---\n%s", out)
+	}
+	if !strings.Contains(out, "centre") {
+		t.Errorf("report does not label the centre it prints\n---\n%s", out)
+	}
+}
+
+func TestRenderSurfacesUnresolvedDimensionsAndSkippedDigp(t *testing.T) {
+	// An entity whose dimension will not resolve is still a real entity: it
+	// was killed in game on 2026-09-18 after the report filed it as unknown.
+	// Reporting the count, and why the chunk records were skipped, is what
+	// separates "the census cannot place these" from "these do not exist".
+	c := sampleCensus()
+	c.Stats.UnresolvedDimension = 1897
+	c.Stats.DigpSkippedValue = 12
+	c.Stats.DigpSkippedKey = 3
+	out := Render(c, DefaultReportOptions())
+
+	if !strings.Contains(out, "1897") || !strings.Contains(out, "unresolved") {
+		t.Errorf("report does not state how many entities it could not place\n---\n%s", out)
+	}
+	if !strings.Contains(out, "12") || !strings.Contains(out, "skipped") {
+		t.Errorf("report does not state why chunk records were skipped\n---\n%s", out)
+	}
+	if !strings.Contains(out, "3") {
+		t.Errorf("report does not state the bad-key skips\n---\n%s", out)
+	}
+}
