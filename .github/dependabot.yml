@@ -1,0 +1,29 @@
+version: 2
+
+# Without this file the only dependency movement is GitHub's automated security
+# fixes, which react to a published advisory and nothing else. A module with no
+# CVE simply never moves, so the zero open alerts this repository shows means
+# "nothing reported yet", not "up to date".
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Go modules are updated as one tree by `go get`; splitting them across
+      # pull requests makes each one rewrite go.sum and conflict with the rest.
+      go-modules:
+        patterns: ['*']
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
