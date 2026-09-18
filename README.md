@@ -252,8 +252,10 @@ the better artefact for the spawn-cap and concentration tables; what it cannot
 do is answer "is world load growing?", because the job log holding it is
 evicted within three days.
 
-The payload is published by rename, so a reader never sees a partial one, and
-it is written only for a run that produced a report. A run that refuses to
+The payload is published through `prometheus.WriteToTextfile`, which writes a
+uniquely-named temporary file beside it and renames that into place, so a
+reader never sees a partial payload and two runs cannot collide on a staging
+name. It is written only for a run that produced a report. A run that refuses to
 report - an unreadable world, a snapshot that arrived empty - leaves the
 previous payload in place and exits non-zero, because a fabricated dip on a
 graph outlives the sentence explaining it.
@@ -263,8 +265,8 @@ graph outlives the sentence explaining it.
 | `mc_census_entities` | `dimension` | entities stored in that dimension; the world total is their sum |
 | `mc_census_entity_type` | `identifier`, `dimension`, `category` | count for one type, for the largest `-top-types` only |
 | `mc_census_regions` | `dimension`, `category`, `status` | graded regions per cap status (`headroom`, `at_risk`, `capped`) |
-| `mc_census_persistent_entities` | none | entities the game will never despawn, each holding a cap slot forever |
-| `mc_census_named_entities` | none | name-tagged entities, a subset of the persistent ones |
+| `mc_census_persistent_entities` | none | entities flagged as never despawning, each holding a cap slot forever |
+| `mc_census_named_entities` | none | name-tagged entities, counted from the name rather than from the persistence flag |
 | `mc_census_world_taken_at_timestamp_seconds` | none | when the world was captured, which is not when the scan ran |
 | `mc_census_scan_timestamp_seconds` | none | when the scan ran |
 | `mc_census_world_from_snapshot` | none | 1 for a fresh snapshot, 0 for a backup archive |

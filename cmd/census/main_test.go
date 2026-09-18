@@ -625,11 +625,19 @@ func TestRunWritesMetricsBesideTheReport(t *testing.T) {
 			t.Errorf("metrics payload is missing %q\n---\n%s", want, payload)
 		}
 	}
-	// The file the publish renames from must not survive. Whatever serves
-	// this directory would otherwise find two payloads, one of them
-	// arbitrarily old and equally readable.
-	if _, err := os.Stat(metrics + ".tmp"); !os.IsNotExist(err) {
-		t.Errorf("the staging file was left behind (stat error %v)", err)
+	// The file the publish renames from must not survive, whatever it was
+	// named. A textfile directory holding two payloads is one where a
+	// collector reads both, and the leftover is arbitrarily old.
+	entries, err := os.ReadDir(filepath.Dir(metrics))
+	if err != nil {
+		t.Fatalf("read metrics dir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(metrics) {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("metrics directory holds %v, want only %s", names, filepath.Base(metrics))
 	}
 }
 

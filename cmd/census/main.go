@@ -187,25 +187,8 @@ func reportFrom(ctx context.Context, source census.Source, opts census.ReportOpt
 	// world this command would not stand behind is worse than a gap in the
 	// series, because a graph cannot show the sentence explaining it.
 	if metricsPath != "" {
-		if err := writeMetrics(metricsPath,
-			census.RenderMetrics(aggregate, time.Now(), census.MetricsOptions{TopTypes: opts.TopTypes})); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// writeMetrics publishes the payload by rename, so a reader never sees a
-// half-written one. Prometheus rejects a whole scrape on a single malformed
-// line, and whatever serves this file has no way to tell a truncated payload
-// from a world that really did lose its mobs.
-func writeMetrics(path, payload string) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(payload), 0o644); err != nil {
-		return fmt.Errorf("write metrics: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("publish metrics %s: %w", path, err)
+		return census.WriteMetricsFile(metricsPath, aggregate, time.Now(),
+			census.MetricsOptions{TopTypes: opts.TopTypes})
 	}
 	return nil
 }

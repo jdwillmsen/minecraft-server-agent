@@ -2,6 +2,7 @@ package census
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +29,22 @@ func sampleValue(t *testing.T, exposition, name string) string {
 	return ""
 }
 
+// numericSample parses a sample's value. Fails the test when the sample is
+// absent, because "missing" and "zero" are exactly what several of these
+// assertions are distinguishing.
+func numericSample(t *testing.T, exposition, name string) float64 {
+	t.Helper()
+	raw := sampleValue(t, exposition, name)
+	if raw == "" {
+		t.Fatalf("%s is absent from the payload:\n%s", name, exposition)
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		t.Fatalf("%s = %q, which does not parse as a number: %v", name, raw, err)
+	}
+	return value
+}
+
 func TestRenderMetricsCountsEntitiesPerDimension(t *testing.T) {
 	out := RenderMetrics(sampleCensus(), scrapedAt, DefaultMetricsOptions())
 
@@ -36,6 +53,28 @@ func TestRenderMetricsCountsEntitiesPerDimension(t *testing.T) {
 	}
 	if got := sampleValue(t, out, `mc_census_entities{dimension="nether"}`); got != "1" {
 		t.Errorf("nether entities = %q, want 1", got)
+	}
+}
+
+// An emptied dimension must report 0 rather than dropping its series: a graph
+// of a series that vanishes shows a gap, which reads as "not measured" when
+// the measurement is the interesting part.
+func TestRenderMetricsZeroFillsTheRealDimensions(t *testing.T) {
+	c := Aggregate([]Entity{{Identifier: "zombie", Dimension: Overworld}},
+		ScanStats{Records: 1, Decoded: 1}, scrapedAt, KindArchive)
+
+	out := RenderMetrics(c, scrapedAt, DefaultMetricsOptions())
+
+	for _, d := range []Dimension{Overworld, Nether, End} {
+		if sampleValue(t, out, `mc_census_entities{dimension="`+d.String()+`"}`) == "" {
+			t.Errorf("no series for %s, which is a dimension the world always has", d)
+		}
+	}
+	// The two diagnostic buckets are the opposite case: a permanent zero for
+	// "the scan could not place this" is a series that exists only to say
+	// nothing is wrong.
+	if got := sampleValue(t, out, `mc_census_entities{dimension="unknown"}`); got != "" {
+		t.Errorf("unplaceable-entity bucket exported %q with nothing in it", got)
 	}
 }
 
@@ -60,12 +99,14 @@ func TestRenderMetricsAgreesWithTheReport(t *testing.T) {
 func TestRenderMetricsPublishesProvenance(t *testing.T) {
 	out := RenderMetrics(sampleCensus(), scrapedAt, DefaultMetricsOptions())
 
-	// 2026-09-13T20:31:00Z
-	if got := sampleValue(t, out, "mc_census_world_taken_at_timestamp_seconds"); got != "1789331460" {
-		t.Errorf("world taken-at = %q, want the sample census's 1789331460", got)
+	// Compared as numbers: the exposition format renders a Unix timestamp in
+	// scientific notation, which is canonical and not something this test
+	// should pin the spelling of.
+	if got := numericSample(t, out, "mc_census_world_taken_at_timestamp_seconds"); got != 1789331460 {
+		t.Errorf("world taken-at = %v, want the sample census's 2026-09-13T20:31:00Z", got)
 	}
-	if got := sampleValue(t, out, "mc_census_scan_timestamp_seconds"); got != "1789333200" {
-		t.Errorf("scan timestamp = %q, want the scrape time 1789333200", got)
+	if got := numericSample(t, out, "mc_census_scan_timestamp_seconds"); got != float64(scrapedAt.Unix()) {
+		t.Errorf("scan timestamp = %v, want the scrape time %d", got, scrapedAt.Unix())
 	}
 	// A reading taken from a day-old archive must not be readable as current,
 	// and this is the gauge that says which it is.
