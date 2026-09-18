@@ -1,0 +1,44 @@
+name: CodeQL
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # CodeQL's value is not only in scanning new code: the query suites gain
+  # checks over time, so an unchanged tree can become known-vulnerable without
+  # a commit. Weekly re-runs catch that. Four runs a month, and free on a
+  # public repository.
+  schedule:
+    - cron: '17 6 * * 1'
+
+# Cancel superseded PR runs; a main-push always lands its results.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: github/codeql-action/init@v4.37.9
+        with:
+          languages: go
+          # security-and-quality over the default security-extended: this is a
+          # small codebase where the extra maintainability queries are cheap,
+          # and a false positive costs one dismissal rather than a triage
+          # backlog.
+          queries: security-and-quality
+
+      # Go builds with autobuild rather than a hand-written build step; the
+      # module has no generate step or build tags that autobuild would miss.
+      - uses: github/codeql-action/autobuild@v4.37.9
+
+      - uses: github/codeql-action/analyze@v4.37.9
+        with:
+          category: /language:go
