@@ -20,5 +20,12 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c
 COPY --from=build /out/agent /agent
 COPY --from=build /out/census /census
 
+# Redundant at runtime -- the `:nonroot` base already runs as uid 65532 -- but
+# a scanner reading this file cannot resolve a digest-pinned base image's USER,
+# so without the line it reports the image as running root. Stating it makes
+# the property checkable from the Dockerfile alone, and survives a future base
+# image change that quietly reverts to root.
+USER nonroot:nonroot
+
 VOLUME ["/data"]
 ENTRYPOINT ["/agent"]
