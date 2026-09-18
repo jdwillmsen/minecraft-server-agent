@@ -64,6 +64,27 @@ var noArgs = json.RawMessage(`{"type":"object","properties":{}}`)
 // read an accurate reply as an invented one.
 const olderClientsMustUpdate = " A client older than the version this server runs is refused before login, so a player on an older version has to update."
 
+// noReleaseSchedule bounds what the rule above licences. A model holding the
+// rule and nothing limiting it answered "what date does the next update come
+// out" with the build number and the compatibility rule -- true, but about a
+// different question, and delivered with no sign that the one asked went
+// unanswered.
+//
+// Stated on the result rather than by narrowing the tool's description,
+// because the model's belief was never wrong: the text it wrote during the
+// tool rounds, which the answer path discards, already said it had no release
+// dates. Only the final composition, holding a version and nothing saying
+// what a version does not tell you, dropped it. Two narrower descriptions
+// were measured instead and both scored worse, one of them badly enough to
+// invent a build number.
+//
+// Unlike the rule it bounds, this rides on server_version alone. A status
+// reading leads with health, and no release-date question was observed
+// routing to it, so the sentence bought nothing there and measurably crowded
+// the answers it did reach: status replies drifted off the phrasings the
+// evaluation recognises while saying the same thing.
+const noReleaseSchedule = " Nothing here says when future Minecraft versions are released."
+
 // Build assembles the read-only tools for one answer.
 //
 // A capability that is not configured contributes no tool. That is the
@@ -221,7 +242,7 @@ func Build(pctx *plugin.Context) (*tools.Registry, *CallerScoped) {
 					if err != nil {
 						return "", err
 					}
-					return version + olderClientsMustUpdate, nil
+					return version + olderClientsMustUpdate + noReleaseSchedule, nil
 				},
 			},
 		)

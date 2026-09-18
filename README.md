@@ -1337,8 +1337,10 @@ players. Not wired into CI, because it needs a GPU endpoint and takes
 minutes. Run it by hand before changing the model, the prompt or the LLM
 settings, and commit the report under `docs/eval/`. A change to the scorer
 gets a record there too, since it moves what every earlier number means:
-`docs/eval/2026-09-15-scoring-the-delivered-line.md` is the latest, and no
-run has yet been taken with the inputs it describes. The scorer's own tests
+`docs/eval/2026-09-15-scoring-the-delivered-line.md` is the latest of those.
+`docs/eval/2026-09-18-release-date-versus-compatibility.md` is the most
+recent run, and carries its own before half rather than comparing against an
+older report. The scorer's own tests
 need no endpoint and run with `go test ./...`.
 
 ### Testing the store against a real database

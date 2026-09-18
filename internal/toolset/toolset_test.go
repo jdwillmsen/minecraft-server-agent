@@ -215,6 +215,32 @@ func TestBuildReportingToolsStateThatAnOlderClientMustUpdate(t *testing.T) {
 	}
 }
 
+// A model holding the compatibility rule and nothing bounding it answered a
+// question about Minecraft's release dates with the server's build and the
+// rule. The limit belongs on the tool asked for the build, and only there:
+// on a status result it cost more in crowded answers than it bought.
+func TestServerVersionDisclaimsTheReleaseSchedule(t *testing.T) {
+	registry, _ := Build(&plugin.Context{ServerInfo: stubServerInfo{version: "Bedrock 1.21.100.7."}})
+
+	const limit = "when future Minecraft versions are released"
+
+	out, err := registry.Invoke(t.Context(), "server_version", noArgs, "2535411111111111")
+	if err != nil {
+		t.Fatalf("server_version: %v", err)
+	}
+	if !strings.Contains(out, limit) {
+		t.Errorf("server_version = %q, want the limit that the build says nothing about release dates", out)
+	}
+
+	out, err = registry.Invoke(t.Context(), "server_status", noArgs, "2535411111111111")
+	if err != nil {
+		t.Fatalf("server_status: %v", err)
+	}
+	if strings.Contains(out, limit) {
+		t.Errorf("server_status = %q, want no release-date limit on a health reading", out)
+	}
+}
+
 // The version the adapter reported has to survive the rule being appended
 // to it, or the reply loses the one fact the asker needs to compare against.
 func TestServerVersionStillReportsTheBuild(t *testing.T) {
