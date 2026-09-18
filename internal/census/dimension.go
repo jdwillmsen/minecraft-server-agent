@@ -11,6 +11,18 @@ const digpPrefix = "digp"
 // that owns it. Actor records themselves carry no dimension.
 type dimensionIndex map[[8]byte]Dimension
 
+// digpSkip says whether a digp record was usable, and if not, which half of
+// it was not. Skipping one costs every actor in that chunk its dimension,
+// which the report can only distinguish from a genuinely unplaceable world
+// if the skips are counted.
+type digpSkip int
+
+const (
+	digpOK digpSkip = iota
+	digpBadKey
+	digpBadValue
+)
+
 // addDigp records every actor listed in one digp value.
 //
 // The key suffix is 8 bytes (chunk X and Z) for the overworld, or 12 bytes
@@ -18,7 +30,7 @@ type dimensionIndex map[[8]byte]Dimension
 // packed array of 8-byte actor ids. Malformed records are skipped rather
 // than guessed at: a wrong dimension silently moves entities between cap
 // tables.
-func (ix dimensionIndex) addDigp(key, value []byte) {
+func (ix dimensionIndex) addDigp(key, value []byte) digpSkip {
 	suffix := key[len(digpPrefix):]
 	var dim Dimension
 	switch len(suffix) {
@@ -27,16 +39,17 @@ func (ix dimensionIndex) addDigp(key, value []byte) {
 	case 12:
 		dim = knownDimension(int32(binary.LittleEndian.Uint32(suffix[8:])))
 	default:
-		return
+		return digpBadKey
 	}
 	if len(value)%8 != 0 {
-		return
+		return digpBadValue
 	}
 	for i := 0; i+8 <= len(value); i += 8 {
 		var id [8]byte
 		copy(id[:], value[i:i+8])
 		ix[id] = dim
 	}
+	return digpOK
 }
 
 // knownDimension keeps the index closed over the dimensions the report can
