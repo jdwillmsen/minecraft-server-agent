@@ -1,0 +1,36 @@
+name: Security Scan
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    # The main-branch run exists to land SARIF on the default branch, which
+    # docs-only commits cannot change. Every PR's commits re-scan a tree the
+    # PR run already scanned.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+
+# Cancel superseded PR runs; a main-push always uploads its SARIF.
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  scan:
+    # Reusable workflow from the jdwlabs org, which is public, so this
+    # personal repository can call it. Pinned by SHA rather than by branch:
+    # a moving ref would let a change over there alter what gates this repo
+    # without a commit here.
+    #
+    # config-ref repeats that SHA deliberately. The input defaults to `main`,
+    # which would run this pinned workflow's logic against whatever
+    # gitleaks.toml main happens to hold -- pinning one and floating the other
+    # defeats the point of pinning. The jdwlabs callers omit it.
+    uses: jdwlabs/.github/.github/workflows/security-scan.yml@b827924589b7e129a81762131b9d451121718bdc  # main as of 2026-08-26 (jdwlabs/.github has no tagged releases)
+    with:
+      config-ref: b827924589b7e129a81762131b9d451121718bdc
