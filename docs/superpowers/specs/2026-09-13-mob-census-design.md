@@ -200,11 +200,22 @@ in reproducible form: entity totals by dimension, over-cap regions ranked,
 named and persistent breakdown, top clusters. `cmd/census --report` prints it;
 the agent serves the latest over its existing httpapi.
 
-**Prometheus metrics.** The agent reads the latest run and exports gauges:
-`mc_census_entities{dimension,identifier}`,
-`mc_census_region_over_cap{dimension,category}`, `mc_census_named_total`,
-`mc_census_persistent_total`, and `mc_census_age_seconds` so a stale census is
-visible on the dashboard rather than silently believed.
+**Prometheus metrics.** Shipped, and not in the shape sketched here. `cmd/census`
+writes the payload itself under `-metrics-file` rather than the agent reading
+the latest run: the census already has the numbers in hand at the end of its
+own scan, and routing them through the agent would have made a nightly batch
+result depend on the pod that answers players in chat.
+
+The names differ too, and README's "Census metrics" table is the current list.
+`mc_census_entities` carries a `dimension` label only — per-identifier counts
+live in `mc_census_entity_type`, bounded by `-top-types`, because
+`{dimension,identifier}` unbounded is the cardinality this feature most needed
+to avoid. Cap pressure is `mc_census_regions{dimension,category,status}` rather
+than an over-cap count alone, so headroom and at-risk are visible on the same
+graph. Staleness is published as `mc_census_world_taken_at_timestamp_seconds`
+plus `mc_census_world_from_snapshot`, not as a pre-computed age: an age
+computed at scan time stops ageing the moment the job ends, which is precisely
+when it starts mattering.
 
 **Leak deltas.** Diff of the latest run against the previous one, exported as
 `mc_census_entity_delta{identifier}` and rendered as a "top growers" report
