@@ -43,6 +43,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	backupDir := fs.String("backup-dir", "/backup", "directory holding fwb-<stamp>.tar.gz backup archives; read when -world-dir holds no snapshot or holds an older one")
 	topRegions := fs.Int("top-regions", census.DefaultReportOptions().TopRegions, "how many regions to list")
 	topTypes := fs.Int("top-types", census.DefaultReportOptions().TopTypes, "how many entity types to list")
+	metricsFile := fs.String("metrics-file", "", "also write the counts here as a Prometheus text exposition payload; the report on stdout is unchanged either way")
 	if parseErr := fs.Parse(args); parseErr != nil {
 		if errors.Is(parseErr, flag.ErrHelp) {
 			// -h/-help is a request for usage, not a failure: it should
@@ -59,7 +60,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	return reportFrom(ctx, source,
-		census.ReportOptions{TopRegions: *topRegions, TopTypes: *topTypes}, stdout)
+		census.ReportOptions{TopRegions: *topRegions, TopTypes: *topTypes}, *metricsFile, stdout)
 }
 
 // chooseSource assembles where the world comes from.
@@ -131,7 +132,7 @@ func (c sourceChain) Open(ctx context.Context) (census.World, func() error, erro
 
 // reportFrom takes the census from an opened source. Splitting it from flag
 // parsing is what lets a test supply a source whose cleanup fails.
-func reportFrom(ctx context.Context, source census.Source, opts census.ReportOptions, stdout io.Writer) (err error) {
+func reportFrom(ctx context.Context, source census.Source, opts census.ReportOptions, metricsPath string, stdout io.Writer) (err error) {
 	world, cleanup, err := source.Open(ctx)
 	if err != nil {
 		return err
@@ -176,9 +177,35 @@ func reportFrom(ctx context.Context, source census.Source, opts census.ReportOpt
 		return fmt.Errorf("%w; first decode failure: %s", unusable, stats.FirstUnparsableErr)
 	}
 
-	report := census.Render(census.Aggregate(entities, stats, world.TakenAt, world.Kind), opts)
-	if _, err := io.WriteString(stdout, report); err != nil {
+	aggregate := census.Aggregate(entities, stats, world.TakenAt, world.Kind)
+	if _, err := io.WriteString(stdout, census.Render(aggregate, opts)); err != nil {
 		return fmt.Errorf("write report: %w", err)
+	}
+
+	// After the report, and only for a run that produced one. Every path above
+	// that refuses to report also refuses to publish: a payload written from a
+	// world this command would not stand behind is worse than a gap in the
+	// series, because a graph cannot show the sentence explaining it.
+	if metricsPath != "" {
+		if err := writeMetrics(metricsPath,
+			census.RenderMetrics(aggregate, time.Now(), census.MetricsOptions{TopTypes: opts.TopTypes})); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeMetrics publishes the payload by rename, so a reader never sees a
+// half-written one. Prometheus rejects a whole scrape on a single malformed
+// line, and whatever serves this file has no way to tell a truncated payload
+// from a world that really did lose its mobs.
+func writeMetrics(path, payload string) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(payload), 0o644); err != nil {
+		return fmt.Errorf("write metrics: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("publish metrics %s: %w", path, err)
 	}
 	return nil
 }

@@ -405,7 +405,7 @@ func TestReportFromSurfacesACleanupFailureThatCancellationWouldHide(t *testing.T
 	err := reportFrom(ctx, stubSource{
 		world:   census.World{DBPath: worldDB(stage), Kind: "archive", Archive: "fwb-20260913T203100Z.tar.gz"},
 		cleanup: func() error { return errors.New("device or resource busy") },
-	}, census.DefaultReportOptions(), &out)
+	}, census.DefaultReportOptions(), "", &out)
 
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("reportFrom of a cancelled context returned %v, want it to still wrap context.Canceled", err)
@@ -425,7 +425,7 @@ func TestReportFromSurfacesACleanupFailureAfterASuccessfulRun(t *testing.T) {
 	err := reportFrom(context.Background(), stubSource{
 		world:   census.World{DBPath: worldDB(stage), Kind: "archive", Archive: "fwb-20260913T203100Z.tar.gz"},
 		cleanup: func() error { return errors.New("device or resource busy") },
-	}, census.DefaultReportOptions(), &out)
+	}, census.DefaultReportOptions(), "", &out)
 
 	if err == nil || !strings.Contains(err.Error(), "device or resource busy") {
 		t.Errorf("reportFrom returned %v, want the cleanup failure", err)
@@ -566,7 +566,7 @@ func TestReportFromNamesTheKindOfSourceAScanFailed(t *testing.T) {
 			Archive: "/snap/world",
 		},
 		cleanup: func() error { return nil },
-	}, census.DefaultReportOptions(), &out)
+	}, census.DefaultReportOptions(), "", &out)
 
 	if err == nil {
 		t.Fatal("reportFrom succeeded over a world that is not there")
@@ -586,7 +586,7 @@ func TestReportFromNamesTheKindOfSourceInTheUnusableRecordsError(t *testing.T) {
 	err := reportFrom(context.Background(), stubSource{
 		world:   census.World{DBPath: worldDB(stage), Kind: census.KindSnapshot, Archive: "/snap/world"},
 		cleanup: func() error { return nil },
-	}, census.DefaultReportOptions(), &out)
+	}, census.DefaultReportOptions(), "", &out)
 
 	if err == nil {
 		t.Fatal("reportFrom reported a world whose every record failed to decode")
@@ -596,5 +596,65 @@ func TestReportFromNamesTheKindOfSourceInTheUnusableRecordsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), census.KindSnapshot) {
 		t.Errorf("error does not name the kind of source it read: %v", err)
+	}
+}
+
+func TestRunWritesMetricsBesideTheReport(t *testing.T) {
+	dir := t.TempDir()
+	buildArchive(t, dir)
+	metrics := filepath.Join(t.TempDir(), "metrics.txt")
+
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{"-backup-dir", dir, "-metrics-file", metrics}, &out, &errOut); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// The report is the half people read, and it has to be untouched by the
+	// export existing: an operator comparing a panel against the printed
+	// numbers is the check that catches a wrong export.
+	if !strings.Contains(out.String(), "FWB mob census") {
+		t.Errorf("report no longer printed when metrics are requested:\n%s", out.String())
+	}
+
+	payload, err := os.ReadFile(metrics)
+	if err != nil {
+		t.Fatalf("read metrics: %v", err)
+	}
+	for _, want := range []string{"mc_census_entities{", "mc_census_world_taken_at_timestamp_seconds", "# TYPE"} {
+		if !strings.Contains(string(payload), want) {
+			t.Errorf("metrics payload is missing %q\n---\n%s", want, payload)
+		}
+	}
+	// The file the publish renames from must not survive. Whatever serves
+	// this directory would otherwise find two payloads, one of them
+	// arbitrarily old and equally readable.
+	if _, err := os.Stat(metrics + ".tmp"); !os.IsNotExist(err) {
+		t.Errorf("the staging file was left behind (stat error %v)", err)
+	}
+}
+
+func TestRunLeavesTheLastMetricsAloneWhenTheScanIsUnusable(t *testing.T) {
+	// A payload written from a world this command refuses to report would put
+	// a fabricated dip on the graph. Keeping the previous night's numbers and
+	// failing the job is the honest pair: the series shows its own age
+	// through the taken-at gauge, and the CronJob goes red.
+	metrics := filepath.Join(t.TempDir(), "metrics.txt")
+	if err := os.WriteFile(metrics, []byte(`mc_census_entities{dimension="overworld"} 24711`+"\n"), 0o644); err != nil {
+		t.Fatalf("seed metrics: %v", err)
+	}
+	dir := t.TempDir()
+	buildArchiveFromRecord(t, dir, []byte{0xff, 0xff, 0xff})
+
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{"-backup-dir", dir, "-metrics-file", metrics}, &out, &errOut); err == nil {
+		t.Fatal("run reported success for a world whose every record failed to decode")
+	}
+
+	payload, err := os.ReadFile(metrics)
+	if err != nil {
+		t.Fatalf("read metrics: %v", err)
+	}
+	if !strings.Contains(string(payload), "24711") {
+		t.Errorf("the previous payload was overwritten by a failed run:\n%s", payload)
 	}
 }

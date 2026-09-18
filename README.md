@@ -244,6 +244,41 @@ indefinitely. The snapshotter's own half of that bargain is to copy the world
 first and create the marker last, by renaming it onto its final name; nothing
 on this side can check the ordering, only its coarser consequences.
 
+### Census metrics
+
+`-metrics-file <path>` writes the same counts as a Prometheus text exposition
+payload, in addition to the report rather than instead of it. The report stays
+the better artefact for the spawn-cap and concentration tables; what it cannot
+do is answer "is world load growing?", because the job log holding it is
+evicted within three days.
+
+The payload is published by rename, so a reader never sees a partial one, and
+it is written only for a run that produced a report. A run that refuses to
+report - an unreadable world, a snapshot that arrived empty - leaves the
+previous payload in place and exits non-zero, because a fabricated dip on a
+graph outlives the sentence explaining it.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `mc_census_entities` | `dimension` | entities stored in that dimension; the world total is their sum |
+| `mc_census_entity_type` | `identifier`, `dimension`, `category` | count for one type, for the largest `-top-types` only |
+| `mc_census_regions` | `dimension`, `category`, `status` | graded regions per cap status (`headroom`, `at_risk`, `capped`) |
+| `mc_census_persistent_entities` | none | entities the game will never despawn, each holding a cap slot forever |
+| `mc_census_named_entities` | none | name-tagged entities, a subset of the persistent ones |
+| `mc_census_world_taken_at_timestamp_seconds` | none | when the world was captured, which is not when the scan ran |
+| `mc_census_scan_timestamp_seconds` | none | when the scan ran |
+| `mc_census_world_from_snapshot` | none | 1 for a fresh snapshot, 0 for a backup archive |
+| `mc_census_scan_records` | none | actor records read out of the world database |
+| `mc_census_scan_unusable_records` | none | records that did not decode into a usable entity |
+
+Per-region series are deliberately absent. A world holds thousands of regions
+whose keys change every night, and that table belongs in the report; the count
+of capped regions is the part that belongs in a time series.
+
+`mc_census_world_taken_at_timestamp_seconds` is what keeps a panel honest. A
+census that fell back to an archive is reporting numbers up to a day old, and
+without that gauge beside them there is nothing on the graph to say so.
+
 ## Environment variables
 
 | Variable | Default | Meaning |
