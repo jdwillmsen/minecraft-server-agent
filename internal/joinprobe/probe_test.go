@@ -3,6 +3,7 @@ package joinprobe
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,10 +22,13 @@ const samplePong = "MCPE;FWB Server;2193;1.26.51;3;20;13467591190557326198;FWB;S
 // framing this probe writes is the part most likely to be wrong, and a stub
 // would agree with whatever the probe did.
 type fakeServer struct {
-	t      *testing.T
-	l      *raknet.Listener
-	reply  func(clientProtocol int32) []packet.Packet
-	closed chan struct{}
+	t     *testing.T
+	l     *raknet.Listener
+	reply func(clientProtocol int32) []packet.Packet
+	// rawReply answers with bytes rather than packets, which is the only way
+	// to stage a reply no well-formed encoder would produce.
+	rawReply func() []byte
+	closed   chan struct{}
 }
 
 func newFakeServer(t *testing.T, pong string, reply func(int32) []packet.Packet) *fakeServer {
@@ -78,6 +82,10 @@ func (s *fakeServer) handle(conn interface {
 	pk := &packet.RequestNetworkSettings{}
 	pk.Marshal(protocol.NewReader(buf, 0, false))
 
+	if s.rawReply != nil {
+		_ = packet.NewEncoder(conn).Encode([][]byte{s.rawReply()})
+		return
+	}
 	if s.reply == nil {
 		return
 	}
@@ -180,6 +188,32 @@ func TestProbeReportsAServerThatGoesSilentAfterThePing(t *testing.T) {
 	}
 	if got.Err == nil {
 		t.Error("a silent handshake produced no error to report")
+	}
+}
+
+// gophertunnel's protocol.Reader reports a short read by panicking, and
+// nothing recovers it out here. A probe that dies on a malformed reply
+// reports nothing at exactly the moment the server is behaving strangely,
+// which is when it is most wanted.
+func TestProbeSurvivesATruncatedPlayStatus(t *testing.T) {
+	s := newFakeServer(t, samplePong, nil)
+	s.rawReply = func() []byte {
+		// A valid PlayStatus header with no body at all.
+		buf := &bytes.Buffer{}
+		header := packet.Header{PacketID: packet.IDPlayStatus}
+		_ = header.Write(buf)
+		return buf.Bytes()
+	}
+
+	got := Probe(context.Background(), s.addr(), 0)
+
+	if got.Joinable() {
+		t.Fatal("a truncated play status was read as a joinable server")
+	}
+	// Named rather than merely non-nil, so the case cannot pass because the
+	// probe failed somewhere earlier and never read the reply at all.
+	if got.Err == nil || !strings.Contains(got.Err.Error(), "play status body") {
+		t.Errorf("error = %v, want one naming the short play status body", got.Err)
 	}
 }
 

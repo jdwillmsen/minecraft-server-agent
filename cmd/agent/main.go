@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -751,15 +752,7 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 	if recycle := time.Duration(cfg.SessionRecycleMs) * time.Millisecond; recycle > 0 {
 		timer := time.AfterFunc(recycle, func() {
 			close(recycled)
-			metrics.SessionRecycled()
-			log.Info("session_recycling", logging.Fields{"after_ms": recycle.Milliseconds()})
-			// Closing the connection is what unblocks ReadPacket below, and
-			// the close itself is the disconnect the server sees. The
-			// deferred leaveGame then closes an already-closed connection,
-			// which it handles and logs at debug -- its grace sleep is for
-			// process shutdown and does not apply here, because this process
-			// is about to reconnect rather than exit.
-			_ = conn.Close()
+			recycleSession(ctx, conn, playerStore, playerRoster.Since(), recycle, log)
 		})
 		defer timer.Stop()
 	}
@@ -802,6 +795,31 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 
 		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, ans, playerStore, auditor, joinClock)
 	}
+}
+
+// recycleSession ends a healthy session on purpose, so that the reconnect
+// which follows measures whether a real account can still join.
+//
+// The playtime close is the part that is easy to leave out and expensive to
+// leave out. This end is deliberate and the agent knows exactly who was online
+// at this instant, so everyone still here keeps the hours they have been
+// here — exactly as a handover does. Without it the next connection's
+// CloseOrphans rewrites those rows to left_at = joined_at as 'unknown', and a
+// player who sat through a six-hour cycle loses six hours of playtime and the
+// milestones that ride on it.
+func recycleSession(ctx context.Context, conn io.Closer, profiles store.Store, since time.Time, after time.Duration, log *logging.Logger) {
+	metrics.SessionRecycled()
+	log.Info("session_recycling", logging.Fields{"after_ms": after.Milliseconds()})
+
+	// nil term: there is no lock to hand over here. This process is not going
+	// anywhere — it is dropping a connection it is about to re-establish.
+	handover(ctx, nil, profiles, since, log)
+
+	// Closing the connection is what unblocks the session's read loop, and
+	// the close itself is the disconnect the server sees. The deferred
+	// leaveGame closes it a second time, which the connection absorbs; its
+	// grace sleep is for process shutdown and does not apply here.
+	_ = conn.Close()
 }
 
 // beginWatching resets everything the agent believes about who is online, at

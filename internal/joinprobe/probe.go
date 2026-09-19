@@ -24,6 +24,7 @@ package joinprobe
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"time"
@@ -195,9 +196,10 @@ func handshake(ctx context.Context, address string, clientProtocol int32) (*int3
 			case packet.IDNetworkSettings:
 				return nil, nil
 			case packet.IDPlayStatus:
-				pk := &packet.PlayStatus{}
-				pk.Marshal(protocol.NewReader(bytes.NewReader(payload), 0, false))
-				status := pk.Status
+				status, err := playStatusOf(payload)
+				if err != nil {
+					return nil, err
+				}
 				return &status, nil
 			case packet.IDDisconnect:
 				// A disconnect without a play status is still a refusal, and
@@ -208,6 +210,22 @@ func handshake(ctx context.Context, address string, clientProtocol int32) (*int3
 		}
 	}
 	return nil, errors.New("server answered the handshake with neither network settings nor a play status")
+}
+
+// playStatusOf reads the status out of a PlayStatus body.
+//
+// Read by hand rather than through packet.PlayStatus.Marshal, which takes
+// gophertunnel's protocol.Reader -- and that reader reports a short read by
+// panicking. gophertunnel recovers that inside its own Conn; nothing recovers
+// it here, so a server (or anything else on that port) answering with a
+// truncated body would take the probe process down. A probe that dies on a
+// malformed reply is a probe that reports nothing precisely when the server is
+// behaving strangely.
+func playStatusOf(payload []byte) (int32, error) {
+	if len(payload) < 4 {
+		return 0, fmt.Errorf("play status body is %d bytes, want at least 4", len(payload))
+	}
+	return int32(binary.BigEndian.Uint32(payload[:4])), nil
 }
 
 // encode marshals a packet with its header, the way a client's encoder does.

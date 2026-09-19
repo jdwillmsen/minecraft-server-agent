@@ -42,6 +42,13 @@ func main() {
 		log.Error("missing_address", logging.Fields{"detail": "-address is required"})
 		os.Exit(2)
 	}
+	// Checked here rather than left to time.NewTicker, which panics on a
+	// non-positive interval: a typo in a manifest should fail with a sentence
+	// and exit 2, not a stack trace and a CrashLoopBackOff.
+	if *interval <= 0 {
+		log.Error("invalid_interval", logging.Fields{"detail": "-interval must be positive", "interval": interval.String()})
+		os.Exit(2)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

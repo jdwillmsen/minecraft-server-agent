@@ -204,9 +204,10 @@ func Load() (Config, error) {
 	}
 	// A recycle that fires faster than the reconnect ladder can settle would
 	// spend the agent's life reconnecting, which costs chat presence and
-	// proves nothing a slower cadence does not. The floor is deliberately
-	// generous: this is a check, and a check that runs every few minutes is
-	// already far more often than the failure it looks for occurs.
+	// proves nothing a slower cadence does not. Ten ceilings is 50 minutes at
+	// the defaults, and the failure this looks for is measured in hours of
+	// nobody being able to join -- so the floor costs the check nothing it
+	// would otherwise catch.
 	if sessionRecycle > 0 && sessionRecycle < 10*reconnectMax {
 		return Config{}, fmt.Errorf("SESSION_RECYCLE_MS (%d) must be at least ten times RECONNECT_MAX_MS (%d) or zero", sessionRecycle, reconnectMax)
 	}
