@@ -263,6 +263,56 @@ func TestHandoverClosesWatchedSessionsBeforeGivingUpTheLock(t *testing.T) {
 	}
 }
 
+// countingCloser stands in for the Bedrock connection: the recycle has to
+// close it, and it has to do so after the playtime is credited.
+type countingCloser struct {
+	order  *steps
+	closes int
+}
+
+func (c *countingCloser) Close() error {
+	c.closes++
+	if c.order != nil {
+		c.order.add("connection_closed")
+	}
+	return nil
+}
+
+// A recycle is a deliberate session end, so everyone online keeps the time
+// they have been here. Left to the ordinary reconnect path, the next
+// connection's CloseOrphans would rewrite those rows to left_at = joined_at
+// and a player who sat through a six-hour cycle would lose six hours.
+func TestRecyclingASessionCreditsPlaytimeBeforeDroppingTheConnection(t *testing.T) {
+	order := &steps{}
+	profiles := &handingOverStore{order: order}
+	conn := &countingCloser{order: order}
+	since := time.Now().Add(-6 * time.Hour)
+
+	recycleSession(t.Context(), conn, profiles, since, 6*time.Hour, quiet())
+
+	if got := order.list(); len(got) != 2 || got[0] != "sessions_closed" || got[1] != "connection_closed" {
+		t.Errorf("recycle did %v, want the sessions closed before the connection was dropped", got)
+	}
+	if profiles.since != since {
+		t.Errorf("sessions closed against since = %v, want this session's own start %v", profiles.since, since)
+	}
+}
+
+// A database that refuses the close costs a player their playtime for one
+// visit. Refusing to recycle over it would cost the check this exists for,
+// which is worse: the recycle is the only thing proving a real account can
+// still join.
+func TestRecyclingStillDropsTheConnectionWhenClosingSessionsFails(t *testing.T) {
+	profiles := &handingOverStore{order: &steps{}, err: errors.New("deadlock detected")}
+	conn := &countingCloser{}
+
+	recycleSession(t.Context(), conn, profiles, time.Now(), time.Hour, quiet())
+
+	if conn.closes != 1 {
+		t.Errorf("connection closed %d times after a failed playtime close, want 1", conn.closes)
+	}
+}
+
 func TestHandoverRunsEvenThoughShutdownHasAlreadyBeenSignalled(t *testing.T) {
 	// The path this exists for is SIGTERM, which has cancelled the process
 	// context before any of this runs. Inheriting that context would mean

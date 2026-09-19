@@ -149,6 +149,21 @@ var (
 		Name: "mc_agent_link_rtt_seconds",
 		Help: "Round trip over the agent's Bedrock connection, as last sampled while a session existed.",
 	}, nil)
+
+	// A plain gauge, like tpsLastSuccess and for the same reason: 0 is the
+	// epoch, which reads as "never" rather than as "just now".
+	sessionEstablished = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "mc_agent_session_established_timestamp_seconds",
+		Help: "Unix time the agent last reached spawn on a fresh Bedrock session. Proof a real account could join at that moment, which no reachability check can give.",
+	})
+	sessionsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mc_agent_sessions_total",
+		Help: "Bedrock sessions this process has taken all the way to spawn.",
+	})
+	sessionRecyclesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "mc_agent_session_recycles_total",
+		Help: "Sessions ended deliberately on the recycle schedule, rather than by the server or a fault.",
+	})
 )
 
 // Pre-initialised because increase() over a series that springs into
@@ -253,3 +268,16 @@ func ServerTPS(tps float64, at time.Time) {
 func LinkRTT(rtt time.Duration) {
 	linkRTT.WithLabelValues().Set(rtt.Seconds())
 }
+
+// SessionEstablished records that a session reached spawn at at.
+//
+// Recorded at spawn rather than at connect: a connection that never spawns is
+// not a session a player would call joining, and this gauge is read as proof
+// that joining works.
+func SessionEstablished(at time.Time) {
+	sessionEstablished.Set(float64(at.Unix()))
+	sessionsTotal.Inc()
+}
+
+// SessionRecycled counts one session ended on purpose by the schedule.
+func SessionRecycled() { sessionRecyclesTotal.Inc() }

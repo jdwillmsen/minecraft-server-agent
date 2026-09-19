@@ -291,6 +291,7 @@ without that gauge beside them there is nothing on the graph to say so.
 | `RECONNECT_MIN_MS` | `5000` | Initial reconnect backoff |
 | `RECONNECT_MAX_MS` | `300000` | Reconnect backoff ceiling |
 | `AUTH_RETRY_DELAY_MS` | `900000` | Flat wait before retrying after Xbox Live rejects the account itself (e.g. `invalid_grant`), instead of the reconnect ladder above |
+| `SESSION_RECYCLE_MS` | `0` (off) | Drop and re-establish the Bedrock session this often, so that a real account joining is something measured rather than assumed — see "Proving the server can still be joined". Must be zero or at least ten times `RECONNECT_MAX_MS` |
 | `HTTP_ADDR` | `:8080` | `/healthz` + `/readyz` + `/metrics` listen address |
 | `AUTH_CACHE_DIR` | `/data/auth` | File token cache, one file per `MC_USERNAME`. Used on its own when `PG_HOST` is unset, and read-through only when it is - see "Where the token is cached" |
 | `COMMAND_RATE_LIMIT_PER_MINUTE` | `10` | Max `!` commands a single actor (XUID) may trigger per rolling minute |
@@ -343,6 +344,9 @@ breaking change.
 | `mc_agent_server_tps` | gauge | none | per successful TPS measurement, background or `!ping` |
 | `mc_agent_tps_last_success_timestamp_seconds` | gauge | none | same moment |
 | `mc_agent_link_rtt_seconds` | gauge | none | per background sample while a session exists |
+| `mc_agent_session_established_timestamp_seconds` | gauge | none | when a session last reached spawn |
+| `mc_agent_sessions_total` | counter | none | per session that reached spawn |
+| `mc_agent_session_recycles_total` | counter | none | per session ended by the recycle schedule |
 
 Every label is bounded by construction; nothing a player types or a model
 invents reaches one unfiltered:
@@ -386,6 +390,70 @@ first measured, and a failed measurement never resets them: a zero would
 read as a crashed server or a perfect link. How old the TPS figure is comes
 from the success timestamp, which starts at 0 so a measurement that never
 succeeds reads as stale rather than as missing.
+
+## Proving the server can still be joined
+
+Every reachability check this cluster ran passed for the whole of the
+2026-09-15 outage while no player could join. The server-list ping answered,
+`mc-monitor` reported the server online with players on it, and all three
+kubelet probes were green. The server was a version behind its clients and
+hard-kicks a mismatched protocol *before* login — a step past everything being
+checked — and the two clients that were connected had established their
+sessions before the fault and implement RakNet themselves, so their presence
+argued the opposite of the truth.
+
+Two things here answer the question those checks could not, at different
+depths and different costs.
+
+### `cmd/joinprobe`
+
+A standalone binary, shipped in the same image, that performs the pre-login
+handshake on a schedule and publishes how far it got. No Xbox Live identity is
+involved: the protocol verdict is delivered before any credential is examined,
+which is exactly why it catches the version-skew failure.
+
+```bash
+joinprobe -address fwb.example:19132 -interval 1m -listen :9103
+```
+
+`-protocol` pins the number the handshake announces. Left at zero it uses
+whatever the server advertises, which asks "is this server consistent with
+itself"; set to a specific number it asks "could a client built against *that*
+version join", which is the question a version skew poses.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `mc_joinprobe_joinable` | none | 1 when the last probe reached the server's network settings |
+| `mc_joinprobe_stage` | none | 0 unreachable, 1 answered the ping, 2 refused the session, 3 completed the handshake |
+| `mc_joinprobe_last_joinable_timestamp_seconds` | none | when a probe last got that far |
+| `mc_joinprobe_attempts_total` | `stage` | one per attempt |
+| `mc_joinprobe_play_status` | none | the refusal a refusing server sent; `-1` when it did not refuse |
+| `mc_joinprobe_server_protocol`, `mc_joinprobe_dialed_protocol` | none | what the server advertises, and what the probe announced |
+| `mc_joinprobe_server_info` | `version` | 1, labelled with the advertised version |
+| `mc_joinprobe_duration_seconds` | none | ping and handshake together |
+
+`-1` for the play status rather than absence or zero: a series that disappears
+cannot be joined against, and `0` is `PlayStatusLoginSuccess`, which would
+claim a login this probe never performs.
+
+The pod has liveness but deliberately no readiness gate on the probe
+succeeding. A server nobody can join must leave this pod Ready and publishing
+zeros — a pod that goes NotReady stops being scraped, and an alert cannot fire
+on a series nobody is collecting.
+
+### `SESSION_RECYCLE_MS`
+
+The probe stops one step short of an account. The agent already holds one, so
+setting this makes it drop and re-establish its own session on a schedule:
+each cycle is a real client authenticating and reaching spawn, recorded in
+`mc_agent_session_established_timestamp_seconds`.
+
+It is off by default because it deliberately ends a working session. The cost
+is the agent leaving chat for the length of a reconnect, which is the same gap
+a deployment already causes; the return is that "a real account can join" stops
+being an assumption between incidents. A recycled session is logged as
+`session_recycled` at info and counted in `mc_agent_session_recycles_total`,
+never as an error — the reconnect that follows is the measurement.
 
 ## Identity model
 
