@@ -29,6 +29,21 @@ type Config struct {
 	// plausibly outlast that hold instead.
 	AuthRetryDelayMs int
 
+	// SessionRecycleMs makes the agent drop and re-establish its Bedrock
+	// session on a schedule. Zero, the default, leaves the session alone.
+	//
+	// It exists as a check rather than as hygiene. Every reachability check
+	// this cluster runs answers "does the server respond", and all of them
+	// passed for the whole 2026-09-15 outage while nobody could join; a
+	// client already holding a session could not have noticed either, since
+	// the sessions that mattered were established before the fault. Dropping
+	// this one on purpose turns the agent into the only thing that
+	// periodically proves a real account can still get all the way to spawn.
+	//
+	// The cost is real and bounded: the agent leaves chat for the length of
+	// a reconnect, which is the same gap a deployment already causes.
+	SessionRecycleMs int
+
 	// HTTP server for /healthz, /readyz, and /metrics.
 	HTTPAddr string
 
@@ -183,6 +198,18 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	sessionRecycle, err := nonNegativeInt("SESSION_RECYCLE_MS", 0)
+	if err != nil {
+		return Config{}, err
+	}
+	// A recycle that fires faster than the reconnect ladder can settle would
+	// spend the agent's life reconnecting, which costs chat presence and
+	// proves nothing a slower cadence does not. The floor is deliberately
+	// generous: this is a check, and a check that runs every few minutes is
+	// already far more often than the failure it looks for occurs.
+	if sessionRecycle > 0 && sessionRecycle < 10*reconnectMax {
+		return Config{}, fmt.Errorf("SESSION_RECYCLE_MS (%d) must be at least ten times RECONNECT_MAX_MS (%d) or zero", sessionRecycle, reconnectMax)
+	}
 	pgPort, err := positiveInt("PG_PORT", 5432)
 	if err != nil {
 		return Config{}, err
@@ -256,6 +283,7 @@ func Load() (Config, error) {
 		ReconnectMinMs:            reconnectMin,
 		ReconnectMaxMs:            reconnectMax,
 		AuthRetryDelayMs:          authRetryDelay,
+		SessionRecycleMs:          sessionRecycle,
 		HTTPAddr:                  stringDefault("HTTP_ADDR", ":8080"),
 		AuthCacheDir:              stringDefault("AUTH_CACHE_DIR", "/data/auth"),
 		PGHost:                    stringDefault("PG_HOST", ""),
@@ -314,6 +342,24 @@ func stringDefault(name, def string) string {
 		return def
 	}
 	return v
+}
+
+// nonNegativeInt is positiveInt's sibling for settings where zero is a real
+// value rather than a mistake -- an interval of zero means "never", which is
+// how an optional periodic behaviour is switched off.
+func nonNegativeInt(name string, def int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("environment variable %s must be an integer, got %q", name, raw)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("environment variable %s must not be negative, got %d", name, n)
+	}
+	return n, nil
 }
 
 func positiveInt(name string, def int) (int, error) {

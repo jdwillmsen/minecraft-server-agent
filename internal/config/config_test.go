@@ -9,7 +9,8 @@ func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
 		"MC_HOST", "MC_USERNAME", "MC_PORT",
-		"RECONNECT_MIN_MS", "RECONNECT_MAX_MS", "AUTH_RETRY_DELAY_MS", "HTTP_ADDR", "AUTH_CACHE_DIR",
+		"RECONNECT_MIN_MS", "RECONNECT_MAX_MS", "AUTH_RETRY_DELAY_MS", "SESSION_RECYCLE_MS",
+		"HTTP_ADDR", "AUTH_CACHE_DIR",
 		"COMMAND_RATE_LIMIT_PER_MINUTE", "LOG_LEVEL",
 		"CONSOLE_BRIDGE_URL", "CONSOLE_BRIDGE_TOKEN", "CONSOLE_BRIDGE_TIMEOUT_MS",
 		"LLM_MAX_TOKENS", "LLM_TIMEOUT_MS", "LLM_TOTAL_TIMEOUT_MS",
@@ -281,6 +282,49 @@ func TestLoad_MaxValidPortSucceeds(t *testing.T) {
 	}
 	if cfg.MCPort != 65535 {
 		t.Errorf("MCPort = %d, want 65535", cfg.MCPort)
+	}
+}
+
+func TestLoad_SessionRecycleIsOffByDefault(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Off by default on purpose: the recycle drops a working session, and a
+	// release should not start doing that to production because it was
+	// deployed.
+	if cfg.SessionRecycleMs != 0 {
+		t.Errorf("SessionRecycleMs = %d, want 0", cfg.SessionRecycleMs)
+	}
+}
+
+func TestLoad_SessionRecycleOverride(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("SESSION_RECYCLE_MS", "21600000")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.SessionRecycleMs != 21600000 {
+		t.Errorf("SessionRecycleMs = %d, want 21600000", cfg.SessionRecycleMs)
+	}
+}
+
+// A recycle faster than the reconnect ladder can settle spends the agent's
+// life reconnecting, which costs chat presence and measures nothing extra.
+func TestLoad_SessionRecycleBelowTheFloorFails(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("RECONNECT_MAX_MS", "300000")
+	t.Setenv("SESSION_RECYCLE_MS", "60000")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error when SESSION_RECYCLE_MS is under ten reconnect ceilings")
 	}
 }
 

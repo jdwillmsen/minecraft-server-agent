@@ -265,6 +265,32 @@ func TestAnAuthRejectionIsCounted(t *testing.T) {
 	}
 }
 
+// A recycle is this process's own decision, so it must not be counted or
+// logged as a rejection or an error. The counter it does move is the one an
+// operator reads to tell a scheduled reconnect from a real disconnection.
+func TestARecycledSessionIsNotReportedAsAFailure(t *testing.T) {
+	if got := metricstest.Delta(t, func() {
+		reportSessionEnd(quietLog, "agent", errSessionRecycled, false, time.Hour, time.Second)
+	}, "mc_agent_auth_rejections_total"); got != 0 {
+		t.Errorf("a recycled session moved auth rejections by %v, want 0", got)
+	}
+}
+
+func TestAnEstablishedSessionIsCountedAndTimestamped(t *testing.T) {
+	at := time.Date(2026, 9, 19, 4, 30, 0, 0, time.UTC)
+
+	if got := metricstest.Delta(t, func() {
+		metrics.SessionEstablished(at)
+	}, "mc_agent_sessions_total"); got != 1 {
+		t.Errorf("sessions moved by %v, want 1", got)
+	}
+	// The timestamp is the half that matters for alerting: it is what says a
+	// real account could reach spawn, and when.
+	if got := metricstest.Value(t, "mc_agent_session_established_timestamp_seconds"); got != float64(at.Unix()) {
+		t.Errorf("established timestamp = %v, want %v", got, at.Unix())
+	}
+}
+
 // discardWriter accepts every packet the respawner sends.
 type discardWriter struct{}
 

@@ -80,6 +80,10 @@ const freshJoinGrace = announceDrainDelay - time.Second
 // storm at full speed.
 const stableSessionThreshold = 60 * time.Second
 
+// errSessionRecycled ends a session this process chose to end. It is not a
+// failure and must not be reported as one -- see SESSION_RECYCLE_MS.
+var errSessionRecycled = errors.New("session recycled on schedule")
+
 // maxConcurrentAnswers caps @server answers in flight across every player.
 //
 // Small on purpose: the backend is one self-hosted model, and beyond a
@@ -509,6 +513,11 @@ func runConnectLoop(ctx context.Context, cfg config.Config, ts oauth2.TokenSourc
 // rejection count can be tested without dialling a server that rejects us.
 func reportSessionEnd(log *logging.Logger, username string, err error, rejected bool, lasted, wait time.Duration) {
 	switch {
+	case errors.Is(err, errSessionRecycled):
+		// The one session end that was this process's own decision. Logged
+		// at info with the same shape as a clean disconnect, because that is
+		// what it is, and the reconnect that follows is the measurement.
+		log.Info("session_recycled", logging.Fields{"session_lasted_ms": lasted.Milliseconds(), "delay_ms": wait.Milliseconds()})
 	case rejected:
 		metrics.AuthRejection()
 		log.Error("auth_rejected", logging.Fields{"username": username, "error": err.Error(), "session_lasted_ms": lasted.Milliseconds(), "delay_ms": wait.Milliseconds()})
@@ -729,6 +738,32 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 	selfXUID := conn.IdentityData().XUID
 	beginWatching(ctx, playerRoster, playerStore, joinClock, selfXUID, log)
 
+	// Recorded here rather than after the dial: a connection that never
+	// spawns is not what a player would call joining, and this timestamp is
+	// read as proof that joining works -- see SESSION_RECYCLE_MS.
+	metrics.SessionEstablished(time.Now())
+
+	// The scheduled recycle, when it is on. Ending a healthy session on
+	// purpose is the point: a session held open proves only that it was
+	// established once, and the outage this guards against left exactly that
+	// kind of session running while nobody new could join.
+	recycled := make(chan struct{})
+	if recycle := time.Duration(cfg.SessionRecycleMs) * time.Millisecond; recycle > 0 {
+		timer := time.AfterFunc(recycle, func() {
+			close(recycled)
+			metrics.SessionRecycled()
+			log.Info("session_recycling", logging.Fields{"after_ms": recycle.Milliseconds()})
+			// Closing the connection is what unblocks ReadPacket below, and
+			// the close itself is the disconnect the server sees. The
+			// deferred leaveGame then closes an already-closed connection,
+			// which it handles and logs at debug -- its grace sleep is for
+			// process shutdown and does not apply here, because this process
+			// is about to reconnect rather than exit.
+			_ = conn.Close()
+		})
+		defer timer.Stop()
+	}
+
 	log.Info("spawned", logging.Fields{"self_xuid": selfXUID})
 	// The agent is on the roster like any other player, so the announcement
 	// audience has to be told which entry is its own before anything is
@@ -751,6 +786,14 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		}
 		pk, err := conn.ReadPacket()
 		if err != nil {
+			// A read that failed because this session was recycled is not a
+			// fault, and reporting it as one would put an error line in the
+			// log every cycle and teach whoever reads them to skip it.
+			select {
+			case <-recycled:
+				return errSessionRecycled
+			default:
+			}
 			return err
 		}
 		// Before anything else: a dead agent answers no commands and holds no
