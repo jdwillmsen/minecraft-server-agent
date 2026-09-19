@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,13 +34,26 @@ type fakeServer struct {
 
 func newFakeServer(t *testing.T, pong string, reply func(int32) []packet.Packet) *fakeServer {
 	t.Helper()
+	return newServer(t, pong, reply, nil)
+}
+
+// newRawServer answers with bytes rather than packets. The raw reply is given
+// at construction rather than assigned afterwards: the accept loop starts
+// here, so a field set later is a data race with the goroutine reading it.
+func newRawServer(t *testing.T, pong string, raw func() []byte) *fakeServer {
+	t.Helper()
+	return newServer(t, pong, nil, raw)
+}
+
+func newServer(t *testing.T, pong string, reply func(int32) []packet.Packet, raw func() []byte) *fakeServer {
+	t.Helper()
 	l, err := raknet.Listen("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	l.PongData([]byte(pong))
 
-	s := &fakeServer{t: t, l: l, reply: reply, closed: make(chan struct{})}
+	s := &fakeServer{t: t, l: l, reply: reply, rawReply: raw, closed: make(chan struct{})}
 	go s.serve()
 	t.Cleanup(func() {
 		_ = l.Close()
@@ -147,16 +161,18 @@ func TestProbeReportsAServerThatRefusesTheProtocol(t *testing.T) {
 // against *this* version join", rather than only "is the server consistent
 // with itself".
 func TestProbeHonoursAForcedProtocol(t *testing.T) {
-	var seen int32
+	// Atomic because the server answers on its own goroutine, and the read
+	// below is on the test's. -race is the gate that says so.
+	var seen atomic.Int32
 	s := newFakeServer(t, samplePong, func(clientProtocol int32) []packet.Packet {
-		seen = clientProtocol
+		seen.Store(clientProtocol)
 		return []packet.Packet{&packet.NetworkSettings{}}
 	})
 
 	Probe(context.Background(), s.addr(), 2200)
 
-	if seen != 2200 {
-		t.Errorf("server saw protocol %d, want the forced 2200", seen)
+	if got := seen.Load(); got != 2200 {
+		t.Errorf("server saw protocol %d, want the forced 2200", got)
 	}
 }
 
@@ -196,14 +212,13 @@ func TestProbeReportsAServerThatGoesSilentAfterThePing(t *testing.T) {
 // reports nothing at exactly the moment the server is behaving strangely,
 // which is when it is most wanted.
 func TestProbeSurvivesATruncatedPlayStatus(t *testing.T) {
-	s := newFakeServer(t, samplePong, nil)
-	s.rawReply = func() []byte {
+	s := newRawServer(t, samplePong, func() []byte {
 		// A valid PlayStatus header with no body at all.
 		buf := &bytes.Buffer{}
 		header := packet.Header{PacketID: packet.IDPlayStatus}
 		_ = header.Write(buf)
 		return buf.Bytes()
-	}
+	})
 
 	got := Probe(context.Background(), s.addr(), 0)
 
