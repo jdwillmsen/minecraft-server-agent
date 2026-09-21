@@ -1,0 +1,9 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Renovate replaces Dependabot here, so dependency automation on this account runs through one pipeline rather than two. Both were active at once after the Renovate GitHub App was installed, which means duplicate pull requests on the same dependency and two bots competing for the same branch names.",
+    "Renovate is the one kept because its commits are signed: an App installation token creates them through the API and GitHub signs them, which verify-pr-signatures requires. Dependabot's are signed too, but it cannot open the Helm or first-party image updates the rest of this estate needs, so keeping both tools meant keeping the weaker guarantee somewhere.",
+    "The shared jdwlabs preset already batches all non-major updates into one weekly pull request with no automerge -- the same shape the dependabot.yml it replaces had, unified across ecosystems instead of one group per ecosystem. Nothing repo-specific is needed here, so nothing is restated."
+  ],
+  "extends": ["github>jdwlabs/.github"]
+}
