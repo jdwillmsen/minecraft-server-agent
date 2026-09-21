@@ -9,19 +9,33 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Majors are excluded from every group so they arrive as their own pull
+    # request. dependabot/fetch-metadata reports a grouped PR's update-type as
+    # major if *any* member is a major, and the auto-merge workflow refuses
+    # majors -- so a single major in a group silently blocks the whole batch,
+    # including the security patches travelling with it. Observed directly: a
+    # 43-package development group held for days behind one Angular major.
     groups:
       # Go modules are updated as one tree by `go get`; splitting them across
       # pull requests makes each one rewrite go.sum and conflict with the rest.
       go-modules:
         patterns: ['*']
+        update-types: ['minor', 'patch']
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    # Majors are excluded from every group so they arrive as their own pull
+    # request. dependabot/fetch-metadata reports a grouped PR's update-type as
+    # major if *any* member is a major, and the auto-merge workflow refuses
+    # majors -- so a single major in a group silently blocks the whole batch,
+    # including the security patches travelling with it. Observed directly: a
+    # 43-package development group held for days behind one Angular major.
     groups:
       actions:
         patterns: ['*']
+        update-types: ['minor', 'patch']
 
   - package-ecosystem: docker
     directory: /
