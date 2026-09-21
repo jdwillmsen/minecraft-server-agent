@@ -8,8 +8,9 @@ require (
 	github.com/df-mc/goleveldb v1.1.9
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/common v0.71.0
 	github.com/sandertv/go-raknet v1.15.2-0.20260705184311-0d1fd09e2cf6
-	github.com/sandertv/gophertunnel v1.61.0
+	github.com/sandertv/gophertunnel v1.62.0
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/oauth2 v0.37.0
 )
@@ -51,7 +52,6 @@ require (
 	github.com/pion/turn/v5 v5.0.13 // indirect
 	github.com/pion/webrtc/v4 v4.2.19 // indirect
 	github.com/prometheus/client_model v0.6.3 // indirect
-	github.com/prometheus/common v0.71.0 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.56.0 // indirect
