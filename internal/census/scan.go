@@ -23,6 +23,18 @@ type ScanStats struct {
 	Unplaced           int    // records decoded but carrying no usable position
 	Unidentified       int    // records placed but naming no entity
 	FirstUnparsableErr string // first decode failure seen, or empty if none
+
+	// UnresolvedDimension counts entities the scan read but could not place
+	// in a dimension, because no chunk's digp record claims them. They are
+	// still returned: 106 such items were killed in game on 2026-09-18,
+	// which is what settles them as real rather than as stale records.
+	UnresolvedDimension int
+	// DigpSkippedKey and DigpSkippedValue count the chunk records the
+	// dimension index refused, which is the leading candidate cause of
+	// UnresolvedDimension: one skipped record takes every actor in its
+	// chunk with it.
+	DigpSkippedKey   int
+	DigpSkippedValue int
 }
 
 // MaxUnusableRatio is how much of a world may fail to yield an entity before
@@ -74,16 +86,19 @@ func Scan(ctx context.Context, dbPath string) ([]Entity, ScanStats, error) {
 	// than in the actor itself, and the iteration order gives no guarantee
 	// that a chunk is seen before the actors it owns.
 	index := dimensionIndex{}
+	var stats ScanStats
 	if err := iterate(ctx, db, []byte(digpPrefix), func(k, v []byte) {
-		index.addDigp(k, v)
+		switch index.addDigp(k, v) {
+		case digpBadKey:
+			stats.DigpSkippedKey++
+		case digpBadValue:
+			stats.DigpSkippedValue++
+		}
 	}); err != nil {
 		return nil, ScanStats{}, err
 	}
 
-	var (
-		entities []Entity
-		stats    ScanStats
-	)
+	var entities []Entity
 	if err := iterate(ctx, db, []byte(actorPrefix), func(k, v []byte) {
 		stats.Records++
 		var m map[string]any
@@ -107,6 +122,9 @@ func Scan(ctx context.Context, dbPath string) ([]Entity, ScanStats, error) {
 			return
 		}
 		e.Dimension = index.lookup(k[len(actorPrefix):])
+		if e.Dimension == UnknownDimension {
+			stats.UnresolvedDimension++
+		}
 		stats.Decoded++
 		entities = append(entities, e)
 	}); err != nil {

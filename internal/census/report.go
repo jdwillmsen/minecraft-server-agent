@@ -34,6 +34,15 @@ func Render(c Census, opts ReportOptions) string {
 	if c.Stats.FirstUnparsableErr != "" {
 		fmt.Fprintf(&b, "first decode failure: %s\n", c.Stats.FirstUnparsableErr)
 	}
+	// Stated only when it happened, and stated as a placement failure rather
+	// than as an absence: these entities exist, and the per-dimension
+	// sections below undercount by exactly this many.
+	if c.Stats.UnresolvedDimension > 0 {
+		fmt.Fprintf(&b, "dimension unresolved for %d entities; they are real and counted only under unknown\n",
+			c.Stats.UnresolvedDimension)
+		fmt.Fprintf(&b, "  chunk records skipped: %d bad key, %d bad value\n",
+			c.Stats.DigpSkippedKey, c.Stats.DigpSkippedValue)
+	}
 	fmt.Fprintf(&b, "\n")
 
 	byDimension := map[Dimension]int{}
@@ -92,12 +101,21 @@ func Render(c Census, opts ReportOptions) string {
 	if len(c.Concentrations) > 0 {
 		fmt.Fprintf(&b, "\nlargest concentrations (%d or more of one type within %.0f blocks)\n",
 			ConcentrationThreshold, ConcentrationRadius)
+		// Grouping is transitive, so a cluster can be a trail hundreds of
+		// blocks long rather than a pile, and its centre can sit where
+		// nothing is. The extent is the part worth flying to; the centre is
+		// kept because it is what every earlier report printed.
+		fmt.Fprintf(&b, "  grouping chains neighbours, so a cluster may be a trail rather than a pile\n")
+		fmt.Fprintf(&b, "  the extent is where to look; the centre may hold nothing at all\n")
 		for i, con := range c.Concentrations {
 			if i >= opts.TopTypes {
 				break
 			}
-			fmt.Fprintf(&b, "  %6d  %-22s %-10s x=%.0f y=%.0f z=%.0f\n",
+			fmt.Fprintf(&b, "  %6d  %-22s %-10s x=%.0f..%.0f y=%.0f..%.0f z=%.0f..%.0f  centre x=%.0f y=%.0f z=%.0f\n",
 				con.Cluster.Count, con.Identifier, con.Dimension,
+				con.Cluster.MinX, con.Cluster.MaxX,
+				con.Cluster.MinY, con.Cluster.MaxY,
+				con.Cluster.MinZ, con.Cluster.MaxZ,
 				con.Cluster.CentreX, con.Cluster.CentreY, con.Cluster.CentreZ)
 		}
 	}

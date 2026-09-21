@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/df-mc/goleveldb/leveldb"
+	"github.com/sandertv/gophertunnel/minecraft/nbt"
 )
 
 func TestScanReadsEntitiesWithTheirDimensions(t *testing.T) {
@@ -199,5 +200,48 @@ func TestScanStopsOnACancelledContext(t *testing.T) {
 	cancel()
 	if _, _, err := Scan(ctx, path); !errors.Is(err, context.Canceled) {
 		t.Errorf("Scan of a cancelled context returned %v, want context.Canceled", err)
+	}
+}
+
+func TestScanCountsActorsWhoseDimensionWillNotResolve(t *testing.T) {
+	// An actor listed in no chunk's digp record still decodes into a real
+	// entity — 106 of them were killed in game on 2026-09-18 after the
+	// report had filed them under the unknown dimension. The scan keeps
+	// them and counts them, rather than dropping them or quietly passing
+	// them off as placed.
+	path := writeFixtureWorld(t, []fixtureActor{
+		{ID: 1, NBT: map[string]any{"identifier": "minecraft:zombie", "Pos": pos(0, 64, 0)}},
+	})
+
+	db, err := leveldb.OpenFile(path, nil)
+	if err != nil {
+		t.Fatalf("reopen fixture world: %v", err)
+	}
+	orphan := make([]byte, 8)
+	binary.LittleEndian.PutUint64(orphan, 99)
+	payload, err := nbt.MarshalEncoding(
+		map[string]any{"identifier": "minecraft:item", "Pos": pos(-32, 15, -1846)}, nbt.LittleEndian)
+	if err != nil {
+		t.Fatalf("marshal orphan: %v", err)
+	}
+	if err := db.Put(append([]byte("actorprefix"), orphan...), payload, nil); err != nil {
+		t.Fatalf("put orphan: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close fixture world: %v", err)
+	}
+
+	entities, stats, err := Scan(context.Background(), path)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if stats.UnresolvedDimension != 1 {
+		t.Errorf("UnresolvedDimension = %d, want 1", stats.UnresolvedDimension)
+	}
+	if len(entities) != 2 {
+		t.Errorf("scan returned %d entities, want 2: an unplaceable actor is still an entity", len(entities))
+	}
+	if stats.Unusable() != 0 {
+		t.Errorf("Unusable() = %d, want 0: an unresolved dimension is not a failed record", stats.Unusable())
 	}
 }

@@ -99,3 +99,28 @@ func TestAnUnrecognisedDimensionIsNotAMissingDigpRecord(t *testing.T) {
 		t.Errorf("an actor with no digp record resolved to %v, want unknown", got)
 	}
 }
+
+func TestAddDigpReportsWhyItSkippedARecord(t *testing.T) {
+	// A skipped digp record silently costs every actor in that chunk its
+	// dimension, and the report then files them as unknown. The caller has
+	// to be able to count the skips to tell that apart from a world that
+	// genuinely holds unplaceable actors.
+	ix := dimensionIndex{}
+
+	if got := ix.addDigp(digpKey(1, 2, nil), actorID(7)); got != digpOK {
+		t.Errorf("well-formed record: got %v, want digpOK", got)
+	}
+
+	short := append([]byte("digp"), 0, 0, 0)
+	if got := ix.addDigp(short, actorID(7)); got != digpBadKey {
+		t.Errorf("unusable key length: got %v, want digpBadKey", got)
+	}
+
+	ragged := append(actorID(8), 0, 0, 0)
+	if got := ix.addDigp(digpKey(1, 2, nil), ragged); got != digpBadValue {
+		t.Errorf("value not a multiple of 8: got %v, want digpBadValue", got)
+	}
+	if got := ix.lookup(actorID(8)); got != UnknownDimension {
+		t.Errorf("actor from a skipped record resolved to %v, want unknown", got)
+	}
+}
