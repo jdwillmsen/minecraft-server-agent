@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,11 @@ const tokenStoreAttempts = 5
 // tokenStoreRetryDelay is how long to wait between those attempts. A var so a
 // test need not spend the real one.
 var tokenStoreRetryDelay = 2 * time.Second
+
+// errTokenStoreNeedsDatabase is the startup failure of an agent configured
+// with a database it could not open: the database is where the Xbox token
+// lives, so without it there is no login.
+var errTokenStoreNeedsDatabase = errors.New("no token store: the Xbox token is kept in Postgres, which could not be opened at startup")
 
 // openTokenStore decides where this process caches its Xbox Live token.
 //
@@ -41,9 +47,17 @@ var tokenStoreRetryDelay = 2 * time.Second
 // A cache directory that cannot be created is not fatal when a database
 // store exists -- once the volume is gone that is the expected state, not a
 // failure -- and is fatal when it is all there is.
+//
+// With PG_HOST set, shared is nil only because the database could not be
+// opened, and that is the cause worth reporting: the file cache failing
+// behind it is the expected state of a pod with no volume, and naming only
+// that sends an operator looking at a directory nobody meant to exist.
 func openTokenStore(cfg config.Config, shared mcauth.Store, log *logging.Logger) (mcauth.Store, error) {
 	file, err := mcauth.NewFileStore(cfg.AuthCacheDir, cfg.MCUsername)
 	if err != nil {
+		if shared == nil && cfg.PGHost != "" {
+			return nil, fmt.Errorf("%w (see store_open_failed); the file cache under AUTH_CACHE_DIR is no substitute: %w", errTokenStoreNeedsDatabase, err)
+		}
 		if shared == nil {
 			return nil, err
 		}

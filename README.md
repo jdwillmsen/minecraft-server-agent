@@ -303,7 +303,7 @@ without that gauge beside them there is nothing on the graph to say so.
 | `PG_DATABASE` | *(empty)* | Database name |
 | `PG_USERNAME` | *(empty)* | Database role |
 | `PG_PASSWORD` | *(empty)* | Database password |
-| `PG_CONNECT_TIMEOUT_MS` | `5000` | Bounds the startup connection check, so a slow database costs persistence, not the ability to start |
+| `PG_CONNECT_TIMEOUT_MS` | `5000` | Bounds each startup connection attempt. A failed attempt is retried with backoff (1s doubling to 15s) for up to 90 seconds before the agent settles for no store - see "Where the token is cached" for why that is not the end of it |
 | `LEADER_POLL_MS` | `500` | How often a warm standby asks whether the agent lock has come free. The dominant term in how long a release leaves the server without an agent; only meaningful with a database configured, since without one there is no lock and no standby |
 | `LEADER_MAX_WAIT_MS` | `60000` | The floor under a standby's wait, not a deadline: once it has elapsed the standby may go live without the lock, but only if the holder has gone quiet - see "When nobody releases the lock" below. Must be at least `LEADER_POLL_MS`, and is deliberately far above the few seconds an ordinary handover takes, so a release never reaches it |
 | `LEADER_HEARTBEAT_MS` | `10000` | How often the live agent announces that it is still there, which is what lets a standby tell a slow holder from a dead one. A standby gives up on three intervals of silence, so keep this under a third of `LEADER_MAX_WAIT_MS`; it must be under `LEADER_MAX_WAIT_MS` or a standby goes live having never had the chance to hear one |
@@ -1069,6 +1069,16 @@ somewhere. Where is a `mcauth.Store`, chosen at startup:
 |---|---|---|
 | unset | the file under `AUTH_CACHE_DIR` | local development; there is no database to use |
 | set | `minecraft.auth_tokens`, falling back to the file for reads | two agent pods coexist during a release and both need the token |
+
+With `PG_HOST` set, the database is not optional for authentication even
+though it is for greetings and commands: in the cluster there is no volume
+under `AUTH_CACHE_DIR`, so an agent that cannot open the database has no
+token store at all. Startup therefore retries the connection for up to 90
+seconds, serving `/healthz` meanwhile so the liveness probe does not cut the
+wait short, and if the database is still unreachable it exits naming the
+database (`no token store: the Xbox token is kept in Postgres, which could
+not be opened at startup`) rather than the cache directory it never meant to
+use.
 
 The database is what makes a warm standby possible at all. A file cache lives
 on a `ReadWriteOnce` volume, which one pod at a time may mount: a standby

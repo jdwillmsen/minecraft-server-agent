@@ -23,13 +23,18 @@ type Postgres struct {
 
 var _ Store = (*Postgres)(nil)
 
+// ErrInvalidDSN is a connection string Open could not parse. It is the one
+// Open failure that asking again cannot fix, so a caller retrying Open stops
+// at it.
+var ErrInvalidDSN = errors.New("store: parse dsn")
+
 // Open connects and verifies the connection before returning. A pool that
 // fails on first use rather than on open turns a configuration mistake into a
 // mystery at the first player join, hours later.
 func Open(ctx context.Context, dsn string, connectTimeout time.Duration) (*Postgres, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("store: parse dsn: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidDSN, err)
 	}
 	// Small on purpose. This workload writes two rows per player visit; a
 	// large pool would reserve connections on a shared cluster to sit idle.

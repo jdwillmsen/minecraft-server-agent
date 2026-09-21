@@ -134,13 +134,46 @@ func main() {
 	link := &linkMeter{}
 	pinger := adapters.NewServerPinger(bridgeClient, link.roundTrip, log)
 
+	// Built first, and serving before anything slow: it is where this
+	// process's role is recorded, which the Deliverer below reads to know
+	// whether it may speak into the game at all, and /healthz has to answer
+	// while openStore waits out an unreachable database, or the liveness
+	// probe kills the pod partway through the wait meant to save it. /readyz
+	// reports a starting process as unready, so serving early claims nothing.
+	httpServer, err := httpapi.New(cfg.HTTPAddr)
+	if err != nil {
+		// A bind failure here (bad address, port already in use) means the
+		// agent would run with no /healthz, /readyz, or /metrics at all -
+		// worse than not starting, since nothing external would notice.
+		log.Error("http_bind_failed", logging.Fields{"error": err.Error()})
+		os.Exit(1)
+	}
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil {
+			log.Error("http_server_failed", logging.Fields{"error": err.Error()})
+			// The listener already succeeded in New, so an error reaching
+			// here means Serve itself broke (not merely "someone else had
+			// the port") - treat it as fatal rather than silently running
+			// on with no health/metrics surface.
+			cancel()
+		}
+	}()
+
 	// Opened before the game connection so a misconfigured database is a
 	// startup log line rather than a surprise at the first player join, and
 	// before the plugins because two of them are constructed from it. Failure
-	// is not fatal: persistence is the personalisation behind greetings, and
-	// losing it must not cost the agent its commands.
-	playerStore := openStore(ctx, cfg, log)
+	// is not fatal to persistence: greetings and commands work without it.
+	// It is fatal to authentication when the database is also where the Xbox
+	// token lives, which is why openStore retries before giving up.
+	playerStore := openStore(ctx, cfg, log, store.Open)
 	defer playerStore.Close()
+	// A shutdown that lands while openStore is still waiting is a pod being
+	// replaced, not a failure: stopping here keeps it from being reported as
+	// the authentication failure a missing store would otherwise become.
+	if ctx.Err() != nil {
+		log.Info("stopped", nil)
+		return
+	}
 
 	// All four share the profile store's pool rather than opening their own:
 	// one database, one set of connections, and a store that cannot outlive
@@ -178,18 +211,6 @@ func main() {
 
 	voice := adapters.NewBridgeVoice(bridgeClient, playerRoster)
 	audience := newDeliveryAudience(playerRoster, siblings)
-
-	// Built here rather than beside the routes it serves: it is where this
-	// process's role is recorded, and the Deliverer below has to read that to
-	// know whether it may speak into the game at all.
-	httpServer, err := httpapi.New(cfg.HTTPAddr)
-	if err != nil {
-		// A bind failure here (bad address, port already in use) means the
-		// agent would run with no /healthz, /readyz, or /metrics at all -
-		// worse than not starting, since nothing external would notice.
-		log.Error("http_bind_failed", logging.Fields{"error": err.Error()})
-		os.Exit(1)
-	}
 
 	// One Deliverer for the process, reached two ways: plugin.Context narrows
 	// it to what !announce and !inbox need, while the drain plugin needs
@@ -246,17 +267,6 @@ func main() {
 	// command resolve can never mean two different players.
 	apiOn := httpServer.MountAnnouncements(cfg.AnnounceAPIToken, deliverer, playerLookup{live: playerRoster, archive: playerStore}, log)
 	log.Info("announce_api", logging.Fields{"enabled": apiOn})
-
-	go func() {
-		if err := httpServer.ListenAndServe(); err != nil {
-			log.Error("http_server_failed", logging.Fields{"error": err.Error()})
-			// The listener already succeeded in New, so an error reaching
-			// here means Serve itself broke (not merely "someone else had
-			// the port") - treat it as fatal rather than silently running
-			// on with no health/metrics surface.
-			cancel()
-		}
-	}()
 
 	tokenStore, err := openTokenStore(cfg, sharedTokens, log)
 	if err != nil {
@@ -984,26 +994,60 @@ func newLLMClient(cfg config.Config, log *logging.Logger) *adapters.LLMClient {
 	)
 }
 
+// storeOpenWindow bounds how long startup keeps asking an unreachable
+// Postgres before settling for no store. Long enough to ride out a failover
+// or a pod whose network is not yet routable; short enough that a database
+// that is really gone becomes a failure an operator sees within minutes.
+// Vars so a test need not spend the real ones.
+var (
+	storeOpenWindow     = 90 * time.Second
+	storeRetryFirstWait = time.Second
+	storeRetryMaxWait   = 15 * time.Second
+)
+
+// storeOpener is store.Open's signature, taken as a parameter so a test can
+// stand in a database that fails a given number of times.
+type storeOpener func(ctx context.Context, dsn string, connectTimeout time.Duration) (*store.Postgres, error)
+
 // openStore connects to Postgres if configured, and degrades to Nop if not.
 //
 // Deliberately never returns an error. Every failure here -- unset, malformed,
-// unreachable -- lands the agent in the same supported state it ran in through
-// Stages 1-4: greeting players plainly and answering commands.
-func openStore(ctx context.Context, cfg config.Config, log *logging.Logger) store.Store {
+// unreachable -- lands the agent in the same supported state for greetings
+// and commands. It is not the same state for authentication: with a database
+// configured the Xbox token lives in it, so an agent that settles for Nop is
+// an agent that cannot log in. Hence the retries, with backoff and within
+// storeOpenWindow, before an unreachable database is taken as the answer. A
+// malformed DSN is not retried: it will read the same every time.
+func openStore(ctx context.Context, cfg config.Config, log *logging.Logger, open storeOpener) store.Store {
 	dsn := cfg.PostgresDSN()
 	if dsn == "" {
 		log.Info("store_disabled", logging.Fields{"reason": "PG_HOST unset"})
 		return store.Nop{}
 	}
-	pg, err := store.Open(ctx, dsn, time.Duration(cfg.PGConnectTimeoutMs)*time.Millisecond)
-	if err != nil {
-		log.Error("store_open_failed", logging.Fields{"error": err.Error()})
-		return store.Nop{}
+	connectTimeout := time.Duration(cfg.PGConnectTimeoutMs) * time.Millisecond
+	deadline := time.Now().Add(storeOpenWindow)
+	wait := storeRetryFirstWait
+	for attempt := 1; ; attempt++ {
+		pg, err := open(ctx, dsn, connectTimeout)
+		if err == nil {
+			// Sessions a previous run left open are closed by beginWatching,
+			// at the start of every connection including the first.
+			log.Info("store_ready", logging.Fields{"database": cfg.PGDatabase, "attempt": attempt})
+			return pg
+		}
+		if errors.Is(err, store.ErrInvalidDSN) || ctx.Err() != nil || time.Now().Add(wait).After(deadline) {
+			log.Error("store_open_failed", logging.Fields{"error": err.Error(), "attempts": attempt})
+			return store.Nop{}
+		}
+		log.Info("store_open_retrying", logging.Fields{"error": err.Error(), "attempt": attempt, "wait_ms": wait.Milliseconds()})
+		select {
+		case <-ctx.Done():
+			log.Error("store_open_failed", logging.Fields{"error": err.Error(), "attempts": attempt})
+			return store.Nop{}
+		case <-time.After(wait):
+		}
+		wait = min(wait*2, storeRetryMaxWait)
 	}
-	// Sessions a previous run left open are closed by beginWatching, at the
-	// start of every connection including the first.
-	log.Info("store_ready", logging.Fields{"database": cfg.PGDatabase})
-	return pg
 }
 
 // startAnswer decides whether an @server question is answered, then answers
