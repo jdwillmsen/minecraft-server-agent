@@ -1,0 +1,95 @@
+name: Semantic Release
+
+# Every commit that lands on main and passes CI is a release candidate.
+# semantic-release reads the Conventional Commit history since the last tag and
+# decides whether it amounts to a new version; if it does, it tags the commit,
+# writes the GitHub release, and the publish job below builds exactly that tag.
+#
+# Chained off CI with workflow_run rather than running on push so a release can
+# never race ahead of, or skip, the checks that gate it.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+# Serialized, never cancelled: a release that has tagged must finish publishing
+# its image, or the tag names a version no registry has. A newer run queued
+# behind this one supersedes any older queued run, which is safe -- it releases
+# everything the older one would have.
+concurrency:
+  group: semantic-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # workflow_run fires for every CI completion, including failures and pull
+    # requests whose head branch happens to be called main (from a fork, say).
+    # Only a green push to this repository's main is a release candidate.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      # Tags and GitHub releases. Nothing else: the success and failure comments
+      # that would need issues and pull-requests write are turned off in
+      # .releaserc.json.
+      contents: write
+    outputs:
+      new-release-published: ${{ steps.release.outputs.new-release-published }}
+      new-release-version: ${{ steps.release.outputs.new-release-version }}
+    steps:
+      # Under workflow_run, checkout defaults to the newest commit on main, not
+      # the one CI just passed -- if main moved while CI ran, that would tag an
+      # untested commit. Check out the exact commit CI ran against instead. If
+      # main has since moved on, semantic-release sees the local branch is
+      # behind and releases nothing; the newer commit's own CI run will.
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          # The whole history and every tag: the next version is derived from
+          # the commits since the last tag.
+          fetch-depth: 0
+          # semantic-release authenticates its tag push with GITHUB_TOKEN
+          # itself; leaving checkout's credential in the git config is just a
+          # second copy of it on disk.
+          persist-credentials: false
+
+      # semantic-release 25 needs Node 22.14 or later, newer than the runner's
+      # preinstalled Node.
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24
+
+      # Run through npx with exact pins rather than a package.json, so this Go
+      # repository carries no Node manifest or lockfile of its own. The exec
+      # plugin is what reports a release to the publish job: the CLI exits 0
+      # both when it tags and when there is nothing to release.
+      - id: release
+        run: >-
+          npx --yes
+          -p semantic-release@25.0.9
+          -p conventional-changelog-conventionalcommits@9.3.1
+          -p @semantic-release/exec@7.1.0
+          semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # A tag pushed with GITHUB_TOKEN does not start other workflows, so the tag
+  # semantic-release just pushed never fires release.yml's own tag trigger.
+  # Calling it here keeps one image-build definition for both paths.
+  publish:
+    needs: release
+    if: needs.release.outputs.new-release-published == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release.outputs.new-release-version }}
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
