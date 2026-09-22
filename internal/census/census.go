@@ -69,6 +69,7 @@ type Census struct {
 	Named                  []Named
 	PersistentByIdentifier map[string]int
 	Concentrations         []Concentration
+	Variants               []VariantGroup
 }
 
 // Aggregate turns scanned entities into the census.
@@ -222,6 +223,8 @@ func Aggregate(entities []Entity, stats ScanStats, takenAt time.Time, sourceKind
 		}
 		return c.Concentrations[i].Cluster.MaxZ < c.Concentrations[j].Cluster.MaxZ
 	})
+
+	c.Variants = aggregateVariants(entities)
 
 	sort.Slice(c.Named, func(i, j int) bool {
 		if c.Named[i].Name != c.Named[j].Name {

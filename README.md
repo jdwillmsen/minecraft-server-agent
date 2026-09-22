@@ -201,7 +201,8 @@ gophertunnel client --> chat.ParseTrigger --> plugin.Registry --> plugin.Voice (
 - `internal/ratelimit` - per-actor sliding-window command rate limiting
 - `internal/census` - reads a Bedrock world save and produces a reproducible
   population report: entity totals, 144-block regions graded against
-  Bedrock's spawn caps, name-tagged mobs, and located entity concentrations.
+  Bedrock's spawn caps, name-tagged mobs, located entity concentrations, and
+  farm-animal variants with their nearest herds.
   Reproducibility is the point, not a nicety - every ordering the report
   depends on is a total order over ties, down to the cluster bounds, so the
   same world bytes always produce the same report. Two sources can supply
@@ -243,6 +244,31 @@ last night's archive instead would let it publish plausible reports
 indefinitely. The snapshotter's own half of that bargain is to copy the world
 first and create the marker last, by renaming it onto its final name; nothing
 on this side can check the ordering, only its coarser consequences.
+
+### Animal variants
+
+The report breaks cows, pigs and chickens down by climate variant, and
+mooshrooms by colour, because the plain type count cannot answer "where is the
+nearest cold cow". Each variant lists its count and its nearest herds -
+clusters chained within the concentration radius, so a pen of twenty is one
+line rather than twenty - with each herd's flat x/z distance from a reference
+point. That point is FWB's base, x=168 z=248, unless `-reference-x` and
+`-reference-z` say otherwise.
+
+| Variant | Read from |
+|---|---|
+| `temperate`, `cold`, `warm` | `properties.minecraft:climate_variant` |
+| `legacy` | a record with no `properties` compound at all |
+| `unrecorded` | a `properties` compound with no climate in it |
+| `red`, `brown` (mooshroom) | the integer `Variant` tag, 0 and 1 |
+
+`legacy` is kept apart from `temperate` on purpose. A record carrying no
+variant is a different fact from one carrying the default, and folding them
+together would hide how much of the herd the save never assigned a climate.
+
+Herds are located in the overworld only, because the reference point is an
+overworld position; a variant with animals elsewhere says how many were left
+out of its herds, so the count still agrees with the totals.
 
 ### Census metrics
 

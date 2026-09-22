@@ -666,3 +666,26 @@ func TestRunLeavesTheLastMetricsAloneWhenTheScanIsUnusable(t *testing.T) {
 		t.Errorf("the previous payload was overwritten by a failed run:\n%s", payload)
 	}
 }
+
+func TestRunMeasuresHerdsFromTheConfiguredReference(t *testing.T) {
+	payload, err := nbt.MarshalEncoding(map[string]any{
+		"identifier": "minecraft:cow",
+		"Pos":        []any{float32(100), float32(70), float32(0)},
+		"UniqueID":   int64(1),
+	}, nbt.LittleEndian)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	dir := t.TempDir()
+	buildArchiveFromRecord(t, dir, payload)
+
+	var out, errOut bytes.Buffer
+	if err := run(context.Background(), []string{"-backup-dir", dir, "-reference-x", "100", "-reference-z", "30"}, &out, &errOut); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	for _, want := range []string{"nearest 3 to x=100 z=30", "cow          legacy", "30 blocks"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("report is missing %q\n---\n%s", want, out.String())
+		}
+	}
+}
