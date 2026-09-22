@@ -173,6 +173,31 @@ func register(c Census, scrapedAt time.Time, opts MetricsOptions) *prometheus.Re
 		}
 	}
 
+	// Only the three climate-bearing animals, zero-filled across the known
+	// climates: twelve series whose label set does not move night to night.
+	// A climate the game adds later is still exported, so the series sum to
+	// the herd's total rather than silently dropping the newcomer.
+	variant := gauge("mc_census_variant",
+		"Animals of one identifier and climate variant, in every dimension. legacy is a record saved before variants existed.",
+		"identifier", "climate")
+	climates := map[string]map[string]int{}
+	for _, id := range ClimateIdentifiers {
+		climates[id] = map[string]int{}
+		for _, climate := range Climates {
+			climates[id][climate] = 0
+		}
+	}
+	for _, g := range c.Variants {
+		if byClimate, ok := climates[g.Identifier]; ok {
+			byClimate[g.Variant] = g.Count
+		}
+	}
+	for id, byClimate := range climates {
+		for climate, n := range byClimate {
+			variant.WithLabelValues(id, climate).Set(float64(n))
+		}
+	}
+
 	persistent := 0
 	for _, n := range c.PersistentByIdentifier {
 		persistent += n
