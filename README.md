@@ -1546,22 +1546,47 @@ alongside the other live suites against one database without killing them.
 ## Releases
 
 Pushing a version tag - a `v` followed by a digit, matching `v[0-9]*` -
-publishes a container image to GitHub Container Registry, with a redundant
-copy on Docker Hub:
+publishes one container image to two registries, GitHub Container Registry
+and Docker Hub:
 
 ```sh
 git tag v0.1.0
 git push origin v0.1.0
 # -> ghcr.io/jdwillmsen/minecraft-server-agent:0.1.0
-# -> docker.io/<DOCKERHUB_USERNAME>/minecraft-server-agent:0.1.0
+# -> docker.io/jdwillmsen/minecraft-server-agent:0.1.0
 ```
 
-The Docker Hub copy needs a `DOCKERHUB_USERNAME` repository variable and a
-`DOCKERHUB_TOKEN` repository secret (a Docker Hub access token). Until the
-variable is set, that half of the publish is skipped and only the ghcr.io
-image is pushed. The copy runs as a separate job after the ghcr.io push, so a
-missing token or a Docker Hub outage fails that job on its own and never
-affects the ghcr.io image. The Helm chart pulls from ghcr.io either way.
+The image is built and pushed to ghcr.io once, then copied to Docker Hub
+registry-to-registry with `docker buildx imagetools create`. Nothing is
+rebuilt, so both tags resolve to the same digest, and a digest pinned from
+either registry is valid on the other. The Helm chart pulls from ghcr.io; the
+Docker Hub copy is there for anyone who finds the image on Docker Hub, not for
+the cluster.
+
+Each image carries OCI labels and index annotations (title, description,
+source, license, version, revision), which is what gives the ghcr.io package
+page its description and repository link. The Docker Hub Overview page is
+[`README.docker.md`](README.docker.md), pushed by the same release job. Every
+image also ships with SLSA provenance (`mode=max`) and an SBOM as attestation
+manifests, and the Docker Hub copy keeps them. To inspect either:
+
+```sh
+docker buildx imagetools inspect ghcr.io/jdwillmsen/minecraft-server-agent:0.1.0 \
+  --format '{{ json .Provenance }}'
+docker buildx imagetools inspect ghcr.io/jdwillmsen/minecraft-server-agent:0.1.0 \
+  --format '{{ json .SBOM }}'
+```
+
+The Docker Hub half needs one-time setup by a human: a `DOCKERHUB_USERNAME`
+repository variable (`jdwillmsen`) and a `DOCKERHUB_TOKEN` repository secret
+holding a Docker Hub personal access token with Read, Write and Delete scope -
+the Overview update refuses anything narrower. Create the token on Docker Hub
+and set it with `gh secret set DOCKERHUB_TOKEN` from a terminal outside any
+agent session, so the token never lands in a transcript. Until the variable is
+set, that half of the publish is skipped and only the ghcr.io image is pushed.
+The copy runs as a separate job after the ghcr.io push, so a missing token or
+a Docker Hub outage fails that job on its own and never affects the ghcr.io
+image.
 
 The leading `v` is stripped, so the git tag `v0.1.0` becomes the image tag
 `0.1.0`. The same release can also be published from the Actions tab via the
