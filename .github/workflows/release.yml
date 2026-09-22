@@ -16,6 +16,13 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      IMAGE_METADATA: |
+        org.opencontainers.image.title=minecraft-server-agent
+        org.opencontainers.image.description=Minecraft Bedrock server chat agent: tool-calling LLM assistant, welcomes, stats, knowledge lookup
+        org.opencontainers.image.vendor=jdwillmsen
+        org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0
+        org.opencontainers.image.documentation=https://github.com/jdwillmsen/minecraft-server-agent#readme
     outputs:
       version: ${{ steps.version.outputs.value }}
     steps:
@@ -47,11 +54,21 @@ jobs:
           esac
           echo "value=$version" >> "$GITHUB_OUTPUT"
 
+      # metadata-action fills url, source, created, version and revision
+      # itself, but builds labels and annotations from separate inputs, so the
+      # overrides are shared through env to keep the two from drifting.
+      # Licenses is explicit because GitHub does not recognise PolyForm and
+      # would report NOASSERTION. Index-level annotations are what ghcr.io
+      # reads for the package description and repository link.
       - id: meta
         uses: docker/metadata-action@v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
         with:
           images: ghcr.io/${{ github.repository_owner }}/minecraft-server-agent
           tags: type=raw,value=${{ steps.version.outputs.value }}
+          labels: ${{ env.IMAGE_METADATA }}
+          annotations: ${{ env.IMAGE_METADATA }}
 
       # The deployment target is amd64-only Talos nodes, so a multi-arch build
       # would cost CI time for a platform nothing pulls.
@@ -62,18 +79,20 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: false
+          provenance: mode=max
+          sbom: true
 
-  # Docker Hub is a redundant copy; the cluster keeps pulling from ghcr.io.
-  # It runs as its own job after the ghcr.io push so a missing credential, a
-  # revoked token, or a Docker Hub outage fails loudly here without ever
-  # blocking the primary publish. It is skipped until a human sets the
-  # DOCKERHUB_USERNAME repo variable and DOCKERHUB_TOKEN secret, because CI
-  # must not mint that credential itself. The username is a variable, not a
-  # secret, because it is part of the image reference and a masked value
-  # would redact the ref from every log line.
+  # Docker Hub is a second public registry for the same image; the cluster
+  # keeps pulling from ghcr.io. It runs as its own job after the ghcr.io push
+  # so a missing credential, a revoked token, or a Docker Hub outage fails
+  # loudly here without ever blocking the primary publish. It is skipped until
+  # a human sets the DOCKERHUB_USERNAME repo variable and DOCKERHUB_TOKEN
+  # secret, because CI must not mint that credential itself. The username is a
+  # variable, not a secret, because it is part of the image reference and a
+  # masked value would redact the ref from every log line.
   mirror-dockerhub:
     needs: publish
     if: vars.DOCKERHUB_USERNAME != ''
@@ -82,6 +101,8 @@ jobs:
       contents: read
       packages: read
     steps:
+      - uses: actions/checkout@v7.0.1
+
       - uses: docker/login-action@v4.6.0
         with:
           registry: ghcr.io
@@ -93,9 +114,24 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # imagetools copies the manifest and blobs registry-to-registry, so the
-      # Docker Hub tag is byte-identical to the ghcr.io one with no rebuild.
+      # With one source and no --annotation or --platform, imagetools pushes
+      # the source index bytes unchanged, so the Docker Hub digest matches
+      # ghcr.io and the index annotations and attestation manifests come
+      # along. Passing --annotation here would rebuild the index, change the
+      # digest, and keep only the annotations given on the command line.
       - env:
           SOURCE: ghcr.io/${{ github.repository_owner }}/minecraft-server-agent:${{ needs.publish.outputs.version }}
           TARGET: docker.io/${{ vars.DOCKERHUB_USERNAME }}/minecraft-server-agent:${{ needs.publish.outputs.version }}
         run: docker buildx imagetools create --tag "$TARGET" "$SOURCE"
+
+      # Docker Hub has no equivalent of reading the description from image
+      # annotations, so the Overview page is pushed separately. That API only
+      # accepts a personal access token with Read, Write and Delete scope, so
+      # DOCKERHUB_TOKEN needs all three even though the image copy needs less.
+      - uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ vars.DOCKERHUB_USERNAME }}/minecraft-server-agent
+          readme-filepath: ./README.docker.md
+          short-description: Minecraft Bedrock chat agent - tool-calling LLM assistant, welcomes, stats
