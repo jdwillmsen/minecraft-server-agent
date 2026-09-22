@@ -26,8 +26,6 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.value }}
     steps:
-      - uses: actions/checkout@v7.0.1
-
       - uses: docker/setup-buildx-action@v4.2.0
 
       - uses: docker/login-action@v4.6.0
@@ -45,18 +43,27 @@ jobs:
         run: |
           raw="${TAG:-$GITHUB_REF_NAME}"
           version="${raw#v}"
-          case "$version" in
-            [0-9]*) ;;
-            *)
-              echo "::error::release version must start with a digit: $version"
-              exit 1
-              ;;
-          esac
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release version must be semver starting with a digit: $version"
+            exit 1
+          fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
 
-      # metadata-action fills url, source, created, version and revision
-      # itself, but builds labels and annotations from separate inputs, so the
-      # overrides are shared through env to keep the two from drifting.
+      # A manual dispatch runs on the dispatching branch, so building its
+      # checkout would publish branch code under a release version. Checking
+      # out the tag makes a re-publish rebuild exactly what was released, and
+      # fails when no such tag exists.
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: refs/tags/v${{ steps.version.outputs.value }}
+
+      - id: revision
+        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # metadata-action fills url, source, created and version itself; revision
+      # is overridden because its default is the dispatching commit. It builds
+      # labels and annotations from separate inputs, so the overrides are
+      # shared through env to keep the two from drifting.
       # Licenses is explicit because GitHub does not recognise PolyForm and
       # would report NOASSERTION. Index-level annotations are what ghcr.io
       # reads for the package description and repository link.
@@ -67,8 +74,12 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/minecraft-server-agent
           tags: type=raw,value=${{ steps.version.outputs.value }}
-          labels: ${{ env.IMAGE_METADATA }}
-          annotations: ${{ env.IMAGE_METADATA }}
+          labels: |
+            ${{ env.IMAGE_METADATA }}
+            org.opencontainers.image.revision=${{ steps.revision.outputs.value }}
+          annotations: |
+            ${{ env.IMAGE_METADATA }}
+            org.opencontainers.image.revision=${{ steps.revision.outputs.value }}
 
       # The deployment target is amd64-only Talos nodes, so a multi-arch build
       # would cost CI time for a platform nothing pulls.
@@ -102,6 +113,8 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          ref: refs/tags/v${{ needs.publish.outputs.version }}
 
       - uses: docker/login-action@v4.6.0
         with:
