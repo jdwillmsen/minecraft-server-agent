@@ -43,6 +43,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	backupDir := fs.String("backup-dir", "/backup", "directory holding fwb-<stamp>.tar.gz backup archives; read when -world-dir holds no snapshot or holds an older one")
 	topRegions := fs.Int("top-regions", census.DefaultReportOptions().TopRegions, "how many regions to list")
 	topTypes := fs.Int("top-types", census.DefaultReportOptions().TopTypes, "how many entity types to list")
+	referenceX := fs.Float64("reference-x", census.DefaultReportOptions().Reference.X, "x of the point animal herds are measured from; the default is FWB's base")
+	referenceZ := fs.Float64("reference-z", census.DefaultReportOptions().Reference.Z, "z of the point animal herds are measured from; the default is FWB's base")
 	metricsFile := fs.String("metrics-file", "", "also write the counts here as a Prometheus text exposition payload; the report on stdout is unchanged either way")
 	if parseErr := fs.Parse(args); parseErr != nil {
 		if errors.Is(parseErr, flag.ErrHelp) {
@@ -60,7 +62,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	return reportFrom(ctx, source,
-		census.ReportOptions{TopRegions: *topRegions, TopTypes: *topTypes}, *metricsFile, stdout)
+		census.ReportOptions{
+			TopRegions: *topRegions,
+			TopTypes:   *topTypes,
+			Reference:  census.Point{X: *referenceX, Z: *referenceZ},
+		}, *metricsFile, stdout)
 }
 
 // chooseSource assembles where the world comes from.

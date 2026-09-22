@@ -13,10 +13,17 @@ import (
 type ReportOptions struct {
 	TopRegions int
 	TopTypes   int
+	// Reference is where herd distances are measured from.
+	Reference Point
 }
 
+// FWBBase is the reference point the report defaults to. The census is
+// written for one world, and the question its variant section answers is how
+// far a player standing at home has to go.
+var FWBBase = Point{X: 168, Z: 248}
+
 func DefaultReportOptions() ReportOptions {
-	return ReportOptions{TopRegions: 15, TopTypes: 20}
+	return ReportOptions{TopRegions: 15, TopTypes: 20, Reference: FWBBase}
 }
 
 // Render writes the census as plain text.
@@ -117,6 +124,25 @@ func Render(c Census, opts ReportOptions) string {
 				con.Cluster.MinY, con.Cluster.MaxY,
 				con.Cluster.MinZ, con.Cluster.MaxZ,
 				con.Cluster.CentreX, con.Cluster.CentreY, con.Cluster.CentreZ)
+		}
+	}
+
+	if len(c.Variants) > 0 {
+		fmt.Fprintf(&b, "\nanimal variants (herds within %.0f blocks, nearest %d to x=%.0f z=%.0f)\n",
+			ConcentrationRadius, HerdsPerVariant, opts.Reference.X, opts.Reference.Z)
+		fmt.Fprintf(&b, "  legacy is a record carrying no variant at all, which is not the same as temperate\n")
+		for _, g := range c.Variants {
+			fmt.Fprintf(&b, "  %-12s %-12s %6d", g.Identifier, g.Variant, g.Count)
+			if g.Elsewhere > 0 {
+				fmt.Fprintf(&b, "  (%d outside the overworld, not located)", g.Elsewhere)
+			}
+			fmt.Fprintf(&b, "\n")
+			for _, h := range g.NearestHerds(opts.Reference, HerdsPerVariant) {
+				fmt.Fprintf(&b, "    %6.0f blocks  %4d at x=%.0f..%.0f z=%.0f..%.0f  centre x=%.0f y=%.0f z=%.0f\n",
+					opts.Reference.Distance(h), h.Count,
+					h.MinX, h.MaxX, h.MinZ, h.MaxZ,
+					h.CentreX, h.CentreY, h.CentreZ)
+			}
 		}
 	}
 

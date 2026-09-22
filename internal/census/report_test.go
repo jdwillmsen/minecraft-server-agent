@@ -224,3 +224,24 @@ func TestRenderSurfacesUnresolvedDimensionsAndSkippedDigp(t *testing.T) {
 		t.Errorf("report does not state the bad-key skips\n---\n%s", out)
 	}
 }
+
+func TestRenderListsVariantsWithHerdDistancesFromTheReference(t *testing.T) {
+	c := Aggregate([]Entity{
+		{Identifier: "mooshroom", Dimension: Overworld, Variant: MooshroomBrown, X: 168, Y: 70, Z: 348},
+		{Identifier: "mooshroom", Dimension: Overworld, Variant: MooshroomBrown, X: 168, Y: 70, Z: 349},
+		{Identifier: "cow", Dimension: Overworld, Climate: ClimateLegacy, X: 0, Y: 70, Z: 0},
+	}, ScanStats{Records: 3, Decoded: 3}, time.Time{}, "archive")
+
+	out := Render(c, DefaultReportOptions())
+	for _, want := range []string{"animal variants", "x=168 z=248", "mooshroom", "brown", "legacy", "100 blocks"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report is missing %q\n---\n%s", want, out)
+		}
+	}
+
+	opts := DefaultReportOptions()
+	opts.Reference = Point{X: 168, Z: 349}
+	if out := Render(c, opts); !strings.Contains(out, "     0 blocks") {
+		t.Errorf("a moved reference did not move the distance\n---\n%s", out)
+	}
+}
