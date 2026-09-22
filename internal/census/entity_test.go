@@ -91,3 +91,56 @@ func TestDimensionString(t *testing.T) {
 		}
 	}
 }
+
+// The three record shapes below are the ones a scan of the live world turned
+// up: an animal saved since variants existed, one saved before and never
+// reloaded, and a mooshroom, whose colour is the integer Variant tag rather
+// than a property.
+func TestEntityFromNBTReadsAVariantBearingAnimal(t *testing.T) {
+	e, ok := EntityFromNBT(map[string]any{
+		"identifier": "minecraft:cow",
+		"Pos":        pos(170, 70, 250),
+		"properties": map[string]any{
+			"minecraft:climate_variant": "temperate",
+			"minecraft:sound_variant":   "default",
+		},
+	})
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if e.Climate != "temperate" || e.Sound != "default" {
+		t.Errorf("Climate = %q Sound = %q, want temperate default", e.Climate, e.Sound)
+	}
+}
+
+func TestEntityFromNBTReportsARecordWithNoPropertiesAsLegacy(t *testing.T) {
+	e, ok := EntityFromNBT(map[string]any{
+		"identifier": "minecraft:chicken",
+		"Pos":        pos(170, 70, 250),
+	})
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if e.Climate != ClimateLegacy {
+		t.Errorf("Climate = %q, want %q: an animal saved before variants is not a temperate one", e.Climate, ClimateLegacy)
+	}
+	if e.Sound != "" {
+		t.Errorf("Sound = %q, want empty", e.Sound)
+	}
+}
+
+func TestEntityFromNBTReadsAMooshroomsColour(t *testing.T) {
+	for variant, want := range map[int32]int{0: MooshroomRed, 1: MooshroomBrown} {
+		e, ok := EntityFromNBT(map[string]any{
+			"identifier": "minecraft:mooshroom",
+			"Pos":        pos(0, 64, 0),
+			"Variant":    variant,
+		})
+		if !ok {
+			t.Fatal("ok = false, want true")
+		}
+		if e.Variant != want {
+			t.Errorf("Variant tag %d read as %d, want %d", variant, e.Variant, want)
+		}
+	}
+}
