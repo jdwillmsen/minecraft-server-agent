@@ -49,7 +49,30 @@ type Entity struct {
 	NameVisible bool
 	Persistent  bool
 	Health      int
+
+	// Climate and Sound are the farm-animal variants Bedrock stores under
+	// the record's properties compound. Climate is ClimateLegacy for a record
+	// with no properties at all: such a record carries no variant, which is
+	// a different fact from carrying the temperate one, and reporting it as
+	// temperate would hide how many animals the save never assigned one.
+	Climate string
+	Sound   string
+	// Variant is the record's integer variant tag, which for a mooshroom is
+	// its colour (MooshroomRed or MooshroomBrown). Other mobs reuse the tag
+	// with their own meanings, so it is read here and interpreted only where
+	// the identifier is known.
+	Variant int
 }
+
+// ClimateLegacy is the climate reported for a record that carries no
+// properties compound.
+const ClimateLegacy = "legacy"
+
+// Mooshroom colours as the Variant tag stores them.
+const (
+	MooshroomRed   = 0
+	MooshroomBrown = 1
+)
 
 // EntityFromNBT reduces a decoded actor record. It reports false when the
 // record carries no usable position: such an actor cannot be assigned to a
@@ -63,6 +86,11 @@ func EntityFromNBT(m map[string]any) (Entity, bool) {
 	if !ok {
 		return Entity{}, false
 	}
+	climate, sound := ClimateLegacy, ""
+	if props, hasProps := m["properties"].(map[string]any); hasProps {
+		climate = nbtString(props, "minecraft:climate_variant")
+		sound = nbtString(props, "minecraft:sound_variant")
+	}
 	return Entity{
 		Identifier:  strings.TrimPrefix(nbtString(m, "identifier"), "minecraft:"),
 		UniqueID:    nbtInt64(m, "UniqueID"),
@@ -74,6 +102,9 @@ func EntityFromNBT(m map[string]any) (Entity, bool) {
 		NameVisible: nbtFlag(m, "CustomNameVisible"),
 		Persistent:  nbtFlag(m, "Persistent"),
 		Health:      nbtInt(m, "Health"),
+		Climate:     climate,
+		Sound:       sound,
+		Variant:     nbtInt(m, "Variant"),
 	}, true
 }
 
@@ -93,7 +124,8 @@ func nbtFlag(m map[string]any, key string) bool {
 	return v != 0
 }
 
-// nbtInt reads a small integer tag. Health is TAG_Short, so int16.
+// nbtInt reads a small integer tag. Health is TAG_Short, so int16; Variant is
+// TAG_Int, so int32.
 func nbtInt(m map[string]any, key string) int {
 	switch v := m[key].(type) {
 	case int16:
