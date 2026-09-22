@@ -8,6 +8,17 @@ on:
       tag:
         description: Version to publish, with or without a leading v
         required: true
+  # How semantic-release.yml publishes the version it just tagged: its
+  # GITHUB_TOKEN tag push cannot fire the tag trigger above.
+  workflow_call:
+    inputs:
+      tag:
+        description: Version to publish, with or without a leading v
+        type: string
+        required: true
+    secrets:
+      DOCKERHUB_TOKEN:
+        required: false
 
 permissions:
   contents: read

@@ -1545,16 +1545,25 @@ alongside the other live suites against one database without killing them.
 
 ## Releases
 
-Pushing a version tag - a `v` followed by a digit, matching `v[0-9]*` -
-publishes one container image to two registries, GitHub Container Registry
-and Docker Hub:
+Releases are cut by
+[`semantic-release.yml`](.github/workflows/semantic-release.yml), not by hand.
+After CI passes on a push to `main`, it reads the
+[Conventional Commits](https://www.conventionalcommits.org/) since the last
+tag: `feat` cuts a minor version; `fix`, `perf` and `chore(deps)` a patch (so
+dependency security fixes ship); `ci`, `docs`, `test` and other `chore`
+commits cut nothing. A breaking change cuts a major. When it cuts a version it
+tags `v<version>`, writes the GitHub release, and publishes one container
+image to two registries, GitHub Container Registry and Docker Hub:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
-# -> ghcr.io/jdwillmsen/minecraft-server-agent:0.1.0
-# -> docker.io/jdwillmsen/minecraft-server-agent:0.1.0
+# feat: ... merged on top of v0.1.0
+# -> tag v0.2.0
+# -> ghcr.io/jdwillmsen/minecraft-server-agent:0.2.0
+# -> docker.io/jdwillmsen/minecraft-server-agent:0.2.0
 ```
+
+Pushing a version tag by hand - a `v` followed by a digit, matching
+`v[0-9]*` - still publishes that tag through the same workflow.
 
 The image is built and pushed to ghcr.io once, then copied to Docker Hub
 registry-to-registry with `docker buildx imagetools create`. Nothing is
