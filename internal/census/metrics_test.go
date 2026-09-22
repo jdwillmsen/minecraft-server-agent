@@ -205,3 +205,33 @@ func TestRenderMetricsDocumentsEveryFamily(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderMetricsExportsClimateVariantsZeroFilled(t *testing.T) {
+	c := Aggregate([]Entity{
+		{Identifier: "cow", Dimension: Overworld, Climate: "temperate"},
+		{Identifier: "cow", Dimension: Overworld, Climate: "temperate"},
+		{Identifier: "cow", Dimension: Overworld, Climate: ClimateLegacy},
+		{Identifier: "mooshroom", Dimension: Overworld, Variant: MooshroomBrown},
+	}, ScanStats{Records: 4, Decoded: 4}, time.Time{}, "archive")
+	out := RenderMetrics(c, scrapedAt, DefaultMetricsOptions())
+
+	if got := numericSample(t, out, `mc_census_variant{climate="temperate",identifier="cow"}`); got != 2 {
+		t.Errorf("temperate cows = %v, want 2", got)
+	}
+	if got := numericSample(t, out, `mc_census_variant{climate="legacy",identifier="cow"}`); got != 1 {
+		t.Errorf("legacy cows = %v, want 1", got)
+	}
+	if got := numericSample(t, out, `mc_census_variant{climate="warm",identifier="pig"}`); got != 0 {
+		t.Errorf("warm pigs = %v, want a zero-filled 0", got)
+	}
+
+	series := strings.Count(out, "\nmc_census_variant{")
+	if series != len(ClimateIdentifiers)*len(Climates) {
+		t.Errorf("mc_census_variant has %d series, want %d", series, len(ClimateIdentifiers)*len(Climates))
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "mc_census_variant{") && strings.Contains(line, `identifier="mooshroom"`) {
+			t.Errorf("mooshrooms are exported by climate, which they do not have: %s", line)
+		}
+	}
+}

@@ -290,6 +290,7 @@ graph outlives the sentence explaining it.
 |---|---|---|
 | `mc_census_entities` | `dimension` | entities stored in that dimension; the world total is their sum |
 | `mc_census_entity_type` | `identifier`, `dimension`, `category` | count for one type, for the largest `-top-types` only |
+| `mc_census_variant` | `identifier`, `climate` | cows, pigs and chickens per climate variant, zero-filled across `temperate`, `cold`, `warm` and `legacy` |
 | `mc_census_regions` | `dimension`, `category`, `status` | graded regions per cap status (`headroom`, `at_risk`, `capped`) |
 | `mc_census_persistent_entities` | none | entities flagged as never despawning, each holding a cap slot forever |
 | `mc_census_named_entities` | none | name-tagged entities, counted from the name rather than from the persistence flag |
