@@ -81,7 +81,7 @@ most.
 | `until` | Optional. When it passes, the override is removed |
 | `wake_on` | Optional. `any_player_join`, or a list of gamertags |
 | `reason` | Free text, required from the API and CLI |
-| `set_by` | `chat:<gamertag>`, `api:<token-name>`, `cli:<token-name>` |
+| `set_by` | `chat:<gamertag>` or `api:<token-name>`; the CLI is an API client and records `api:tools-mc` |
 | `set_at` | Timestamp |
 | `version` | Incremented on every write; writes carry the version they read |
 
