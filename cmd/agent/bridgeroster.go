@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"maps"
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
@@ -51,6 +52,8 @@ type bridgeRoster struct {
 	// held is who the roster had online, by name, when the follower last
 	// cleared it, so the seed that recovers can still name them.
 	held map[string]string
+	// unresolved is every gamertag already reported as unresolvable.
+	unresolved map[string]struct{}
 }
 
 func newBridgeRoster(feed bridgeFeed, r *roster.Roster, joins *joinTimes, archive nameArchive, log *logging.Logger) *bridgeRoster {
@@ -64,7 +67,7 @@ func (b *bridgeRoster) run(ctx context.Context) {
 	// Once nothing is following the bridge, what this learned stops being
 	// true, just as a dead connection's roster does.
 	defer connectionEnded(b.roster, b.joins)
-	b.held = nil
+	b.held, b.unresolved = nil, make(map[string]struct{})
 	refresh, known, failures := false, false, 0
 	for {
 		wait := b.poll
@@ -140,14 +143,17 @@ func (b *bridgeRoster) seed(ctx context.Context, refresh bool) (adapters.BridgeE
 			// Left out rather than guessed. The roster then knows the server
 			// and not this player, which the deliverer reads as departed, so
 			// their copy of an announcement stays pending and is not recorded.
-			b.log.Info("bridge_roster_unresolved", logging.Fields{"gamertag": name})
+			b.unresolvedPlayer(name)
 			continue
 		}
 		players = append(players, roster.Entry{XUID: xuid, Username: name})
 	}
 	b.held = nil
 	if refresh {
-		before := b.roster.Online()
+		before := make(map[string]string)
+		for _, xuid := range b.roster.Online() {
+			before[xuid], _ = b.roster.NameFor(xuid)
+		}
 		b.roster.Seed(players)
 		b.refreshed(before, players)
 	} else {
@@ -160,12 +166,9 @@ func (b *bridgeRoster) seed(ctx context.Context, refresh bool) (adapters.BridgeE
 
 // refreshed tells the join clock what a refresh changed: a player it found
 // who was not on the roster has only just been seen to arrive, and one it
-// did not find has left.
-func (b *bridgeRoster) refreshed(before []string, after []roster.Entry) {
-	gone := make(map[string]struct{}, len(before))
-	for _, xuid := range before {
-		gone[xuid] = struct{}{}
-	}
+// did not find has left. before maps who was online to their username.
+func (b *bridgeRoster) refreshed(before map[string]string, after []roster.Entry) {
+	gone := maps.Clone(before)
 	for _, p := range after {
 		if _, ok := gone[p.XUID]; ok {
 			delete(gone, p.XUID)
@@ -174,10 +177,22 @@ func (b *bridgeRoster) refreshed(before []string, after []roster.Entry) {
 		b.joins.joined(p.XUID)
 		b.log.Info("bridge_player_joined", logging.Fields{"xuid": p.XUID, "username": p.Username})
 	}
-	for xuid := range gone {
+	for xuid, name := range gone {
 		b.joins.left(xuid)
-		b.log.Info("bridge_player_left", logging.Fields{"xuid": xuid})
+		b.log.Info("bridge_player_left", logging.Fields{"xuid": xuid, "username": name})
 	}
+}
+
+// unresolvedPlayer reports a gamertag left off the roster. Every seed misses
+// it again, so only the first miss is Info.
+func (b *bridgeRoster) unresolvedPlayer(name string) {
+	fields := logging.Fields{"gamertag": name}
+	if _, seen := b.unresolved[name]; seen {
+		b.log.Debug("bridge_roster_unresolved", fields)
+		return
+	}
+	b.unresolved[name] = struct{}{}
+	b.log.Info("bridge_roster_unresolved", fields)
 }
 
 // seedFailed drops what an earlier seed reported. A roster that cannot be
@@ -261,7 +276,7 @@ func (b *bridgeRoster) apply(ctx context.Context, e adapters.BridgeEvent) {
 	if xuid == "" {
 		var ok bool
 		if xuid, ok = b.resolve(ctx, e.Player, nil); !ok {
-			b.log.Info("bridge_roster_unresolved", logging.Fields{"gamertag": e.Player})
+			b.unresolvedPlayer(e.Player)
 			return
 		}
 	}
