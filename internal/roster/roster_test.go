@@ -646,3 +646,110 @@ func TestKnownOfflineOfNothingKnowsNothing(t *testing.T) {
 		t.Error("KnownOffline(nil) = true, want false")
 	}
 }
+
+func TestSeedIsWhoIsHereAndSaysSo(t *testing.T) {
+	r := New()
+	r.Seed([]Entry{{XUID: "111", Username: "Steve"}, {XUID: "222", Username: "Alex"}})
+
+	if !r.Knows() {
+		t.Fatal("Knows() = false after a seed: an empty Online() would read as not known yet")
+	}
+	if got := len(r.Online()); got != 2 {
+		t.Errorf("Online() holds %d players, want 2", got)
+	}
+	if !r.IsOnline("111") || !r.IsOnline("222") {
+		t.Error("a seeded player is not online")
+	}
+	if name, ok := r.NameFor("222"); !ok || name != "Alex" {
+		t.Errorf("NameFor(222) = %q, %v; want Alex, true", name, ok)
+	}
+}
+
+// Nobody on the server is still an answer, and the one a seed from an empty
+// `list` gives.
+func TestSeedWithNobodyKnowsTheServerIsEmpty(t *testing.T) {
+	r := New()
+	r.Seed(nil)
+	if !r.Knows() || len(r.Online()) != 0 {
+		t.Errorf("Knows() = %v, Online() = %v; want true and empty", r.Knows(), r.Online())
+	}
+}
+
+// A seed is not an opening snapshot: there is no burst to wait out, so the
+// very next add is somebody arriving.
+func TestAnAddAfterASeedIsAJoin(t *testing.T) {
+	r := New()
+	r.Seed([]Entry{{XUID: "111", Username: "Steve"}})
+
+	joins, _, present := r.Apply([]PlayerListEntry{{XUID: "222", Username: "Alex"}})
+	if len(joins) != 1 || joins[0].XUID != "222" || len(present) != 0 {
+		t.Errorf("joins = %+v, present = %+v; want Alex as the one join", joins, present)
+	}
+}
+
+func TestARemovalAfterASeedIsALeave(t *testing.T) {
+	r := New()
+	r.Seed([]Entry{{XUID: "111", Username: "Steve"}})
+
+	_, leaves, _ := r.Apply([]PlayerListEntry{{XUID: "111", Remove: true}})
+	if len(leaves) != 1 || leaves[0] != (Entry{XUID: "111", Username: "Steve"}) {
+		t.Errorf("leaves = %+v, want Steve", leaves)
+	}
+	if r.IsOnline("111") {
+		t.Error("Steve still online after leaving")
+	}
+}
+
+// A seed replaces what the roster held, including a dead connection's
+// presence, and forgets which entry was the agent's own: the agent is not on
+// the server while something else is reporting who is.
+func TestSeedReplacesEarlierPresence(t *testing.T) {
+	r := New()
+	r.BeginSession(time.Unix(100, 0), agentEntry.XUID)
+	absorbSnapshot(t, r, agentEntry, PlayerListEntry{XUID: "111", Username: "Steve"})
+
+	r.Seed([]Entry{{XUID: "222", Username: "Alex"}})
+
+	if r.IsOnline("111") || r.IsOnline(agentEntry.XUID) {
+		t.Error("presence from before the seed survived it")
+	}
+	if !r.IsOnline("222") {
+		t.Error("the seeded player is not online")
+	}
+	if name, ok := r.NameFor("111"); !ok || name != "Steve" {
+		t.Errorf("NameFor(111) = %q, %v; names outlive presence and must survive a seed", name, ok)
+	}
+	joins, _, _ := r.Apply([]PlayerListEntry{{XUID: agentEntry.XUID, Username: agentEntry.Username}})
+	if len(joins) != 1 {
+		t.Errorf("the old agent XUID arriving after a seed gave %d joins, want 1", len(joins))
+	}
+}
+
+// Since is what the profile store watched through. A seed writes nothing to
+// the store, so it must not move it.
+func TestSeedLeavesSinceAlone(t *testing.T) {
+	r := New()
+	began := time.Unix(100, 0)
+	r.BeginSession(began, agentEntry.XUID)
+	r.Seed(nil)
+	if got := r.Since(); !got.Equal(began) {
+		t.Errorf("Since() = %v after a seed, want %v", got, began)
+	}
+}
+
+func TestSeedSkipsAnEntryWithNoXUID(t *testing.T) {
+	r := New()
+	r.Seed([]Entry{{XUID: "", Username: "Ghost"}})
+	if len(r.Online()) != 0 {
+		t.Errorf("Online() = %v, want empty: an entry with no XUID has no identity", r.Online())
+	}
+}
+
+func TestEndSessionAfterASeedForgetsWhoIsHere(t *testing.T) {
+	r := New()
+	r.Seed([]Entry{{XUID: "111", Username: "Steve"}})
+	r.EndSession()
+	if r.Knows() || r.IsOnline("111") {
+		t.Error("the roster still claims to know who is here after EndSession")
+	}
+}
