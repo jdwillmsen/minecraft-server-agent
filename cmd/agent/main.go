@@ -331,7 +331,8 @@ func main() {
 		//
 		// Standing down demotes the role ahead of both, so nothing that
 		// reads it acts on a game this process no longer has a claim to
-		// while the connect loop is still unwinding.
+		// while the running session mode, the connect loop or the bridge
+		// follower, is still unwinding.
 		liveCtx, endClaim := beginTurn(ctx, tokenGate)
 		endTurn := func() {
 			httpServer.SetRole(httpapi.RoleStandby)
