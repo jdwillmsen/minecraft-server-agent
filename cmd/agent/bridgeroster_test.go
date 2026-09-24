@@ -108,6 +108,14 @@ func (f *fakeBridgeFeed) evictAndLog(name, xuid string, online ...string) {
 	f.log(adapters.BridgeEventConnect, name, xuid)
 }
 
+// evictBefore is the bridge's buffer dropping its oldest lines while the
+// follower keeps up, so the cursor survives.
+func (f *fakeBridgeFeed) evictBefore(id int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = slices.DeleteFunc(f.events, func(e adapters.BridgeEvent) bool { return e.ID < id })
+}
+
 func (f *fakeBridgeFeed) listCalls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -254,6 +262,45 @@ func TestBridgeRosterReseedsWhenItsCursorWasEvicted(t *testing.T) {
 	if feed.listCalls() <= seeds {
 		t.Error("the roster changed without `list` being read again")
 	}
+}
+
+// A player who has been online longer than the bridge's buffer reaches back
+// has no connect line left to resolve them from, and may never have been
+// written to the profile store. The roster already knows who they are.
+func TestBridgeRosterKeepsAPlayerWhoseConnectLineWasEvicted(t *testing.T) {
+	t.Run("at a timed reseed", func(t *testing.T) {
+		feed := &fakeBridgeFeed{}
+		feed.listAnswers(nil, nil)
+		got := startBridgeRoster(t, feed, recordedNames{}, 20*time.Millisecond)
+		waitUntil(t, got.roster.Knows, "the roster never learned who is online")
+		feed.listAnswers([]string{"Steve", "Kai"}, nil)
+		feed.logged(adapters.BridgeEventConnect, "Steve", "111")
+		feed.logged(adapters.BridgeEventConnect, "Kai", "444")
+		waitUntil(t, func() bool { return got.roster.IsOnline("111") && got.roster.IsOnline("444") },
+			"the connect lines never reached the roster")
+
+		feed.evictBefore(2)
+		seeds := feed.listCalls()
+		waitUntil(t, func() bool { return feed.listCalls() >= seeds+2 }, "no periodic seed ran")
+
+		if !got.roster.IsOnline("111") {
+			t.Error("a timed reseed dropped Steve, whom the roster held, because his connect line had been evicted")
+		}
+	})
+	t.Run("at a reseed after eviction", func(t *testing.T) {
+		feed := &fakeBridgeFeed{}
+		feed.logged(adapters.BridgeEventConnect, "Steve", "111")
+		feed.listAnswers([]string{"Steve"}, nil)
+		got := startBridgeRoster(t, feed, recordedNames{}, time.Hour)
+		waitUntil(t, func() bool { return got.roster.IsOnline("111") }, "the first seed never landed")
+		seeds := feed.listCalls()
+
+		feed.evictAndLog("Kai", "444", "Steve", "Kai")
+
+		waitUntil(t, func() bool {
+			return feed.listCalls() > seeds && got.roster.IsOnline("444") && got.roster.IsOnline("111")
+		}, "the reseed after an eviction dropped Steve, whom the roster held until it reset")
+	})
 }
 
 func TestBridgeRosterRetriesASeedTheBridgeCouldNotAnswer(t *testing.T) {
