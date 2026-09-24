@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
 // fakeBridgeFeed is the console bridge as the roster follower reads it: a
@@ -297,5 +301,104 @@ func TestBridgeRosterLeavesTheRosterUnknowingWhenItStops(t *testing.T) {
 	}
 	if got.joins.Generation() == before {
 		t.Error("the join clock's connection did not end: a delivery scheduled under the follower would still speak")
+	}
+}
+
+// runSteppedBridgeRoster runs a follower on the production timings with
+// every wait passing on a fake clock and returning at once, so a test can
+// drive hours of its time in one synchronous call. each sees every wait,
+// after the clock has moved past it; the run ends when each returns false.
+func runSteppedBridgeRoster(t *testing.T, feed bridgeFeed, archive nameArchive, log *logging.Logger, each func(time.Duration) bool) (*roster.Roster, *joinTimes) {
+	t.Helper()
+	clock := &gapClock{at: time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC)}
+	r, j := roster.New(), newJoinTimes()
+	j.now = clock.now
+	b := newBridgeRoster(feed, r, j, archive, log)
+	b.now = clock.now
+	b.wait = func(ctx context.Context, d time.Duration) bool {
+		clock.advance(d)
+		return ctx.Err() == nil && each(d)
+	}
+	b.run(t.Context())
+	return r, j
+}
+
+// loggedEvents returns the fields of every line out holds for event.
+func loggedEvents(t *testing.T, out, event string) []map[string]any {
+	t.Helper()
+	var lines []map[string]any
+	for _, raw := range strings.Split(strings.TrimSpace(out), "\n") {
+		var line map[string]any
+		if err := json.Unmarshal([]byte(raw), &line); err != nil {
+			continue
+		}
+		if line["event"] == event {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// Every seed is a real `list` on the server's console. A bridge that stays
+// down must not have one sent every poll for as long as it is gone.
+func TestBridgeRosterBacksOffASeedThatKeepsFailing(t *testing.T) {
+	feed := &fakeBridgeFeed{}
+	feed.listAnswers(nil, errors.New("bridge unreachable"))
+	var waited, longest time.Duration
+	runSteppedBridgeRoster(t, feed, recordedNames{}, quiet(), func(d time.Duration) bool {
+		waited += d
+		longest = max(longest, d)
+		return waited < 30*time.Minute
+	})
+
+	// 900 at one per poll; doubling from the poll to the reseed interval
+	// takes eight retries to reach the cap and one per 5m after it.
+	if n := feed.listCalls(); n > 16 {
+		t.Errorf("`list` was sent %d times in 30m of outage, want at most 16", n)
+	}
+	if longest != bridgeRosterReseed {
+		t.Errorf("the longest wait between retries was %v, want it capped at %v", longest, bridgeRosterReseed)
+	}
+}
+
+// A seed that lands resets the backoff, so the next outage is noticed on
+// the poll again, and the known roster going unknown is said once, loudly.
+func TestBridgeRosterResetsItsBackoffOnceASeedLands(t *testing.T) {
+	feed := &fakeBridgeFeed{}
+	feed.listAnswers(nil, errors.New("bridge unreachable"))
+	var afterFailures []time.Duration
+	var retryAfterLoss time.Duration
+	out := captureStdout(t, func() {
+		runSteppedBridgeRoster(t, feed, recordedNames{}, logging.New("debug"), func(d time.Duration) bool {
+			switch feed.listCalls() {
+			case 5:
+				afterFailures = append(afterFailures, d)
+				feed.listAnswers([]string{}, nil)
+			case 6:
+				feed.listAnswers(nil, errors.New("bridge unreachable again"))
+			case 7:
+				retryAfterLoss = d
+				return false
+			default:
+				afterFailures = append(afterFailures, d)
+			}
+			return true
+		})
+	})
+
+	want := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second}
+	if !slices.Equal(afterFailures, want) {
+		t.Errorf("waits after five failed seeds = %v, want %v", afterFailures, want)
+	}
+	if retryAfterLoss != bridgeRosterPoll {
+		t.Errorf("the first retry after a good seed waited %v, want %v: the backoff outlived the seed that landed", retryAfterLoss, bridgeRosterPoll)
+	}
+	var levels []any
+	for _, line := range loggedEvents(t, out, "bridge_roster_seed_failed") {
+		levels = append(levels, line["level"])
+	}
+	wantLevels := []any{"debug", "debug", "debug", "debug", "debug", "warn"}
+	if !slices.Equal(levels, wantLevels) {
+		t.Errorf("bridge_roster_seed_failed levels = %v, want %v: only losing a known roster is a warning", levels, wantLevels)
 	}
 }
