@@ -493,3 +493,44 @@ func TestBridgeRosterResetsItsBackoffOnceASeedLands(t *testing.T) {
 		t.Errorf("bridge_roster_seed_failed levels = %v, want %v: only losing a known roster is a warning", levels, wantLevels)
 	}
 }
+
+// A refresh that finds a player gone knows them only by XUID, and a leave
+// logged without a name cannot be read back.
+func TestBridgeRosterNamesAPlayerARefreshFoundGone(t *testing.T) {
+	feed := &fakeBridgeFeed{}
+	feed.listAnswers([]string{"Steve", "Sam"}, nil)
+	archive := recordedNames{byName: map[string]string{"Steve": "111", "Sam": "333"}}
+	out := captureStdout(t, func() {
+		runSteppedBridgeRoster(t, feed, archive, logging.New("info"), func(time.Duration) bool {
+			if feed.listCalls() == 1 {
+				feed.listAnswers([]string{"Steve"}, nil)
+			}
+			return feed.listCalls() < 2
+		})
+	})
+
+	left := loggedEvents(t, out, "bridge_player_left")
+	if len(left) != 1 || left[0]["xuid"] != "333" || left[0]["username"] != "Sam" {
+		t.Errorf("bridge_player_left = %v, want one line for Sam (333) with his username", left)
+	}
+}
+
+// A gamertag the follower cannot resolve is missed again at every seed. Once
+// is news; every five minutes for the rest of the absence is noise.
+func TestBridgeRosterReportsAnUnresolvedPlayerOnce(t *testing.T) {
+	feed := &fakeBridgeFeed{}
+	feed.listAnswers([]string{"Sam"}, nil)
+	out := captureStdout(t, func() {
+		runSteppedBridgeRoster(t, feed, recordedNames{}, logging.New("debug"), func(time.Duration) bool {
+			return feed.listCalls() < 3
+		})
+	})
+
+	var levels []any
+	for _, line := range loggedEvents(t, out, "bridge_roster_unresolved") {
+		levels = append(levels, line["level"])
+	}
+	if want := []any{"info", "debug", "debug"}; !slices.Equal(levels, want) {
+		t.Errorf("bridge_roster_unresolved levels = %v, want %v", levels, want)
+	}
+}
