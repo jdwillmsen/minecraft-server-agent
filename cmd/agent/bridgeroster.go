@@ -47,6 +47,10 @@ type bridgeRoster struct {
 	log     *logging.Logger
 	now     func() time.Time
 	wait    func(ctx context.Context, d time.Duration) bool
+
+	// held is who the roster had online, by name, when the follower last
+	// cleared it, so the seed that recovers can still name them.
+	held map[string]string
 }
 
 func newBridgeRoster(feed bridgeFeed, r *roster.Roster, joins *joinTimes, archive nameArchive, log *logging.Logger) *bridgeRoster {
@@ -60,6 +64,7 @@ func (b *bridgeRoster) run(ctx context.Context) {
 	// Once nothing is following the bridge, what this learned stops being
 	// true, just as a dead connection's roster does.
 	defer connectionEnded(b.roster, b.joins)
+	b.held = nil
 	refresh, known, failures := false, false, 0
 	for {
 		wait := b.poll
@@ -140,6 +145,7 @@ func (b *bridgeRoster) seed(ctx context.Context, refresh bool) (adapters.BridgeE
 		}
 		players = append(players, roster.Entry{XUID: xuid, Username: name})
 	}
+	b.held = nil
 	if refresh {
 		before := b.roster.Online()
 		b.roster.Seed(players)
@@ -180,7 +186,7 @@ func (b *bridgeRoster) refreshed(before []string, after []roster.Entry) {
 // are Debug for the same reason as tps_sample_failed, since an outage would
 // otherwise add a line every retry.
 func (b *bridgeRoster) seedFailed(err error, wasKnown bool) {
-	connectionEnded(b.roster, b.joins)
+	b.forget()
 	fields := logging.Fields{"error": err.Error()}
 	if wasKnown {
 		b.log.Warn("bridge_roster_seed_failed", fields)
@@ -222,7 +228,7 @@ func (b *bridgeRoster) follow(ctx context.Context, cursor adapters.BridgeEvent) 
 		}
 		if cursor.ID > 0 && (len(events) == 0 || !sameEvent(events[0], cursor)) {
 			b.log.Info("bridge_roster_reset", logging.Fields{"cursor": cursor.ID, "reason": "bridge restart or eviction"})
-			connectionEnded(b.roster, b.joins)
+			b.forget()
 			return false
 		}
 		for _, e := range events {
@@ -270,10 +276,33 @@ func (b *bridgeRoster) apply(ctx context.Context, e adapters.BridgeEvent) {
 	}
 }
 
+// forget ends what the roster knows, keeping who it held.
+func (b *bridgeRoster) forget() {
+	held := make(map[string]string)
+	for _, xuid := range b.roster.Online() {
+		if name, ok := b.roster.NameFor(xuid); ok {
+			held[name] = xuid
+		}
+	}
+	if len(held) > 0 {
+		b.held = held
+	}
+	connectionEnded(b.roster, b.joins)
+}
+
 // resolve turns a gamertag into the XUID everything else keys on: first from
-// the bridge's own connect lines, then from the profile store.
+// the bridge's own connect lines, then from who the roster holds or held,
+// then from the profile store. The roster matters for anyone online longer
+// than the bridge's buffer reaches back, whose connect line is gone and who
+// may never have been written to the store.
 func (b *bridgeRoster) resolve(ctx context.Context, name string, logged map[string]string) (string, bool) {
 	if xuid, ok := logged[name]; ok {
+		return xuid, true
+	}
+	if xuid, ok := b.roster.XUIDFor(name); ok {
+		return xuid, true
+	}
+	if xuid, ok := b.held[name]; ok {
 		return xuid, true
 	}
 	xuid, ok, err := b.archive.XUIDForName(ctx, name)
