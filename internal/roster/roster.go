@@ -170,6 +170,33 @@ func (r *Roster) EndSession() {
 	r.clearPresence()
 }
 
+// Seed replaces who is present with players, as reported by something other
+// than this process's own Bedrock connection: the console bridge, while the
+// agent is deliberately out of the world. The roster then knows who is here,
+// and every later add Apply sees is an arrival, because nothing is describing
+// the world to a client that just logged in.
+//
+// The agent's own XUID is forgotten, since the agent is not on the server
+// while it is being described from outside. Since is left alone: it dates
+// what the profile store watched through, and nothing a seed feeds writes to
+// the store. Names learned earlier are kept, as EndSession keeps them.
+func (r *Roster) Seed(players []Entry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.clearPresence()
+	r.agentXUID = ""
+	for _, p := range players {
+		if p.XUID == "" {
+			continue
+		}
+		r.players[p.XUID] = p.Username
+		r.names[p.XUID] = p.Username
+	}
+	r.snapshotStarted = true
+	r.snapshotEnded = true
+	r.answered = true
+}
+
 // clearPresence drops everything a connection reported about who is here,
 // leaving the Roster pre-snapshot. Shared by the two ends of a session so
 // that a presence field added to the Roster cannot be cleared at one of them
