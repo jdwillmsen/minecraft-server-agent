@@ -119,9 +119,11 @@ func main() {
 	}()
 
 	// roster is the live XUID<->gamertag mapping, fed from PlayerList
-	// packets (see handlePlayerList). It serves two needs: join detection
-	// for the welcome plugin, and gamertag resolution for BridgeVoice.Tell
-	// (which only ever receives an XUID).
+	// packets while the agent is in the world (see handlePlayerList) and from
+	// the console bridge while it is deliberately out of it (see
+	// bridgeRoster). It serves two needs: join detection for the welcome
+	// plugin, and gamertag resolution for BridgeVoice.Tell (which only ever
+	// receives an XUID).
 	playerRoster := roster.New()
 
 	bridgeTimeout := time.Duration(cfg.ConsoleBridgeTimeoutMs) * time.Millisecond
@@ -299,21 +301,33 @@ func main() {
 
 	log.Info("starting", logging.Fields{"mc_host": cfg.MCHost, "mc_port": cfg.MCPort})
 
+	// Nothing decides presence yet, so the live agent is always in the world.
+	var gate sessionGate = alwaysPresent{}
+	// Built after withPlayerEvents has wrapped playerStore, so a name the
+	// follower resolves comes from the same store the session writes.
+	bridgeFollower := newBridgeRoster(bridgeClient, playerRoster, joins, playerStore, log)
+
 	// One pass of this loop is one turn as the live agent: wait for the lock,
-	// play until the process is shutting down or the lock is gone, then hand
-	// over. A process that loses the lock becomes a standby again rather than
-	// exiting -- the database blinking must not cost the server its agent,
-	// which is exactly what it cost before there was a lock at all.
+	// do the live agent's work until the process is shutting down or the lock
+	// is gone, then hand over. A process that loses the lock becomes a
+	// standby again rather than exiting -- the database blinking must not
+	// cost the server its agent, which is exactly what it cost before there
+	// was a lock at all.
+	//
+	// The turn and the session are separate lifecycles. The monitoring the
+	// lock entitles this process to runs for the whole turn. The session in
+	// the world runs only while the gate wants it, and while it does not,
+	// the roster is followed from the console bridge instead.
 	for ctx.Err() == nil {
 		term, live := awaitLeadership(ctx, election, httpServer.SetRole, log)
 		if !live {
 			break
 		}
-		// liveCtx ends with this turn, not with the process: the connect
-		// loop and every live-only writer below run under it, so losing the
-		// lock takes the agent out of the game without taking the process
-		// down. The claim on the Xbox Live login is opened and closed with
-		// it -- see beginTurn.
+		// liveCtx ends with this turn, not with the process: the sessions
+		// and every live-only writer below run under it, so losing the lock
+		// takes the agent out of the game without taking the process down.
+		// The claim on the Xbox Live login is opened and closed with it --
+		// see beginTurn.
 		//
 		// Standing down demotes the role ahead of both, so nothing that
 		// reads it acts on a game this process no longer has a claim to
@@ -330,7 +344,19 @@ func main() {
 		go watchForcedLeadership(liveCtx, term, log)
 		startLiveWork(liveCtx, cfg, bridgeTimeout, pinger, link, announceStore, deliverer, scheduleStore, moderationStore, log)
 
-		runConnectLoop(liveCtx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblings, permResolver, ans, playerStore, auditor, link, joins)
+		runSessions(liveCtx, gate, sessionModes{
+			present: func(sessionCtx context.Context) {
+				runConnectLoop(sessionCtx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblings, permResolver, ans, playerStore, auditor, link, joins)
+			},
+			// Leaving on purpose owes what a recycle owes: everyone still
+			// here keeps the time they were watched for, instead of the
+			// next connection's CloseOrphans rewriting it as unknown. No
+			// term, because the lock is not being passed on.
+			left: func() {
+				handover(liveCtx, nil, playerStore, playerRoster.Since(), log)
+			},
+			absent: bridgeFollower.run,
+		}, log)
 
 		endTurn()
 		// The agent is out of the game by now -- the connect loop waits for
