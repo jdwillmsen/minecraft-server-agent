@@ -25,6 +25,8 @@ type fakeBridgeFeed struct {
 	online  []string
 	listErr error
 	lists   int
+	// stamps carries on across restarts, as the wall clock does.
+	stamps int
 }
 
 var _ bridgeFeed = (*fakeBridgeFeed)(nil)
@@ -64,9 +66,11 @@ func (f *fakeBridgeFeed) log(kind, name, xuid string) {
 		verb = "disconnected"
 	}
 	f.nextID++
+	f.stamps++
 	f.events = append(f.events, adapters.BridgeEvent{
 		ID:     f.nextID,
 		Type:   kind,
+		Time:   time.Date(2026, 9, 23, 10, 0, f.stamps, 0, time.UTC),
 		Player: name,
 		Raw:    "[2026-09-23 10:00:00:000 INFO] Player " + verb + ": " + name + ", xuid: " + xuid,
 	})
@@ -83,6 +87,15 @@ func (f *fakeBridgeFeed) restart(online ...string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextID, f.events, f.online = 0, nil, online
+}
+
+// restartAndLog is the bridge restarting and logging a line before the
+// follower next polls, so the new line takes the ID the old log counted from.
+func (f *fakeBridgeFeed) restartAndLog(kind, name, xuid string, online ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID, f.events, f.online = 0, nil, online
+	f.log(kind, name, xuid)
 }
 
 // evictAndLog is the bridge's buffer filling while the follower is behind:
@@ -187,6 +200,37 @@ func TestBridgeRosterReseedsWhenTheBridgeRestarts(t *testing.T) {
 	waitUntil(t, func() bool {
 		return got.roster.IsOnline("222") && !got.roster.IsOnline("111")
 	}, "a restarted bridge was never noticed: the roster still holds the old population")
+}
+
+// A restarted bridge numbers from 1 again, so the event at a small cursor can
+// come back as a different line. Only the ID matching is not the same event.
+func TestBridgeRosterReseedsWhenARestartedBridgeReusesTheCursorID(t *testing.T) {
+	t.Run("a different line", func(t *testing.T) {
+		feed := &fakeBridgeFeed{}
+		feed.logged(adapters.BridgeEventConnect, "Steve", "111")
+		feed.listAnswers([]string{"Steve"}, nil)
+		got := startBridgeRoster(t, feed, recordedNames{}, time.Hour)
+		waitUntil(t, func() bool { return got.roster.IsOnline("111") }, "the first seed never landed")
+
+		feed.restartAndLog(adapters.BridgeEventConnect, "Alex", "222", "Alex")
+
+		waitUntil(t, func() bool {
+			return got.roster.IsOnline("222") && !got.roster.IsOnline("111")
+		}, "a restart whose first line reused the cursor's ID was never noticed")
+	})
+	t.Run("the same line logged later", func(t *testing.T) {
+		feed := &fakeBridgeFeed{}
+		feed.logged(adapters.BridgeEventConnect, "Steve", "111")
+		feed.listAnswers([]string{"Steve"}, nil)
+		got := startBridgeRoster(t, feed, recordedNames{}, time.Hour)
+		waitUntil(t, func() bool { return got.roster.IsOnline("111") }, "the first seed never landed")
+		seeds := feed.listCalls()
+
+		feed.restartAndLog(adapters.BridgeEventConnect, "Steve", "111", "Steve")
+
+		waitUntil(t, func() bool { return feed.listCalls() > seeds },
+			"a restart that logged the same line at the cursor's ID was never reseeded")
+	})
 }
 
 // The bridge keeps a bounded log. A follower that falls behind finds the

@@ -95,7 +95,8 @@ func (b *bridgeRoster) retryAfter(failures int) time.Duration {
 }
 
 // seed replaces the roster with who `list` says is online and reports the
-// newest event ID it has already taken into account.
+// newest event it has already taken into account, or the zero event when the
+// backlog was empty.
 //
 // A refresh corrects a server the follower was already following, so it
 // keeps the join clock's connection and every arrival it holds, and reports
@@ -107,15 +108,15 @@ func (b *bridgeRoster) retryAfter(failures int) time.Duration {
 // from that cursor onward, and applying a join or a leave the list already
 // reflects changes nothing. Reading in the other order would lose any change
 // that landed between the two reads.
-func (b *bridgeRoster) seed(ctx context.Context, refresh bool) (int64, error) {
+func (b *bridgeRoster) seed(ctx context.Context, refresh bool) (adapters.BridgeEvent, error) {
+	var cursor adapters.BridgeEvent
 	backlog, err := b.feed.Events(ctx, 0)
 	if err != nil {
-		return 0, err
+		return cursor, err
 	}
-	var cursor int64
 	logged := make(map[string]string)
 	for _, e := range backlog {
-		cursor = e.ID
+		cursor = e
 		if e.Type == adapters.BridgeEventConnect {
 			if xuid := e.XUID(); xuid != "" {
 				logged[e.Player] = xuid
@@ -125,7 +126,7 @@ func (b *bridgeRoster) seed(ctx context.Context, refresh bool) (int64, error) {
 
 	names, err := b.feed.OnlinePlayers(ctx)
 	if err != nil {
-		return 0, err
+		return cursor, err
 	}
 	players := make([]roster.Entry, 0, len(names))
 	for _, name := range names {
@@ -197,34 +198,46 @@ func (b *bridgeRoster) seedFailed(err error, wasKnown bool) {
 // and it drops its oldest events once its buffer is full. Either way the
 // event at the cursor is missing, so each poll asks for it again: if it is
 // not the first event returned, what happened since the cursor cannot be
-// read back, and only a fresh seed can recover the population.
-func (b *bridgeRoster) follow(ctx context.Context, cursor int64) (reseedDue bool) {
+// read back, and only a fresh seed can recover the population. The ID alone
+// does not identify it, because a restarted bridge that has logged as many
+// lines hands the same ID to a different one, so its time and line must
+// match too.
+//
+// With no cursor, because the backlog was empty at the seed, a restart
+// leaves nothing to compare. Every event the new process logs is still
+// applied, and what happened while it was down waits for the periodic
+// reseed.
+func (b *bridgeRoster) follow(ctx context.Context, cursor adapters.BridgeEvent) (reseedDue bool) {
 	reseedAt := b.now().Add(b.reseed)
 	for b.wait(ctx, b.poll) {
 		if b.now().After(reseedAt) {
 			return true
 		}
-		events, err := b.feed.Events(ctx, max(cursor-1, 0))
+		events, err := b.feed.Events(ctx, max(cursor.ID-1, 0))
 		if err != nil {
 			// Kept, not cleared: the bridge holds its log across its own
 			// outage, and the next poll picks up where this one stopped.
 			b.log.Debug("bridge_roster_poll_failed", logging.Fields{"error": err.Error()})
 			continue
 		}
-		if cursor > 0 && (len(events) == 0 || events[0].ID != cursor) {
-			b.log.Info("bridge_roster_reset", logging.Fields{"cursor": cursor, "reason": "bridge restart or eviction"})
+		if cursor.ID > 0 && (len(events) == 0 || !sameEvent(events[0], cursor)) {
+			b.log.Info("bridge_roster_reset", logging.Fields{"cursor": cursor.ID, "reason": "bridge restart or eviction"})
 			connectionEnded(b.roster, b.joins)
 			return false
 		}
 		for _, e := range events {
-			if e.ID <= cursor {
+			if e.ID <= cursor.ID {
 				continue
 			}
 			b.apply(ctx, e)
-			cursor = e.ID
+			cursor = e
 		}
 	}
 	return false
+}
+
+func sameEvent(a, b adapters.BridgeEvent) bool {
+	return a.ID == b.ID && a.Time.Equal(b.Time) && a.Raw == b.Raw
 }
 
 // apply puts one connect or disconnect on the roster and the join clock, as
