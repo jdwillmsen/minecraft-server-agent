@@ -45,10 +45,13 @@ type bridgeRoster struct {
 	poll    time.Duration
 	reseed  time.Duration
 	log     *logging.Logger
+	now     func() time.Time
+	wait    func(ctx context.Context, d time.Duration) bool
 }
 
 func newBridgeRoster(feed bridgeFeed, r *roster.Roster, joins *joinTimes, archive nameArchive, log *logging.Logger) *bridgeRoster {
-	return &bridgeRoster{feed: feed, roster: r, joins: joins, archive: archive, poll: bridgeRosterPoll, reseed: bridgeRosterReseed, log: log}
+	return &bridgeRoster{feed: feed, roster: r, joins: joins, archive: archive, poll: bridgeRosterPoll, reseed: bridgeRosterReseed, log: log,
+		now: time.Now, wait: waitOrShutdown}
 }
 
 // run follows the server until ctx ends. It never returns early, because the
@@ -57,14 +60,38 @@ func (b *bridgeRoster) run(ctx context.Context) {
 	// Once nothing is following the bridge, what this learned stops being
 	// true, just as a dead connection's roster does.
 	defer connectionEnded(b.roster, b.joins)
-	refresh := false
+	refresh, known, failures := false, false, 0
 	for {
-		cursor, ok := b.seed(ctx, refresh)
-		refresh = ok && b.follow(ctx, cursor)
-		if !waitOrShutdown(ctx, b.poll) {
+		wait := b.poll
+		cursor, err := b.seed(ctx, refresh)
+		if err != nil {
+			b.seedFailed(err, known)
+			refresh, known = false, false
+			failures++
+			wait = b.retryAfter(failures)
+		} else {
+			known, failures = true, 0
+			refresh = b.follow(ctx, cursor)
+		}
+		if !b.wait(ctx, wait) {
 			return
 		}
 	}
+}
+
+// retryAfter spaces seeds that keep failing. Each one sends `list` to the
+// server's console, so a bridge that stays down would otherwise be asked
+// every poll for as long as it is gone. It is capped at the reseed
+// interval, which is already how stale a roster that is working may be.
+func (b *bridgeRoster) retryAfter(failures int) time.Duration {
+	d := b.poll
+	for range failures - 1 {
+		if d >= b.reseed {
+			break
+		}
+		d *= 2
+	}
+	return min(d, b.reseed)
 }
 
 // seed replaces the roster with who `list` says is online and reports the
@@ -80,11 +107,10 @@ func (b *bridgeRoster) run(ctx context.Context) {
 // from that cursor onward, and applying a join or a leave the list already
 // reflects changes nothing. Reading in the other order would lose any change
 // that landed between the two reads.
-func (b *bridgeRoster) seed(ctx context.Context, refresh bool) (int64, bool) {
+func (b *bridgeRoster) seed(ctx context.Context, refresh bool) (int64, error) {
 	backlog, err := b.feed.Events(ctx, 0)
 	if err != nil {
-		b.seedFailed(err)
-		return 0, false
+		return 0, err
 	}
 	var cursor int64
 	logged := make(map[string]string)
@@ -99,8 +125,7 @@ func (b *bridgeRoster) seed(ctx context.Context, refresh bool) (int64, bool) {
 
 	names, err := b.feed.OnlinePlayers(ctx)
 	if err != nil {
-		b.seedFailed(err)
-		return 0, false
+		return 0, err
 	}
 	players := make([]roster.Entry, 0, len(names))
 	for _, name := range names {
@@ -123,7 +148,7 @@ func (b *bridgeRoster) seed(ctx context.Context, refresh bool) (int64, bool) {
 		b.joins.connected()
 	}
 	b.log.Info("bridge_roster_seeded", logging.Fields{"players": len(players), "unresolved": len(names) - len(players), "refresh": refresh})
-	return cursor, true
+	return cursor, nil
 }
 
 // refreshed tells the join clock what a refresh changed: a player it found
@@ -150,11 +175,17 @@ func (b *bridgeRoster) refreshed(before []string, after []roster.Entry) {
 
 // seedFailed drops what an earlier seed reported. A roster that cannot be
 // refreshed must say it does not know, not repeat a population that may have
-// left. Debug for the same reason as tps_sample_failed: a bridge outage would
-// otherwise add a line every poll.
-func (b *bridgeRoster) seedFailed(err error) {
+// left. Losing a roster that was known is a warning; the retries after it
+// are Debug for the same reason as tps_sample_failed, since an outage would
+// otherwise add a line every retry.
+func (b *bridgeRoster) seedFailed(err error, wasKnown bool) {
 	connectionEnded(b.roster, b.joins)
-	b.log.Debug("bridge_roster_seed_failed", logging.Fields{"error": err.Error()})
+	fields := logging.Fields{"error": err.Error()}
+	if wasKnown {
+		b.log.Warn("bridge_roster_seed_failed", fields)
+		return
+	}
+	b.log.Debug("bridge_roster_seed_failed", fields)
 }
 
 // follow applies the bridge's events after cursor until ctx ends, the log
@@ -168,9 +199,9 @@ func (b *bridgeRoster) seedFailed(err error) {
 // not the first event returned, what happened since the cursor cannot be
 // read back, and only a fresh seed can recover the population.
 func (b *bridgeRoster) follow(ctx context.Context, cursor int64) (reseedDue bool) {
-	reseedAt := time.Now().Add(b.reseed)
-	for waitOrShutdown(ctx, b.poll) {
-		if time.Now().After(reseedAt) {
+	reseedAt := b.now().Add(b.reseed)
+	for b.wait(ctx, b.poll) {
+		if b.now().After(reseedAt) {
 			return true
 		}
 		events, err := b.feed.Events(ctx, max(cursor-1, 0))
