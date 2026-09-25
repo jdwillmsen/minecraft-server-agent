@@ -50,3 +50,23 @@ func TruncateEllipsis(s string, limit int) string {
 	}
 	return Truncate(s, limit-len(ellipsis)) + ellipsis
 }
+
+// FoldASCII lowercases only the ASCII letters in s; every other byte,
+// including each byte of a multi-byte UTF-8 rune, is left alone.
+//
+// Every gamertag comparison in this repo -- presence config validation, the
+// roster, chat matching -- folds through here rather than strings.ToLower,
+// so a name can only collide with another by the exact ASCII spelling an
+// operator typed. Full Unicode case folding would accept collisions nobody
+// configured (the Kelvin sign folds to "k"), and mirrors mc-console-bridge's
+// own kick-name folding, since the two agree on which gamertags are the same
+// one.
+func FoldASCII(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}

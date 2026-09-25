@@ -79,3 +79,33 @@ func TestTruncateEllipsisBelowEllipsisWidthDropsIt(t *testing.T) {
 		}
 	}
 }
+
+func TestFoldASCIILowersOnlyASCIILetters(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"JdwAgent", "jdwagent"},
+		{"jdwagent", "jdwagent"},
+		{"", ""},
+		{"Já Né", "já né"},
+	}
+	for _, tc := range cases {
+		if got := FoldASCII(tc.in); got != tc.want {
+			t.Errorf("FoldASCII(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestFoldASCIILeavesNonASCIICaseAlone(t *testing.T) {
+	// The Kelvin sign folds to "k" under full Unicode case folding but must
+	// not here: an operator who never typed "k" never configured a match
+	// for it.
+	kelvin := "K" // KELVIN SIGN
+	if got := FoldASCII(kelvin); got != kelvin {
+		t.Errorf("FoldASCII(%q) = %q, want it left unchanged", kelvin, got)
+	}
+}
+
+func TestFoldASCIIMakesEquivalentGamertagsEqual(t *testing.T) {
+	if FoldASCII("JdwAgent") != FoldASCII("jdwagent") {
+		t.Errorf("FoldASCII disagreed on gamertags that differ only in ASCII case")
+	}
+}
