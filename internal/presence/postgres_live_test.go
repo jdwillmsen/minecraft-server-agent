@@ -4,7 +4,7 @@
 // as the runtime role. The version rules are enforced by these statements
 // and nothing else, so only a real database can say they hold.
 //
-//	MC_TEST_DSN=postgres://app:...@127.0.0.1:55432/jdwillmsen_prd?sslmode=disable \
+//	MC_TEST_DSN=postgres://app:...@127.0.0.1:55432/presence_test?sslmode=disable \
 //	  go test -tags livedb ./internal/presence/
 package presence
 
