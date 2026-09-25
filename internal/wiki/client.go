@@ -99,6 +99,11 @@ func Format(title, sectionPath, body string, others []string) string {
 	return out
 }
 
+// Enabled reports that a configured Client always answers -- the plugin.Wiki
+// contract exists for wiki.Nop, the implementation that stands in when no
+// Client was built at all.
+func (c *Client) Enabled() bool { return true }
+
 func (c *Client) Lookup(ctx context.Context, topic, aspect string) (string, error) {
 	topic = text.Truncate(strings.TrimSpace(topic), maxTopicChars)
 	aspect = text.Truncate(strings.TrimSpace(aspect), maxAspectChars)

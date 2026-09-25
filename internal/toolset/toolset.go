@@ -9,6 +9,7 @@ package toolset
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/knowledge"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/wiki"
 )
 
 // CallerScoped records whether a tool that reads the asking player's own
@@ -257,6 +259,38 @@ func Build(pctx *plugin.Context) (*tools.Registry, *CallerScoped) {
 			Schema:      noArgs,
 			Invoke: func(ctx context.Context, _ json.RawMessage, _ string) (string, error) {
 				return pctx.ServerInfo.BackupStatus(ctx)
+			},
+		})
+	}
+
+	if pctx.Wiki != nil && pctx.Wiki.Enabled() {
+		list = append(list, tools.Tool{
+			Name:        "wiki_lookup",
+			Description: "Look up how Minecraft itself works on minecraft.wiki: items, blocks, mobs, recipes and game mechanics. Not for anything about this server.",
+			Schema: json.RawMessage(`{"type":"object","properties":{` +
+				`"topic":{"type":"string","description":"The item, block, mob or mechanic, e.g. 'iron golem' or 'torch'."},` +
+				`"aspect":{"type":"string","description":"Optional part of the page, e.g. 'crafting', 'spawning', 'drops'. Leave out to get a summary and the list of sections."}},` +
+				`"required":["topic"]}`),
+			MaxResultChars: 1200,
+			Invoke: func(ctx context.Context, args json.RawMessage, _ string) (string, error) {
+				var a struct {
+					Topic  string `json:"topic"`
+					Aspect string `json:"aspect"`
+				}
+				if err := json.Unmarshal(args, &a); err != nil {
+					return "", fmt.Errorf("wiki_lookup: bad arguments: %w", err)
+				}
+				out, err := pctx.Wiki.Lookup(ctx, a.Topic, a.Aspect)
+				// Returned as results, not errors: the loop would replace an
+				// error with its generic unavailable line, and "no such page"
+				// is a different thing for the model to say.
+				switch {
+				case errors.Is(err, wiki.ErrNotFound):
+					return fmt.Sprintf("no minecraft.wiki page found for %q", a.Topic), nil
+				case err != nil:
+					return "minecraft.wiki is unavailable right now", nil
+				}
+				return out, nil
 			},
 		})
 	}
