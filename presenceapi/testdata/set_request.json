@@ -1,0 +1,11 @@
+{
+  "state": "parked",
+  "duration": "2h",
+  "wake_on": {
+    "players": [
+      "Jdwillmsen"
+    ]
+  },
+  "reason": "chunk budget for the build",
+  "version": 0
+}

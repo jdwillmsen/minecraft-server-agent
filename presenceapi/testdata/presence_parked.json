@@ -1,0 +1,16 @@
+{
+  "actor_id": "afk-bot-1",
+  "effective": "parked",
+  "default": "present",
+  "override": {
+    "state": "parked",
+    "until": "2026-09-23T20:00:00Z",
+    "wake_on": {
+      "any_player_join": true
+    },
+    "reason": "chunk budget for the build",
+    "set_by": "api:tools-mc",
+    "set_at": "2026-09-23T18:00:00Z",
+    "version": 3
+  }
+}

@@ -39,6 +39,13 @@ jobs:
       - name: go test
         run: go test -race ./...
 
+      # A module of its own, so the root's ./... never reaches it.
+      - name: presenceapi
+        working-directory: presenceapi
+        run: |
+          go vet ./...
+          go test -race ./...
+
   docker:
     runs-on: ubuntu-latest
     steps:
