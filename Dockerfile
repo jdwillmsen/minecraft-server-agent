@@ -1,7 +1,10 @@
 FROM golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b AS build
 WORKDIR /src
 
+# The contract module is a local replace target, so go mod download needs
+# its go.mod before the rest of the source arrives.
 COPY go.mod go.sum ./
+COPY presenceapi/go.mod presenceapi/
 RUN go mod download
 
 COPY . .
