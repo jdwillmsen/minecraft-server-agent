@@ -164,6 +164,16 @@ type Config struct {
 	// absent one, and never open.
 	AnnounceAPIToken string
 
+	// PresenceActors is every account that puts a player into the world, from
+	// PRESENCE_ACTORS. Empty turns presence control off entirely: the agent is
+	// always in the world, as before it existed.
+	PresenceActors []PresenceActor
+	// PresenceTokens authorise the /v1 presence routes. Empty leaves them
+	// unmounted, on the same terms as AnnounceAPIToken.
+	PresenceTokens []PresenceToken
+	// PresenceSelfID is which of PresenceActors this process is.
+	PresenceSelfID string
+
 	// Logging.
 	LogLevel string
 }
@@ -276,6 +286,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	presenceActors, presenceTokens, presenceSelf, err := loadPresence()
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
 		MCHost:                    host,
@@ -311,6 +325,9 @@ func Load() (Config, error) {
 		ConsoleBridgeTimeoutMs:    bridgeTimeout,
 		ModerationTerms:           commaList("MODERATION_TERMS"),
 		AnnounceAPIToken:          stringDefault("ANNOUNCE_API_TOKEN", ""),
+		PresenceActors:            presenceActors,
+		PresenceTokens:            presenceTokens,
+		PresenceSelfID:            presenceSelf,
 		LogLevel:                  strings.ToLower(stringDefault("LOG_LEVEL", "info")),
 	}
 	return cfg, nil
