@@ -41,6 +41,7 @@ type options struct {
 	label         string
 	out           string
 	trace         string
+	maxToolRounds int
 }
 
 // traceLine is one case's raw exchanges. The report shows what the agent
@@ -69,6 +70,10 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	if err != nil {
 		return o, err
 	}
+	maxToolRounds, err := envInt("MAX_TOOL_ROUNDS", adapters.DefaultMaxToolRounds)
+	if err != nil {
+		return o, err
+	}
 
 	fs := flag.NewFlagSet("evalllm", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -78,6 +83,7 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	fs.IntVar(&o.maxTokens, "max-tokens", maxTokens, "max tokens per call (LLM_MAX_TOKENS)")
 	fs.IntVar(&timeoutMs, "timeout-ms", timeoutMs, "per-call timeout (LLM_TIMEOUT_MS)")
 	fs.IntVar(&totalMs, "total-timeout-ms", totalMs, "whole-answer timeout (LLM_TOTAL_TIMEOUT_MS)")
+	fs.IntVar(&o.maxToolRounds, "max-tool-rounds", maxToolRounds, "tool rounds per answer (MAX_TOOL_ROUNDS)")
 	budgetMs := fs.Int("latency-budget-ms", 0, "latency pass threshold per answer (default: the per-call timeout)")
 	only := fs.String("only", "", "regexp: run only cases whose id or category matches")
 	fs.StringVar(&o.label, "label", "evaluation", "title for the report, e.g. baseline")
@@ -179,7 +185,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	r := runner{
-		client:   adapters.NewLLMClient(localURL, o.model, o.apiKey, o.maxTokens, o.timeout, nil),
+		client:   adapters.NewLLMClient(localURL, o.model, o.apiKey, o.maxTokens, o.timeout, nil, adapters.WithMaxToolRounds(o.maxToolRounds)),
 		recorder: recorder,
 		total:    o.total,
 		world:    fixtureContext,
