@@ -3,6 +3,7 @@ package presence
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/presenceapi"
 )
@@ -37,9 +38,11 @@ type Store interface {
 	// Clear removes the rows of ids in one statement; an id with no row is
 	// not in the result.
 	Clear(ctx context.Context, ids []string) ([]Change, error)
-	// Remove deletes actorID's row only while it is still at version, and
-	// reports whether it did.
-	Remove(ctx context.Context, actorID string, version int64) (bool, error)
+	// Remove deletes actorID's row only while it is still the one set at
+	// setAt with version, and reports whether it did. The version alone is
+	// not enough: a removed row takes its count with it, so a re-park starts
+	// again at 1.
+	Remove(ctx context.Context, actorID string, version int64, setAt time.Time) (bool, error)
 	Statuses(ctx context.Context) (map[string]presenceapi.Status, error)
 	PutStatus(ctx context.Context, actorID string, s presenceapi.Status) error
 	Enabled() bool
@@ -60,7 +63,7 @@ func (Nop) SetMany(context.Context, map[string]presenceapi.Override) ([]Change, 
 	return nil, ErrDisabled
 }
 func (Nop) Clear(context.Context, []string) ([]Change, error)               { return nil, ErrDisabled }
-func (Nop) Remove(context.Context, string, int64) (bool, error)             { return false, ErrDisabled }
+func (Nop) Remove(context.Context, string, int64, time.Time) (bool, error)  { return false, ErrDisabled }
 func (Nop) Statuses(context.Context) (map[string]presenceapi.Status, error) { return nil, ErrDisabled }
 func (Nop) PutStatus(context.Context, string, presenceapi.Status) error     { return ErrDisabled }
 func (Nop) Enabled() bool                                                   { return false }

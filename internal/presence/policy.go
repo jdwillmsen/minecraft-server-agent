@@ -25,8 +25,8 @@ const (
 )
 
 // Removal is an override the policy says has ended. Override is the row as
-// it was read: its Version is what makes the removal safe against a newer
-// write landing in between.
+// it was read: its Version and SetAt together are what make the removal safe
+// against a newer write, or a re-park, landing in between.
 type Removal struct {
 	ActorID  string
 	Cause    Cause

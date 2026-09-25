@@ -192,6 +192,24 @@ func TestLoopDoesNotRemoveANewerOverride(t *testing.T) {
 	}
 }
 
+// Versions restart at 1 once a row is gone, so an unpark and a re-park
+// between the loop's read and its removal leave a row at the version it
+// read. Only the time it was set tells the two apart.
+func TestLoopDoesNotRemoveAReparkThatReusedTheVersion(t *testing.T) {
+	r := newLoopRig(t)
+	until := t0.Add(time.Minute)
+	r.set(t, "afk-bot-1", Request{State: presenceapi.StateParked, Until: &until, Reason: "r"})
+	r.clock = until
+	r.store.reparkOnRemove = func(ov presenceapi.Override) presenceapi.Override {
+		ov.Until, ov.SetAt, ov.Reason = nil, until.Add(-time.Second), "parked again"
+		return ov
+	}
+	r.loop.tick(t.Context())
+	if row, ok := r.store.row("afk-bot-1"); !ok || row.Reason != "parked again" {
+		t.Errorf("row = %+v, %v; the loop removed a re-park as the expired override it replaced", row, ok)
+	}
+}
+
 func TestLoopSkipsATickItCannotRead(t *testing.T) {
 	r := newLoopRig(t)
 	r.set(t, "agent", Request{State: presenceapi.StateParked, Reason: "r"})
