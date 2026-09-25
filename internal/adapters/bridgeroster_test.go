@@ -116,3 +116,14 @@ func TestParseListRefusesACountItCannotAccountFor(t *testing.T) {
 		}
 	}
 }
+
+func TestBridgeEvent_DecodesTheBackfillFlag(t *testing.T) {
+	var got []BridgeEvent
+	body := `[{"id":1,"type":"connect","time":"2026-09-23T10:00:00Z","player":"Steve","raw":"x","backfill":true},{"id":2,"type":"connect","time":"2026-09-23T10:00:00Z","player":"Alex","raw":"y"}]`
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !got[0].Backfill || got[1].Backfill {
+		t.Errorf("Backfill = %v, %v; want true for the replayed line and false for one without the flag", got[0].Backfill, got[1].Backfill)
+	}
+}
