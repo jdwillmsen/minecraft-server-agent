@@ -29,6 +29,9 @@ type presenceRuntime struct {
 	loop   *presence.Loop
 	api    *presence.API
 	plugin *presence.ChatPlugin
+	// looped closes when the last turn's loop has returned. Only lead reads
+	// or writes it, and turns never overlap.
+	looped chan struct{}
 }
 
 // newPresence builds every presence part from configuration. It is called
@@ -93,12 +96,24 @@ func (p *presenceRuntime) sessionGate() sessionGate {
 // lead starts presence's share of a turn as the live agent. The first tick
 // runs before it returns, so the gate holds the stored answer by the time
 // the session lifecycle first asks it.
+//
+// The last turn's loop may still be finishing a tick after its context
+// ended. It withdraws its gauges as it returns, so starting before then
+// would let it wipe the ones this turn exports.
 func (p *presenceRuntime) lead(ctx context.Context) {
 	if !p.svc.Enabled() {
 		return
 	}
+	if p.looped != nil {
+		<-p.looped
+	}
 	p.loop.Prime(ctx)
-	go p.loop.Run(ctx)
+	looped := make(chan struct{})
+	p.looped = looped
+	go func() {
+		defer close(looped)
+		p.loop.Run(ctx)
+	}()
 }
 
 // presenceModes adds what presence needs around the session modes.
