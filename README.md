@@ -345,6 +345,9 @@ without that gauge beside them there is nothing on the graph to say so.
 | `BACKUP_EXPORTER_URL` | *(empty)* | Backup exporter's `/metrics.txt` behind `!backup`; unset reports the command unconfigured rather than erroring |
 | `MODERATION_TERMS` | *(empty disables the term rule)* | Comma-separated terms whose use in public chat is flagged, matched case-insensitively as whole words; blanks between commas are ignored. The flood and caps rules need no configuration |
 | `ANNOUNCE_API_TOKEN` | *(empty disables the API)* | Bearer token for `POST /announcements`. Optional: unset leaves the route unmounted, so it answers 404 like any path that was never there - a disabled API is indistinguishable from an absent one and is never open. Created by a human, never by an agent |
+| `PRESENCE_ACTORS` | *(empty disables presence)* | JSON list of every account that puts a player into the world: `[{"id","gamertag","kind","groups":[...],"default_state"}]`. `id` matches `^[a-z0-9][a-z0-9-]{0,62}$`, `kind` is `agent` or `afk-bot`, `default_state` is `present` or `parked`, and `all` is an implicit group. Rendered by the chart from the same values list as the bot Deployments. Unset keeps the agent always in the world, as before |
+| `PRESENCE_TOKENS` | *(empty disables the API)* | JSON list of `/v1` bearer tokens: `[{"name","token","scopes":[...],"actor"}]`. Scopes are `presence:read`, `presence:write` and `presence:report`. `actor` binds a token to one actor, and every `presence:report` token needs one. Tokens are at least 16 characters. Unset leaves `/v1` unmounted. Created by a human, never by an agent |
+| `PRESENCE_SELF_ID` | `agent` | Which actor in `PRESENCE_ACTORS` this process is; it must be of kind `agent` |
 | `LOG_LEVEL` | `info` | `info` or `debug` |
 
 ## Metrics
@@ -374,6 +377,10 @@ breaking change.
 | `mc_agent_session_established_timestamp_seconds` | gauge | none | when a session last reached spawn |
 | `mc_agent_sessions_total` | counter | none | per session that reached spawn |
 | `mc_agent_session_recycles_total` | counter | none | per session ended by the recycle schedule |
+| `mc_presence_desired` | gauge | `actor` | per policy tick on the leader: 1 present, 0 parked |
+| `mc_presence_observed` | gauge | `actor` | per policy tick on the leader: 1 when the actor's own report says connected and is under 60s old (the agent reads its own session), 0 otherwise |
+| `mc_presence_override_age_seconds` | gauge | `actor` | per policy tick, only for an override with no `until`; absent otherwise |
+| `mc_presence_kicks_total` | counter | `actor` | per `kick` sent for an actor still listed 20s after it was parked; starts at zero |
 
 Every label is bounded by construction; nothing a player types or a model
 invents reaches one unfiltered:
@@ -417,6 +424,13 @@ first measured, and a failed measurement never resets them: a zero would
 read as a crashed server or a perfect link. How old the TPS figure is comes
 from the success timestamp, which starts at 0 so a measurement that never
 succeeds reads as stale rather than as missing.
+
+The `mc_presence_*` gauges exist only on the pod that leads, and they are
+withdrawn when it stops leading, so a standby never exports a stale view beside
+the leader's. `actor` is always an id from `PRESENCE_ACTORS`. An actor that
+should be present and is not reads desired 1 and observed 0, which is what the
+degraded and disconnected alerts are written against. A deliberate park reads
+0 and 0, and pages nobody.
 
 ## Proving the server can still be joined
 
@@ -1076,6 +1090,86 @@ read. With the variable unset the route is not mounted at all. The token is
 never minted by an agent: a human creates it, in a terminal outside any
 agent session, and until then the API stays off while everything else runs.
 
+## Parking actors
+
+Every actor that puts a player into the world keeps chunks loaded around it.
+Parking an actor disconnects it, which releases those chunks. Git stays the
+baseline: each actor has a `default_state` in `PRESENCE_ACTORS`, and a park
+is a runtime override with an owner, a reason and usually an expiry. Clearing
+an override always falls back to what git says. Overrides live in Postgres
+(`minecraft.presence_overrides`), so they survive restarts, rollouts and
+leader handovers.
+
+The leader runs a policy loop every 10 seconds. It removes overrides whose
+`until` has passed and wakes those whose `wake_on` player has joined. It also
+sends `kick <gamertag>` through the console bridge for any actor that is
+still in the server's `list` 20 seconds after it was parked, because Bedrock
+keeps a session open after the client goes - but only once its own roster
+still shows that actor online; a roster the loop cannot currently read (a
+session gap, a bridge outage) is left alone rather than polled with `list`
+every tick. The agent itself is an actor. Parked, it leaves the world and
+keeps monitoring through the bridge. While it is parked it reads no chat, so
+chat commands and `@server` questions are unavailable until it is back.
+
+### From chat
+
+| Command | Who | Effect |
+|---|---|---|
+| `!presence` | member | Each actor's effective state, who set it and until when |
+| `!park <actor\|group\|all> [duration]` | operator | Park. With no duration a bot stays parked until unparked |
+| `!unpark <actor\|group\|all>` | operator | Remove the override; the actor returns to its default |
+| `!leave [duration]`, `@server leave [duration]` | operator | Park the agent |
+
+A park of the agent from chat, including `!park all`, always comes back by
+itself. It lasts one hour, or the duration given, and it ends early as soon
+as a player joins. The agent says so before it leaves, and says it is back
+when it rejoins. Durations use Go syntax: `30m`, `2h`. A write is saved
+before it is announced, so a park that failed to save is never announced as
+having happened; `@server leave` runs through the same registered command as
+`!leave`, so it gets the same permission check, rate limit and audit row.
+
+### Over HTTP
+
+Mounted on `HTTP_ADDR` when `PRESENCE_TOKENS` is set. Every replica answers
+from Postgres, the standby included.
+
+| Method and path | Scope | Answers |
+|---|---|---|
+| `GET /v1/actors` | `presence:read` | every actor with default, override, effective and observed state |
+| `GET /v1/actors/{id}/presence` | `presence:read` | effective state; `ETag: "<version>-<effective>"`, 304 on `If-None-Match` |
+| `PUT /v1/actors/{id}/presence` | `presence:write` | set an override; stale `version` is 409 with the current row |
+| `DELETE /v1/actors/{id}/presence` | `presence:write` | remove the override |
+| `PUT /v1/groups/{group}/presence` | `presence:write` | set every member in one transaction; `version` ignored |
+| `POST /v1/actors/{id}/status` | `presence:report` | a bot's own observed status; the token must be bound to `id` - 403 otherwise, including an unbound token |
+
+```sh
+curl -sS -X PUT http://<release>-server-agent:8080/v1/actors/afk-bot-1/presence \
+  -H "Authorization: Bearer $PRESENCE_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"state":"parked","duration":"2h","reason":"chunk budget for the build","version":0}'
+```
+
+`version` is the override version the caller last read. It is 0 for "I
+expect no override", and a mismatch answers 409 with the current row in
+`current`. `until` and `duration` are exclusive, and a duration is resolved on
+the agent's clock. Every error body is `{"code","message"}`, where `code` is
+one of `not_found`, `conflict`, `forbidden`, `unauthorized`, `invalid` or
+`unavailable`. A database that cannot answer is a 503, and the bots keep
+acting on their last answer. A token bound to one actor (every
+`presence:report` token, and any bound `presence:write` token) may change
+only that actor and may never write a group. The request and response types
+live in the `github.com/jdwillmsen/minecraft-server-agent/presenceapi`
+module, which imports nothing beyond the standard library.
+
+Every override write, removal and wake is also recorded in
+`minecraft.command_audit` with `command = 'presence'`. The `args` column
+reads `actor=… from=… to=… cause=set|cleared|expired|woken source=… reason="…"`.
+For an API write, `xuid` holds `api:<token-name>` - the CLI is a thin client
+over this same API, so its own token (named `tools-mc`) records `api:tools-mc`
+like any other. For the loop's own removals it holds `presence-loop`.
+
+`replicas: 0` in the chart remains the way to take a bot away for
+maintenance. For gameplay, park it.
+
 ## Targeting a reply
 
 `Voice.Tell` only ever receives an XUID, but Bedrock's `tellraw` needs a
@@ -1526,6 +1620,12 @@ reuses the two most recently seen `minecraft.players` rows, because
 `minecraft.waypoints` has a NOT NULL foreign key to them, and skips when the
 table holds fewer than two. Both write and delete rows keyed to the test that
 wrote them, so point them at a disposable database.
+
+`internal/presence` has them too, against `minecraft.presence_overrides` and
+`minecraft.presence_status` from `V8__minecraft_presence.sql`: the version
+rules, the group transaction, and a leader handover in which a second process
+removes the first one's expired override. Apply V8 after the earlier
+migrations and run `go test -tags livedb ./internal/presence/`.
 
 `internal/announce` and `internal/audit` follow the same pattern - a
 `livedb`-tagged test in each package. Their tables come from two further
