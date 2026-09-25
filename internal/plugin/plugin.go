@@ -222,6 +222,10 @@ type Context struct {
 	// both are guarded at every use for the same reason Profiles is.
 	Knowledge KnowledgeStore
 	Waypoints WaypointStore
+	// Wiki may be nil, on the same terms as Knowledge and Waypoints: cmd/agent
+	// always supplies one -- wiki.Nop when WIKI_ENABLED is off -- and every
+	// use asks Enabled first, so no wiki tool exists while it is disabled.
+	Wiki Wiki
 	// Announcements and Deliverer may be nil, on the same terms: cmd/agent
 	// always supplies both, and every use asks AnnouncementsReady rather
 	// than assuming it.
@@ -284,6 +288,15 @@ type KnowledgeStore interface {
 	Upsert(ctx context.Context, topic, body, authorXUID string) error
 	Delete(ctx context.Context, topic string) (removed bool, err error)
 	List(ctx context.Context) ([]knowledge.Entry, error)
+	Enabled() bool
+}
+
+// Wiki answers how the game itself works. Lookup returns text ready for the
+// model, or one of wiki.ErrNotFound, wiki.ErrUnavailable, wiki.ErrLimited.
+// Enabled reports whether a wiki is configured; when false, no wiki tool
+// exists.
+type Wiki interface {
+	Lookup(ctx context.Context, topic, aspect string) (string, error)
 	Enabled() bool
 }
 

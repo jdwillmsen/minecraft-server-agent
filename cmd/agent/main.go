@@ -48,6 +48,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/tools"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/toolset"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/wiki"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/liveness"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/mcauth"
@@ -1025,6 +1026,8 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 		// configured, the disabled implementation when not, never nil.
 		Knowledge: knowledgeStore,
 		Waypoints: waypointStore,
+		// The disabled implementation until the wiki is configured, never nil.
+		Wiki: wiki.Nop{},
 		// Same reasoning as Profiles again -- pool-backed when a database is
 		// configured, the disabled implementation when not, never nil, even
 		// though the field is documented as possibly nil for tests that
