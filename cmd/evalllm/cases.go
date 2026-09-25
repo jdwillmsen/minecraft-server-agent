@@ -159,3 +159,24 @@ func selectCases(cases []Case, only *regexp.Regexp) []Case {
 	}
 	return out
 }
+
+// filterWiki drops every category-wiki case when wikiOn is false, mirroring
+// production with WIKI_ENABLED off: wiki_lookup is never registered there
+// (see fixtureContext), so a wiki case could only fail on tool selection --
+// a result about the toolset, not about the question a wiki-off run is
+// asking. It reports how many it dropped, for the report to state.
+func filterWiki(cases []Case, wikiOn bool) ([]Case, int) {
+	if wikiOn {
+		return cases, 0
+	}
+	kept := make([]Case, 0, len(cases))
+	skipped := 0
+	for _, c := range cases {
+		if c.Category == "wiki" {
+			skipped++
+			continue
+		}
+		kept = append(kept, c)
+	}
+	return kept, skipped
+}

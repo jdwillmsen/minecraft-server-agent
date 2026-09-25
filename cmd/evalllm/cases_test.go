@@ -136,3 +136,38 @@ func TestFixtureFactsComeFromTheCannedAnswers(t *testing.T) {
 		}
 	}
 }
+
+func TestFilterWikiSkipsWikiCategoryCases(t *testing.T) {
+	cases, err := loadCases("../../eval/cases.yaml", fixtureToolNames())
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := len(cases)
+	wantWiki := 0
+	for _, c := range cases {
+		if c.Category == "wiki" {
+			wantWiki++
+		}
+	}
+	if wantWiki == 0 {
+		t.Fatal("committed cases have no wiki case to skip")
+	}
+
+	on, skippedOn := filterWiki(cases, true)
+	if len(on) != total || skippedOn != 0 {
+		t.Errorf("wiki on: kept %d (want %d), skipped %d (want 0)", len(on), total, skippedOn)
+	}
+
+	off, skippedOff := filterWiki(cases, false)
+	if skippedOff != wantWiki {
+		t.Errorf("wiki off: skipped %d, want %d", skippedOff, wantWiki)
+	}
+	if len(off) != total-wantWiki {
+		t.Errorf("wiki off: kept %d, want %d", len(off), total-wantWiki)
+	}
+	for _, c := range off {
+		if c.Category == "wiki" {
+			t.Errorf("wiki off still kept %s", c.ID)
+		}
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 )
 
 // scriptedBackend answers each chat-completions call with the next canned
@@ -70,7 +71,7 @@ func newTestRunner(t *testing.T, backend http.Handler) runner {
 		client:   adapters.NewLLMClient(base, "test-model", "k", 192, 2*time.Second, nil),
 		recorder: recorder,
 		total:    5 * time.Second,
-		world:    fixtureContext,
+		world:    func() *plugin.Context { return fixtureContext(true) },
 	}
 }
 

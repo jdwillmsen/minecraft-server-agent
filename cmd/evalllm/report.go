@@ -21,6 +21,11 @@ type reportMeta struct {
 	Total         time.Duration
 	LatencyBudget time.Duration
 	MaxToolRounds int
+	// Wiki is whether wiki_lookup was offered this run. WikiCasesSkipped is
+	// how many category-wiki cases were left out because it was not --
+	// a reader comparing two reports needs both, not just the case count.
+	Wiki             bool
+	WikiCasesSkipped int
 }
 
 func writeReport(w io.Writer, meta reportMeta, results []Result) error {
@@ -33,7 +38,12 @@ func writeReport(w io.Writer, meta reportMeta, results []Result) error {
 	fmt.Fprintf(&b, "| Run | %s |\n", meta.Started.UTC().Format("2006-01-02 15:04 UTC"))
 	fmt.Fprintf(&b, "| Settings | max_tokens %d, per-call timeout %s, total %s, %d tool rounds, latency budget %s |\n",
 		meta.MaxTokens, seconds(meta.Timeout), seconds(meta.Total), meta.MaxToolRounds, seconds(meta.LatencyBudget))
-	fmt.Fprintf(&b, "| Cases | %d |\n\n", len(results))
+	fmt.Fprintf(&b, "| Cases | %d |\n", len(results))
+	if meta.Wiki {
+		b.WriteString("| Wiki | on |\n\n")
+	} else {
+		fmt.Fprintf(&b, "| Wiki | off (%d wiki case%s skipped) |\n\n", meta.WikiCasesSkipped, plural(meta.WikiCasesSkipped))
+	}
 
 	passed := 0
 	for _, r := range results {
@@ -148,6 +158,13 @@ func percentile(sorted []time.Duration, p float64) time.Duration {
 	}
 	i := int(math.Ceil(p*float64(len(sorted)))) - 1
 	return sorted[max(0, min(i, len(sorted)-1))]
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 var cellEscaper = strings.NewReplacer("|", `\|`, "\r", " ", "\n", " ")

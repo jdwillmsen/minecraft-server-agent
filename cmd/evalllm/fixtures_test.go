@@ -22,7 +22,7 @@ const partialMarker = "no entry for what was asked"
 // the registry the eval run itself builds.
 func fixtureLookup(t *testing.T, query string) string {
 	t.Helper()
-	registry, _ := toolset.Build(fixtureContext())
+	registry, _ := toolset.Build(fixtureContext(true))
 	args, err := json.Marshal(struct {
 		Query string `json:"query"`
 	}{query})
@@ -99,5 +99,16 @@ func TestFixtureWikiAnswersInProductionShape(t *testing.T) {
 	}
 	if !fixtureToolNames()["wiki_lookup"] {
 		t.Error("the fixture world offers no wiki_lookup, so no wiki case can pass")
+	}
+}
+
+func TestFixtureContextWithWikiOffOffersNoWikiTool(t *testing.T) {
+	registry, _ := toolset.Build(fixtureContext(false))
+	if registry.Has("wiki_lookup") {
+		t.Error("wiki_lookup registered with fixtureContext(false), want the WIKI_ENABLED=off toolset")
+	}
+	// The rest of the production toolset is untouched by the wiki setting.
+	if !registry.Has("knowledge_lookup") {
+		t.Error("fixtureContext(false) dropped an unrelated tool")
 	}
 }
