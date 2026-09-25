@@ -66,7 +66,7 @@ var categories = []string{
 	"status", "version", "players", "backup",
 	"knowledge_hit", "knowledge_miss",
 	"own_waypoints", "other_waypoints",
-	"injection", "small_talk", "unanswerable",
+	"injection", "small_talk", "unanswerable", "wiki",
 }
 
 func loadCases(path string, knownTools map[string]bool) ([]Case, error) {

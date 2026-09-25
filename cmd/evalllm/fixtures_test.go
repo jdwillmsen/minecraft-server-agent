@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/toolset"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/wiki"
 )
 
 // partialMarker is the wording knowledge_lookup puts in front of an entry
@@ -81,5 +83,21 @@ func TestFixtureLookupFindsNothingForAnAbsentTopic(t *testing.T) {
 		if out := fixtureLookup(t, query); out != "nothing recorded about that" {
 			t.Errorf("lookup(%q) = %q, want nothing recorded", query, out)
 		}
+	}
+}
+
+func TestFixtureWikiAnswersInProductionShape(t *testing.T) {
+	out, err := fixtureWiki{}.Lookup(t.Context(), "torch", "crafting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(out, `Reference text from minecraft.wiki page "Torch"`) {
+		t.Errorf("fixture result = %q, want wiki.Format's shape", out)
+	}
+	if _, err := (fixtureWiki{}).Lookup(t.Context(), "herobrine", ""); !errors.Is(err, wiki.ErrNotFound) {
+		t.Errorf("unknown topic err = %v, want wiki.ErrNotFound", err)
+	}
+	if !fixtureToolNames()["wiki_lookup"] {
+		t.Error("the fixture world offers no wiki_lookup, so no wiki case can pass")
 	}
 }

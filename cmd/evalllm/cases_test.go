@@ -100,7 +100,7 @@ func TestWaypointNumbersAppearNowhereElseInTheFixtures(t *testing.T) {
 }
 
 func TestFixtureToolsetIsTheFullProductionSurface(t *testing.T) {
-	want := []string{"knowledge_lookup", "waypoint_lookup", "waypoint_list", "players_online", "server_status", "server_version", "backup_status"}
+	want := []string{"knowledge_lookup", "waypoint_lookup", "waypoint_list", "players_online", "server_status", "server_version", "backup_status", "wiki_lookup"}
 	got := fixtureToolNames()
 	if len(got) != len(want) {
 		t.Errorf("fixture offers %d tools, want %d", len(got), len(want))

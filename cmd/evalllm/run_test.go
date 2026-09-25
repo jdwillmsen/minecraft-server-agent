@@ -100,7 +100,7 @@ func TestRunnerObservesToolsWhisperAndReply(t *testing.T) {
 	if got := obs.ToolsCalled(); len(got) != 1 || got[0] != "waypoint_lookup" {
 		t.Errorf("tools called = %v", got)
 	}
-	if len(obs.Rounds) != 2 || obs.Rounds[0].ToolsOffered != 7 || obs.Rounds[1].CompletionTokens != 12 {
+	if len(obs.Rounds) != 2 || obs.Rounds[0].ToolsOffered != 8 || obs.Rounds[1].CompletionTokens != 12 {
 		t.Errorf("rounds = %+v", obs.Rounds)
 	}
 	// The waypoint tool reads the case's XUID, not whatever the model said.
