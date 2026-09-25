@@ -7,6 +7,7 @@ toolchain go1.27.1
 require (
 	github.com/df-mc/goleveldb v1.1.9
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jdwillmsen/minecraft-server-agent/presenceapi v0.1.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/common v0.71.0
 	github.com/sandertv/go-raknet v1.15.2-0.20260705184311-0d1fd09e2cf6
@@ -63,3 +64,5 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+replace github.com/jdwillmsen/minecraft-server-agent/presenceapi => ./presenceapi
