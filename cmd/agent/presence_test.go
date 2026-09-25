@@ -13,6 +13,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/audit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/config"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/metrics/metricstest"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/presence"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
@@ -99,12 +100,31 @@ type memPresence struct {
 	mu        sync.Mutex
 	overrides map[string]presenceapi.Override
 	version   int64
+	// stall, when set, holds the next read until it is closed, after
+	// closing stalled.
+	stall, stalled chan struct{}
 }
 
 func (m *memPresence) Enabled() bool { return true }
 
+// stallNextRead makes the next Overrides call wait, as a slow database
+// would. entered closes once a read is waiting; closing release frees it.
+func (m *memPresence) stallNextRead() (entered, release chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stall, m.stalled = make(chan struct{}), make(chan struct{})
+	return m.stalled, m.stall
+}
+
 func (m *memPresence) Overrides(context.Context) (map[string]presenceapi.Override, error) {
 	m.mu.Lock()
+	if stall, stalled := m.stall, m.stalled; stall != nil {
+		m.stall, m.stalled = nil, nil
+		m.mu.Unlock()
+		close(stalled)
+		<-stall
+		m.mu.Lock()
+	}
 	defer m.mu.Unlock()
 	out := make(map[string]presenceapi.Override, len(m.overrides))
 	for id, ov := range m.overrides {
@@ -179,6 +199,54 @@ func TestLeadKicksAParkedActorThePlayerRosterShows(t *testing.T) {
 	rt.lead(ctx)
 	if got := console.kicks(); !slices.Equal(got, []string{"JdwBot"}) {
 		t.Errorf("kicked %v, want the parked bot the roster shows", got)
+	}
+}
+
+// A turn ends by cancelling its context, but the loop it started may still
+// be inside a tick. The next turn must wait for that loop to return, or its
+// deferred reset lands after the new turn exported its gauges and wipes them.
+func TestLeadWaitsForThePreviousTurnsLoopToReturn(t *testing.T) {
+	mem := &memPresence{overrides: map[string]presenceapi.Override{}}
+	rt, err := buildPresence(twoActors(), mem, audit.Nop{}, &recordingConsole{}, roster.New(), quiet())
+	if err != nil {
+		t.Fatalf("buildPresence: %v", err)
+	}
+	first, endFirst := context.WithCancel(t.Context())
+	rt.lead(first)
+	entered, release := mem.stallNextRead()
+	var freed sync.Once
+	free := func() { freed.Do(func() { close(release) }) }
+	t.Cleanup(free)
+	if _, err := rt.svc.Set(first, "afk-bot-1", presence.Request{State: presenceapi.StatePresent, Reason: "test"}, presence.APISource("ops")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first turn's loop never ticked on the write")
+	}
+	endFirst()
+
+	second, endSecond := context.WithCancel(t.Context())
+	defer endSecond()
+	led := make(chan struct{})
+	go func() {
+		defer close(led)
+		rt.lead(second)
+	}()
+	select {
+	case <-led:
+		t.Fatal("the next turn started while the previous turn's loop was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	free()
+	select {
+	case <-led:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the next turn never started once the previous loop returned")
+	}
+	if !metricstest.Exists(t, "mc_presence_desired", "actor", "agent") {
+		t.Error("the new turn's gauges are gone")
 	}
 }
 
