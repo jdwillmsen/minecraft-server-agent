@@ -12,8 +12,8 @@ const presenceActorsJSON = `[
 ]`
 
 const presenceTokensJSON = `[
- {"name":"ops","token":"0123456789abcdef-ops","scopes":["presence:read","presence:write"]},
- {"name":"afk-bot-1","token":"0123456789abcdef-b1","scopes":["presence:read","presence:report"],"actor":"afk-bot-1"}
+ {"name":"ops","token":"aaaaaaaaaaaaaaaa-ops","scopes":["presence:read","presence:write"]},
+ {"name":"afk-bot-1","token":"bbbbbbbbbbbbbbbb-b1","scopes":["presence:read","presence:report"],"actor":"afk-bot-1"}
 ]`
 
 func loadWithPresence(t *testing.T, actors, tokens, self string) (Config, error) {
@@ -104,12 +104,12 @@ func TestPresenceRefusesBadConfiguration(t *testing.T) {
 		{"self not an agent", presenceActorsJSON, "", "afk-bot-1", "PRESENCE_SELF_ID"},
 		{"tokens without actors", "", presenceTokensJSON, "", "PRESENCE_ACTORS"},
 		{"short token", presenceActorsJSON, `[{"name":"ops","token":"short","scopes":["presence:read"]}]`, "", "16"},
-		{"unknown scope", presenceActorsJSON, `[{"name":"ops","token":"0123456789abcdef","scopes":["presence:admin"]}]`, "", "presence:admin"},
-		{"no scopes", presenceActorsJSON, `[{"name":"ops","token":"0123456789abcdef","scopes":[]}]`, "", "scope"},
-		{"unknown bound actor", presenceActorsJSON, `[{"name":"b","token":"0123456789abcdef","scopes":["presence:read"],"actor":"afk-bot-9"}]`, "", "afk-bot-9"},
-		{"report without actor", presenceActorsJSON, `[{"name":"b","token":"0123456789abcdef","scopes":["presence:report"]}]`, "", "presence:report"},
-		{"duplicate name", presenceActorsJSON, `[{"name":"a","token":"0123456789abcdef-1","scopes":["presence:read"]},{"name":"a","token":"0123456789abcdef-2","scopes":["presence:read"]}]`, "", "twice"},
-		{"shared secret", presenceActorsJSON, `[{"name":"a","token":"0123456789abcdef","scopes":["presence:read"]},{"name":"b","token":"0123456789abcdef","scopes":["presence:read"]}]`, "", "secret"},
+		{"unknown scope", presenceActorsJSON, `[{"name":"ops","token":"cccccccccccccccc","scopes":["presence:admin"]}]`, "", "presence:admin"},
+		{"no scopes", presenceActorsJSON, `[{"name":"ops","token":"dddddddddddddddd","scopes":[]}]`, "", "scope"},
+		{"unknown bound actor", presenceActorsJSON, `[{"name":"b","token":"eeeeeeeeeeeeeeee","scopes":["presence:read"],"actor":"afk-bot-9"}]`, "", "afk-bot-9"},
+		{"report without actor", presenceActorsJSON, `[{"name":"b","token":"ffffffffffffffff","scopes":["presence:report"]}]`, "", "presence:report"},
+		{"duplicate name", presenceActorsJSON, `[{"name":"a","token":"gggggggggggggggg-1","scopes":["presence:read"]},{"name":"a","token":"gggggggggggggggg-2","scopes":["presence:read"]}]`, "", "twice"},
+		{"shared secret", presenceActorsJSON, `[{"name":"a","token":"hhhhhhhhhhhhhhhh","scopes":["presence:read"]},{"name":"b","token":"hhhhhhhhhhhhhhhh","scopes":["presence:read"]}]`, "", "secret"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -127,7 +127,7 @@ func TestPresenceRefusesBadConfiguration(t *testing.T) {
 // A token is a secret: whatever is wrong with the configuration, the error
 // that reaches the pod log must not carry one.
 func TestPresenceErrorsNeverCarryATokenValue(t *testing.T) {
-	const secret = "0123456789abcdef-leak"
+	const secret = "zzzzzzzzzzzzzzzz-leak"
 	_, err := loadWithPresence(t, presenceActorsJSON, `[{"name":"b","token":"`+secret+`","scopes":["presence:nope"]}]`, "")
 	if err == nil || strings.Contains(err.Error(), secret) {
 		t.Errorf("error = %v, want a refusal that does not include the token", err)
