@@ -43,9 +43,9 @@ type bridgeRoster struct {
 	roster  *roster.Roster
 	joins   *joinTimes
 	archive nameArchive
-	// onJoin, when set, hears every connect line with the line's own time.
-	// It is how a player arriving wakes a parked agent while the follower,
-	// not a session, is watching.
+	// onJoin, when set, hears each arrival with its line's own time. It is
+	// how a player arriving wakes a parked agent while the follower, not a
+	// session, is watching.
 	onJoin func(gamertag string, at time.Time)
 	poll   time.Duration
 	reseed time.Duration
@@ -132,9 +132,12 @@ func (b *bridgeRoster) seed(ctx context.Context, refresh bool) (adapters.BridgeE
 		if e.Type == adapters.BridgeEventConnect {
 			// Arrivals the follower never applies: whoever came while the
 			// session was unwinding into this absence, or while the bridge
-			// was unreachable. Replaying older ones is harmless, since each
-			// keeps its own time.
-			b.reportJoin(e)
+			// was unreachable. A backfilled line, or one with no time, is
+			// stamped with when the bridge read it rather than when it
+			// happened, so it could pass for an arrival after a park.
+			if !e.Backfill && !e.Time.IsZero() {
+				b.reportJoin(e)
+			}
 			if xuid := e.XUID(); xuid != "" {
 				logged[e.Player] = xuid
 			}
@@ -282,8 +285,11 @@ func (b *bridgeRoster) apply(ctx context.Context, e adapters.BridgeEvent) {
 		return
 	}
 	// Before resolving an XUID: a first-time player nobody has recorded yet
-	// is exactly who should bring a parked agent back.
-	if !remove {
+	// is exactly who should bring a parked agent back. A player the roster
+	// already holds has not arrived; a bridge that redials replays their
+	// connect, and one too old to flag the replay as backfill gives no
+	// other sign.
+	if !remove && !e.Backfill && !b.onRoster(e) {
 		b.reportJoin(e)
 	}
 	xuid := e.XUID()
@@ -303,6 +309,14 @@ func (b *bridgeRoster) apply(ctx context.Context, e adapters.BridgeEvent) {
 		b.joins.left(l.XUID)
 		b.log.Info("bridge_player_left", logging.Fields{"xuid": l.XUID, "username": l.Username})
 	}
+}
+
+func (b *bridgeRoster) onRoster(e adapters.BridgeEvent) bool {
+	if xuid := e.XUID(); xuid != "" && b.roster.IsOnline(xuid) {
+		return true
+	}
+	_, ok := b.roster.XUIDFor(e.Player)
+	return ok
 }
 
 func (b *bridgeRoster) reportJoin(e adapters.BridgeEvent) {

@@ -536,10 +536,9 @@ func TestBridgeRosterReportsAnUnresolvedPlayerOnce(t *testing.T) {
 }
 
 // A first-time player has no XUID anyone recorded, and is exactly who should
-// wake a parked agent, so every connect line is reported before resolution.
-// The line's own time travels with it: a replayed backlog line must not pass
-// for an arrival after a park.
-func TestBridgeRosterReportsEveryConnectToOnJoin(t *testing.T) {
+// wake a parked agent, so a new player's connect is reported before
+// resolution, with the line's own time.
+func TestBridgeRosterReportsANewPlayersConnectToOnJoin(t *testing.T) {
 	b := newBridgeRoster(&fakeBridgeFeed{}, roster.New(), newJoinTimes(), recordedNames{}, quiet())
 	type join struct {
 		name string
@@ -571,5 +570,103 @@ func TestBridgeRosterSeedReportsBacklogConnectsToOnJoin(t *testing.T) {
 	}
 	if want := []string{"Sam@10:00:01"}; !slices.Equal(got, want) {
 		t.Errorf("onJoin saw %v, want %v: the backlog's connect alone, at its own time", got, want)
+	}
+}
+
+// joinRecorder collects what onJoin hears as name@time.
+type joinRecorder struct {
+	mu  sync.Mutex
+	got []string
+}
+
+func (j *joinRecorder) record(name string, at time.Time) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.got = append(j.got, name+"@"+at.Format(time.TimeOnly))
+}
+
+func (j *joinRecorder) seen() []string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return slices.Clone(j.got)
+}
+
+// A bridge that redials its console replays the server's log history as
+// fresh lines. A bridge too old to flag them gives no other sign, so a
+// connect for a player the roster already holds must not wake a park.
+func TestBridgeRosterIgnoresAReplayedConnectForAPlayerAlreadyOnline(t *testing.T) {
+	b := newBridgeRoster(&fakeBridgeFeed{}, roster.New(), newJoinTimes(), recordedNames{}, quiet())
+	b.roster.Seed([]roster.Entry{{XUID: "111", Username: "Steve"}})
+	var rec joinRecorder
+	b.onJoin = rec.record
+	at := time.Date(2026, 9, 23, 18, 0, 0, 0, time.UTC)
+	b.apply(t.Context(), adapters.BridgeEvent{ID: 7, Type: adapters.BridgeEventConnect, Time: at, Player: "Steve",
+		Raw: "Player connected: Steve, xuid: 111"})
+	b.apply(t.Context(), adapters.BridgeEvent{ID: 8, Type: adapters.BridgeEventConnect, Time: at, Player: "Steve"})
+	if got := rec.seen(); len(got) != 0 {
+		t.Errorf("onJoin saw %v, want nothing: Steve was already online", got)
+	}
+}
+
+// The same replay through a running follower: the bridge redials while
+// Steve stays online and logs his connect again.
+func TestBridgeRosterRedialReplayRecordsNoJoin(t *testing.T) {
+	feed := &fakeBridgeFeed{}
+	feed.logged(adapters.BridgeEventConnect, "Steve", "111")
+	feed.listAnswers([]string{"Steve"}, nil)
+	r := roster.New()
+	b := newBridgeRoster(feed, r, newJoinTimes(), recordedNames{}, quiet())
+	b.poll = time.Millisecond
+	b.reseed = time.Hour
+	var rec joinRecorder
+	b.onJoin = rec.record
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { defer close(done); b.run(ctx) }()
+	defer func() { cancel(); <-done }()
+	waitUntil(t, func() bool { return r.IsOnline("111") }, "the seed never put Steve on the roster")
+	seeded := len(rec.seen())
+
+	feed.logged(adapters.BridgeEventConnect, "Steve", "111")
+	feed.logged(adapters.BridgeEventConnect, "Alex", "222")
+	waitUntil(t, func() bool { return r.IsOnline("222") }, "Alex's connect was never applied")
+	if got := rec.seen()[seeded:]; !slices.Equal(got, []string{"Alex@10:00:03"}) {
+		t.Errorf("onJoin saw %v after the seed, want Alex's genuine arrival alone", got)
+	}
+}
+
+// A backfilled line is history the bridge read back on connecting, stamped
+// with when it was read. It is never an arrival, on either path.
+func TestBridgeRosterNeverReportsABackfilledConnect(t *testing.T) {
+	feed := &fakeBridgeFeed{}
+	feed.logged(adapters.BridgeEventConnect, "Sam", "333")
+	feed.events[0].Backfill = true
+	b := newBridgeRoster(feed, roster.New(), newJoinTimes(), recordedNames{}, quiet())
+	var rec joinRecorder
+	b.onJoin = rec.record
+	if _, err := b.seed(t.Context(), false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	b.apply(t.Context(), adapters.BridgeEvent{ID: 9, Type: adapters.BridgeEventConnect, Backfill: true,
+		Time: time.Date(2026, 9, 23, 18, 0, 0, 0, time.UTC), Player: "Alex", Raw: "Player connected: Alex, xuid: 444"})
+	if got := rec.seen(); len(got) != 0 {
+		t.Errorf("onJoin saw %v, want nothing: every connect was backfilled", got)
+	}
+}
+
+// Without a time of its own a backlog line cannot be told from one logged
+// long before the park, so the seed drops it rather than stamping it now.
+func TestBridgeRosterSeedSkipsABacklogConnectWithNoTime(t *testing.T) {
+	feed := &fakeBridgeFeed{}
+	feed.logged(adapters.BridgeEventConnect, "Sam", "333")
+	feed.events[0].Time = time.Time{}
+	b := newBridgeRoster(feed, roster.New(), newJoinTimes(), recordedNames{}, quiet())
+	var rec joinRecorder
+	b.onJoin = rec.record
+	if _, err := b.seed(t.Context(), false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if got := rec.seen(); len(got) != 0 {
+		t.Errorf("onJoin saw %v, want nothing: the line carried no time", got)
 	}
 }

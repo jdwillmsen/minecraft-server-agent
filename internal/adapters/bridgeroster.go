@@ -26,6 +26,10 @@ type BridgeEvent struct {
 	Time   time.Time `json:"time"`
 	Player string    `json:"player,omitempty"`
 	Raw    string    `json:"raw"`
+	// Backfill marks a line the bridge replayed from the server's log
+	// history when it connected. It is stamped with when it was read, not
+	// when it happened, so it says nothing about who just arrived.
+	Backfill bool `json:"backfill,omitempty"`
 }
 
 var eventXUID = regexp.MustCompile(`xuid: (\d+)`)

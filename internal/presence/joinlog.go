@@ -10,8 +10,9 @@ const (
 	// joinRetention is how long an arrival is kept for the wake rules. It is
 	// several ticks rather than one, so a tick that could not read the
 	// database does not lose the arrival that should have woken an actor.
-	// Replaying an old arrival is harmless: the policy ignores any from
-	// before an override was set.
+	// Recording an arrival again at its real time is harmless, since the
+	// policy ignores any from before an override was set; a replay stamped
+	// with a later time is not, which is why RecordAt's callers drop them.
 	joinRetention = 5 * time.Minute
 	// maxJoins bounds the log against a join storm. Far above what a
 	// friends' server sees in five minutes.
@@ -32,11 +33,11 @@ func NewJoinLog() *JoinLog { return &JoinLog{now: time.Now} }
 // Record notes an arrival now, for a source that carries no time of its own.
 func (l *JoinLog) Record(gamertag string) { l.RecordAt(gamertag, l.now()) }
 
-// RecordAt notes an arrival at the time its source says it happened. A
-// console line replayed from the bridge's backlog keeps its own time, so it
-// cannot pass for a join that came after a park. One already past retention
-// is dropped here rather than at the next read, so a long stale backlog
-// cannot crowd fresh arrivals out of the bounded log.
+// RecordAt notes an arrival at the time its source says it happened. The
+// caller filters out lines the bridge replayed from the server's history,
+// which carry when they were read rather than when they happened. One
+// already past retention is dropped here rather than at the next read, so a
+// long stale backlog cannot crowd fresh arrivals out of the bounded log.
 func (l *JoinLog) RecordAt(gamertag string, at time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
