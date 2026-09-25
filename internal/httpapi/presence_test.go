@@ -35,3 +35,15 @@ func TestMountPresence(t *testing.T) {
 		}
 	}
 }
+
+func TestConnectedReadsBackWhatWasSet(t *testing.T) {
+	t.Cleanup(func() { SetConnected(false) })
+	SetConnected(true)
+	if !Connected() {
+		t.Error("Connected() = false after SetConnected(true)")
+	}
+	SetConnected(false)
+	if Connected() {
+		t.Error("Connected() = true after SetConnected(false)")
+	}
+}
