@@ -12,6 +12,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/text"
 	"github.com/jdwillmsen/minecraft-server-agent/presenceapi"
 )
 
@@ -244,10 +245,12 @@ func utcClock(t time.Time) string { return t.UTC().Format("15:04 UTC") }
 
 // LeaveArgs recognises "@server leave [duration]" and returns its arguments.
 // Only the exact form, at the start of the message: "@server where are the
-// leaves" is a question for the model, not a command to walk out.
+// leaves" is a question for the model, not a command to walk out. Both
+// keywords are ASCII, so the fold is too, and a look-alike letter such as
+// the long s does not spell one.
 func LeaveArgs(message string) ([]string, bool) {
 	fields := strings.Fields(message)
-	if len(fields) < 2 || len(fields) > 3 || !strings.EqualFold(fields[0], chat.MentionToken) || !strings.EqualFold(fields[1], "leave") {
+	if len(fields) < 2 || len(fields) > 3 || text.FoldASCII(fields[0]) != chat.MentionToken || text.FoldASCII(fields[1]) != "leave" {
 		return nil, false
 	}
 	return fields[2:], true
