@@ -96,3 +96,23 @@ func TestRegistrySkipsMalformedTools(t *testing.T) {
 		t.Fatalf("Len = %d, want 1 -- unnamed and nil-Invoke tools must be dropped", r.Len())
 	}
 }
+
+func TestInvokeHonoursAPerToolCap(t *testing.T) {
+	long := strings.Repeat("a", 2000)
+	r := NewRegistry(
+		Tool{Name: "default", Invoke: func(context.Context, json.RawMessage, string) (string, error) { return long, nil }},
+		Tool{Name: "wide", MaxResultChars: 1200, Invoke: func(context.Context, json.RawMessage, string) (string, error) { return long, nil }},
+	)
+	for name, want := range map[string]int{"default": MaxToolResultChars, "wide": 1200} {
+		out, err := r.Invoke(t.Context(), name, nil, "")
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got := len([]rune(out)); got > want {
+			t.Errorf("%s returned %d runes, want at most %d", name, got, want)
+		}
+		if got := len([]rune(out)); got < want-5 {
+			t.Errorf("%s returned %d runes, want close to %d: the cap should cut, not shrink", name, got, want)
+		}
+	}
+}
