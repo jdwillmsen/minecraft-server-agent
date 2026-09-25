@@ -105,11 +105,11 @@ func (r *Registry) Group(name string) ([]Actor, bool) {
 
 // Resolve turns a chat target -- an actor id, a group or all -- into actors.
 // Case-insensitive because it is typed in chat; configuration keeps ids and
-// groups lower-case, so folding cannot make two targets collide. This is
-// never a gamertag: an actor id or group name, so the plain ASCII fold
-// below (not text.FoldASCII) is the right tool.
+// groups lower-case ASCII, so folding cannot make two targets collide, and
+// an ASCII-only fold keeps a look-alike such as the Kelvin sign from naming
+// one.
 func (r *Registry) Resolve(target string) ([]Actor, bool) {
-	t := strings.ToLower(strings.TrimSpace(target))
+	t := text.FoldASCII(strings.TrimSpace(target))
 	if a, ok := r.Actor(t); ok {
 		return []Actor{a}, true
 	}

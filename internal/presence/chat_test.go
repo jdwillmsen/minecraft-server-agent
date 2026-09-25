@@ -217,6 +217,8 @@ func TestLeaveArgs(t *testing.T) {
 		{"@server leave now please", nil, false},
 		{"can @server leave?", nil, false},
 		{"@server where is the leaves farm", nil, false},
+		// U+017F, the long s, folds to "s" under Unicode rules only.
+		{"@\u017fERVER leave", nil, false},
 	}
 	for _, tc := range cases {
 		args, ok := LeaveArgs(tc.message)

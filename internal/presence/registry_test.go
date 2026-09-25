@@ -44,6 +44,11 @@ func TestRegistryResolvesActorsGroupsAndAll(t *testing.T) {
 	if got, ok := r.Resolve("nobody"); ok {
 		t.Errorf("Resolve(nobody) = %v, want not found", ids(got))
 	}
+	// The Kelvin sign folds to "k" under Unicode rules. Ids are ASCII, so a
+	// target spelled with it names nothing.
+	if got, ok := r.Resolve("af\u212a-bot-1"); ok {
+		t.Errorf("Resolve with a Kelvin sign = %v, want not found", ids(got))
+	}
 }
 
 // The API's group route takes the path segment as written, so it is
