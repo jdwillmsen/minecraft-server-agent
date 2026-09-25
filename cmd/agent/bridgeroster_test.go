@@ -534,3 +534,42 @@ func TestBridgeRosterReportsAnUnresolvedPlayerOnce(t *testing.T) {
 		t.Errorf("bridge_roster_unresolved levels = %v, want %v", levels, want)
 	}
 }
+
+// A first-time player has no XUID anyone recorded, and is exactly who should
+// wake a parked agent, so every connect line is reported before resolution.
+// The line's own time travels with it: a replayed backlog line must not pass
+// for an arrival after a park.
+func TestBridgeRosterReportsEveryConnectToOnJoin(t *testing.T) {
+	b := newBridgeRoster(&fakeBridgeFeed{}, roster.New(), newJoinTimes(), recordedNames{}, quiet())
+	type join struct {
+		name string
+		at   time.Time
+	}
+	var got []join
+	b.onJoin = func(name string, at time.Time) { got = append(got, join{name, at}) }
+	at := time.Date(2026, 9, 23, 18, 0, 0, 0, time.UTC)
+	b.apply(t.Context(), adapters.BridgeEvent{ID: 1, Type: adapters.BridgeEventConnect, Time: at, Player: "Sam"})
+	b.apply(t.Context(), adapters.BridgeEvent{ID: 2, Type: adapters.BridgeEventDisconnect, Time: at, Player: "Sam"})
+	if len(got) != 1 || got[0].name != "Sam" || !got[0].at.Equal(at) {
+		t.Errorf("onJoin saw %+v, want Sam's connect alone, at the line's time", got)
+	}
+}
+
+// A player who arrived while the session was unwinding into absence, or
+// while the bridge was unreachable, is in the backlog the seed reads rather
+// than in any event the follower applies. They must still wake a parked
+// agent.
+func TestBridgeRosterSeedReportsBacklogConnectsToOnJoin(t *testing.T) {
+	feed := &fakeBridgeFeed{}
+	feed.logged(adapters.BridgeEventConnect, "Sam", "333")
+	feed.logged(adapters.BridgeEventDisconnect, "Alex", "444")
+	b := newBridgeRoster(feed, roster.New(), newJoinTimes(), recordedNames{}, quiet())
+	var got []string
+	b.onJoin = func(name string, at time.Time) { got = append(got, name+"@"+at.Format(time.TimeOnly)) }
+	if _, err := b.seed(t.Context(), false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if want := []string{"Sam@10:00:01"}; !slices.Equal(got, want) {
+		t.Errorf("onJoin saw %v, want %v: the backlog's connect alone, at its own time", got, want)
+	}
+}

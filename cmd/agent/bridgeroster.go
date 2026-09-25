@@ -43,11 +43,15 @@ type bridgeRoster struct {
 	roster  *roster.Roster
 	joins   *joinTimes
 	archive nameArchive
-	poll    time.Duration
-	reseed  time.Duration
-	log     *logging.Logger
-	now     func() time.Time
-	wait    func(ctx context.Context, d time.Duration) bool
+	// onJoin, when set, hears every connect line with the line's own time.
+	// It is how a player arriving wakes a parked agent while the follower,
+	// not a session, is watching.
+	onJoin func(gamertag string, at time.Time)
+	poll   time.Duration
+	reseed time.Duration
+	log    *logging.Logger
+	now    func() time.Time
+	wait   func(ctx context.Context, d time.Duration) bool
 
 	// held is who the roster had online, by name, when the follower last
 	// cleared it, so the seed that recovers can still name them.
@@ -58,7 +62,7 @@ type bridgeRoster struct {
 
 func newBridgeRoster(feed bridgeFeed, r *roster.Roster, joins *joinTimes, archive nameArchive, log *logging.Logger) *bridgeRoster {
 	return &bridgeRoster{feed: feed, roster: r, joins: joins, archive: archive, poll: bridgeRosterPoll, reseed: bridgeRosterReseed, log: log,
-		now: time.Now, wait: waitOrShutdown}
+		now: time.Now, wait: waitOrShutdown, unresolved: make(map[string]struct{})}
 }
 
 // run follows the server until ctx ends. It never returns early, because the
@@ -126,6 +130,11 @@ func (b *bridgeRoster) seed(ctx context.Context, refresh bool) (adapters.BridgeE
 	for _, e := range backlog {
 		cursor = e
 		if e.Type == adapters.BridgeEventConnect {
+			// Arrivals the follower never applies: whoever came while the
+			// session was unwinding into this absence, or while the bridge
+			// was unreachable. Replaying older ones is harmless, since each
+			// keeps its own time.
+			b.reportJoin(e)
 			if xuid := e.XUID(); xuid != "" {
 				logged[e.Player] = xuid
 			}
@@ -272,6 +281,11 @@ func (b *bridgeRoster) apply(ctx context.Context, e adapters.BridgeEvent) {
 	default:
 		return
 	}
+	// Before resolving an XUID: a first-time player nobody has recorded yet
+	// is exactly who should bring a parked agent back.
+	if !remove {
+		b.reportJoin(e)
+	}
 	xuid := e.XUID()
 	if xuid == "" {
 		var ok bool
@@ -289,6 +303,17 @@ func (b *bridgeRoster) apply(ctx context.Context, e adapters.BridgeEvent) {
 		b.joins.left(l.XUID)
 		b.log.Info("bridge_player_left", logging.Fields{"xuid": l.XUID, "username": l.Username})
 	}
+}
+
+func (b *bridgeRoster) reportJoin(e adapters.BridgeEvent) {
+	if b.onJoin == nil {
+		return
+	}
+	at := e.Time
+	if at.IsZero() {
+		at = b.now()
+	}
+	b.onJoin(e.Player, at)
 }
 
 // forget ends what the roster knows, keeping who it held.

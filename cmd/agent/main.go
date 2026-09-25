@@ -40,6 +40,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/moderation"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/plugins"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/presence"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/ratelimit"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/sources"
@@ -211,6 +212,14 @@ func main() {
 		log.Info("knowledge_ready", nil)
 	}
 
+	// Built here, before playerStore is wrapped below, for the same reason
+	// the stores above are: it borrows the concrete Postgres's pool.
+	presenceRT, err := newPresence(cfg, playerStore, auditor, bridgeClient, playerRoster, log)
+	if err != nil {
+		log.Error("presence_config_failed", logging.Fields{"error": err.Error()})
+		os.Exit(1)
+	}
+
 	voice := adapters.NewBridgeVoice(bridgeClient, playerRoster)
 	audience := newDeliveryAudience(playerRoster, siblings)
 
@@ -241,7 +250,7 @@ func main() {
 	playerStore = withPlayerEvents(playerStore, sources.NewEvents(ctx, deliverer, log))
 
 	registry := plugin.NewRegistry()
-	if err := registerPlugins(ctx, registry, deliverer, joins, cfg.ModerationTerms, log); err != nil {
+	if err := registerPlugins(ctx, registry, deliverer, joins, cfg.ModerationTerms, log, presenceRT.plugin); err != nil {
 		log.Error("plugin_register_failed", logging.Fields{"error": err.Error()})
 		os.Exit(1)
 	}
@@ -269,6 +278,8 @@ func main() {
 	// command resolve can never mean two different players.
 	apiOn := httpServer.MountAnnouncements(cfg.AnnounceAPIToken, deliverer, playerLookup{live: playerRoster, archive: playerStore}, log)
 	log.Info("announce_api", logging.Fields{"enabled": apiOn})
+	presenceOn := httpServer.MountPresence(presenceRT.api)
+	log.Info("presence_api", logging.Fields{"enabled": presenceOn, "actors": len(cfg.PresenceActors)})
 
 	tokenStore, err := openTokenStore(cfg, sharedTokens, log)
 	if err != nil {
@@ -301,11 +312,13 @@ func main() {
 
 	log.Info("starting", logging.Fields{"mc_host": cfg.MCHost, "mc_port": cfg.MCPort})
 
-	// Nothing decides presence yet, so the live agent is always in the world.
-	var gate sessionGate = alwaysPresent{}
+	// The agent's own effective presence when actors are configured, and
+	// always present otherwise.
+	gate := presenceRT.sessionGate()
 	// Built after withPlayerEvents has wrapped playerStore, so a name the
 	// follower resolves comes from the same store the session writes.
 	bridgeFollower := newBridgeRoster(bridgeClient, playerRoster, joins, playerStore, log)
+	bridgeFollower.onJoin = presenceRT.joins.RecordAt
 
 	// One pass of this loop is one turn as the live agent: wait for the lock,
 	// do the live agent's work until the process is shutting down or the lock
@@ -344,8 +357,11 @@ func main() {
 		// long as it lasts.
 		go watchForcedLeadership(liveCtx, term, log)
 		startLiveWork(liveCtx, cfg, bridgeTimeout, pinger, link, announceStore, deliverer, scheduleStore, moderationStore, log)
+		// Leader-only, like startLiveWork, and before runSessions: its first
+		// tick decides the gate that runSessions reads first.
+		presenceRT.lead(liveCtx)
 
-		runSessions(liveCtx, gate, sessionModes{
+		runSessions(liveCtx, gate, presenceModes(sessionModes{
 			present: func(sessionCtx context.Context) {
 				runConnectLoop(sessionCtx, cfg, ts, log, registry, pctx, eventBus, limiter, httpServer, playerRoster, audience, siblings, permResolver, ans, playerStore, auditor, link, joins)
 			},
@@ -357,7 +373,7 @@ func main() {
 				handover(liveCtx, nil, playerStore, playerRoster.Since(), log)
 			},
 			absent: bridgeFollower.run,
-		}, log)
+		}, httpServer.SetReady, announceRejoin(voice, log)), log)
 
 		endTurn()
 		// The agent is out of the game by now -- the connect loop waits for
@@ -386,12 +402,12 @@ func main() {
 //
 // The error carries the plugin's own name, because "registration failed" on
 // its own does not say which one.
-func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer plugins.AnnounceDeliverer, conns plugins.Connections, moderationTerms []string, log *logging.Logger) error {
+func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer plugins.AnnounceDeliverer, conns plugins.Connections, moderationTerms []string, log *logging.Logger, extra ...plugin.Plugin) error {
 	mod, err := plugins.NewModeration(ctx, moderationTerms, log)
 	if err != nil {
 		return fmt.Errorf("moderation: %w", err)
 	}
-	for _, p := range []plugin.Plugin{
+	for _, p := range append([]plugin.Plugin{
 		plugins.NewCore(),
 		plugins.NewStats(),
 		plugins.NewKnowledge(),
@@ -401,7 +417,7 @@ func registerPlugins(ctx context.Context, registry *plugin.Registry, deliverer p
 		plugins.NewAnnounceDrain(ctx, deliverer, announceDrainDelay, log, plugins.WithConnections(conns)),
 		mod,
 		plugins.NewSchedule(),
-	} {
+	}, extra...) {
 		if err := registry.Register(p); err != nil {
 			return fmt.Errorf("%s: %w", p.Name(), err)
 		}
@@ -787,11 +803,11 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 	// kind of session running while nobody new could join.
 	recycled := make(chan struct{})
 	if recycle := time.Duration(cfg.SessionRecycleMs) * time.Millisecond; recycle > 0 {
-		timer := time.AfterFunc(recycle, func() {
+		stopRecycle := afterFuncWaited(recycle, func() {
 			close(recycled)
 			recycleSession(ctx, conn, playerStore, playerRoster.Since(), recycle, log)
 		})
-		defer timer.Stop()
+		defer stopRecycle()
 	}
 
 	log.Info("spawned", logging.Fields{"self_xuid": selfXUID})
@@ -831,6 +847,23 @@ func session(ctx context.Context, cfg config.Config, ts oauth2.TokenSource, log 
 		handleLiveness(pk, respawner, conn, log, httpServer.SetReady)
 
 		handlePacket(ctx, pk, selfXUID, siblingXUIDs, log, registry, pctx, eventBus, limiter, playerRoster, permResolver, ans, playerStore, auditor, joinClock)
+	}
+}
+
+// afterFuncWaited is time.AfterFunc whose stop also waits out a call that
+// has already begun, which Timer.Stop does not. A session recycle that fired
+// just before the session ended would otherwise still be closing playtime
+// while the caller's own handover closes it again.
+func afterFuncWaited(d time.Duration, fn func()) (stop func()) {
+	done := make(chan struct{})
+	timer := time.AfterFunc(d, func() {
+		defer close(done)
+		fn()
+	})
+	return func() {
+		if !timer.Stop() {
+			<-done
+		}
 	}
 }
 
@@ -947,6 +980,13 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 	case chat.TriggerCommand:
 		handleCommand(ctx, id, trigger, chat.IsPrivateType(text.TextType), log, registry, pctx, limiter, permResolver, auditor, playerRoster)
 	case chat.TriggerMention:
+		// A command in a mention's clothing: dispatched like !leave, so it
+		// gets the same permission check, rate limit and audit row, and never
+		// reaches the model.
+		if args, ok := presence.LeaveArgs(trigger.Message); ok {
+			handleCommand(ctx, id, chat.Trigger{Kind: chat.TriggerCommand, Command: "leave", Args: args}, chat.IsPrivateType(text.TextType), log, registry, pctx, limiter, permResolver, auditor, playerRoster)
+			return
+		}
 		startAnswer(ctx, id, trigger, chat.IsPrivateType(text.TextType), log, pctx, ans, playerRoster)
 	}
 }
@@ -1315,6 +1355,12 @@ func handlePlayerList(ctx context.Context, pk *packet.PlayerList, selfXUID strin
 // decides only whether an unknown command is answered -- see the
 // ErrUnknownCommand case below for why that one distinction exists.
 func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, whispered bool, log *logging.Logger, registry *plugin.Registry, pctx *plugin.Context, limiter *ratelimit.PerActor, permResolver *adapters.PermissionResolver, auditor audit.Store, playerRoster *roster.Roster) {
+	// The reply and the audit row are sent on a context the session cannot
+	// end, each still under its own bound: a !leave's write wakes the loop
+	// that cancels the session before the command has even returned, and
+	// the operator must still hear the answer and the dispatch be recorded.
+	settle := context.WithoutCancel(ctx)
+
 	// Mirrors handleMention's resolution exactly: the roster is the one place
 	// an XUID becomes a name, and a second lookup path here would be a second
 	// place for that mapping to drift from the first.
@@ -1349,7 +1395,7 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 		// deadline of its own a slow or hung one would stall every player's
 		// commands behind it -- exactly what "never blocks the command" rules
 		// out.
-		auditCtx, auditCancel := context.WithTimeout(ctx, plugin.DefaultDispatchTimeout)
+		auditCtx, auditCancel := context.WithTimeout(settle, plugin.DefaultDispatchTimeout)
 		defer auditCancel()
 		if err := auditor.Write(auditCtx, audit.Record{
 			XUID:       actorXUID,
@@ -1395,7 +1441,7 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 		// indistinguishable from the agent being down.
 		log.Debug("command_unknown", logging.Fields{"command": trigger.Command, "actor": actorXUID, "whispered": whispered})
 		if whispered {
-			speak(ctx, log, pctx, actorXUID, trigger.Command, unknownCommandReply(trigger.Command))
+			speak(settle, log, pctx, actorXUID, trigger.Command, unknownCommandReply(trigger.Command))
 		}
 		writeAudit(audit.OutcomeUnknown)
 		return
@@ -1411,7 +1457,7 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 		// than the existence of !shutdown being guessable on a server whose
 		// members are known to each other.
 		log.Info("command_denied", logging.Fields{"command": trigger.Command, "actor": actorXUID})
-		speak(ctx, log, pctx, actorXUID, trigger.Command, deniedCommandReply(trigger.Command))
+		speak(settle, log, pctx, actorXUID, trigger.Command, deniedCommandReply(trigger.Command))
 		writeAudit(audit.OutcomeDenied)
 		return
 	case errors.Is(err, plugin.ErrCommandTimedOut):
@@ -1419,12 +1465,12 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 		// wraps into that branch too, and a timeout recorded as a plain error
 		// loses exactly the distinction the schema draws between them.
 		log.Error("command_timed_out", logging.Fields{"command": trigger.Command, "actor": actorXUID})
-		speak(ctx, log, pctx, actorXUID, trigger.Command, commandTimedOutReply)
+		speak(settle, log, pctx, actorXUID, trigger.Command, commandTimedOutReply)
 		writeAudit(audit.OutcomeTimeout)
 		return
 	case err != nil:
 		log.Error("command_failed", logging.Fields{"command": trigger.Command, "actor": actorXUID, "error": err.Error()})
-		speak(ctx, log, pctx, actorXUID, trigger.Command, commandFailedReply)
+		speak(settle, log, pctx, actorXUID, trigger.Command, commandFailedReply)
 		writeAudit(audit.OutcomeError)
 		return
 	}
@@ -1437,7 +1483,7 @@ func handleCommand(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 	}
 	log.Info("command_replied", replied)
 
-	speak(ctx, log, pctx, actorXUID, trigger.Command, reply)
+	speak(settle, log, pctx, actorXUID, trigger.Command, reply)
 	// Written after the reply is sent, not before: the record must never be
 	// in front of what the player is waiting on.
 	writeAudit(audit.OutcomeOK)

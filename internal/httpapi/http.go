@@ -108,11 +108,13 @@ func (s *Server) Addr() net.Addr {
 	return s.ln.Addr()
 }
 
-// SetReady controls what /readyz reports about a live agent's session: true
-// once a Bedrock session is established, false the moment it is lost, so
-// /readyz reflects real session state rather than always answering ok. It
-// says nothing about a standby, which has no session by design -- see
-// SetRole.
+// SetReady controls what /readyz reports about a live agent: true once a
+// Bedrock session is established, false the moment it is lost, so /readyz
+// reflects real session state rather than always answering ok. A live agent
+// parked out of the world on purpose is also ready: it is doing the work its
+// turn asks of it, and dropping out of the Service would cut the bots off
+// from the presence API. It says nothing about a standby, which has no
+// session by design -- see SetRole.
 func (s *Server) SetReady(ready bool) {
 	s.ready.Store(ready)
 }

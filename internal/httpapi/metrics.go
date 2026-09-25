@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"net/http"
+	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -43,14 +44,23 @@ var (
 	})
 )
 
+// connected mirrors connectedGauge for readers in this process: a gauge
+// cannot be read back, and the presence loop reports the agent's own status
+// from the same fact the metric exports.
+var connected atomic.Bool
+
 // SetConnected records whether a Bedrock session is currently established.
-func SetConnected(connected bool) {
-	if connected {
+func SetConnected(up bool) {
+	connected.Store(up)
+	if up {
 		connectedGauge.Set(1)
 	} else {
 		connectedGauge.Set(0)
 	}
 }
+
+// Connected reports what SetConnected last recorded.
+func Connected() bool { return connected.Load() }
 
 // setLeader records whether this process is the live agent. Unexported
 // because it must move with the role the rest of the process acts on -- see
