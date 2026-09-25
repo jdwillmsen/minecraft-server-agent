@@ -40,6 +40,11 @@ type Tool struct {
 	// the loop and never supplied by the model -- which is what stops a tool
 	// from being asked for another player's data.
 	Invoke func(ctx context.Context, args json.RawMessage, caller string) (string, error)
+	// MaxResultChars overrides MaxToolResultChars for this tool. Zero keeps
+	// the shared cap. A reference page needs more room than a status line
+	// to say anything useful, and raising the shared cap would spend context
+	// on every tool to buy it for one.
+	MaxResultChars int
 }
 
 // FunctionDefinition and Definition are the OpenAI-compatible wire shapes.
@@ -140,5 +145,9 @@ func (r *Registry) Invoke(ctx context.Context, name string, args json.RawMessage
 	if err != nil {
 		return "", err
 	}
-	return text.Truncate(strings.Join(strings.Fields(out), " "), MaxToolResultChars), nil
+	limit := MaxToolResultChars
+	if t.MaxResultChars > 0 {
+		limit = t.MaxResultChars
+	}
+	return text.Truncate(strings.Join(strings.Fields(out), " "), limit), nil
 }
