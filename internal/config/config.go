@@ -174,9 +174,23 @@ type Config struct {
 	// PresenceSelfID is which of PresenceActors this process is.
 	PresenceSelfID string
 
+	// MaxToolRounds caps tool rounds per answer. Load refuses a value the
+	// timeouts cannot honour: (MaxToolRounds + 1) sequential calls must fit
+	// inside LLMTotalTimeoutMs, or a model that uses its budget is cancelled
+	// before it answers.
+	MaxToolRounds int
+	// WikiEnabled registers wiki_lookup. WikiBaseURL is pinned to
+	// WikiProductionURL unless WIKI_ALLOW_TEST_BASE_URL is set, so a stray
+	// value cannot point the agent at a host an operator never chose.
+	WikiEnabled bool
+	WikiBaseURL string
+
 	// Logging.
 	LogLevel string
 }
+
+// WikiProductionURL is the only wiki API the agent is meant to call.
+const WikiProductionURL = "https://minecraft.wiki/api.php"
 
 // Load reads Config from the process environment.
 func Load() (Config, error) {
@@ -266,6 +280,28 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	maxToolRounds, err := positiveInt("MAX_TOOL_ROUNDS", 2)
+	if err != nil {
+		return Config{}, err
+	}
+	if maxToolRounds > 6 {
+		return Config{}, fmt.Errorf("MAX_TOOL_ROUNDS must be between 1 and 6, got %d", maxToolRounds)
+	}
+	if need := (maxToolRounds + 1) * llmTimeout; llmTotalTimeout < need {
+		return Config{}, fmt.Errorf("LLM_TOTAL_TIMEOUT_MS (%d) must be at least (MAX_TOOL_ROUNDS + 1) x LLM_TIMEOUT_MS = %d", llmTotalTimeout, need)
+	}
+	wikiEnabled, err := boolDefault("WIKI_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	allowTestWiki, err := boolDefault("WIKI_ALLOW_TEST_BASE_URL", false)
+	if err != nil {
+		return Config{}, err
+	}
+	wikiBaseURL := stringDefault("WIKI_BASE_URL", WikiProductionURL)
+	if wikiBaseURL != WikiProductionURL && !allowTestWiki {
+		return Config{}, fmt.Errorf("WIKI_BASE_URL must be %s unless WIKI_ALLOW_TEST_BASE_URL=true, got %q", WikiProductionURL, wikiBaseURL)
+	}
 	answerRateLimit, err := positiveInt("ANSWER_MAX_PER_MINUTE", 4)
 	if err != nil {
 		return Config{}, err
@@ -316,6 +352,9 @@ func Load() (Config, error) {
 		LLMMaxTokens:              llmMaxTokens,
 		LLMTimeoutMs:              llmTimeout,
 		LLMTotalTimeoutMs:         llmTotalTimeout,
+		MaxToolRounds:             maxToolRounds,
+		WikiEnabled:               wikiEnabled,
+		WikiBaseURL:               wikiBaseURL,
 		AnswerMaxPerMinute:        answerRateLimit,
 		MCMonitorURL:              stringDefault("MC_MONITOR_URL", ""),
 		BackupExporterURL:         stringDefault("BACKUP_EXPORTER_URL", ""),
@@ -360,6 +399,22 @@ func stringDefault(name, def string) string {
 		return def
 	}
 	return v
+}
+
+// boolDefault reads a boolean the way strconv does ("true", "1", "false",
+// "0", ...) and rejects anything else rather than reading it as false: a
+// typo in an enable flag should stop the process, not quietly disable the
+// feature.
+func boolDefault(name string, def bool) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("environment variable %s must be true or false, got %q", name, raw)
+	}
+	return v, nil
 }
 
 // nonNegativeInt is positiveInt's sibling for settings where zero is a real
