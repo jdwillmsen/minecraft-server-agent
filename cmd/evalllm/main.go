@@ -231,7 +231,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if err := writeReport(&report, reportMeta{
 		Label: o.label, Model: o.model, Host: host, Started: started,
 		MaxTokens: o.maxTokens, Timeout: o.timeout, Total: o.total,
-		LatencyBudget: o.latencyBudget, MaxToolRounds: adapters.MaxToolRounds,
+		LatencyBudget: o.latencyBudget, MaxToolRounds: r.client.MaxToolRounds(),
 	}, results); err != nil {
 		fmt.Fprintf(stdout, "error: render report: %v\n", err)
 		return 1

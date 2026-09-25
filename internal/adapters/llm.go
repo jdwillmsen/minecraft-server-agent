@@ -34,11 +34,45 @@ const (
 	MaxQuestionChars = 256
 )
 
-// MaxToolRounds caps how many times the model may ask for tools before it
-// is made to answer. Two covers the questions this serves -- one lookup,
-// occasionally two -- and an uncapped loop driven by a chat message is an
-// unbounded cost per message.
-const MaxToolRounds = 2
+// DefaultMaxToolRounds is the round cap when a deployment sets none. Two
+// covers the server questions this was built for -- one lookup, occasionally
+// two -- and a cap exists at all because an uncapped loop driven by a chat
+// message is an unbounded cost per message. Game questions can want a page
+// lookup and then a narrower one, which is what WithMaxToolRounds is for.
+const DefaultMaxToolRounds = 2
+
+// Option configures an LLMClient at construction. Options rather than
+// setters: AnswerWithTools runs on one goroutine per answer, and a field
+// written after construction would be a data race waiting for a caller.
+type Option func(*LLMClient)
+
+// WithMaxToolRounds sets the round cap. A non-positive n keeps the default,
+// so a zero from an unset config cannot disable tools outright.
+func WithMaxToolRounds(n int) Option {
+	return func(c *LLMClient) {
+		if n > 0 {
+			c.maxToolRounds = n
+		}
+	}
+}
+
+// MaxToolRounds reports the cap in force, for reports that must state the
+// budget they measured.
+func (c *LLMClient) MaxToolRounds() int { return c.maxToolRounds }
+
+// AnswerOption configures one AnswerWithTools call.
+type AnswerOption func(*answerOptions)
+
+type answerOptions struct {
+	onToolRound func(round int)
+}
+
+// WithToolRoundHook is called after each round's tools have run, on the
+// answering goroutine. It must return quickly: the next model call waits
+// for it.
+func WithToolRoundHook(fn func(round int)) AnswerOption {
+	return func(o *answerOptions) { o.onToolRound = fn }
+}
 
 // systemPrompt is where most of this feature's safety lives.
 //
@@ -89,23 +123,29 @@ type LLMClient struct {
 	// again, because AnswerWithTools is called from one goroutine per
 	// answer and a setter would be a data race waiting for its first
 	// concurrent caller.
-	log *logging.Logger
+	log           *logging.Logger
+	maxToolRounds int
 }
 
 // NewLLMClient builds a client. An empty baseURL disables answering: the
 // caller checks Enabled rather than discovering it through a failed call. A
 // nil log is supported -- the events are dropped rather than the client
 // requiring one to function.
-func NewLLMClient(baseURL, model, apiKey string, maxTokens int, timeout time.Duration, log *logging.Logger) *LLMClient {
-	return &LLMClient{
-		baseURL:   strings.TrimRight(baseURL, "/"),
-		model:     model,
-		apiKey:    apiKey,
-		maxTokens: maxTokens,
-		timeout:   timeout,
-		http:      &http.Client{},
-		log:       log,
+func NewLLMClient(baseURL, model, apiKey string, maxTokens int, timeout time.Duration, log *logging.Logger, opts ...Option) *LLMClient {
+	c := &LLMClient{
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		model:         model,
+		apiKey:        apiKey,
+		maxTokens:     maxTokens,
+		timeout:       timeout,
+		http:          &http.Client{},
+		log:           log,
+		maxToolRounds: DefaultMaxToolRounds,
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // Enabled reports whether a backend is configured at all.
@@ -480,9 +520,14 @@ func (c *LLMClient) post(ctx context.Context, body chatRequest) ([]byte, error) 
 // callerXUID is passed to every tool the model invokes and is never taken
 // from the model's own arguments: that is what keeps waypoint_lookup from
 // being talked into reading someone else's coordinates.
-func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, question string, registry *tools.Registry) (string, error) {
+func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, question string, registry *tools.Registry, opts ...AnswerOption) (string, error) {
 	if !c.Enabled() {
 		return "", nil
+	}
+
+	var o answerOptions
+	for _, opt := range opts {
+		opt(&o)
 	}
 
 	// Asked before the loop, so that a question already recognisable as
@@ -525,7 +570,7 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 		body := chatRequest{Model: c.model, MaxTokens: c.maxTokens, Messages: messages}
 		// Tools are withheld on the final pass, which is what forces text
 		// out of a model that would otherwise keep calling tools forever.
-		if registry.Len() > 0 && round < MaxToolRounds {
+		if registry.Len() > 0 && round < c.maxToolRounds {
 			body.Tools = registry.Definitions()
 		}
 
@@ -541,7 +586,7 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 		// Dropping it here costs nothing the model can't recover from on
 		// its next turn.
 		calls = withNonEmptyIDs(calls)
-		if len(calls) == 0 || round >= MaxToolRounds {
+		if len(calls) == 0 || round >= c.maxToolRounds {
 			reply := cleanReply(withUnheardRefusal(unheard, cutToolMarkup(messageContent(payload))))
 			// The durable half of the same boundary. A question naming an
 			// owner without a possessive and without the word waypoint --
@@ -607,6 +652,9 @@ func (c *LLMClient) AnswerWithTools(ctx context.Context, asker, callerXUID, ques
 			messages = append(messages, chatMessage{
 				Role: "tool", ToolCallID: call.ID, Content: result,
 			})
+		}
+		if o.onToolRound != nil {
+			o.onToolRound(round)
 		}
 		// After the round's results, so the model reads it as the last word
 		// before it writes the reply rather than as an aside to its own turn.
