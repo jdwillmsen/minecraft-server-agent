@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -191,7 +192,7 @@ func toolBackend(t *testing.T, replies []string) (*httptest.Server, *int) {
 		reply := replies[calls]
 		calls++
 		// The final call must not offer tools -- that is what forces text.
-		if calls == len(replies) && strings.Contains(string(body), `"tools"`) && len(replies) > MaxToolRounds {
+		if calls == len(replies) && strings.Contains(string(body), `"tools"`) && len(replies) > DefaultMaxToolRounds {
 			t.Errorf("final call still offered tools: %s", body)
 		}
 		w.Header().Set("content-type", "application/json")
@@ -718,5 +719,64 @@ func TestExtractTextDoesNotEndOnAQuestionTheCapExposes(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "…") || len(got) > MaxReplyChars {
 		t.Errorf("ExtractText = %q, want a reply cut to the cap and marked with an ellipsis", got)
+	}
+}
+
+func TestAnswerWithToolsHonoursAConfiguredRoundBudget(t *testing.T) {
+	lookup := toolCallReply("knowledge_lookup", `{"query":"x"}`)
+	// Four tool rounds, then the forced text round: five calls in all.
+	srv, calls := toolBackend(t, []string{lookup, lookup, lookup, lookup, textReply})
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil, WithMaxToolRounds(4))
+	registry := tools.NewRegistry(tools.Tool{
+		Name:   "knowledge_lookup",
+		Invoke: func(context.Context, json.RawMessage, string) (string, error) { return "x", nil },
+	})
+
+	if _, err := client.AnswerWithTools(t.Context(), "Alex", "1", "q", registry); err != nil {
+		t.Fatal(err)
+	}
+	if *calls != 5 {
+		t.Errorf("backend called %d times, want 5 (4 tool rounds + 1 answer)", *calls)
+	}
+}
+
+func TestWithMaxToolRoundsIgnoresNonPositive(t *testing.T) {
+	client := NewLLMClient("http://x", "m", "", 192, time.Second, nil, WithMaxToolRounds(0))
+	if got := client.MaxToolRounds(); got != DefaultMaxToolRounds {
+		t.Errorf("MaxToolRounds() = %d, want the default %d", got, DefaultMaxToolRounds)
+	}
+}
+
+func TestToolRoundHookFiresOncePerToolRound(t *testing.T) {
+	lookup := toolCallReply("knowledge_lookup", `{"query":"x"}`)
+	srv, _ := toolBackend(t, []string{lookup, lookup, textReply})
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
+	registry := tools.NewRegistry(tools.Tool{
+		Name:   "knowledge_lookup",
+		Invoke: func(context.Context, json.RawMessage, string) (string, error) { return "x", nil },
+	})
+
+	var rounds []int
+	_, err := client.AnswerWithTools(t.Context(), "Alex", "1", "q", registry,
+		WithToolRoundHook(func(round int) { rounds = append(rounds, round) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(rounds, []int{0, 1}) {
+		t.Errorf("hook saw rounds %v, want [0 1]", rounds)
+	}
+}
+
+func TestToolRoundHookSilentWhenNoToolRuns(t *testing.T) {
+	srv, _ := toolBackend(t, []string{textReply})
+	client := NewLLMClient(srv.URL, "m", "", 192, 5*time.Second, nil)
+	fired := false
+	_, err := client.AnswerWithTools(t.Context(), "Alex", "1", "q", tools.NewRegistry(),
+		WithToolRoundHook(func(int) { fired = true }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fired {
+		t.Error("hook fired for an answer that ran no tool")
 	}
 }
