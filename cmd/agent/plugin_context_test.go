@@ -15,6 +15,7 @@ import (
 	"github.com/jdwillmsen/minecraft-server-agent/internal/roster"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/store"
 	"github.com/jdwillmsen/minecraft-server-agent/internal/waypoints"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/wiki"
 	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
 )
 
@@ -50,6 +51,7 @@ func testPluginContext() *plugin.Context {
 		adapters.NewServerPinger(bridgeClient, (&linkMeter{}).roundTrip, logging.New("error")),
 		moderation.Nop{},
 		announce.Nop{},
+		wiki.Nop{},
 	)
 }
 
