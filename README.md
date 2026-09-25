@@ -1153,7 +1153,8 @@ expect no override", and a mismatch answers 409 with the current row in
 `current`. `until` and `duration` are exclusive, and a duration is resolved on
 the agent's clock. Every error body is `{"code","message"}`, where `code` is
 one of `not_found`, `conflict`, `forbidden`, `unauthorized`, `invalid` or
-`unavailable`. A database that cannot answer is a 503, and the bots keep
+`unavailable`, including a 404 `not_found` for a path under `/v1` that no
+route serves and a 405 `invalid`, with `Allow`, for a wrong method. A database that cannot answer is a 503, and the bots keep
 acting on their last answer. A token bound to one actor (every
 `presence:report` token, and any bound `presence:write` token) may change
 only that actor and may never write a group. The request and response types

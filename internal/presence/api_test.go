@@ -133,6 +133,10 @@ func TestAPIRefusesMalformedRequests(t *testing.T) {
 		"not JSON":           `{`,
 		"unknown field":      `{"state":"parked","reason":"r","version":0,"expires":"2h"}`,
 		"trailing data":      parkBody + `{}`,
+		"trailing brace":     parkBody + `}`,
+		"trailing bracket":   parkBody + `]`,
+		"oversized":          `{"state":"parked","reason":"` + strings.Repeat("x", maxPresenceRequest) + `","version":0}`,
+		"oversized padding":  parkBody + strings.Repeat(" ", maxPresenceRequest),
 		"until and duration": `{"state":"parked","reason":"r","version":0,"until":"2026-09-23T20:00:00Z","duration":"2h"}`,
 		"bad duration":       `{"state":"parked","reason":"r","version":0,"duration":"soon"}`,
 		"negative duration":  `{"state":"parked","reason":"r","version":0,"duration":"-1h"}`,
@@ -144,6 +148,31 @@ func TestAPIRefusesMalformedRequests(t *testing.T) {
 	}
 	wantError(t, r.do(http.MethodPut, "/v1/actors/afk-bot-9/presence", opsSecret, parkBody), http.StatusNotFound, presenceapi.CodeNotFound)
 	wantError(t, r.do(http.MethodGet, "/v1/actors/afk-bot-9/presence", opsSecret, ""), http.StatusNotFound, presenceapi.CodeNotFound)
+}
+
+// Every answer under /v1 is the contract's Error, including for a path or
+// method no route serves, so a client never has to parse the mux's text.
+func TestAPIAnswersUnknownPathsAndMethodsWithJSON(t *testing.T) {
+	r := newAPIRig(t)
+	for _, path := range []string{"/v1/", "/v1/nothing", "/v1/actors/afk-bot-1", "/v1/actors/afk-bot-1/presence/extra"} {
+		wantError(t, r.do(http.MethodGet, path, opsSecret, ""), http.StatusNotFound, presenceapi.CodeNotFound)
+	}
+	for _, tc := range []struct{ method, path, allow string }{
+		{http.MethodPost, "/v1/actors", "GET, HEAD"},
+		{http.MethodPost, "/v1/actors/afk-bot-1/presence", "DELETE, GET, HEAD, PUT"},
+		{http.MethodGet, "/v1/groups/bots/presence", "PUT"},
+		{http.MethodGet, "/v1/actors/afk-bot-1/status", "POST"},
+	} {
+		rec := r.do(tc.method, tc.path, opsSecret, "")
+		wantError(t, rec, http.StatusMethodNotAllowed, presenceapi.CodeInvalid)
+		if got := rec.Header().Get("Allow"); got != tc.allow {
+			t.Errorf("%s %s: Allow = %q, want %q", tc.method, tc.path, got, tc.allow)
+		}
+	}
+	// Still behind the token, like every other route: an anonymous caller
+	// learns nothing about which paths exist.
+	wantError(t, r.do(http.MethodGet, "/v1/nothing", "", ""), http.StatusUnauthorized, presenceapi.CodeUnauthorized)
+	wantError(t, r.do(http.MethodPost, "/v1/actors", "", ""), http.StatusUnauthorized, presenceapi.CodeUnauthorized)
 }
 
 func TestAPIDurationBecomesAnExpiry(t *testing.T) {

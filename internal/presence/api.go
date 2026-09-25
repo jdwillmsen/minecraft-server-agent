@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -76,6 +77,16 @@ func NewAPI(svc *Service, tokens []Token, log *logging.Logger) *API {
 	mux.HandleFunc("DELETE /v1/actors/{id}/presence", a.guard(ScopeWrite, a.del))
 	mux.HandleFunc("PUT /v1/groups/{group}/presence", a.guard(ScopeWrite, a.putGroup))
 	mux.HandleFunc("POST /v1/actors/{id}/status", a.guard(ScopeReport, a.status))
+	// Method-less patterns lose to the method-specific ones above, so they
+	// catch only what no route serves, and answer in the contract's Error
+	// rather than the mux's plain text.
+	mux.HandleFunc("/v1/actors", a.authenticated(notAllowed("GET, HEAD")))
+	mux.HandleFunc("/v1/actors/{id}/presence", a.authenticated(notAllowed("DELETE, GET, HEAD, PUT")))
+	mux.HandleFunc("/v1/groups/{group}/presence", a.authenticated(notAllowed("PUT")))
+	mux.HandleFunc("/v1/actors/{id}/status", a.authenticated(notAllowed("POST")))
+	mux.HandleFunc("/v1/", a.authenticated(func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusNotFound, presenceapi.Error{Code: presenceapi.CodeNotFound, Message: "no such route"})
+	}))
 	a.mux = mux
 	return a
 }
@@ -94,8 +105,7 @@ func (a *API) guard(scope string, h handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		c, ok := a.authenticate(r.Header.Get("Authorization"))
 		if !ok {
-			w.Header().Set("WWW-Authenticate", "Bearer")
-			writeError(w, http.StatusUnauthorized, presenceapi.Error{Code: presenceapi.CodeUnauthorized, Message: "a valid bearer token is required"})
+			unauthorized(w)
 			return
 		}
 		if !c.scopes[scope] {
@@ -106,6 +116,30 @@ func (a *API) guard(scope string, h handler) http.HandlerFunc {
 		defer cancel()
 		h(w, r.WithContext(ctx), c)
 	}
+}
+
+// authenticated serves h to any valid token, for the answers that need no
+// scope but should still not tell an anonymous caller which routes exist.
+func (a *API) authenticated(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := a.authenticate(r.Header.Get("Authorization")); !ok {
+			unauthorized(w)
+			return
+		}
+		h(w, r)
+	}
+}
+
+func notAllowed(allow string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Allow", allow)
+		writeError(w, http.StatusMethodNotAllowed, presenceapi.Error{Code: presenceapi.CodeInvalid, Message: r.Method + " is not allowed here; use " + allow})
+	}
+}
+
+func unauthorized(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	writeError(w, http.StatusUnauthorized, presenceapi.Error{Code: presenceapi.CodeUnauthorized, Message: "a valid bearer token is required"})
 }
 
 // authenticate compares the presented token against every configured one,
@@ -254,14 +288,16 @@ func (a *API) decodeSet(w http.ResponseWriter, r *http.Request) (Request, error)
 }
 
 // decodeStrict reads exactly one JSON object of bounded size. Unknown fields
-// are refused: a caller who wrote "expires" meant something by it.
+// are refused: a caller who wrote "expires" meant something by it. Only the
+// end of the body may follow the object; dec.More would let a stray closing
+// brace or bracket through.
 func decodeStrict(w http.ResponseWriter, r *http.Request, v any) error {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxPresenceRequest))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return invalid("invalid JSON: " + err.Error())
 	}
-	if dec.More() {
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return invalid("trailing data after the JSON object")
 	}
 	return nil
