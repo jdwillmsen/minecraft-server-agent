@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -15,6 +16,7 @@ func clearEnv(t *testing.T) {
 		"CONSOLE_BRIDGE_URL", "CONSOLE_BRIDGE_TOKEN", "CONSOLE_BRIDGE_TIMEOUT_MS",
 		"LLM_MAX_TOKENS", "LLM_TIMEOUT_MS", "LLM_TOTAL_TIMEOUT_MS",
 		"LEADER_POLL_MS", "LEADER_MAX_WAIT_MS", "LEADER_HEARTBEAT_MS",
+		"MAX_TOOL_ROUNDS", "WIKI_ENABLED", "WIKI_BASE_URL", "WIKI_ALLOW_TEST_BASE_URL",
 	} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
@@ -432,5 +434,82 @@ func TestLoad_NoModerationTermsTurnsTheRuleOff(t *testing.T) {
 	}
 	if len(cfg.ModerationTerms) != 0 {
 		t.Errorf("ModerationTerms = %q, want none", cfg.ModerationTerms)
+	}
+}
+
+func TestLoad_ToolRoundAndWikiDefaults(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxToolRounds != 2 || cfg.WikiEnabled || cfg.WikiBaseURL != WikiProductionURL {
+		t.Errorf("got rounds=%d wiki=%v url=%q, want 2 false %q", cfg.MaxToolRounds, cfg.WikiEnabled, cfg.WikiBaseURL, WikiProductionURL)
+	}
+}
+
+func TestLoad_MaxToolRoundsOutOfRangeFails(t *testing.T) {
+	for _, v := range []string{"0", "7", "-1", "two"} {
+		clearEnv(t)
+		setRequired(t)
+		t.Setenv("MAX_TOOL_ROUNDS", v)
+		if _, err := Load(); err == nil {
+			t.Errorf("MAX_TOOL_ROUNDS=%s loaded, want an error", v)
+		}
+	}
+}
+
+func TestLoad_TotalTimeoutMustCoverEveryRound(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("MAX_TOOL_ROUNDS", "4")
+	t.Setenv("LLM_TIMEOUT_MS", "8000")
+	t.Setenv("LLM_TOTAL_TIMEOUT_MS", "30000") // needs 40000
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "LLM_TOTAL_TIMEOUT_MS") || !strings.Contains(err.Error(), "40000") {
+		t.Fatalf("err = %v, want one naming LLM_TOTAL_TIMEOUT_MS and the 40000 it needs", err)
+	}
+	t.Setenv("LLM_TOTAL_TIMEOUT_MS", "45000")
+	if _, err := Load(); err != nil {
+		t.Fatalf("a covering budget still failed: %v", err)
+	}
+}
+
+func TestLoad_WikiBaseURLIsPinned(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("WIKI_BASE_URL", "http://127.0.0.1:9999/api.php")
+	if _, err := Load(); err == nil {
+		t.Fatal("a non-production wiki URL loaded without WIKI_ALLOW_TEST_BASE_URL")
+	}
+	t.Setenv("WIKI_ALLOW_TEST_BASE_URL", "true")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WikiBaseURL != "http://127.0.0.1:9999/api.php" {
+		t.Errorf("WikiBaseURL = %q", cfg.WikiBaseURL)
+	}
+}
+
+func TestLoad_WikiEnabledParsesBooleans(t *testing.T) {
+	for v, want := range map[string]bool{"true": true, "1": true, "false": false, "": false} {
+		clearEnv(t)
+		setRequired(t)
+		t.Setenv("WIKI_ENABLED", v)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("WIKI_ENABLED=%q: %v", v, err)
+		}
+		if cfg.WikiEnabled != want {
+			t.Errorf("WIKI_ENABLED=%q gave %v, want %v", v, cfg.WikiEnabled, want)
+		}
+	}
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("WIKI_ENABLED", "yes please")
+	if _, err := Load(); err == nil {
+		t.Error("WIKI_ENABLED=\"yes please\" loaded, want an error")
 	}
 }
