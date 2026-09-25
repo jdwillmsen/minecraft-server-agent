@@ -1,0 +1,35 @@
+[
+  {
+    "id": "agent",
+    "gamertag": "JdwAgent",
+    "kind": "agent",
+    "groups": [],
+    "actor_id": "agent",
+    "effective": "present",
+    "default": "present",
+    "status": {
+      "connected": true,
+      "observed_state": "present",
+      "last_seen": "2026-09-23T18:00:05Z",
+      "process_version": "0.21.0"
+    }
+  },
+  {
+    "id": "afk-bot-1",
+    "gamertag": "JdwAfk1",
+    "kind": "afk-bot",
+    "groups": [
+      "bots"
+    ],
+    "actor_id": "afk-bot-1",
+    "effective": "parked",
+    "default": "present",
+    "override": {
+      "state": "parked",
+      "reason": "chunk budget for the build",
+      "set_by": "chat:Jdwillmsen",
+      "set_at": "2026-09-23T18:00:00Z",
+      "version": 1
+    }
+  }
+]
