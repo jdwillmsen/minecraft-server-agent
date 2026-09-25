@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	opsSecret    = "ops-secret-0123456789"
+	opsSecret    = "ops-secret-aaaaaaaaaa"
 	readSecret   = "read-secret-0123456789"
-	botSecret    = "bot1-secret-0123456789"
+	botSecret    = "bot1-secret-bbbbbbbbbb"
 	writerSecret = "writer1-secret-0123456789"
 )
 

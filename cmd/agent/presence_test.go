@@ -43,7 +43,7 @@ func TestNewPresenceGatesTheSessionOnItsOwnActor(t *testing.T) {
 	cfg := config.Config{
 		PresenceSelfID: "agent",
 		PresenceActors: []config.PresenceActor{{ID: "agent", Gamertag: "JdwAgent", Kind: "agent", DefaultState: "parked"}},
-		PresenceTokens: []config.PresenceToken{{Name: "ops", Token: "0123456789abcdef", Scopes: []string{"presence:read"}}},
+		PresenceTokens: []config.PresenceToken{{Name: "ops", Token: "aaaaaaaaaaaaaaaa", Scopes: []string{"presence:read"}}},
 	}
 	rt, err := newPresence(cfg, store.Nop{}, audit.Nop{}, unusedBridge(), roster.New(), quiet())
 	if err != nil {
