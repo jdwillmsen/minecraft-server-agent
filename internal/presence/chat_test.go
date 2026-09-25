@@ -243,19 +243,21 @@ func TestServerLeaveParksTheAgentWithTheGivenTimer(t *testing.T) {
 }
 
 // sayRecorder notes, for each broadcast, whether the agent's park had
-// already been written when it was said.
+// already been written when it was said, and whether its context was live.
 type sayRecorder struct {
 	store     *fakeStore
 	said      []string
 	parkedYet []bool
+	ctxErr    []error
 	err       error
 }
 
 func (v *sayRecorder) Tell(context.Context, string, string) error { return nil }
-func (v *sayRecorder) Say(_ context.Context, msg string) error {
+func (v *sayRecorder) Say(ctx context.Context, msg string) error {
 	_, parked := v.store.row("agent")
 	v.said = append(v.said, msg)
 	v.parkedYet = append(v.parkedYet, parked)
+	v.ctxErr = append(v.ctxErr, ctx.Err())
 	return v.err
 }
 
@@ -274,7 +276,7 @@ func (r *chatRig) runWith(t *testing.T, pctx *plugin.Context, name string, args 
 	return ""
 }
 
-func TestTheAgentConfirmsBeforeItLeaves(t *testing.T) {
+func TestTheAgentConfirmsOnceTheLeaveIsWritten(t *testing.T) {
 	for _, tc := range []struct {
 		command string
 		args    []string
@@ -282,16 +284,62 @@ func TestTheAgentConfirmsBeforeItLeaves(t *testing.T) {
 		r := newChatRig(t)
 		voice := &sayRecorder{store: r.store}
 		r.runWith(t, &plugin.Context{Voice: voice}, tc.command, tc.args...)
-		if len(voice.said) != 1 || voice.parkedYet[0] {
-			t.Errorf("!%s %v: said %q (park already written: %v), want one confirmation before the write", tc.command, tc.args, voice.said, voice.parkedYet)
+		if len(voice.said) != 1 || !voice.parkedYet[0] {
+			t.Errorf("!%s %v: said %q (park already written: %v), want one confirmation after the write", tc.command, tc.args, voice.said, voice.parkedYet)
 			continue
 		}
 		if !strings.Contains(voice.said[0], "Leaving the world") || !strings.Contains(voice.said[0], "player joins") {
 			t.Errorf("!%s %v: said %q, want when and how it comes back", tc.command, tc.args, voice.said[0])
 		}
-		if _, ok := r.store.row("agent"); !ok {
-			t.Errorf("!%s %v: agent not parked", tc.command, tc.args)
+	}
+}
+
+// The write wakes the loop, which ends the session whose context the
+// handler runs on; the broadcast must survive that.
+func TestTheConfirmationOutlivesTheSessionItEnds(t *testing.T) {
+	r := newChatRig(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	r.plugin.svc.OnChange(cancel)
+	voice := &sayRecorder{store: r.store}
+	for _, c := range r.plugin.Commands() {
+		if c.Name == "leave" {
+			if _, err := c.Run(ctx, &plugin.Context{Voice: voice}, plugin.Invocation{ActorXUID: "2535400000000001", ActorPermission: plugin.PermissionOperator}); err != nil {
+				t.Fatal(err)
+			}
 		}
+	}
+	if ctx.Err() == nil {
+		t.Fatal("the write did not cancel the handler's context; the test proves nothing")
+	}
+	if len(voice.ctxErr) != 1 || voice.ctxErr[0] != nil {
+		t.Errorf("broadcast context errors = %v, want one live context", voice.ctxErr)
+	}
+}
+
+func TestAFailedLeaveIsNeverAnnounced(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		args    []string
+	}{{"leave", nil}, {"park", []string{"all"}}} {
+		r := newChatRig(t)
+		r.store.fail(errors.New("connection refused"))
+		voice := &sayRecorder{store: r.store}
+		reply := r.runWith(t, &plugin.Context{Voice: voice}, tc.command, tc.args...)
+		if len(voice.said) != 0 {
+			t.Errorf("!%s %v: said %q after a failed write", tc.command, tc.args, voice.said)
+		}
+		if !strings.Contains(reply, "database") || !strings.Contains(reply, "nothing was parked") || !strings.Contains(reply, "staying") {
+			t.Errorf("!%s %v: reply = %q, want that nothing was parked and it is staying", tc.command, tc.args, reply)
+		}
+	}
+}
+
+func TestAFailedBotParkSaysNothingWasParked(t *testing.T) {
+	r := newChatRig(t)
+	r.store.fail(errors.New("connection refused"))
+	if got := r.run(t, "park", "bots"); !strings.Contains(got, "nothing was parked") {
+		t.Errorf("!park bots = %q, want that nothing was parked", got)
 	}
 }
 
@@ -310,15 +358,5 @@ func TestLeaveRepliesWithTheConfirmationWhenItCouldNotBeSaid(t *testing.T) {
 	reply := r.runWith(t, &plugin.Context{Voice: voice}, "leave")
 	if !strings.Contains(reply, "Leaving the world") {
 		t.Errorf("reply = %q, want the confirmation that could not be broadcast", reply)
-	}
-}
-
-func TestLeaveThatCannotBeSavedSaysItIsStaying(t *testing.T) {
-	r := newChatRig(t)
-	r.store.fail(errors.New("connection refused"))
-	voice := &sayRecorder{store: r.store}
-	reply := r.runWith(t, &plugin.Context{Voice: voice}, "leave")
-	if !strings.Contains(reply, "database") || !strings.Contains(reply, "staying") {
-		t.Errorf("reply = %q, want that it could not save and is staying", reply)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -23,7 +24,8 @@ const (
 	notConfigured     = "Presence control isn't set up on this server."
 	storeDownRead     = "I can't read presence right now - the database isn't answering."
 	storeDownWrite    = "I couldn't save that - the database isn't answering."
-	storeDownStaying  = "I couldn't save that - the database isn't answering, so I'm staying."
+	storeDownParked   = "I couldn't save that - the database isn't answering, so nothing was parked."
+	storeDownStaying  = "I couldn't save that - the database isn't answering, so nothing was parked and I'm staying."
 	chatParkReason    = "parked from chat by "
 	chatLeaveReason   = "asked to leave from chat by "
 	leaveUsage        = "Usage: !leave [duration], or @server leave [duration]. Durations look like 30m or 2h."
@@ -148,39 +150,46 @@ func (p *ChatPlugin) unpark(ctx context.Context, _ *plugin.Context, inv plugin.I
 	return "Back to default: " + describeAll(views), nil
 }
 
-// parkActors parks actors, announcing first when the agent is among them.
+// parkActors parks actors, and announces it once the write has landed if
+// the agent is among them, so a leave that did not happen is never
+// announced.
 //
-// The announcement cannot wait for the reply: the write wakes the loop, the
-// loop ends this session, and the reply is spoken on the session's context,
-// so a confirmation sent after the write can be cancelled before it is
-// delivered. Saying it first is the only order that always reaches chat.
+// The announcement goes through the bridge, which outlives the session the
+// write is about to end, but the handler's ctx does not: it is the session's,
+// and the write wakes the loop that cancels it. So the broadcast runs
+// detached from that cancellation, under its own bound.
 func (p *ChatPlugin) parkActors(ctx context.Context, pctx *plugin.Context, actors []Actor, d time.Duration, reason string, inv plugin.Invocation) (string, error) {
 	now := p.now()
 	by := p.source(inv)
-	var confirmation string
-	for _, a := range actors {
-		if a.ID == p.svc.Registry().SelfID() {
-			until, _ := ChatPark(a, d, now)
-			confirmation = fmt.Sprintf(leaveConfirmation, utcClock(*until))
-		}
-	}
-	announced := confirmation != "" && pctx != nil && pctx.Voice != nil && pctx.Voice.Say(ctx, confirmation) == nil
-
 	views, err := p.svc.SetEach(ctx, actors, func(a Actor) Request {
 		until, wake := ChatPark(a, d, now)
 		return Request{State: presenceapi.StateParked, Until: until, WakeOn: wake, Reason: reason + by.Gamertag}
 	}, by)
+	leaving := slices.ContainsFunc(actors, func(a Actor) bool { return a.ID == p.svc.Registry().SelfID() })
 	switch {
-	case errors.Is(err, ErrUnavailable) && confirmation != "":
+	case errors.Is(err, ErrUnavailable) && leaving:
 		return storeDownStaying, nil
 	case errors.Is(err, ErrUnavailable):
-		return storeDownWrite, nil
+		return storeDownParked, nil
 	case err != nil:
 		return "", err
-	case confirmation != "" && !announced:
-		return confirmation + " Parked: " + describeAll(views), nil
 	}
-	return "Parked: " + describeAll(views), nil
+	parked := "Parked: " + describeAll(views)
+	if !leaving {
+		return parked, nil
+	}
+	self, _ := p.svc.Registry().Actor(p.svc.Registry().SelfID())
+	until, _ := ChatPark(self, d, now)
+	confirmation := fmt.Sprintf(leaveConfirmation, utcClock(*until))
+	if pctx == nil || pctx.Voice == nil {
+		return confirmation + " " + parked, nil
+	}
+	sayCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), plugin.DefaultDispatchTimeout)
+	defer cancel()
+	if pctx.Voice.Say(sayCtx, confirmation) != nil {
+		return confirmation + " " + parked, nil
+	}
+	return parked, nil
 }
 
 // source names who typed the command. The console has no gamertag, and the
