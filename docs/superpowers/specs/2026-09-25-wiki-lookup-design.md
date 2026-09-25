@@ -95,25 +95,32 @@ One `Client` with one method:
 func (c *Client) Lookup(ctx context.Context, topic, aspect string) (Result, error)
 ```
 
-Steps, each one HTTP request to the fixed base URL:
+Steps, against the fixed base URL:
 
-1. **Resolve.** `opensearch` with the topic, limit 5. Take the first title that
-   is not a disambiguation page (one `pageprops` request for the candidates).
-   If opensearch returns nothing, fall back to `list=search` with a limit of 3
-   under the same disambiguation rule. Follow redirects (`redirects=1`).
-2. **Structure.** `action=parse&prop=sections` for the resolved title.
+1. **Resolve.** `opensearch` with the topic, limit 5. If it returns nothing,
+   fall back to `list=search` with a limit of 3.
+2. **Fetch.** One `prop=extracts|pageprops` query for the first candidate
+   (`explaintext`, `exsectionformat=wiki`, `ppprop=disambiguation`,
+   `redirects=1`). A disambiguation page moves on to the next candidate, up to
+   two tries. The heading structure is read from the extract's own
+   `== … ==` lines, so no separate sections request is needed.
 3. **Select.** Without an aspect: the intro. With one: the section whose
-   heading best matches it (case-insensitive exact match, then a token-overlap
-   score). Inside the chosen section, a descendant headed "Bedrock Edition" is
-   preferred over one headed "Java Edition". Sections never selected, because
-   they answer nothing a player asks: History, Gallery, Trivia, Videos, Sounds,
-   Data values, Issues, Achievements, Advancements.
-4. **Render.** A section containing `{{Crafting` or `{{Smelting` is fetched as
-   wikitext and the templates are rendered to one line each
-   (`Crafting: Coal or Charcoal over Stick makes 4 Torch`). Grid positions are
-   read as rows, not coordinates, so the line stays readable in chat. Anything
-   else uses the plain-text extract. Unknown templates are dropped, never
-   echoed as `{{…}}`.
+   heading best matches it (case-insensitive exact match, then a small synonym
+   table — recipe → Crafting, spawn → Spawning, loot → Drops — then token
+   overlap). Inside the chosen section, wherever a heading "Java Edition" has a
+   sibling "Bedrock Edition", the Java one is dropped. Sections never
+   selected, because they answer nothing a player asks: History, Gallery,
+   Trivia, Videos, Sounds, Data values, Issues, Achievements, Advancements.
+4. **Render.** When the selected section's extract text is empty — which is
+   what a section made of `{{Crafting}}` or `{{Smelting}}` templates looks
+   like — the page wikitext is fetched once (`action=parse&prop=wikitext`),
+   the same heading is sliced out of it, and those templates are rendered to
+   one line each (`Crafting: Coal or Charcoal in the center, Stick at bottom
+   middle makes 4 Torch`). Unknown templates are dropped, never echoed as
+   `{{…}}`.
+
+An uncached lookup is therefore at most five requests: opensearch, the
+full-text fallback, two fetch attempts, and the wikitext.
 
 Every result carries the resolved title and section path, which the answer
 credits.
@@ -126,11 +133,12 @@ rejects any value that is not `https://minecraft.wiki/api.php` unless
 **Cache.** In-memory, keyed by `(normalized title, normalized aspect)` and by
 normalized topic → title, TTL 6 hours, at most 512 entries (LRU). Misses are
 cached for 30 minutes so a misspelled topic asked repeatedly costs one fetch.
+Failures (timeouts, errors, rate limits) are never cached, so an outage ends
+when the wiki recovers rather than 30 minutes later.
 Repeating the same call within one answer is therefore free.
 
 **Limits.** 3 s timeout per request. An uncached lookup costs at most 5
-requests (opensearch, pageprops, sections, content, and the full-text fallback
-when opensearch is empty). A process-wide token bucket of 60 requests per
+requests (see above), usually 2. A process-wide token bucket of 60 requests per
 minute therefore covers about three players each spending two uncached
 lookups at once, and bounds what any loop can send to the wiki. Past that,
 lookups report `limited` rather than queue, because a queued answer would
