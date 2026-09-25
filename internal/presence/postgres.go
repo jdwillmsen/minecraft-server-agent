@@ -237,8 +237,8 @@ func (p *Postgres) Clear(ctx context.Context, ids []string) ([]Change, error) {
 	return changes, nil
 }
 
-func (p *Postgres) Remove(ctx context.Context, actorID string, version int64) (bool, error) {
-	tag, err := p.pool.Exec(ctx, `DELETE FROM minecraft.presence_overrides WHERE actor_id = $1 AND version = $2`, actorID, version)
+func (p *Postgres) Remove(ctx context.Context, actorID string, version int64, setAt time.Time) (bool, error) {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM minecraft.presence_overrides WHERE actor_id = $1 AND version = $2 AND set_at = $3`, actorID, version, setAt)
 	if err != nil {
 		return false, fmt.Errorf("presence: remove %s: %w", actorID, err)
 	}

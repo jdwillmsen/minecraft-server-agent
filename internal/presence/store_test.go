@@ -3,6 +3,7 @@ package presence
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/presenceapi"
 )
@@ -21,7 +22,7 @@ func TestNopRefusesEveryCall(t *testing.T) {
 	_, checks["Set"] = s.Set(ctx, "a", presenceapi.Override{}, 0)
 	_, checks["SetMany"] = s.SetMany(ctx, map[string]presenceapi.Override{"a": {}})
 	_, checks["Clear"] = s.Clear(ctx, []string{"a"})
-	_, checks["Remove"] = s.Remove(ctx, "a", 1)
+	_, checks["Remove"] = s.Remove(ctx, "a", 1, time.Time{})
 	_, checks["Statuses"] = s.Statuses(ctx)
 	checks["PutStatus"] = s.PutStatus(ctx, "a", presenceapi.Status{})
 	for name, err := range checks {

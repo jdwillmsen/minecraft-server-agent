@@ -85,15 +85,41 @@ func TestSetFollowsTheVersionRules(t *testing.T) {
 		t.Errorf("stored row = %+v, want every field back", row)
 	}
 
-	if ok, err := s.Remove(ctx, "zz-test-a", 1); err != nil || ok {
+	if ok, err := s.Remove(ctx, "zz-test-a", 1, row.SetAt); err != nil || ok {
 		t.Errorf("Remove at a stale version = %v, %v; want nothing removed", ok, err)
 	}
-	if ok, err := s.Remove(ctx, "zz-test-a", 2); err != nil || !ok {
+	if ok, err := s.Remove(ctx, "zz-test-a", 2, row.SetAt); err != nil || !ok {
 		t.Errorf("Remove at the current version = %v, %v; want removed", ok, err)
 	}
 	again, err := s.Set(ctx, "zz-test-a", liveOverride(presenceapi.StateParked), 0)
 	if err != nil || again.Now.Version != 1 {
 		t.Errorf("set after removal = %+v, %v; want a fresh row at version 1", again, err)
+	}
+}
+
+// An unpark and a re-park reuse version 1, so a removal the loop decided on
+// against the first park must not take the second.
+func TestRemoveSparesARowThatReusedTheVersion(t *testing.T) {
+	ctx := t.Context()
+	s := NewPostgres(livePool(t))
+	first := liveOverride(presenceapi.StateParked)
+	read, err := s.Set(ctx, "zz-test-a", first, 0)
+	if err != nil {
+		t.Fatalf("first park: %v", err)
+	}
+	if _, err := s.Clear(ctx, []string{"zz-test-a"}); err != nil {
+		t.Fatalf("unpark: %v", err)
+	}
+	second := liveOverride(presenceapi.StateParked)
+	second.SetAt = read.Now.SetAt.Add(time.Second)
+	if again, err := s.Set(ctx, "zz-test-a", second, 0); err != nil || again.Now.Version != read.Now.Version {
+		t.Fatalf("re-park = %+v, %v; want a row at the same version", again, err)
+	}
+	if ok, err := s.Remove(ctx, "zz-test-a", read.Now.Version, read.Now.SetAt); err != nil || ok {
+		t.Errorf("Remove of the first park = %v, %v; want the re-park left alone", ok, err)
+	}
+	if ok, err := s.Remove(ctx, "zz-test-a", read.Now.Version, second.SetAt); err != nil || !ok {
+		t.Errorf("Remove of the re-park = %v, %v; want removed", ok, err)
 	}
 }
 

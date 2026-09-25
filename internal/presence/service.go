@@ -241,14 +241,14 @@ func (s *Service) landed(ctx context.Context, actors []Actor, changes []Change, 
 }
 
 // Expire removes an override the policy says has ended, only if it is still
-// the version the policy read. A newer write means an operator decided again
+// the row the policy read. A newer write means an operator decided again
 // in the meantime, and that decision stands until the next tick weighs it.
 func (s *Service) Expire(ctx context.Context, r Removal) (bool, error) {
 	a, ok := s.reg.Actor(r.ActorID)
 	if !ok {
 		return false, ErrNotFound
 	}
-	removed, err := s.store.Remove(ctx, r.ActorID, r.Override.Version)
+	removed, err := s.store.Remove(ctx, r.ActorID, r.Override.Version, r.Override.SetAt)
 	if err != nil {
 		return false, unavailable(err)
 	}

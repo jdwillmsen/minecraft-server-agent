@@ -22,6 +22,9 @@ type fakeStore struct {
 	err    error
 	// bumpOnRemove simulates a write landing between a read and a removal.
 	bumpOnRemove bool
+	// reparkOnRemove simulates an unpark and a re-park landing between a
+	// read and a removal: the new row starts again at version 1.
+	reparkOnRemove func(presenceapi.Override) presenceapi.Override
 }
 
 var _ Store = (*fakeStore)(nil)
@@ -117,7 +120,7 @@ func (f *fakeStore) Clear(_ context.Context, ids []string) ([]Change, error) {
 	return out, nil
 }
 
-func (f *fakeStore) Remove(_ context.Context, id string, version int64) (bool, error) {
+func (f *fakeStore) Remove(_ context.Context, id string, version int64, setAt time.Time) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
@@ -128,7 +131,12 @@ func (f *fakeStore) Remove(_ context.Context, id string, version int64) (bool, e
 		p.Version++
 		f.rows[id] = p
 	}
-	if !ok || p.Version != version {
+	if f.reparkOnRemove != nil && ok {
+		p = f.reparkOnRemove(p)
+		p.Version = 1
+		f.rows[id] = p
+	}
+	if !ok || p.Version != version || !p.SetAt.Equal(setAt) {
 		return false, nil
 	}
 	delete(f.rows, id)
