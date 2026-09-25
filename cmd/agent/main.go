@@ -256,7 +256,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, voice, playerRoster, registry, playerStore, knowledgeStore, waypointStore, announceStore, deliverer, pinger, moderationStore, scheduleStore)
+	pctx := newPluginContext(cfg, bridgeClient, bridgeTimeout, voice, playerRoster, registry, playerStore, knowledgeStore, waypointStore, announceStore, deliverer, pinger, moderationStore, scheduleStore, newWiki(cfg, log))
 	// Every answerable chat message and every roster join is published
 	// here; event-driven plugins (welcome) subscribe via startEventDispatch
 	// rather than touching the connection directly.
@@ -1000,7 +1000,7 @@ func handleText(ctx context.Context, text *packet.Text, selfXUID string, sibling
 // RecordJoin without reporting anything, and no player arrival was ever
 // persisted. Nothing failed loudly, because the one branch that would have
 // logged is the error path of the call that was not being made.
-func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, voice plugin.Voice, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store, announceStore plugin.AnnounceStore, deliverer plugin.AnnounceDeliverer, pinger plugin.Pinger, moderationStore plugin.ModerationStore, scheduleStore plugin.ScheduleStore) *plugin.Context {
+func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, bridgeTimeout time.Duration, voice plugin.Voice, playerRoster *roster.Roster, registry *plugin.Registry, playerStore store.Store, knowledgeStore knowledge.Store, waypointStore waypoints.Store, announceStore plugin.AnnounceStore, deliverer plugin.AnnounceDeliverer, pinger plugin.Pinger, moderationStore plugin.ModerationStore, scheduleStore plugin.ScheduleStore, wikiClient plugin.Wiki) *plugin.Context {
 	return &plugin.Context{
 		// The same Voice the Deliverer speaks through, passed in rather than
 		// built here: an announcement and a command reply are the same console
@@ -1027,7 +1027,7 @@ func newPluginContext(cfg config.Config, bridgeClient *adapters.BridgeClient, br
 		Knowledge: knowledgeStore,
 		Waypoints: waypointStore,
 		// The disabled implementation until the wiki is configured, never nil.
-		Wiki: wiki.Nop{},
+		Wiki: wikiClient,
 		// Same reasoning as Profiles again -- pool-backed when a database is
 		// configured, the disabled implementation when not, never nil, even
 		// though the field is documented as possibly nil for tests that
@@ -1061,7 +1061,30 @@ func newLLMClient(cfg config.Config, log *logging.Logger) *adapters.LLMClient {
 		cfg.LLMBaseURL, cfg.LLMModel, cfg.LLMAPIKey,
 		cfg.LLMMaxTokens, time.Duration(cfg.LLMTimeoutMs)*time.Millisecond,
 		log,
+		adapters.WithMaxToolRounds(cfg.MaxToolRounds),
 	)
+}
+
+// newWiki returns wiki.Nop when the wiki is off, never nil: plugin.Context.Wiki
+// is a repo invariant that every field is wired to a usable value, and the
+// disabled implementation is what keeps wiki_lookup out of the toolset --
+// toolset.Build asks Enabled and skips registering it, rather than the
+// context carrying a nil interface a plugin could dereference.
+func newWiki(cfg config.Config, log *logging.Logger) plugin.Wiki {
+	if !cfg.WikiEnabled {
+		return wiki.Nop{}
+	}
+	return wiki.New(wiki.Options{
+		BaseURL:           cfg.WikiBaseURL,
+		UserAgent:         "minecraft-server-agent (+https://github.com/jdwillmsen/minecraft-server-agent)",
+		RequestTimeout:    3 * time.Second,
+		RequestsPerMinute: 60,
+		CacheTTL:          6 * time.Hour,
+		MissTTL:           30 * time.Minute,
+		CacheSize:         512,
+		Observe:           func(o wiki.Outcome) { metrics.WikiLookup(string(o)) },
+		Log:               log,
+	})
 }
 
 // storeOpenWindow bounds how long startup keeps asking an unreachable
@@ -1194,7 +1217,23 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 
 	registry, personal := ans.toolsFor(pctx)
 	started := time.Now()
-	reply, err := ans.llm.AnswerWithTools(answerCtx, name, actorXUID, trigger.Message, registry)
+	progress := newProgressHook(started, progressDelay, time.Now, func() {
+		if actorXUID == chat.ServerOrigin || pctx.Voice == nil {
+			return
+		}
+		// Off the answering goroutine: the next model call should not wait
+		// on the bridge, and the answer is still at least one model call
+		// away, so it cannot overtake this.
+		go func() {
+			tellCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ans.broadcast)
+			defer cancel()
+			if err := pctx.Voice.Tell(tellCtx, actorXUID, progressText); err != nil {
+				log.Error("mention_progress_send_failed", logging.Fields{"actor": actorXUID, "error": err.Error()})
+			}
+		}()
+	})
+	reply, err := ans.llm.AnswerWithTools(answerCtx, name, actorXUID, trigger.Message, registry,
+		adapters.WithToolRoundHook(progress))
 	// Timed as answered even when the reply turns out empty: the histogram
 	// is how long the model takes to come back, and an empty completion took
 	// exactly as long as a usable one. Whether the reply could be used is

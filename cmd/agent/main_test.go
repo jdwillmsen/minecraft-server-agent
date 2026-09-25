@@ -339,3 +339,26 @@ func TestProductionLLMClientLogsToolFailures(t *testing.T) {
 		t.Error("the production LLM client has no logger: failed tool invocations would be dropped")
 	}
 }
+
+// newWiki must never return a nil plugin.Wiki -- plugin.Context.Wiki is a
+// repo invariant enforced by TestEveryPluginContextFieldIsWired, and the
+// disabled implementation is what keeps wiki_lookup out of the toolset
+// (toolset.Build asks Enabled), not a nil interface a caller could panic on.
+func TestNewWiki_DisabledReturnsAnUnusableButNonNilWiki(t *testing.T) {
+	w := newWiki(config.Config{WikiEnabled: false}, logging.New("error"))
+
+	if w == nil {
+		t.Fatal("newWiki(disabled) returned nil, want wiki.Nop")
+	}
+	if w.Enabled() {
+		t.Error("newWiki(disabled).Enabled() = true, want false")
+	}
+}
+
+func TestNewWiki_EnabledReturnsAWorkingClient(t *testing.T) {
+	w := newWiki(config.Config{WikiEnabled: true, WikiBaseURL: "http://wiki.invalid/api.php"}, logging.New("error"))
+
+	if !w.Enabled() {
+		t.Error("newWiki(enabled).Enabled() = false, want true")
+	}
+}
