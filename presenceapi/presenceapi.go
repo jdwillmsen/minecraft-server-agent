@@ -44,7 +44,7 @@ type Presence struct {
 }
 
 // SetRequest is the body of PUT /v1/actors/{id}/presence and
-// PUT /v1/groups/{group}/presence. Exactly one of Until and Duration may be
+// PUT /v1/groups/{group}/presence. At most one of Until and Duration may be
 // set. Version is required for a single actor (0 = "expect no override"),
 // ignored for a group.
 type SetRequest struct {
