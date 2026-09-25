@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/jdwillmsen/minecraft-server-agent/internal/adapters"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
 )
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -42,6 +43,7 @@ type options struct {
 	out           string
 	trace         string
 	maxToolRounds int
+	wiki          bool
 }
 
 // traceLine is one case's raw exchanges. The report shows what the agent
@@ -89,6 +91,7 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&o.label, "label", "evaluation", "title for the report, e.g. baseline")
 	fs.StringVar(&o.out, "out", "", "also write the report to this file")
 	fs.StringVar(&o.trace, "trace", "", "write every case's raw exchanges to this file as JSON lines")
+	fs.BoolVar(&o.wiki, "wiki", true, "offer wiki_lookup and run wiki cases; -wiki=false measures the WIKI_ENABLED=off default")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: evalllm [flags]   runs eval/cases.yaml against the model; markdown report on stdout")
 		fmt.Fprintln(stderr, "the API key is read from LLM_API_KEY only, so it never appears in a process list")
@@ -160,6 +163,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	cases = selectCases(cases, o.only)
+	cases, wikiSkipped := filterWiki(cases, o.wiki)
 	if len(cases) == 0 {
 		fmt.Fprintf(stdout, "error: no case id or category matches -only %q\n", o.only)
 		return 1
@@ -188,7 +192,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		client:   adapters.NewLLMClient(localURL, o.model, o.apiKey, o.maxTokens, o.timeout, nil, adapters.WithMaxToolRounds(o.maxToolRounds)),
 		recorder: recorder,
 		total:    o.total,
-		world:    fixtureContext,
+		world:    func() *plugin.Context { return fixtureContext(o.wiki) },
 	}
 	lim := Limits{
 		MaxReplyChars: adapters.MaxReplyChars,
@@ -238,6 +242,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		Label: o.label, Model: o.model, Host: host, Started: started,
 		MaxTokens: o.maxTokens, Timeout: o.timeout, Total: o.total,
 		LatencyBudget: o.latencyBudget, MaxToolRounds: r.client.MaxToolRounds(),
+		Wiki: o.wiki, WikiCasesSkipped: wikiSkipped,
 	}, results); err != nil {
 		fmt.Fprintf(stdout, "error: render report: %v\n", err)
 		return 1

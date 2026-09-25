@@ -62,21 +62,30 @@ const (
 )
 
 // fixtureContext offers every capability production can, so the model is
-// shown the full production toolset.
-func fixtureContext() *plugin.Context {
-	return &plugin.Context{
+// shown the full production toolset. wikiEnabled false swaps in wiki.Nop,
+// the same stand-in production uses with WIKI_ENABLED off, so a -wiki=false
+// run measures the toolset a default deployment actually offers.
+func fixtureContext(wikiEnabled bool) *plugin.Context {
+	c := &plugin.Context{
 		Knowledge:  fixtureKnowledge{},
 		Waypoints:  fixtureWaypointStore{},
 		Facts:      fixturePlayersOnline{},
 		ServerInfo: fixtureServerInfo{},
 		Wiki:       fixtureWiki{},
 	}
+	if !wikiEnabled {
+		c.Wiki = wiki.Nop{}
+	}
+	return c
 }
 
 // fixtureToolNames is the set of tools the model is offered, used to check
-// the case file names only tools that exist.
+// the case file names only tools that exist. Always the full toolset,
+// independent of any run's -wiki setting: a case naming wiki_lookup should
+// fail to load if the tool is ever renamed, not merely when a run happens
+// to have the wiki off.
 func fixtureToolNames() map[string]bool {
-	registry, _ := toolset.Build(fixtureContext())
+	registry, _ := toolset.Build(fixtureContext(true))
 	names := make(map[string]bool, registry.Len())
 	for _, d := range registry.Definitions() {
 		names[d.Function.Name] = true
