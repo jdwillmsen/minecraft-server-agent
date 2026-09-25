@@ -33,6 +33,7 @@ func TestEverySeriesIsExportedUnderItsAgreedName(t *testing.T) {
 		"mc_agent_server_tps",
 		"mc_agent_tps_last_success_timestamp_seconds",
 		"mc_agent_link_rtt_seconds",
+		"mc_agent_wiki_requests_total",
 	} {
 		if metricstest.Series(t, name) == 0 {
 			t.Errorf("%s is not exported", name)
@@ -152,5 +153,18 @@ func TestEveryModerationFlagPairStartsAtZero(t *testing.T) {
 	}
 	if n := metricstest.Series(t, "mc_agent_moderation_flags_total"); n != len(moderationRules)*len(moderationActions) {
 		t.Errorf("mc_agent_moderation_flags_total exports %d series, want exactly %d", n, len(moderationRules)*len(moderationActions))
+	}
+}
+
+func TestWikiLookupOutcomesStartAtZero(t *testing.T) {
+	// Present at zero from startup: increase() over a series that first
+	// appears at 1 reads as 0, so an alert on the first failure would miss it.
+	for _, o := range wikiOutcomes {
+		if !metricstest.Exists(t, "mc_agent_wiki_requests_total", "outcome", o) {
+			t.Errorf("wiki outcome %q is not pre-initialised", o)
+		}
+	}
+	if d := metricstest.Delta(t, func() { WikiLookup("hit") }, "mc_agent_wiki_requests_total", "outcome", "hit"); d != 1 {
+		t.Errorf("WikiLookup(hit) moved the counter by %v, want 1", d)
 	}
 }

@@ -164,6 +164,11 @@ var (
 		Name: "mc_agent_session_recycles_total",
 		Help: "Sessions ended deliberately on the recycle schedule, rather than by the server or a fault.",
 	})
+
+	wikiRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "mc_agent_wiki_requests_total",
+		Help: "wiki_lookup calls, by how each ended. Counts lookups, not HTTP requests.",
+	}, []string{"outcome"})
 )
 
 // Pre-initialised because increase() over a series that springs into
@@ -187,6 +192,9 @@ func init() {
 		for _, a := range moderationActions {
 			moderationFlagsTotal.WithLabelValues(string(r), string(a))
 		}
+	}
+	for _, o := range wikiOutcomes {
+		wikiRequestsTotal.WithLabelValues(o)
 	}
 }
 
@@ -281,3 +289,10 @@ func SessionEstablished(at time.Time) {
 
 // SessionRecycled counts one session ended on purpose by the schedule.
 func SessionRecycled() { sessionRecyclesTotal.Inc() }
+
+var wikiOutcomes = []string{"hit", "miss", "cached", "error", "limited"}
+
+// WikiLookup counts one wiki_lookup by outcome.
+func WikiLookup(outcome string) {
+	wikiRequestsTotal.WithLabelValues(outcome).Inc()
+}
