@@ -22,6 +22,8 @@ type fakeStore struct {
 	err    error
 	// overridesErr fails only the override read, leaving statuses readable.
 	overridesErr error
+	// statusesErr fails only the status read.
+	statusesErr error
 	// bumpOnRemove simulates a write landing between a read and a removal.
 	bumpOnRemove bool
 	// reparkOnRemove simulates an unpark and a re-park landing between a
@@ -37,6 +39,7 @@ func newFakeStore() *fakeStore {
 
 func (f *fakeStore) fail(err error)          { f.mu.Lock(); f.err = err; f.mu.Unlock() }
 func (f *fakeStore) failOverrides(err error) { f.mu.Lock(); f.overridesErr = err; f.mu.Unlock() }
+func (f *fakeStore) failStatuses(err error)  { f.mu.Lock(); f.statusesErr = err; f.mu.Unlock() }
 func (f *fakeStore) Enabled() bool           { return true }
 
 func (f *fakeStore) row(id string) (presenceapi.Override, bool) {
@@ -149,11 +152,19 @@ func (f *fakeStore) Remove(_ context.Context, id string, version int64, setAt ti
 	return true, nil
 }
 
-func (f *fakeStore) Statuses(context.Context) (map[string]presenceapi.Status, error) {
+// Statuses honours ctx as a real query would, so a tick whose leadership
+// has ended fails here too.
+func (f *fakeStore) Statuses(ctx context.Context) (map[string]presenceapi.Status, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.statusesErr != nil {
+		return nil, f.statusesErr
 	}
 	out := make(map[string]presenceapi.Status, len(f.status))
 	for k, v := range f.status {

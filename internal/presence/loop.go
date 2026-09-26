@@ -153,8 +153,13 @@ func (l *Loop) tick(parent context.Context) {
 		// database blink neither pulls the agent out nor puts it back.
 		// Observed is still refreshed, since a bot dropping during a store
 		// outage would otherwise hide behind its last exported value.
+		// A parent that has ended is a leader stepping down, and
+		// ResetPresence follows; writing now could race it and leave a
+		// standby exporting beside the new leader.
 		l.log.Warn("presence_tick_skipped", logging.Fields{"error": err.Error()})
-		l.exportObserved(ctx, now)
+		if parent.Err() == nil {
+			l.exportObserved(ctx, now)
+		}
 		return
 	}
 
@@ -172,8 +177,9 @@ func (l *Loop) tick(parent context.Context) {
 
 	l.gate.Set(d.Effective[self.ID] == presenceapi.StatePresent)
 	l.reportSelf(ctx, self, d)
-	l.export(ctx, overrides, d, now)
-	metrics.PresenceTickSuccess(now)
+	if l.export(ctx, overrides, d, now) {
+		metrics.PresenceTickSuccess(now)
+	}
 	l.kick(ctx, overrides, d, now)
 }
 
@@ -187,18 +193,19 @@ func (l *Loop) reportSelf(ctx context.Context, self Actor, d Decision) {
 	}
 }
 
-func (l *Loop) export(ctx context.Context, overrides map[string]presenceapi.Override, d Decision, now time.Time) {
+// export reports whether every gauge came from a successful read.
+func (l *Loop) export(ctx context.Context, overrides map[string]presenceapi.Override, d Decision, now time.Time) bool {
 	for _, a := range l.svc.reg.Actors() {
 		metrics.PresenceDesired(a.ID, d.Effective[a.ID] == presenceapi.StatePresent)
 		ov, ok := overrides[a.ID]
 		metrics.PresenceOverrideAge(a.ID, now.Sub(ov.SetAt), ok && ov.Until == nil)
 	}
-	l.exportObserved(ctx, now)
+	return l.exportObserved(ctx, now)
 }
 
 // exportObserved needs no overrides, so it can run on a tick that could not
-// read them.
-func (l *Loop) exportObserved(ctx context.Context, now time.Time) {
+// read them. It reports whether the statuses could be read.
+func (l *Loop) exportObserved(ctx context.Context, now time.Time) bool {
 	statuses, err := l.svc.store.Statuses(ctx)
 	if err != nil {
 		// Every other actor then reads as not connected, which is what the loop
@@ -215,6 +222,7 @@ func (l *Loop) exportObserved(ctx context.Context, now time.Time) {
 		}
 		metrics.PresenceObserved(a.ID, connected)
 	}
+	return err == nil
 }
 
 // kick removes every actor that has been parked for KickGrace and that both

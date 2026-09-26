@@ -229,22 +229,51 @@ func TestLoopSkipsATickItCannotRead(t *testing.T) {
 
 // A presence-store failure is when a bot outage matters most, so a failed
 // override read still refreshes what each actor is observed doing. desired
-// keeps its last answer, as the gate does.
+// and the override age keep their last answers, as the gate does.
 func TestLoopKeepsObservedCurrentWhenTheOverrideReadFails(t *testing.T) {
 	r := newLoopRig(t)
-	r.store.status["afk-bot-1"] = presenceapi.Status{Connected: true, ObservedState: presenceapi.StatePresent, LastSeen: t0}
+	r.set(t, "afk-bot-2", Request{State: presenceapi.StatePresent, Reason: "r"})
+	r.clock = t0.Add(30 * time.Second)
+	r.store.status["afk-bot-1"] = presenceapi.Status{Connected: true, ObservedState: presenceapi.StatePresent, LastSeen: r.clock}
 	r.loop.tick(t.Context())
 	if got := metricstest.Value(t, "mc_presence_observed", "actor", "afk-bot-1"); got != 1 {
 		t.Fatalf("afk-bot-1 observed = %v before the failure, want 1", got)
 	}
+	if got := metricstest.Value(t, "mc_presence_override_age_seconds", "actor", "afk-bot-2"); got != 30 {
+		t.Fatalf("afk-bot-2 override age = %v before the failure, want 30", got)
+	}
 	r.store.failOverrides(errors.New("connection refused"))
-	r.clock = t0.Add(statusStale + time.Second)
+	r.clock = r.clock.Add(statusStale + time.Second)
 	r.loop.tick(t.Context())
 	if got := metricstest.Value(t, "mc_presence_observed", "actor", "afk-bot-1"); got != 0 {
 		t.Errorf("afk-bot-1 observed = %v after its report went stale, want 0", got)
 	}
 	if got := metricstest.Value(t, "mc_presence_desired", "actor", "afk-bot-1"); got != 1 {
 		t.Errorf("afk-bot-1 desired = %v, want its last answer of 1", got)
+	}
+	if got := metricstest.Value(t, "mc_presence_override_age_seconds", "actor", "afk-bot-2"); got != 30 {
+		t.Errorf("afk-bot-2 override age = %v, want its last answer of 30", got)
+	}
+}
+
+// A tick cut short by losing leadership is followed by ResetPresence, and a
+// write racing it would put a standby's zeros back beside the new leader's.
+func TestLoopWritesNothingOnAFailedReadAfterLeadershipEnds(t *testing.T) {
+	var r *loopRig
+	out := captureStdout(t, func() {
+		r = newLoopRigLogging(t, logging.New("info"))
+		r.store.status["afk-bot-1"] = presenceapi.Status{Connected: true, ObservedState: presenceapi.StatePresent, LastSeen: t0}
+		r.loop.tick(t.Context())
+		r.store.failOverrides(context.Canceled)
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		r.loop.tick(ctx)
+	})
+	if got := metricstest.Value(t, "mc_presence_observed", "actor", "afk-bot-1"); got != 1 {
+		t.Errorf("afk-bot-1 observed = %v, want the last leading tick's 1 untouched", got)
+	}
+	if strings.Contains(out, "presence_status_read_failed") {
+		t.Errorf("read statuses on a tick whose leadership had ended:\n%s", out)
 	}
 }
 
@@ -283,6 +312,43 @@ func TestLoopStampsOnlyTicksThatReadTheOverrides(t *testing.T) {
 	r.loop.tick(t.Context())
 	if got := metricstest.Value(t, "mc_presence_tick_success_timestamp_seconds"); got != float64(r.clock.Unix()) {
 		t.Errorf("tick success = %v after recovering, want %v", got, r.clock.Unix())
+	}
+}
+
+func TestLoopDoesNotStampATickThatCouldNotReadStatuses(t *testing.T) {
+	r := newLoopRig(t)
+	r.loop.tick(t.Context())
+	r.store.failStatuses(errors.New("connection refused"))
+	r.clock = t0.Add(TickInterval)
+	r.loop.tick(t.Context())
+	if got := metricstest.Value(t, "mc_presence_tick_success_timestamp_seconds"); got != float64(t0.Unix()) {
+		t.Errorf("tick success = %v after a failed status read, want it held at %v", got, t0.Unix())
+	}
+}
+
+// A leader that has never ticked cleanly must read as stale, not as absent,
+// or an alert on the timestamp's age would have nothing to fire on.
+func TestANewLeaderWhoseFirstTickFailsReadsTheEpoch(t *testing.T) {
+	r := newLoopRig(t)
+	r.store.failOverrides(errors.New("connection refused"))
+	r.loop.Prime(t.Context())
+	metrics.InitPresence([]string{"agent"})
+	if !metricstest.Exists(t, "mc_presence_tick_success_timestamp_seconds") {
+		t.Fatal("tick success not exported by a leader whose first tick failed")
+	}
+	if got := metricstest.Value(t, "mc_presence_tick_success_timestamp_seconds"); got != 0 {
+		t.Errorf("tick success = %v, want 0", got)
+	}
+}
+
+// Prime ticks before Run initialises the metrics, so that initialisation
+// must not wipe the stamp Prime just wrote.
+func TestRunKeepsTheStampPrimeWrote(t *testing.T) {
+	r := newLoopRig(t)
+	r.loop.Prime(t.Context())
+	metrics.InitPresence([]string{"agent"})
+	if got := metricstest.Value(t, "mc_presence_tick_success_timestamp_seconds"); got != float64(t0.Unix()) {
+		t.Errorf("tick success = %v after Run's initialisation, want Prime's %v", got, t0.Unix())
 	}
 }
 

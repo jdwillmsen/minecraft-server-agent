@@ -27,7 +27,7 @@ var (
 	// gauge always exports its one series.
 	presenceTickSuccess = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "mc_presence_tick_success_timestamp_seconds",
-		Help: "Unix time of the leader's last policy tick that read the overrides and exported every presence gauge. Exported by the leader only.",
+		Help: "Unix time of the leader's last policy tick that read both the overrides and the actor statuses; 0 until the first. Exported by the leader only.",
 	}, nil)
 	presenceKicksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "mc_presence_kicks_total",
@@ -36,11 +36,14 @@ var (
 )
 
 // InitPresence starts every actor's kick counter at zero, for the same
-// reason init does for the fixed label sets.
+// reason init does for the fixed label sets. The tick stamp starts at the
+// epoch so a leader that never ticks cleanly reads as stale rather than
+// absent, but only if unset: Prime may already have stamped this turn.
 func InitPresence(actors []string) {
 	for _, a := range actors {
 		presenceKicksTotal.WithLabelValues(a)
 	}
+	presenceTickSuccess.WithLabelValues()
 }
 
 func PresenceDesired(actor string, present bool) {
@@ -62,6 +65,10 @@ func PresenceOverrideAge(actor string, age time.Duration, open bool) {
 	presenceOverrideAge.WithLabelValues(actor).Set(age.Seconds())
 }
 
+// PresenceTickSuccess stamps a tick that read both the overrides and the
+// statuses. A failing store otherwise leaves the per-actor gauges looking
+// current, since a failed tick keeps desired and the override age as they
+// were; the stamp's age is what says they have stopped moving.
 func PresenceTickSuccess(at time.Time) {
 	presenceTickSuccess.WithLabelValues().Set(float64(at.UnixNano()) / float64(time.Second))
 }
