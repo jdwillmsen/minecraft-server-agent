@@ -1,7 +1,7 @@
 # wiki_lookup and a larger tool budget
 
 Date: 2026-09-25
-Status: design for review, not yet implemented
+Status: implemented behind WIKI_ENABLED (off); see docs/eval/2026-09-25-wiki-lookup.md
 
 ## Problem
 
@@ -167,6 +167,12 @@ One clause added after the server-facts clause:
 The existing "say you don't know rather than guess" clause already covers a
 wiki miss. The clause is measured with `evalllm` like every earlier prompt
 change, and it is dropped if it moves any existing case.
+
+As built: the clause was measured and removed. It pulled server-knowledge
+questions (`kb_mending`, `kb_end_portal`) to `wiki_lookup` instead of
+`knowledge_lookup`, so the shipped `systemPrompt` is unchanged from before
+this feature and `wiki_lookup` is reached through its tool description alone
+-- see docs/eval/2026-09-25-wiki-lookup.md.
 
 ### Tool budget
 
