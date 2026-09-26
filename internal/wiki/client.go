@@ -75,9 +75,14 @@ func New(o Options) *Client {
 	if o.BaseURL == "" {
 		o.BaseURL = DefaultBaseURL
 	}
-	if o.HTTP == nil {
-		o.HTTP = &http.Client{}
+	hc := http.Client{}
+	if o.HTTP != nil {
+		hc = *o.HTTP
 	}
+	// A redirect is the one way the fixed host could widen, so a 3xx is
+	// answered as the failure it is rather than followed.
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	o.HTTP = &hc
 	if o.Now == nil {
 		o.Now = time.Now
 	}
@@ -227,7 +232,10 @@ func (c *Client) fetchPage(ctx context.Context, title string) (page, error) {
 		_, disambiguation := p.PageProps["disambiguation"]
 		return page{title: p.Title, extract: p.Extract, missing: p.Missing != nil, disambiguation: disambiguation}, nil
 	}
-	return page{missing: true}, nil
+	// A title query always answers with a page, even a missing one, so an
+	// empty answer is a broken response -- caching it as a miss would hide a
+	// real page for the miss TTL.
+	return page{}, errors.New("query returned no pages")
 }
 
 func (c *Client) render(ctx context.Context, p page, aspect string) (string, error) {
@@ -236,9 +244,10 @@ func (c *Client) render(ctx context.Context, p page, aspect string) (string, err
 	if aspect == "" {
 		return Format(p.title, "intro", root.Text, others), nil
 	}
+	unmatched := fmt.Sprintf("no section matched %q; ", aspect) + Format(p.title, "intro", root.Text, others)
 	node, path, ok := selectSection(root, aspect)
 	if !ok {
-		return fmt.Sprintf("no section matched %q; ", aspect) + Format(p.title, "intro", root.Text, others), nil
+		return unmatched, nil
 	}
 	body := renderSection(node)
 	if body == "" {
@@ -253,6 +262,11 @@ func (c *Client) render(ctx context.Context, p page, aspect string) (string, err
 			return "", err
 		}
 		body = strings.Join(renderRecipes(sliceWikitext(parsed.Parse.Wikitext.Text, path)), " ")
+	}
+	// A heading with nothing under it the client can read answers the aspect
+	// no better than a heading that was never there.
+	if body == "" {
+		return unmatched, nil
 	}
 	return Format(p.title, strings.Join(path, " > "), body, others), nil
 }
@@ -283,9 +297,23 @@ func (c *Client) get(ctx context.Context, q url.Values, into any) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
+	// MediaWiki reports maxlag, readonly and internal errors with a 200, so
+	// the status alone would let them decode as an empty answer and be cached
+	// as a miss.
+	if code := resp.Header.Get("MediaWiki-API-Error"); code != "" {
+		return fmt.Errorf("api error %s", code)
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return err
+	}
+	var apiErr struct {
+		Error *struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &apiErr) == nil && apiErr.Error != nil {
+		return fmt.Errorf("api error %s", apiErr.Error.Code)
 	}
 	return json.Unmarshal(body, into)
 }
