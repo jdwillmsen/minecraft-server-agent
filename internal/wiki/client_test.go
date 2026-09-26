@@ -132,6 +132,22 @@ func TestLookupReportsAnUnmatchedAspect(t *testing.T) {
 	}
 }
 
+func TestLookupDoesNotMatchAnAspectOnFillerWords(t *testing.T) {
+	f := &fakeWiki{
+		opensearch: map[string][]string{"emerald": {"Emerald"}},
+		pages:      map[string]string{"Emerald": "An emerald is a rare mineral.\n\n== Trading to villagers ==\nVillagers buy and sell for emeralds."},
+	}
+	c := newTestClient(t, f, nil)
+	out, err := c.Lookup(t.Context(), "emerald", "how to get")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `no section matched "how to get"; ` + Format("Emerald", "intro", "An emerald is a rare mineral.", []string{"Trading to villagers"})
+	if out != want {
+		t.Errorf("result = %q, want %q", out, want)
+	}
+}
+
 func TestLookupRendersRecipesTheExtractDrops(t *testing.T) {
 	c := newTestClient(t, golemWiki(), nil)
 	out, err := c.Lookup(t.Context(), "torch", "recipe")

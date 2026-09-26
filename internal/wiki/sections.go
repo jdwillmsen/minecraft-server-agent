@@ -111,9 +111,20 @@ func selectSection(root *section, aspect string) (*section, []string, bool) {
 	return best, bestPath, best != nil
 }
 
+// fillerWords carry no topic, so sharing one says nothing about whether a
+// heading answers the aspect: "how to get" must not pick "Trading to
+// villagers".
+var fillerWords = map[string]bool{
+	"the": true, "and": true, "how": true, "get": true, "for": true,
+	"with": true, "from": true, "into": true, "what": true,
+}
+
 func overlap(a, b string) int {
 	n := 0
 	for _, w := range strings.Fields(a) {
+		if len(w) < 3 || fillerWords[w] {
+			continue
+		}
 		for _, h := range strings.Fields(b) {
 			if strings.TrimSuffix(w, "s") == strings.TrimSuffix(h, "s") {
 				n++
