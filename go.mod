@@ -10,7 +10,7 @@ require (
 	github.com/jdwillmsen/minecraft-server-agent/presenceapi v0.1.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/common v0.71.0
-	github.com/sandertv/go-raknet v1.15.2-0.20260705184311-0d1fd09e2cf6
+	github.com/sandertv/go-raknet v1.15.2
 	github.com/sandertv/gophertunnel v1.62.0
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/oauth2 v0.37.0
