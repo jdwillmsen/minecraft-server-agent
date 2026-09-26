@@ -91,7 +91,7 @@ func parseOptions(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&o.label, "label", "evaluation", "title for the report, e.g. baseline")
 	fs.StringVar(&o.out, "out", "", "also write the report to this file")
 	fs.StringVar(&o.trace, "trace", "", "write every case's raw exchanges to this file as JSON lines")
-	fs.BoolVar(&o.wiki, "wiki", true, "offer wiki_lookup and run wiki cases; -wiki=false measures the WIKI_ENABLED=off default")
+	fs.BoolVar(&o.wiki, "wiki", false, "offer wiki_lookup and run the wiki cases, as WIKI_ENABLED=true would; off by default, like production")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: evalllm [flags]   runs eval/cases.yaml against the model; markdown report on stdout")
 		fmt.Fprintln(stderr, "the API key is read from LLM_API_KEY only, so it never appears in a process list")
@@ -164,7 +164,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	cases = selectCases(cases, o.only)
 	cases, wikiSkipped := filterWiki(cases, o.wiki)
-	if len(cases) == 0 {
+	switch {
+	case len(cases) == 0 && wikiSkipped > 0:
+		fmt.Fprintf(stdout, "error: -only %q matches only wiki cases, %d skipped by -wiki=false; add -wiki to run them\n", o.only, wikiSkipped)
+		return 1
+	case len(cases) == 0:
 		fmt.Fprintf(stdout, "error: no case id or category matches -only %q\n", o.only)
 		return 1
 	}
