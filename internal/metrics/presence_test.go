@@ -49,7 +49,11 @@ func TestResetPresenceWithdrawsTheGauges(t *testing.T) {
 	PresenceDesired("agent", true)
 	PresenceObserved("agent", true)
 	PresenceOverrideAge("agent", time.Minute, true)
+	PresenceTickSuccess(time.Unix(1700000000, 0))
 	ResetPresence()
+	if metricstest.Exists(t, "mc_presence_tick_success_timestamp_seconds") {
+		t.Error("mc_presence_tick_success_timestamp_seconds still exported after ResetPresence")
+	}
 	for _, name := range []string{"mc_presence_desired", "mc_presence_observed", "mc_presence_override_age_seconds"} {
 		if metricstest.Exists(t, name, "actor", "agent") {
 			t.Errorf("%s still exported after ResetPresence", name)
