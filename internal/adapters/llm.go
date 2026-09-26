@@ -102,9 +102,9 @@ func WithToolRoundHook(fn func(round int)) AnswerOption {
 // server-knowledge questions this server has its own answer for --
 // mending books, the end portal location -- toward wiki_lookup instead of
 // knowledge_lookup. Measured with evalllm and removed; wiki_lookup stays
-// registered (see its tool description in internal/toolset/toolset.go) so
-// the model can still reach for it on its own, but nothing here points it
-// there.
+// registered when the wiki is enabled (see its tool description in
+// internal/toolset/toolset.go) so the model can still reach for it on its
+// own, but nothing here points it there.
 const systemPrompt = "You are the voice of a Minecraft Bedrock server, replying directly in its own chat. " +
 	"Answer in one or two short, plain sentences under 400 characters. " +
 	"For anything about this server, such as places, coordinates, links, rules or players, look it up with a tool and state only what it returned; " +
