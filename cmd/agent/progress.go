@@ -1,6 +1,13 @@
 package main
 
-import "time"
+import (
+	"context"
+	"time"
+
+	"github.com/jdwillmsen/minecraft-server-agent/internal/chat"
+	"github.com/jdwillmsen/minecraft-server-agent/internal/plugin"
+	"github.com/jdwillmsen/minecraft-server-agent/pkg/logging"
+)
 
 // progressText is whispered, never broadcast: only the asker is waiting, and
 // a line in open chat for every slow answer would be noise to everyone else.
@@ -22,5 +29,26 @@ func newProgressHook(started time.Time, delay time.Duration, now func() time.Tim
 		}
 		done = true
 		send()
+	}
+}
+
+// sendProgress returns the send newProgressHook calls: a whisper of
+// progressText to the asker. A question from the server console gets none,
+// because the console has no chat to whisper into.
+func sendProgress(ctx context.Context, actorXUID string, pctx *plugin.Context, ans answering, log *logging.Logger) func() {
+	return func() {
+		if actorXUID == chat.ServerOrigin || pctx.Voice == nil {
+			return
+		}
+		// Off the answering goroutine: the next model call should not wait
+		// on the bridge, and the answer is still at least one model call
+		// away, so it cannot overtake this.
+		go func() {
+			tellCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ans.broadcast)
+			defer cancel()
+			if err := pctx.Voice.Tell(tellCtx, actorXUID, progressText); err != nil {
+				log.Error("mention_progress_send_failed", logging.Fields{"actor": actorXUID, "error": err.Error()})
+			}
+		}()
 	}
 }

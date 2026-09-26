@@ -1217,21 +1217,7 @@ func handleMention(ctx context.Context, actorXUID string, trigger chat.Trigger, 
 
 	registry, personal := ans.toolsFor(pctx)
 	started := time.Now()
-	progress := newProgressHook(started, progressDelay, time.Now, func() {
-		if actorXUID == chat.ServerOrigin || pctx.Voice == nil {
-			return
-		}
-		// Off the answering goroutine: the next model call should not wait
-		// on the bridge, and the answer is still at least one model call
-		// away, so it cannot overtake this.
-		go func() {
-			tellCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ans.broadcast)
-			defer cancel()
-			if err := pctx.Voice.Tell(tellCtx, actorXUID, progressText); err != nil {
-				log.Error("mention_progress_send_failed", logging.Fields{"actor": actorXUID, "error": err.Error()})
-			}
-		}()
-	})
+	progress := newProgressHook(started, progressDelay, time.Now, sendProgress(ctx, actorXUID, pctx, ans, log))
 	reply, err := ans.llm.AnswerWithTools(answerCtx, name, actorXUID, trigger.Message, registry,
 		adapters.WithToolRoundHook(progress))
 	// Timed as answered even when the reply turns out empty: the histogram
