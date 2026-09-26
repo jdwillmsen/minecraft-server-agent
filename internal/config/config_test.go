@@ -444,8 +444,11 @@ func TestLoad_ToolRoundAndWikiDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MaxToolRounds != 2 || cfg.WikiEnabled || cfg.WikiBaseURL != WikiProductionURL {
-		t.Errorf("got rounds=%d wiki=%v url=%q, want 2 false %q", cfg.MaxToolRounds, cfg.WikiEnabled, cfg.WikiBaseURL, WikiProductionURL)
+	// The literal, not WikiProductionURL: the pin is derived from the wiki
+	// client's default, and a change there must fail here.
+	const want = "https://minecraft.wiki/api.php"
+	if cfg.MaxToolRounds != 2 || cfg.WikiEnabled || cfg.WikiBaseURL != want {
+		t.Errorf("got rounds=%d wiki=%v url=%q, want 2 false %q", cfg.MaxToolRounds, cfg.WikiEnabled, cfg.WikiBaseURL, want)
 	}
 }
 

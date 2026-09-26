@@ -9,6 +9,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/jdwillmsen/minecraft-server-agent/internal/wiki"
 )
 
 // Config is the agent's fully-parsed runtime configuration.
@@ -138,12 +140,11 @@ type Config struct {
 	// tools answers arbitrarily late.
 	//
 	// The two are not independent. One answer makes up to
-	// (MaxToolRounds + 1) sequential calls -- three, for the two tool
-	// rounds internal/adapters allows -- so this must be at least
-	// (MaxToolRounds + 1) x LLMTimeoutMs, with margin for the tool calls
-	// between them. Set below that and a model that uses both of its tool
-	// rounds is cancelled before it ever answers, which the player who
-	// asked experiences as silence.
+	// MAX_TOOL_ROUNDS + 1 sequential calls, so Load refuses a value below
+	// (MAX_TOOL_ROUNDS + 1) x LLM_TIMEOUT_MS; leave margin above that for the
+	// tool calls between them. A budget that fell short would cancel a model
+	// that used all its tool rounds before it ever answered, which the player
+	// who asked experiences as silence.
 	LLMTotalTimeoutMs int
 	// AnswerMaxPerMinute bounds answers per player, separately from the
 	// command limiter: one LLM call is far more expensive than one console
@@ -189,8 +190,9 @@ type Config struct {
 	LogLevel string
 }
 
-// WikiProductionURL is the only wiki API the agent is meant to call.
-const WikiProductionURL = "https://minecraft.wiki/api.php"
+// WikiProductionURL is the only wiki API the agent is meant to call. It is
+// the wiki client's own default, so the pin and the client cannot disagree.
+const WikiProductionURL = wiki.DefaultBaseURL
 
 // Load reads Config from the process environment.
 func Load() (Config, error) {
