@@ -227,6 +227,65 @@ func TestLoopSkipsATickItCannotRead(t *testing.T) {
 	}
 }
 
+// A presence-store failure is when a bot outage matters most, so a failed
+// override read still refreshes what each actor is observed doing. desired
+// keeps its last answer, as the gate does.
+func TestLoopKeepsObservedCurrentWhenTheOverrideReadFails(t *testing.T) {
+	r := newLoopRig(t)
+	r.store.status["afk-bot-1"] = presenceapi.Status{Connected: true, ObservedState: presenceapi.StatePresent, LastSeen: t0}
+	r.loop.tick(t.Context())
+	if got := metricstest.Value(t, "mc_presence_observed", "actor", "afk-bot-1"); got != 1 {
+		t.Fatalf("afk-bot-1 observed = %v before the failure, want 1", got)
+	}
+	r.store.failOverrides(errors.New("connection refused"))
+	r.clock = t0.Add(statusStale + time.Second)
+	r.loop.tick(t.Context())
+	if got := metricstest.Value(t, "mc_presence_observed", "actor", "afk-bot-1"); got != 0 {
+		t.Errorf("afk-bot-1 observed = %v after its report went stale, want 0", got)
+	}
+	if got := metricstest.Value(t, "mc_presence_desired", "actor", "afk-bot-1"); got != 1 {
+		t.Errorf("afk-bot-1 desired = %v, want its last answer of 1", got)
+	}
+}
+
+func TestLoopReadsBotsAsDisconnectedWhenNothingCanBeRead(t *testing.T) {
+	r := newLoopRig(t)
+	r.store.status["afk-bot-1"] = presenceapi.Status{Connected: true, ObservedState: presenceapi.StatePresent, LastSeen: t0}
+	r.loop.tick(t.Context())
+	r.store.fail(errors.New("connection refused"))
+	r.loop.tick(t.Context())
+	if got := metricstest.Value(t, "mc_presence_observed", "actor", "afk-bot-1"); got != 0 {
+		t.Errorf("afk-bot-1 observed = %v with no status readable, want 0", got)
+	}
+	if got := metricstest.Value(t, "mc_presence_observed", "actor", "agent"); got != 1 {
+		t.Errorf("agent observed = %v with its session up, want 1", got)
+	}
+	r.up = false
+	r.loop.tick(t.Context())
+	if got := metricstest.Value(t, "mc_presence_observed", "actor", "agent"); got != 0 {
+		t.Errorf("agent observed = %v with its session down, want 0", got)
+	}
+}
+
+func TestLoopStampsOnlyTicksThatReadTheOverrides(t *testing.T) {
+	r := newLoopRig(t)
+	r.loop.tick(t.Context())
+	if got := metricstest.Value(t, "mc_presence_tick_success_timestamp_seconds"); got != float64(t0.Unix()) {
+		t.Fatalf("tick success = %v, want %v", got, t0.Unix())
+	}
+	r.store.failOverrides(errors.New("connection refused"))
+	r.clock = t0.Add(TickInterval)
+	r.loop.tick(t.Context())
+	if got := metricstest.Value(t, "mc_presence_tick_success_timestamp_seconds"); got != float64(t0.Unix()) {
+		t.Errorf("tick success = %v after a failed read, want it held at %v", got, t0.Unix())
+	}
+	r.store.failOverrides(nil)
+	r.loop.tick(t.Context())
+	if got := metricstest.Value(t, "mc_presence_tick_success_timestamp_seconds"); got != float64(r.clock.Unix()) {
+		t.Errorf("tick success = %v after recovering, want %v", got, r.clock.Unix())
+	}
+}
+
 // A release that outran its migration reads a table that is not there on
 // every tick. Said once, at INFO, and each such tick is skipped outright.
 func TestLoopReportsAMissingTableOnceAndSkipsTheTick(t *testing.T) {
@@ -408,6 +467,9 @@ func TestRunActsOnANudgeAndWithdrawsMetricsOnExit(t *testing.T) {
 	stop()
 	if metricstest.Exists(t, "mc_presence_desired", "actor", "agent") {
 		t.Error("desired still exported after the leader's loop ended")
+	}
+	if metricstest.Exists(t, "mc_presence_tick_success_timestamp_seconds") {
+		t.Error("tick success still exported after the leader's loop ended")
 	}
 }
 

@@ -23,6 +23,12 @@ var (
 		Name: "mc_presence_override_age_seconds",
 		Help: "Age of the actor's override when it has no expiry; absent otherwise.",
 	}, []string{"actor"})
+	// A vec with no labels only so ResetPresence can withdraw it: a plain
+	// gauge always exports its one series.
+	presenceTickSuccess = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "mc_presence_tick_success_timestamp_seconds",
+		Help: "Unix time of the leader's last policy tick that read the overrides and exported every presence gauge. Exported by the leader only.",
+	}, nil)
 	presenceKicksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "mc_presence_kicks_total",
 		Help: "Kicks sent for an actor still on the server after its park grace.",
@@ -56,6 +62,10 @@ func PresenceOverrideAge(actor string, age time.Duration, open bool) {
 	presenceOverrideAge.WithLabelValues(actor).Set(age.Seconds())
 }
 
+func PresenceTickSuccess(at time.Time) {
+	presenceTickSuccess.WithLabelValues().Set(float64(at.UnixNano()) / float64(time.Second))
+}
+
 func PresenceKick(actor string) { presenceKicksTotal.WithLabelValues(actor).Inc() }
 
 // ResetPresence withdraws every presence gauge when this process stops
@@ -65,6 +75,7 @@ func ResetPresence() {
 	presenceDesired.Reset()
 	presenceObserved.Reset()
 	presenceOverrideAge.Reset()
+	presenceTickSuccess.Reset()
 }
 
 func boolValue(b bool) float64 {

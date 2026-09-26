@@ -151,7 +151,10 @@ func (l *Loop) tick(parent context.Context) {
 	if err != nil {
 		// Skipped rather than guessed: the gate keeps its last answer, so a
 		// database blink neither pulls the agent out nor puts it back.
+		// Observed is still refreshed, since a bot dropping during a store
+		// outage would otherwise hide behind its last exported value.
 		l.log.Warn("presence_tick_skipped", logging.Fields{"error": err.Error()})
+		l.exportObserved(ctx, now)
 		return
 	}
 
@@ -170,6 +173,7 @@ func (l *Loop) tick(parent context.Context) {
 	l.gate.Set(d.Effective[self.ID] == presenceapi.StatePresent)
 	l.reportSelf(ctx, self, d)
 	l.export(ctx, overrides, d, now)
+	metrics.PresenceTickSuccess(now)
 	l.kick(ctx, overrides, d, now)
 }
 
@@ -184,15 +188,25 @@ func (l *Loop) reportSelf(ctx context.Context, self Actor, d Decision) {
 }
 
 func (l *Loop) export(ctx context.Context, overrides map[string]presenceapi.Override, d Decision, now time.Time) {
+	for _, a := range l.svc.reg.Actors() {
+		metrics.PresenceDesired(a.ID, d.Effective[a.ID] == presenceapi.StatePresent)
+		ov, ok := overrides[a.ID]
+		metrics.PresenceOverrideAge(a.ID, now.Sub(ov.SetAt), ok && ov.Until == nil)
+	}
+	l.exportObserved(ctx, now)
+}
+
+// exportObserved needs no overrides, so it can run on a tick that could not
+// read them.
+func (l *Loop) exportObserved(ctx context.Context, now time.Time) {
 	statuses, err := l.svc.store.Statuses(ctx)
 	if err != nil {
-		// Every actor then reads as not connected, which is what the loop
+		// Every other actor then reads as not connected, which is what the loop
 		// can actually vouch for.
 		l.log.Warn("presence_status_read_failed", logging.Fields{"error": err.Error()})
 	}
 	selfID := l.svc.reg.SelfID()
 	for _, a := range l.svc.reg.Actors() {
-		metrics.PresenceDesired(a.ID, d.Effective[a.ID] == presenceapi.StatePresent)
 		var connected bool
 		if a.ID == selfID {
 			connected = l.up()
@@ -200,8 +214,6 @@ func (l *Loop) export(ctx context.Context, overrides map[string]presenceapi.Over
 			connected = st.Connected && now.Sub(st.LastSeen) <= statusStale
 		}
 		metrics.PresenceObserved(a.ID, connected)
-		ov, ok := overrides[a.ID]
-		metrics.PresenceOverrideAge(a.ID, now.Sub(ov.SetAt), ok && ov.Until == nil)
 	}
 }
 

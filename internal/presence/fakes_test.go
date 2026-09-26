@@ -20,6 +20,8 @@ type fakeStore struct {
 	rows   map[string]presenceapi.Override
 	status map[string]presenceapi.Status
 	err    error
+	// overridesErr fails only the override read, leaving statuses readable.
+	overridesErr error
 	// bumpOnRemove simulates a write landing between a read and a removal.
 	bumpOnRemove bool
 	// reparkOnRemove simulates an unpark and a re-park landing between a
@@ -33,8 +35,9 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{rows: map[string]presenceapi.Override{}, status: map[string]presenceapi.Status{}}
 }
 
-func (f *fakeStore) fail(err error) { f.mu.Lock(); f.err = err; f.mu.Unlock() }
-func (f *fakeStore) Enabled() bool  { return true }
+func (f *fakeStore) fail(err error)          { f.mu.Lock(); f.err = err; f.mu.Unlock() }
+func (f *fakeStore) failOverrides(err error) { f.mu.Lock(); f.overridesErr = err; f.mu.Unlock() }
+func (f *fakeStore) Enabled() bool           { return true }
 
 func (f *fakeStore) row(id string) (presenceapi.Override, bool) {
 	f.mu.Lock()
@@ -48,6 +51,9 @@ func (f *fakeStore) Overrides(context.Context) (map[string]presenceapi.Override,
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.overridesErr != nil {
+		return nil, f.overridesErr
 	}
 	out := make(map[string]presenceapi.Override, len(f.rows))
 	for k, v := range f.rows {
