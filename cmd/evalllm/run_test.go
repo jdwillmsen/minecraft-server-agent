@@ -188,3 +188,37 @@ func TestRunWithoutAnEndpointIsAnError(t *testing.T) {
 		t.Errorf("code %d, stdout %q", code, out.String())
 	}
 }
+
+func TestWikiDefaultsToTheProductionToolset(t *testing.T) {
+	t.Setenv("LLM_BASE_URL", "http://127.0.0.1:1/v1")
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{nil, false},
+		{[]string{"-wiki"}, true},
+	} {
+		o, err := parseOptions(append([]string{"-model", "m"}, tc.args...), io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if o.wiki != tc.want {
+			t.Errorf("args %q: wiki = %v, want %v", tc.args, o.wiki, tc.want)
+		}
+	}
+}
+
+func TestOnlyMatchingWikiCasesWithTheWikiOffNamesTheFlag(t *testing.T) {
+	t.Setenv("LLM_BASE_URL", "http://127.0.0.1:1/v1")
+	var out, errOut bytes.Buffer
+	code := run([]string{"-model", "m", "-cases", "../../eval/cases.yaml", "-only", "^wiki"}, &out, &errOut)
+	if code != 1 || !strings.Contains(out.String(), "skipped by -wiki=false") || strings.Contains(out.String(), "no case id or category matches") {
+		t.Errorf("code %d, stdout %q", code, out.String())
+	}
+
+	out.Reset()
+	code = run([]string{"-model", "m", "-cases", "../../eval/cases.yaml", "-only", "^nothing-matches$"}, &out, &errOut)
+	if code != 1 || !strings.Contains(out.String(), "no case id or category matches") {
+		t.Errorf("code %d, stdout %q", code, out.String())
+	}
+}
