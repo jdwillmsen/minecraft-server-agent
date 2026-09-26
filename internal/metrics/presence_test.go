@@ -60,3 +60,22 @@ func TestResetPresenceWithdrawsTheGauges(t *testing.T) {
 		}
 	}
 }
+
+// Seeded at 0 so a leader that never ticks cleanly reads as stale, but
+// never over a stamp already written this turn.
+func TestInitPresenceSeedsTheTickStampWithoutClobberingIt(t *testing.T) {
+	t.Cleanup(ResetPresence)
+	ResetPresence()
+	InitPresence(nil)
+	if !metricstest.Exists(t, "mc_presence_tick_success_timestamp_seconds") {
+		t.Fatal("tick success not seeded by InitPresence")
+	}
+	if got := metricstest.Value(t, "mc_presence_tick_success_timestamp_seconds"); got != 0 {
+		t.Errorf("seeded tick success = %v, want 0", got)
+	}
+	PresenceTickSuccess(time.Unix(1700000000, 0))
+	InitPresence(nil)
+	if got := metricstest.Value(t, "mc_presence_tick_success_timestamp_seconds"); got != 1700000000 {
+		t.Errorf("tick success = %v after a second InitPresence, want 1700000000", got)
+	}
+}

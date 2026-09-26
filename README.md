@@ -380,7 +380,7 @@ breaking change.
 | `mc_presence_desired` | gauge | `actor` | per policy tick on the leader: 1 present, 0 parked |
 | `mc_presence_observed` | gauge | `actor` | per policy tick on the leader: 1 when the actor's own report says connected and is under 60s old (the agent reads its own session), 0 otherwise |
 | `mc_presence_override_age_seconds` | gauge | `actor` | per policy tick, only for an override with no `until`; absent otherwise |
-| `mc_presence_tick_success_timestamp_seconds` | gauge | none | per policy tick on the leader that read the overrides and exported every presence gauge |
+| `mc_presence_tick_success_timestamp_seconds` | gauge | none | per policy tick on the leader that read both the overrides and the actors' reports; 0 until the first such tick |
 | `mc_presence_kicks_total` | counter | `actor` | per `kick` sent for an actor still listed 20s after it was parked; starts at zero |
 
 Every label is bounded by construction; nothing a player types or a model
@@ -435,8 +435,9 @@ degraded and disconnected alerts are written against. A deliberate park reads
 
 A tick that cannot read the overrides still refreshes `mc_presence_observed`,
 so a bot that drops during a presence-store outage still reads observed 0;
-desired and the override age keep their last values, and the tick success
-timestamp stops advancing, which is how to tell that the store is failing.
+desired and the override age keep their last values. The tick success
+timestamp advances only when both reads succeed, so while either is failing it
+stops advancing, which is how to tell that the store is failing.
 
 ## Proving the server can still be joined
 
