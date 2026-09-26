@@ -1076,7 +1076,7 @@ func newWiki(cfg config.Config, log *logging.Logger) plugin.Wiki {
 	}
 	return wiki.New(wiki.Options{
 		BaseURL:           cfg.WikiBaseURL,
-		UserAgent:         "minecraft-server-agent (+https://github.com/jdwillmsen/minecraft-server-agent)",
+		UserAgent:         wikiUserAgent(processVersion()),
 		RequestTimeout:    3 * time.Second,
 		RequestsPerMinute: 60,
 		CacheTTL:          6 * time.Hour,
@@ -1085,6 +1085,18 @@ func newWiki(cfg config.Config, log *logging.Logger) plugin.Wiki {
 		Observe:           func(o wiki.Outcome) { metrics.WikiLookup(string(o)) },
 		Log:               log,
 	})
+}
+
+// wikiUserAgent names the build to the wiki's operators when the build knows
+// its version. "(devel)" -- what an image built without VCS metadata
+// reports -- is not a valid User-Agent product version, so it is left out
+// rather than sent malformed.
+func wikiUserAgent(version string) string {
+	ua := "minecraft-server-agent"
+	if version != "" && version != "(devel)" {
+		ua += "/" + version
+	}
+	return ua + " (+https://github.com/jdwillmsen/minecraft-server-agent)"
 }
 
 // storeOpenWindow bounds how long startup keeps asking an unreachable

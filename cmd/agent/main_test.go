@@ -362,3 +362,15 @@ func TestNewWiki_EnabledReturnsAWorkingClient(t *testing.T) {
 		t.Error("newWiki(enabled).Enabled() = false, want true")
 	}
 }
+
+func TestWikiUserAgentNamesARealBuildOnly(t *testing.T) {
+	for version, want := range map[string]string{
+		"v1.4.0":  "minecraft-server-agent/v1.4.0 (+https://github.com/jdwillmsen/minecraft-server-agent)",
+		"(devel)": "minecraft-server-agent (+https://github.com/jdwillmsen/minecraft-server-agent)",
+		"":        "minecraft-server-agent (+https://github.com/jdwillmsen/minecraft-server-agent)",
+	} {
+		if got := wikiUserAgent(version); got != want {
+			t.Errorf("wikiUserAgent(%q) = %q, want %q", version, got, want)
+		}
+	}
+}
