@@ -139,9 +139,47 @@ func templates(s string) []string {
 	return out
 }
 
+// splitTemplate splits only on pipes at the top level: a pipe inside a
+// nested template or a link belongs to that inner markup. Nested templates
+// (edition notes such as {{only|java}}) are dropped from the values, so no
+// "{{" or "}}" reaches the model.
 func splitTemplate(body string) (string, []string, map[string]string) {
-	body = wikiLink.ReplaceAllString(body, "$1")
-	fields := strings.Split(body, "|")
+	var fields []string
+	var cur strings.Builder
+	braces, brackets := 0, 0
+	for i := 0; i < len(body); i++ {
+		switch {
+		case strings.HasPrefix(body[i:], "{{"):
+			braces++
+			i++
+			continue
+		case braces > 0 && strings.HasPrefix(body[i:], "}}"):
+			braces--
+			i++
+			continue
+		case braces > 0:
+			continue
+		case strings.HasPrefix(body[i:], "[["):
+			brackets++
+			cur.WriteString("[[")
+			i++
+			continue
+		case brackets > 0 && strings.HasPrefix(body[i:], "]]"):
+			brackets--
+			cur.WriteString("]]")
+			i++
+			continue
+		case brackets == 0 && body[i] == '|':
+			fields = append(fields, cur.String())
+			cur.Reset()
+			continue
+		}
+		cur.WriteByte(body[i])
+	}
+	fields = append(fields, cur.String())
+	for i, f := range fields {
+		fields[i] = wikiLink.ReplaceAllString(f, "$1")
+	}
 	name := strings.TrimSpace(fields[0])
 	var positional []string
 	named := make(map[string]string)
