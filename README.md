@@ -338,8 +338,12 @@ without that gauge beside them there is nothing on the graph to say so.
 | `LLM_MODEL` | *(empty)* | Model name sent with each request |
 | `LLM_API_KEY` | *(empty)* | Bearer token for the LLM backend, if it requires one |
 | `LLM_MAX_TOKENS` | `192` | Max tokens per LLM call |
-| `LLM_TIMEOUT_MS` | `8000` | Timeout for each individual LLM call; one answer makes up to three of them (two tool rounds plus the final answer), so `LLM_TOTAL_TIMEOUT_MS` has to leave room for three of these |
-| `LLM_TOTAL_TIMEOUT_MS` | `30000` | Bounds one whole `@server` answering attempt, including every tool round trip - separate from `LLM_TIMEOUT_MS` so one stalled call can't eat the entire budget, and separate from having no bound so a model that keeps calling tools can't answer arbitrarily late. Must be at least three times `LLM_TIMEOUT_MS` (two tool rounds plus the answer), with margin; below that a model that uses both tool rounds is cut off mid-answer and the asker hears nothing |
+| `LLM_TIMEOUT_MS` | `8000` | Timeout for each individual LLM call; one answer makes up to `MAX_TOOL_ROUNDS` + 1 of them (every tool round plus the final answer), so `LLM_TOTAL_TIMEOUT_MS` has to leave room for that many |
+| `LLM_TOTAL_TIMEOUT_MS` | `30000` | Bounds one whole `@server` answering attempt, including every tool round trip - separate from `LLM_TIMEOUT_MS` so one stalled call can't eat the entire budget, and separate from having no bound so a model that keeps calling tools can't answer arbitrarily late. Startup refuses a value below (`MAX_TOOL_ROUNDS` + 1) x `LLM_TIMEOUT_MS`; leave margin above that for the tool calls in between, or a model that uses every tool round is cut off mid-answer and the asker hears nothing |
+| `MAX_TOOL_ROUNDS` | `2` | Tool rounds one answer may use before the next request withholds tools and forces text out. Accepted 1-6; anything else refuses startup, as does a value the two timeouts above cannot fit |
+| `WIKI_ENABLED` | `false` | Offers the model `wiki_lookup`, which answers game questions from minecraft.wiki - the only request the agent makes to the internet. Off by default: it has not yet cleared its evaluation bar (`docs/eval/2026-09-25-wiki-lookup.md`). Only `true`/`false` (and the other spellings Go's `strconv.ParseBool` accepts) are valid; anything else refuses startup rather than guessing |
+| `WIKI_BASE_URL` | `https://minecraft.wiki/api.php` | The wiki API `wiki_lookup` calls. Startup refuses any other value unless `WIKI_ALLOW_TEST_BASE_URL=true`, so a stray setting cannot point the agent at a host nobody chose |
+| `WIKI_ALLOW_TEST_BASE_URL` | `false` | Lets `WIKI_BASE_URL` name a test server. For tests and local fakes only; never set in production |
 | `ANSWER_MAX_PER_MINUTE` | `4` | Max `@server` answers a single actor may trigger per rolling minute, tracked separately from `COMMAND_RATE_LIMIT_PER_MINUTE` since one LLM call costs far more than one console command |
 | `MC_MONITOR_URL` | *(empty)* | mc-monitor Prometheus endpoint behind `!online`; unset reports the command unconfigured rather than erroring |
 | `BACKUP_EXPORTER_URL` | *(empty)* | Backup exporter's `/metrics.txt` behind `!backup`; unset reports the command unconfigured rather than erroring |
@@ -366,6 +370,7 @@ breaking change.
 | `mc_agent_mentions_total` | counter | `outcome` | once per `@server` mention |
 | `mc_agent_answer_duration_seconds` | histogram | `outcome` | per answer attempt that reached the model |
 | `mc_agent_tool_calls_total` | counter | `tool`, `outcome` | per tool invocation |
+| `mc_agent_wiki_requests_total` | counter | `outcome` | per `wiki_lookup` - lookups, not HTTP requests, since one lookup can make several; every outcome starts at zero |
 | `mc_agent_announce_deliveries_total` | counter | `delivery`, `outcome` | per send attempt |
 | `mc_agent_audit_write_failures_total` | counter | none | per dispatch the audit trail did not record |
 | `mc_agent_auth_rejections_total` | counter | none | per Xbox Live account rejection |
@@ -399,6 +404,10 @@ invents reaches one unfiltered:
   model made up; `outcome` is `ok` or `error`
 - `delivery` is `broadcast`, `whisper`, or `summary` (the drain's "more are
   waiting" line); `outcome` is `sent` or `failed`
+- wiki `outcome`: `hit`, `miss` (no such page), `cached` (answered from the
+  cache, hit or miss), `error` (the wiki failed or answered malformed; never
+  cached), `limited` (the process-wide 60-per-minute budget was spent, or the
+  wiki answered 429)
 
 Every known mention, announce-delivery and command/outcome combination, and
 the audit, auth and death counters, start at zero: `increase()` over a
@@ -519,8 +528,8 @@ granted more trust than a stranger, and a bridge outage fails closed.
 ## Answering with tools
 
 An `@server` question is not a single completion: the model may call tools
-from `internal/tools` for up to two rounds before the next request
-withholds tools entirely, which is what forces text out of a model that
+from `internal/tools` for up to `MAX_TOOL_ROUNDS` rounds (two by default)
+before the next request withholds tools entirely, which is what forces text out of a model that
 would otherwise keep calling them instead of answering. Each round is
 carried into the next as the standard message shape has it: the assistant
 turn keeps both what the model wrote and the calls it asked for, so a
@@ -558,6 +567,11 @@ out of chat. The full surface, as wired in `internal/toolset/toolset.go`:
   older than it is refused before login and has to update
 - `backup_status` - how recently the world was backed up and how large
   that backup was
+- `wiki_lookup` - how Minecraft itself works, from minecraft.wiki: items,
+  blocks, mobs, recipes and mechanics, never facts about this server. **Off
+  by default** (`WIKI_ENABLED`). The model supplies only a topic and an
+  optional aspect; the host is fixed, redirects are refused, and what comes
+  back is framed as reference text, not instructions
 
 A tool whose backing capability is not configured is not offered to the
 model at all - not offered-but-erroring, not offered-but-answering
@@ -566,10 +580,18 @@ need `PG_HOST`; `server_status` and `server_version` need
 `MC_MONITOR_URL`; `backup_status` needs its own `BACKUP_EXPORTER_URL`,
 checked separately since the backup exporter is a different deployment
 from mc-monitor. `players_online` has no such gate - it rides
-`mc-console-bridge`, which every deployment already requires. Run with
-none of the optional variables set and `@server` answers with no tools at
-all, rather than spending a tool round asking a model to discover an
-absence the wiring already knows about.
+`mc-console-bridge`, which every deployment already requires. `wiki_lookup`
+needs `WIKI_ENABLED=true`. Run with none of the optional variables set and
+`@server` answers with no tools at all, rather than spending a tool round
+asking a model to discover an absence the wiring already knows about.
+
+A slow answer says it is coming. When a tool round finishes more than 3
+seconds after the question arrived, the asker is whispered `Looking that
+up…` - once per question, never broadcast, and never to the console, which
+has no chat to whisper into. It does not depend on the wiki: any answer that
+is still working through tool rounds at that point sends it. It promises
+nothing, either - an answer that then fails or comes back empty leaves the
+asker with only that line, the same silence as before it plus one message.
 
 The security property this rests on: there is no write tool. Every tool
 answers a question and changes nothing, so a prompt-injection attempt
