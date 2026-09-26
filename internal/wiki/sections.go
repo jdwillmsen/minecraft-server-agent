@@ -75,8 +75,9 @@ func topSectionNames(root *section) []string {
 
 // selectSection finds the heading best matching aspect: an exact heading,
 // then the heading a synonym names, then the most shared words. Excluded
-// headings are never candidates. The tree is walked in order so a top-level
-// match beats a same-named subsection further down.
+// headings are never candidates. Among equal scores the first heading in
+// document order wins, whatever its depth: a subsection that comes earlier
+// beats a same-named top-level section further down.
 func selectSection(root *section, aspect string) (*section, []string, bool) {
 	want := strings.ToLower(strings.TrimSpace(aspect))
 	if want == "" {

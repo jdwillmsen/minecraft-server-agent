@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,10 +23,14 @@ type fakeWiki struct {
 	pages          map[string]string // title -> extract
 	disambiguation map[string]bool
 	wikitext       map[string]string
-	status         int           // non-zero: answer every request with it
-	delay          time.Duration // slow every request
-	requests       atomic.Int64
-	lastQuery      atomic.Value // most recent raw query string
+	redirects      map[string]string // requested title -> the title it redirects to
+	status         int               // non-zero: answer every request with it
+	// override answers a request itself when it returns true, for the
+	// malformed and erroring responses no canned page produces.
+	override  func(w http.ResponseWriter, q url.Values) bool
+	delay     time.Duration // slow every request
+	requests  atomic.Int64
+	lastQuery atomic.Value // most recent raw query string
 }
 
 func (f *fakeWiki) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -39,6 +45,9 @@ func (f *fakeWiki) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	w.Header().Set("content-type", "application/json")
+	if f.override != nil && f.override(w, q) {
+		return
+	}
 	switch {
 	case q.Get("action") == "opensearch":
 		term := strings.ToLower(q.Get("search"))
@@ -53,6 +62,9 @@ func (f *fakeWiki) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"parse": map[string]any{"wikitext": map[string]string{"*": f.wikitext[q.Get("page")]}}})
 	default: // prop=extracts|pageprops
 		title := q.Get("titles")
+		if to, ok := f.redirects[title]; ok {
+			title = to
+		}
 		extract, ok := f.pages[title]
 		page := map[string]any{"title": title, "extract": extract}
 		if !ok {
@@ -231,4 +243,158 @@ func TestLookupIsSafeConcurrently(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestLookupDoesNotFollowAnHTTPRedirect(t *testing.T) {
+	elsewhere := golemWiki()
+	other := httptest.NewServer(elsewhere)
+	t.Cleanup(other.Close)
+	f := golemWiki()
+	f.override = func(w http.ResponseWriter, _ url.Values) bool {
+		w.Header().Set("Location", other.URL+"/api.php")
+		w.WriteHeader(http.StatusFound)
+		return true
+	}
+	c := newTestClient(t, f, nil)
+	if _, err := c.Lookup(t.Context(), "iron golem", ""); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable for a redirect", err)
+	}
+	if got := elsewhere.requests.Load(); got != 0 {
+		t.Errorf("the redirect target saw %d requests, want 0", got)
+	}
+}
+
+// failsOnce answers the first page request with bad, then behaves.
+func failsOnce(bad func(w http.ResponseWriter)) func(http.ResponseWriter, url.Values) bool {
+	var done atomic.Bool
+	return func(w http.ResponseWriter, q url.Values) bool {
+		if q.Get("prop") != "extracts|pageprops" || done.Swap(true) {
+			return false
+		}
+		bad(w)
+		return true
+	}
+}
+
+func TestLookupTreatsAnAPIErrorAsUnavailableAndDoesNotCacheIt(t *testing.T) {
+	for name, bad := range map[string]func(w http.ResponseWriter){
+		"error body": func(w http.ResponseWriter) {
+			_, _ = w.Write([]byte(`{"error":{"code":"maxlag","info":"Waiting for a database server"}}`))
+		},
+		"error header": func(w http.ResponseWriter) {
+			w.Header().Set("MediaWiki-API-Error", "readonly")
+			_, _ = w.Write([]byte(`{}`))
+		},
+		"no pages": func(w http.ResponseWriter) {
+			_, _ = w.Write([]byte(`{"query":{"pages":{}}}`))
+		},
+		"no query": func(w http.ResponseWriter) {
+			_, _ = w.Write([]byte(`{"batchcomplete":""}`))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := golemWiki()
+			f.override = failsOnce(bad)
+			var outcomes []Outcome
+			c := newTestClient(t, f, func(o Outcome) { outcomes = append(outcomes, o) })
+			if _, err := c.Lookup(t.Context(), "iron golem", ""); !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("err = %v, want ErrUnavailable", err)
+			}
+			out, err := c.Lookup(t.Context(), "iron golem", "")
+			if err != nil || !strings.Contains(out, `page "Iron Golem"`) {
+				t.Fatalf("the wiki recovered but the lookup returned %q, %v", out, err)
+			}
+			if len(outcomes) != 2 || outcomes[0] != OutcomeError || outcomes[1] != OutcomeHit {
+				t.Errorf("outcomes = %v, want [error hit]", outcomes)
+			}
+		})
+	}
+}
+
+func TestLookupFallsBackToSearchOnAShortOpensearchAnswer(t *testing.T) {
+	f := golemWiki()
+	f.search = map[string][]string{"iron golem": {"Iron Golem"}}
+	f.override = func(w http.ResponseWriter, q url.Values) bool {
+		if q.Get("action") != "opensearch" {
+			return false
+		}
+		_, _ = w.Write([]byte(`["iron golem"]`))
+		return true
+	}
+	c := newTestClient(t, f, nil)
+	out, err := c.Lookup(t.Context(), "iron golem", "")
+	if err != nil || !strings.Contains(out, `page "Iron Golem"`) {
+		t.Fatalf("result = %q, %v", out, err)
+	}
+}
+
+func TestLookupFallsBackToTheIntroWhenASectionIsEmpty(t *testing.T) {
+	for name, parse := range map[string]string{
+		"no recipe in the wikitext": `{"parse":{"wikitext":{"*":"== Obtaining ==\n=== Crafting ===\nSee elsewhere."}}}`,
+		"no parse key":              `{}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := golemWiki()
+			f.override = func(w http.ResponseWriter, q url.Values) bool {
+				if q.Get("action") != "parse" {
+					return false
+				}
+				_, _ = w.Write([]byte(parse))
+				return true
+			}
+			c := newTestClient(t, f, nil)
+			out, err := c.Lookup(t.Context(), "torch", "recipe")
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := `no section matched "recipe"; ` + Format("Torch", "intro", "A torch is a light source.", []string{"Obtaining"})
+			if out != want {
+				t.Errorf("result = %q\nwant     %q", out, want)
+			}
+		})
+	}
+}
+
+func TestLookupReportsTheLimitOnHTTP429(t *testing.T) {
+	f := golemWiki()
+	f.status = http.StatusTooManyRequests
+	var outcomes []Outcome
+	c := newTestClient(t, f, func(o Outcome) { outcomes = append(outcomes, o) })
+	if _, err := c.Lookup(t.Context(), "iron golem", ""); !errors.Is(err, ErrLimited) {
+		t.Fatalf("err = %v, want ErrLimited", err)
+	}
+	if len(outcomes) != 1 || outcomes[0] != OutcomeLimited {
+		t.Errorf("outcomes = %v, want [limited]", outcomes)
+	}
+}
+
+func TestLookupObservesEachOutcome(t *testing.T) {
+	f := golemWiki()
+	var outcomes []Outcome
+	c := newTestClient(t, f, func(o Outcome) { outcomes = append(outcomes, o) })
+	if _, err := c.Lookup(t.Context(), "iron golem", ""); err != nil {
+		t.Fatal(err)
+	}
+	f.status = http.StatusBadGateway
+	_, _ = c.Lookup(t.Context(), "torch", "")
+	f.status = http.StatusTooManyRequests
+	_, _ = c.Lookup(t.Context(), "golem", "")
+	want := []Outcome{OutcomeHit, OutcomeError, OutcomeLimited}
+	if !slices.Equal(outcomes, want) {
+		t.Errorf("outcomes = %v, want %v", outcomes, want)
+	}
+}
+
+func TestLookupFollowsAPageRedirect(t *testing.T) {
+	f := golemWiki()
+	f.opensearch["villager golem"] = []string{"Villager Golem"}
+	f.redirects = map[string]string{"Villager Golem": "Iron Golem"}
+	c := newTestClient(t, f, nil)
+	out, err := c.Lookup(t.Context(), "villager golem", "spawning")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `page "Iron Golem"`) || !strings.Contains(out, "20 beds") {
+		t.Errorf("result = %q, want the page the redirect resolved to", out)
+	}
 }
