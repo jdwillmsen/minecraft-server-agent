@@ -9,8 +9,8 @@ require (
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/jdwillmsen/minecraft-server-agent/presenceapi v0.1.0
 	github.com/prometheus/client_golang v1.24.1
-	github.com/prometheus/common v0.71.0
-	github.com/sandertv/go-raknet v1.15.2-0.20260705184311-0d1fd09e2cf6
+	github.com/prometheus/common v0.72.0
+	github.com/sandertv/go-raknet v1.15.2
 	github.com/sandertv/gophertunnel v1.62.0
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/oauth2 v0.37.0
@@ -55,12 +55,12 @@ require (
 	github.com/prometheus/client_model v0.6.3 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
-	golang.org/x/crypto v0.56.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20260824195058-e88cd73687aa // indirect
-	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
