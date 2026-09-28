@@ -195,8 +195,8 @@ build with different toolchains and ship as different artifacts.
 
 Code moves to a shared folder only when a second component uses it: the
 census LevelDB reader moves to `minecraft/internal/leveldb` when mcmap needs
-it, and presence goes to the top-level `internal/` when the restructure folds
-`presenceapi` in. Go's `internal/` visibility rule enforces the boundary:
+it, and the presence contract goes to `internal/presenceapi` when the
+restructure folds the `presenceapi` module in. Go's `internal/` visibility rule enforces the boundary:
 `minecraft/agent/internal` stays private to the agent.
 
 `pnpm-workspace.yaml`, `packages/` and `api/` are created by the first
@@ -282,7 +282,8 @@ this one is a pure restructure:
   `github.com/jdwillmsen/gameops/minecraft/agent/internal/census`.
 - `presenceapi` stops being a separately tagged module: its `go.mod`, the
   `replace` directive and its tag series go away, and it becomes
-  `internal/presence`.
+  `internal/presenceapi`. (The agent already has an `internal/presence`, the
+  consumer side, which keeps its name.)
 - Dockerfiles build from the repo root, since the module root is now the
   repo root, and each stays in its component directory.
 - Each component gets its `component.yaml` in this PR.
@@ -331,8 +332,9 @@ it until spurious releases actually cause a problem.
   the only required status check, so branch protection does not change as the
   set of jobs changes. Changes to `tools/` or the workflows themselves run
   every component.
-- `codeql.yml` (with every language present), `security-scan.yml` and
-  `verify-pr-signatures.yml` run once for the repo.
+- `codeql.yml`, `security-scan.yml` and `verify-pr-signatures.yml` run once
+  for the repo. CodeQL starts with `go`; the first TypeScript component adds
+  `javascript-typescript` to its language list.
 - The AFK bot's `protocol-check.yml` keeps its job, scoped to `minecraft/`.
 - One `renovate.json` covers every package manager and groups Go dependencies,
   so a gophertunnel bump lands in one PR for every component that uses it.
