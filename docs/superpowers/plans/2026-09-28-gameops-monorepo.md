@@ -168,6 +168,16 @@ Expected:
 
 If a count differs, stop: a tag was lost in the rename.
 
+- [ ] **Step 6: Each component still builds and tests where it now sits.** Each still has its own `go.mod` at this point.
+
+```bash
+cd ~/scratch/gameops
+for c in agent bridge afkbot; do (cd minecraft/$c && go build ./... && go test -race ./...) || exit 1; done
+(cd minecraft/agent/presenceapi && go test -race ./...)
+```
+
+Expected: all pass. This is the bootstrap state that gets pushed. Task 3's restructure is verified on its own PR before it reaches `main`.
+
 ---
 
 ### Task 2: Create the GitHub repo and push the bootstrap
