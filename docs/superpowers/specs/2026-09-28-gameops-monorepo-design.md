@@ -35,6 +35,8 @@ repos. So the repos merge first.
 |---|---|---|
 | Repo | `jdwillmsen/gameops`, top level split by game, `minecraft/` first | Auth, presence and Discord code are game-agnostic; a second game reuses them |
 | What moves in | agent, console bridge, AFK bot, plus the new map | Same language, same server, same chart |
+| Component model | Any language or kind; each component declares itself in a `component.yaml` that CI and releases read | UIs, backends, packs and libraries all fit without workflow edits |
+| Build orchestration | Manifests plus native tools (go, pnpm); no Nx, moon or Bazel | Mostly Go; keeps dependencies minimal; a later move to Nx is mechanical |
 | Chart | Stays in `jdw-deployments` | Keeps the GitOps split: code repo publishes images, deploy repo pins them |
 | Releases | semantic-release per component, automatic on merge | Keeps today's flow; no release PRs, no new token |
 | Image names | Unchanged; new map image is `minecraft-map` | Chart and tag history keep working |
@@ -149,8 +151,12 @@ independent layers on top.
 
 - One repo, `jdwillmsen/gameops`, holding the agent, console bridge and AFK
   bot with every commit of their history preserved and `git blame` intact.
+- Any kind of software can live in it: Go services, TypeScript frontends,
+  script packs, shared libraries, jobs and CLIs, and later other languages.
+  Adding a component means adding a folder and a manifest, never editing CI
+  or release workflows.
 - Each component still versions and releases on its own, automatically on
-  merge, and publishes to the same image names on ghcr.io and docker.io.
+  merge. The existing images keep their names on ghcr.io and docker.io.
 - A PR runs CI only for the components it touches, behind one required check.
 - No change to the chart or to anything running in the cluster.
 
@@ -158,31 +164,88 @@ independent layers on top.
 
 - Moving the Helm chart.
 - Renaming images.
-- Pulling in non-Minecraft projects.
+- Pulling in non-Minecraft projects now. The layout allows it; this migration
+  does not do it.
 - Any map code. That starts in sub-project 1, in the new repo.
+- A monorepo build system (Nx, moon, Bazel). See "Orchestration".
 
 ## Layout
 
-After the migration and restructure:
-
 ```
 gameops/
-  go.mod                    module github.com/jdwillmsen/gameops
-  internal/                 game-agnostic code with more than one user
+  go.mod                    one Go module for all Go code
+  pnpm-workspace.yaml       one pnpm workspace for all TypeScript code
+  internal/                 shared Go libraries, game-agnostic
+  packages/                 shared TypeScript libraries (UI kit, API clients)
+  api/                      OpenAPI contracts between backends and frontends
   minecraft/
+    internal/               shared Go libraries, Minecraft-specific
     agent/                  was minecraft-server-agent
-      cmd/ internal/ Dockerfile README.md docs/ eval/ scripts/
     bridge/                 was mc-console-bridge
     afkbot/                 was minecraft-afk-bot
-  tools/release/            per-component semantic-release glue
+  tools/                    component schema, change detection, release glue
   .github/workflows/
 ```
+
+The top level splits by game. Within a game, each component is one directory
+holding one deployable or publishable thing. Sub-project 1 adds
+`minecraft/mcmap` (Go backend), `minecraft/mcmap-web` (TypeScript frontend) and
+`minecraft/mcmap-pack` (Script API pack) as three components, not one: they
+build with different toolchains and ship as different artifacts.
 
 Code moves to a shared folder only when a second component uses it: the
 census LevelDB reader moves to `minecraft/internal/leveldb` when mcmap needs
 it, and presence goes to the top-level `internal/` when the restructure folds
 `presenceapi` in. Go's `internal/` visibility rule enforces the boundary:
 `minecraft/agent/internal` stays private to the agent.
+
+`pnpm-workspace.yaml`, `packages/` and `api/` are created by the first
+component that needs them, not by this migration. The layout only reserves
+their places.
+
+## Components
+
+Every component has a `component.yaml` at its root:
+
+```yaml
+name: agent
+kind: service          # service | frontend | library | pack | job | cli
+language: go           # go | typescript | ...
+depends:               # shared paths whose changes affect this component
+  - internal/
+  - minecraft/internal/
+tasks:
+  build: go build ./minecraft/agent/...
+  test: go test ./minecraft/agent/...
+  lint: golangci-lint run ./minecraft/agent/...
+release:
+  tag: agent           # git tags agent-v0.24.0
+  artifacts: [image]   # image | github-asset | none
+  image: minecraft-server-agent
+  description: Minecraft Bedrock server chat agent
+```
+
+- A component is affected by a change if the change touches its own
+  directory, any path in `depends`, or a toolchain file for its language:
+  `go.mod`/`go.sum` for Go; `pnpm-lock.yaml`/`pnpm-workspace.yaml` for
+  TypeScript.
+- `tasks` are plain shell commands run from the repo root. The language's own
+  tool does the work.
+- `kind` is descriptive; it drives nothing yet except validation that
+  `release.artifacts` makes sense for it (a `library` releases nothing).
+- `tools/components` is a small Go program that loads and validates every
+  manifest against a schema, answers "which components does this diff
+  affect", and prints the CI matrix. Unit tests cover each path class and
+  every validation error.
+
+### Orchestration
+
+No monorepo build system. Go and pnpm already handle their own dependency
+graphs and caching, and the repo is mostly Go, where Nx relies on a
+community plugin. The owned code is the manifest loader and change detection
+above, plus the release glue below. If the repo outgrows that, each
+`component.yaml` maps almost one-to-one onto an Nx `project.json`, so moving
+is mechanical.
 
 ## History merge
 
@@ -220,50 +283,59 @@ this one is a pure restructure:
 - `presenceapi` stops being a separately tagged module: its `go.mod`, the
   `replace` directive and its tag series go away, and it becomes
   `internal/presence`.
-- Dockerfiles build from the repo root with the component path as an argument,
-  since the module root is now the repo root.
+- Dockerfiles build from the repo root, since the module root is now the
+  repo root, and each stays in its component directory.
+- Each component gets its `component.yaml` in this PR.
 
 ## Releases
 
-Each component keeps semantic-release, run once per component with its own
-config in `tools/release/<component>.json`:
+semantic-release runs once per releasable component, driven by the
+manifests:
 
-- `tagFormat` is `agent-v${version}` (and `bridge-`, `afkbot-`).
+- `tagFormat` comes from `release.tag`: `agent-v${version}`, and likewise
+  `bridge-` and `afkbot-`.
 - A small local plugin in `tools/release/` wraps the commit analyzer and
-  release notes generator and drops every commit that did not touch the
-  component. A commit counts for a component if it changes a file under the
-  component's directory, or under a shared path: `go.mod`, `go.sum`, the
-  top-level `internal/`, or `minecraft/internal/`.
-- The workflow runs the components one at a time, not in parallel, so their
-  tag pushes do not race.
-- The tag, stripped of its component prefix, is the image version: tag
-  `agent-v0.24.0` publishes `minecraft-server-agent:0.24.0`. Registry tags
-  therefore look exactly as they do today, and the chart and its Renovate
-  rules need no change.
+  release notes generator and drops every commit that did not affect the
+  component, using the same change detection as CI.
+- The workflow runs components one at a time, not in parallel, so their tag
+  pushes do not race.
+- The artifact step depends on `release.artifacts`:
+  - `image`: the tag, stripped of its prefix, is the image version. Tag
+    `agent-v0.24.0` publishes `minecraft-server-agent:0.24.0`, so registry
+    tags look exactly as they do today and the chart and its Renovate rules
+    need no change.
+  - `github-asset`: the build output is attached to the component's GitHub
+    release (for example the `.mcpack` from the map's script pack).
+  - `none`: tag and release notes only.
 
-`release.yml` becomes one reusable workflow taking the component, image name
-and description as inputs. Everything it does today is preserved: tag checkout
-for rebuilds, ghcr.io and docker.io dual publish, OCI labels and annotations,
-the PolyForm Noncommercial license label, and no `latest` tag.
+`release.yml` becomes one reusable image workflow taking the component's
+directory, image name and description from its manifest. Everything it does
+today is preserved: tag checkout for rebuilds, ghcr.io and docker.io dual
+publish, OCI labels and annotations, the PolyForm Noncommercial license label,
+and no `latest` tag.
 
-Trade-off accepted: a `go.mod`/`go.sum` change releases every component, even
-one that does not use the bumped dependency. Working out the real
+Trade-off accepted: a `go.mod`/`go.sum` change releases every Go component,
+even one that does not use the bumped dependency. Working out the real
 per-component dependency graph from `go list -deps` is possible but not worth
 it until spurious releases actually cause a problem.
 
 ## CI
 
-- `ci.yml` has a `changes` job that maps changed paths to components, using
-  the same rules as the release plugin, then one build/test/lint job per
-  affected component.
+- `ci.yml` starts with a `plan` job that runs `tools/components` against the
+  PR diff and emits a matrix of affected components with their language and
+  tasks.
+- A `component` matrix job sets up the toolchain for the language (Go, or
+  Node plus pnpm) and runs `lint`, `test` and `build`. A new language adds one
+  setup branch here, once.
 - A final `ci-ok` job depends on all of them and fails if any failed. It is
   the only required status check, so branch protection does not change as the
-  set of jobs changes.
-- `codeql.yml`, `security-scan.yml` and `verify-pr-signatures.yml` run once
-  for the repo.
+  set of jobs changes. Changes to `tools/` or the workflows themselves run
+  every component.
+- `codeql.yml` (with every language present), `security-scan.yml` and
+  `verify-pr-signatures.yml` run once for the repo.
 - The AFK bot's `protocol-check.yml` keeps its job, scoped to `minecraft/`.
-- One `renovate.json` groups Go dependencies, so a gophertunnel bump lands in
-  one PR for every component that uses it.
+- One `renovate.json` covers every package manager and groups Go dependencies,
+  so a gophertunnel bump lands in one PR for every component that uses it.
 
 ## Cutover
 
@@ -288,11 +360,11 @@ it until spurious releases actually cause a problem.
   file's original first commit.
 - `git tag -l 'agent-v*'` must show every old agent tag, and likewise for the
   bridge and bot.
+- `tools/components` unit tests: manifest validation, and change detection for
+  own-directory, `depends`, toolchain-file and `tools/` changes.
 - Release glue test: a fixture repo with commits touching one component, a
   shared path, and neither, checked with semantic-release's dry-run mode.
   Only the expected components get a release, at the expected versions.
-- CI path mapping test: the `changes` job's mapping table has unit cases for
-  each path class.
 
 ## Risks
 
