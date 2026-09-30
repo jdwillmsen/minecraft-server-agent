@@ -1,3 +1,8 @@
+> **Moved.** This project now lives in
+> [jdwillmsen/gameops](https://github.com/jdwillmsen/gameops/tree/main/minecraft/agent),
+> history and tags included (tags there are prefixed `agent-`). This
+> repository is archived and read-only; images keep their names.
+
 # minecraft-server-agent
 
 [![License](https://img.shields.io/badge/License-PolyForm%20NonCommercial%201.0-blue)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
